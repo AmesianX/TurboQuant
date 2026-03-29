@@ -8,6 +8,9 @@ on:
         required: true
         default: 'v1.0.0'
 
+permissions:
+  contents: write
+
 jobs:
   # ============================================================
   # Linux x64 + CUDA 12.8
