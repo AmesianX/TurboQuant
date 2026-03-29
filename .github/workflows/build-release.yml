@@ -1,0 +1,167 @@
+name: Build Release Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach binaries to (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  # ============================================================
+  # Linux amd64 + CUDA 12.8
+  # ============================================================
+  build-linux-x64-cuda128:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit 12.8
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.8.0'
+          method: 'network'
+
+      - name: Build
+        run: |
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+      - name: Package
+        run: |
+          PKG="turboquant-bin-linux-x64-cuda-cu12.8"
+          mkdir -p $PKG
+          for bin in llama-cli llama-server llama-perplexity llama-bench \
+                     llama-quantize llama-gguf-split llama-imatrix llama-tokenize; do
+            cp build/bin/$bin $PKG/ 2>/dev/null || true
+          done
+          cp -P build/bin/lib*.so* $PKG/ 2>/dev/null || true
+          zip -r $PKG.zip $PKG/
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.inputs.tag }} \
+            turboquant-bin-linux-x64-cuda-cu12.8.zip \
+            --clobber
+
+  # ============================================================
+  # Linux amd64 + CUDA 13.0
+  # ============================================================
+  build-linux-x64-cuda130:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit 13.0
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '13.0.0'
+          method: 'network'
+        continue-on-error: true
+
+      - name: Fallback - Install CUDA 13.0 manually
+        if: failure()
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y cuda-toolkit-13-0 || echo "CUDA 13.0 not available yet"
+
+      - name: Build
+        run: |
+          export PATH=/usr/local/cuda/bin:$PATH
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+      - name: Package
+        run: |
+          PKG="turboquant-bin-linux-x64-cuda-cu13.0"
+          mkdir -p $PKG
+          for bin in llama-cli llama-server llama-perplexity llama-bench \
+                     llama-quantize llama-gguf-split llama-imatrix llama-tokenize; do
+            cp build/bin/$bin $PKG/ 2>/dev/null || true
+          done
+          cp -P build/bin/lib*.so* $PKG/ 2>/dev/null || true
+          zip -r $PKG.zip $PKG/
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.inputs.tag }} \
+            turboquant-bin-linux-x64-cuda-cu13.0.zip \
+            --clobber
+
+  # ============================================================
+  # Windows amd64 + CUDA 12.8
+  # ============================================================
+  build-windows-x64-cuda128:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit 12.8
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.8.0'
+          method: 'network'
+
+      - name: Build
+        run: |
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Package
+        run: |
+          $PKG = "turboquant-bin-win-x64-cuda-cu12.8"
+          New-Item -ItemType Directory -Path $PKG -Force
+          Get-ChildItem build/bin/Release/*.exe | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
+          Get-ChildItem build/bin/Release/*.dll | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path $PKG -DestinationPath "$PKG.zip"
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.inputs.tag }} `
+            turboquant-bin-win-x64-cuda-cu12.8.zip `
+            --clobber
+
+  # ============================================================
+  # Windows amd64 + CUDA 13.0
+  # ============================================================
+  build-windows-x64-cuda130:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit 13.0
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '13.0.0'
+          method: 'network'
+        continue-on-error: true
+
+      - name: Build
+        run: |
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Package
+        run: |
+          $PKG = "turboquant-bin-win-x64-cuda-cu13.0"
+          New-Item -ItemType Directory -Path $PKG -Force
+          Get-ChildItem build/bin/Release/*.exe | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
+          Get-ChildItem build/bin/Release/*.dll | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path $PKG -DestinationPath "$PKG.zip"
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.inputs.tag }} `
+            turboquant-bin-win-x64-cuda-cu13.0.zip `
+            --clobber
