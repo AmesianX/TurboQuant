@@ -440,7 +440,11 @@ extern "C" {
         GGML_TYPE_TBQ4_2  = 50, // TurboQuant 4-bit, blck_size=64 (head_dim=64)
         GGML_TYPE_TBQP3_2 = 51, // TurboQuant_prod 3-bit, blck_size=64 (head_dim=64)
         GGML_TYPE_TBQP4_2 = 52, // TurboQuant_prod 4-bit, blck_size=64 (head_dim=64)
-        GGML_TYPE_COUNT   = 53,
+        GGML_TYPE_TBQ3_3  = 53, // TurboQuant 3-bit, cross-head WHT (8×64=512)
+        GGML_TYPE_TBQ4_3  = 54, // TurboQuant 4-bit, cross-head WHT (8×64=512)
+        GGML_TYPE_TBQP3_3 = 55, // TurboQuant_prod 3-bit, cross-head WHT (8×64=512)
+        GGML_TYPE_TBQP4_3 = 56, // TurboQuant_prod 4-bit, cross-head WHT (8×64=512)
+        GGML_TYPE_COUNT   = 57,
     };
 
     // precision

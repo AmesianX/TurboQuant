@@ -1,656 +1,1027 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 538d2a4b0..97a56dc61 100644
+index 97a56dc61..ec5da90ae 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -387,6 +387,10 @@ const std::vector<ggml_type> kv_cache_types = {
-     GGML_TYPE_IQ4_NL,
-     GGML_TYPE_Q5_0,
-     GGML_TYPE_Q5_1,
-+    GGML_TYPE_TBQ3_0,
-+    GGML_TYPE_TBQ4_0,
-+    GGML_TYPE_TBQP3_0,
-+    GGML_TYPE_TBQP4_0,
+@@ -391,9 +391,29 @@ const std::vector<ggml_type> kv_cache_types = {
+     GGML_TYPE_TBQ4_0,
+     GGML_TYPE_TBQP3_0,
+     GGML_TYPE_TBQP4_0,
++    GGML_TYPE_TBQ3_1,
++    GGML_TYPE_TBQ4_1,
++    GGML_TYPE_TBQP3_1,
++    GGML_TYPE_TBQP4_1,
++    GGML_TYPE_TBQ3_2,
++    GGML_TYPE_TBQ4_2,
++    GGML_TYPE_TBQP3_2,
++    GGML_TYPE_TBQP4_2,
  };
  
  static ggml_type kv_cache_type_from_str(const std::string & s) {
++    // TurboQuant shorthand: "tbq3" → tbq3_0 (resolved to correct _N by head_dim later)
++    // Users don't need to know about _0/_1/_2 suffixes
++    static const std::unordered_map<std::string, ggml_type> tbq_shortcuts = {
++        {"tbq3",  GGML_TYPE_TBQ3_0},
++        {"tbq4",  GGML_TYPE_TBQ4_0},
++        {"tbqp3", GGML_TYPE_TBQP3_0},
++        {"tbqp4", GGML_TYPE_TBQP4_0},
++    };
++    auto it = tbq_shortcuts.find(s);
++    if (it != tbq_shortcuts.end()) {
++        return it->second;
++    }
+     for (const auto & type : kv_cache_types) {
+         if (ggml_type_name(type) == s) {
+             return type;
+diff --git a/common/common.cpp b/common/common.cpp
+index a9bd49419..e525b0492 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1225,6 +1225,143 @@ common_init_result::common_init_result(common_params & params) :
+         cparams.n_samplers = pimpl->samplers_seq_config.size();
+     }
+ 
++    // TurboQuant auto-mapping: resolve _0 placeholder to correct _N based on head_dim
++    // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
++    {
++        // Get KV head dimension from GGUF metadata: {arch}.attention.key_length
++        int32_t head_dim = 0;
++        {
++            char arch[64] = {}, buf[64] = {};
++            llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
++            if (llama_model_meta_val_str(model, (std::string(arch) + ".attention.key_length").c_str(), buf, sizeof(buf)) > 0) {
++                head_dim = std::atoi(buf);
++            }
++        }
++
++        // Helper: check if a type is any TBQ/TBQP variant
++        auto is_tbq_type = [](ggml_type t) -> bool {
++            return t == GGML_TYPE_TBQ3_0  || t == GGML_TYPE_TBQ4_0
++                || t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP4_0
++                || t == GGML_TYPE_TBQ3_1  || t == GGML_TYPE_TBQ4_1
++                || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
++                || t == GGML_TYPE_TBQ3_2  || t == GGML_TYPE_TBQ4_2
++                || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
++                || t == GGML_TYPE_TBQ3_3  || t == GGML_TYPE_TBQ4_3
++                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3;
++        };
++        auto is_tbqp_type = [](ggml_type t) -> bool {
++            return t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP4_0
++                || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
++                || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
++                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3;
++        };
++
++        // Validation 1: V cache must not use TBQP (QJL) — no QJL dequantize for V
++        if (is_tbqp_type(cparams.type_v)) {
++            const char * orig = ggml_type_name(cparams.type_v);
++            // Downgrade tbqp → tbq (strip QJL, keep bit-width)
++                 if (cparams.type_v == GGML_TYPE_TBQP3_0) cparams.type_v = GGML_TYPE_TBQ3_0;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_0) cparams.type_v = GGML_TYPE_TBQ4_0;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_1) cparams.type_v = GGML_TYPE_TBQ3_1;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_1) cparams.type_v = GGML_TYPE_TBQ4_1;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_2) cparams.type_v = GGML_TYPE_TBQ3_2;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_2) cparams.type_v = GGML_TYPE_TBQ4_2;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_3) cparams.type_v = GGML_TYPE_TBQ3_3;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_3) cparams.type_v = GGML_TYPE_TBQ4_3;
++            LOG_WRN("%s: TBQP (QJL) not supported for V cache, downgraded %s → %s\n",
++                    __func__, orig, ggml_type_name(cparams.type_v));
++        }
++
++        // Validation 2: _3 (cross-head) types → strip to _0 (will be re-mapped below)
++        auto strip_cross_head = [](ggml_type t) -> ggml_type {
++            if (t == GGML_TYPE_TBQ3_3)  return GGML_TYPE_TBQ3_0;
++            if (t == GGML_TYPE_TBQ4_3)  return GGML_TYPE_TBQ4_0;
++            if (t == GGML_TYPE_TBQP3_3) return GGML_TYPE_TBQP3_0;
++            if (t == GGML_TYPE_TBQP4_3) return GGML_TYPE_TBQP4_0;
++            return t;
++        };
++        if (cparams.type_k != strip_cross_head(cparams.type_k)) {
++            LOG_WRN("%s: cross-head _3 types are deprecated, auto-mapping to standard type\n", __func__);
++            cparams.type_k = strip_cross_head(cparams.type_k);
++        }
++        if (cparams.type_v != strip_cross_head(cparams.type_v)) {
++            LOG_WRN("%s: cross-head _3 types are deprecated, auto-mapping to standard type\n", __func__);
++            cparams.type_v = strip_cross_head(cparams.type_v);
++        }
++
++        // Auto-map _0 types to correct _N based on head_dim
++        auto tbq_resolve = [&](ggml_type type, bool is_key) -> ggml_type {
++            struct tbq_map { ggml_type from; ggml_type to_256; ggml_type to_128; ggml_type to_64; };
++            static const tbq_map maps[] = {
++                { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2  },
++                { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2  },
++                { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2 },
++                { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2 },
++            };
++
++            // Also catch _1/_2 types that don't match head_dim (user specified directly)
++            auto is_wrong_suffix = [&](ggml_type t) -> bool {
++                bool is_1 = (t == GGML_TYPE_TBQ3_1 || t == GGML_TYPE_TBQ4_1 || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1);
++                bool is_2 = (t == GGML_TYPE_TBQ3_2 || t == GGML_TYPE_TBQ4_2 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2);
++                if (is_1 && head_dim != 128) return true;
++                if (is_2 && head_dim != 64)  return true;
++                return false;
++            };
++            if (is_wrong_suffix(type)) {
++                const ggml_type fallback = is_key ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
++                LOG_WRN("%s: %s does not match head_dim=%d, falling back to %s\n",
++                        __func__, ggml_type_name(type), head_dim, ggml_type_name(fallback));
++                return fallback;
++            }
++
++            for (const auto & m : maps) {
++                if (type == m.from) {
++                    if (head_dim == 256) {
++                        if (m.to_256 != type) {
++                            LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
++                                    __func__, ggml_type_name(type), ggml_type_name(m.to_256), head_dim);
++                        }
++                        return m.to_256;
++                    } else if (head_dim == 128) {
++                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
++                                __func__, ggml_type_name(type), ggml_type_name(m.to_128), head_dim);
++                        return m.to_128;
++                    } else if (head_dim == 64) {
++                        if (is_key) {
++                            LOG_WRN("\n");
++                            LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
++                            LOG_WRN("║  TurboQuant: head_dim=%d detected — K cache forced to q8_0  ║\n", head_dim);
++                            LOG_WRN("║  WHT quantization degrades attention accuracy at dim<128.   ║\n");
++                            LOG_WRN("║  V cache uses %s (WHT is OK for values)                 ║\n", ggml_type_name(m.to_64));
++                            LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
++                            LOG_WRN("\n");
++                            return GGML_TYPE_Q8_0;
++                        }
++                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
++                                __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
++                        return m.to_64;
++                    } else {
++                        LOG_WRN("%s: unsupported head_dim=%d for TurboQuant, falling back to %s\n",
++                                __func__, head_dim, is_key ? "q8_0" : "f16");
++                        return is_key ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
++                    }
++                }
++            }
++            return type; // not a _0 TBQ type, pass through
++        };
++
++        if (is_tbq_type(cparams.type_k) || is_tbq_type(cparams.type_v)) {
++            if (head_dim <= 0) {
++                LOG_WRN("%s: could not determine head_dim from model metadata, TurboQuant disabled\n", __func__);
++                if (is_tbq_type(cparams.type_k)) cparams.type_k = GGML_TYPE_Q8_0;
++                if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_F16;
++            } else {
++                cparams.type_k = tbq_resolve(cparams.type_k, true);
++                cparams.type_v = tbq_resolve(cparams.type_v, false);
++            }
++        }
++    }
++
+     llama_context * lctx = llama_init_from_model(model, cparams);
+     if (lctx == NULL) {
+         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 669f66b65..00f2ba66d 100644
+index 00f2ba66d..0ea67025f 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -428,7 +428,19 @@ extern "C" {
-         // GGML_TYPE_IQ4_NL_8_8 = 38,
-         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
--        GGML_TYPE_COUNT   = 41,
-+        GGML_TYPE_TBQ3_0  = 41, // TurboQuant 3-bit (rotation + Lloyd-Max)
-+        GGML_TYPE_TBQ4_0  = 42, // TurboQuant 4-bit (rotation + Lloyd-Max)
-+        GGML_TYPE_TBQP3_0 = 43, // TurboQuant_prod 3-bit (2-bit Lloyd-Max + 1-bit QJL)
-+        GGML_TYPE_TBQP4_0 = 44, // TurboQuant_prod 4-bit (3-bit Lloyd-Max + 1-bit QJL)
-+        GGML_TYPE_TBQ3_1  = 45, // TurboQuant 3-bit, blck_size=128 (head_dim=128)
-+        GGML_TYPE_TBQ4_1  = 46, // TurboQuant 4-bit, blck_size=128 (head_dim=128)
-+        GGML_TYPE_TBQP3_1 = 47, // TurboQuant_prod 3-bit, blck_size=128 (head_dim=128)
-+        GGML_TYPE_TBQP4_1 = 48, // TurboQuant_prod 4-bit, blck_size=128 (head_dim=128)
-+        GGML_TYPE_TBQ3_2  = 49, // TurboQuant 3-bit, blck_size=64 (head_dim=64)
-+        GGML_TYPE_TBQ4_2  = 50, // TurboQuant 4-bit, blck_size=64 (head_dim=64)
-+        GGML_TYPE_TBQP3_2 = 51, // TurboQuant_prod 3-bit, blck_size=64 (head_dim=64)
-+        GGML_TYPE_TBQP4_2 = 52, // TurboQuant_prod 4-bit, blck_size=64 (head_dim=64)
-+        GGML_TYPE_COUNT   = 53,
+@@ -440,7 +440,11 @@ extern "C" {
+         GGML_TYPE_TBQ4_2  = 50, // TurboQuant 4-bit, blck_size=64 (head_dim=64)
+         GGML_TYPE_TBQP3_2 = 51, // TurboQuant_prod 3-bit, blck_size=64 (head_dim=64)
+         GGML_TYPE_TBQP4_2 = 52, // TurboQuant_prod 4-bit, blck_size=64 (head_dim=64)
+-        GGML_TYPE_COUNT   = 53,
++        GGML_TYPE_TBQ3_3  = 53, // TurboQuant 3-bit, cross-head WHT (8×64=512)
++        GGML_TYPE_TBQ4_3  = 54, // TurboQuant 4-bit, cross-head WHT (8×64=512)
++        GGML_TYPE_TBQP3_3 = 55, // TurboQuant_prod 3-bit, cross-head WHT (8×64=512)
++        GGML_TYPE_TBQP4_3 = 56, // TurboQuant_prod 4-bit, cross-head WHT (8×64=512)
++        GGML_TYPE_COUNT   = 57,
      };
  
      // precision
 diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
-index 92cf739e7..eb290d80f 100644
+index eb290d80f..bcd7b2050 100644
 --- a/ggml/src/ggml-common.h
 +++ b/ggml/src/ggml-common.h
-@@ -266,6 +266,108 @@ typedef struct {
- } block_tq2_0;
- static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
+@@ -368,6 +368,15 @@ typedef struct {
+ } block_tbqp4_2;
+ static_assert(sizeof(block_tbqp4_2) == 2*sizeof(ggml_half) + TBQ_K64*3/8 + TBQ_K64/8, "wrong tbqp4_2 block size/padding");
  
-+// TurboQuant 3-bit: ~3.0625 bpw
-+// 256 elements x 3 bits = 96 bytes packed + 2 bytes norm
-+typedef struct {
-+    ggml_half d;           // L2 norm of original vector
-+    uint8_t qs[QK_K*3/8]; // 3-bit packed indices (96 bytes for QK_K=256)
-+} block_tbq3_0;
-+static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + QK_K*3/8, "wrong tbq3_0 block size/padding");
++// TurboQuant cross-head WHT variants (8 heads × 64 dims = 512-element WHT)
++// Block format identical to _2 (blck_size=64), but quantization spans 8 heads
++// The 'd' field stores the L2 norm of the 512-element concatenated vector
 +
-+// TurboQuant 4-bit: ~4.0625 bpw
-+// 256 elements x 4 bits = 128 bytes packed + 2 bytes norm
-+typedef struct {
-+    ggml_half d;           // L2 norm of original vector
-+    uint8_t qs[QK_K/2];   // 4-bit packed indices (128 bytes for QK_K=256)
-+} block_tbq4_0;
-+static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_K/2, "wrong tbq4_0 block size/padding");
-+
-+// TurboQuant_prod 3-bit: (b-1)=2-bit Lloyd-Max + 1-bit QJL correction
-+// Provides unbiased inner product estimation (paper's recommended variant for Key cache)
-+// 256 x 2-bit indices + 256 x 1-bit QJL signs + MSE norm + residual norm
-+typedef struct {
-+    ggml_half d;             // L2 norm (MSE part)
-+    ggml_half d_qjl;         // residual L2 norm (QJL part)
-+    uint8_t qs[QK_K/4];     // 2-bit packed Lloyd-Max indices (64 bytes)
-+    uint8_t qjl[QK_K/8];    // 1-bit QJL signs (32 bytes)
-+} block_tbqp3_0;
-+static_assert(sizeof(block_tbqp3_0) == 2*sizeof(ggml_half) + QK_K/4 + QK_K/8, "wrong tbqp3_0 block size/padding");
-+
-+// TurboQuant_prod 4-bit: (b-1)=3-bit Lloyd-Max + 1-bit QJL correction
-+typedef struct {
-+    ggml_half d;             // L2 norm (MSE part)
-+    ggml_half d_qjl;         // residual L2 norm (QJL part)
-+    uint8_t qs[QK_K*3/8];   // 3-bit packed Lloyd-Max indices (96 bytes)
-+    uint8_t qjl[QK_K/8];    // 1-bit QJL signs (32 bytes)
-+} block_tbqp4_0;
-+static_assert(sizeof(block_tbqp4_0) == 2*sizeof(ggml_half) + QK_K*3/8 + QK_K/8, "wrong tbqp4_0 block size/padding");
-+
-+// TurboQuant head_dim=128 variants (blck_size=128)
-+#define TBQ_K128 128
-+
-+// TurboQuant 3-bit, 128-block: ~3.125 bpw
-+typedef struct {
-+    ggml_half d;               // L2 norm of original vector
-+    uint8_t qs[TBQ_K128*3/8]; // 3-bit packed indices (48 bytes for 128 elements)
-+} block_tbq3_1;
-+static_assert(sizeof(block_tbq3_1) == sizeof(ggml_half) + TBQ_K128*3/8, "wrong tbq3_1 block size/padding");
-+
-+// TurboQuant 4-bit, 128-block: ~4.125 bpw
-+typedef struct {
-+    ggml_half d;               // L2 norm of original vector
-+    uint8_t qs[TBQ_K128/2];   // 4-bit packed indices (64 bytes for 128 elements)
-+} block_tbq4_1;
-+static_assert(sizeof(block_tbq4_1) == sizeof(ggml_half) + TBQ_K128/2, "wrong tbq4_1 block size/padding");
-+
-+// TurboQuant_prod 3-bit, 128-block: 2-bit Lloyd-Max + 1-bit QJL
-+typedef struct {
-+    ggml_half d;                 // L2 norm (MSE part)
-+    ggml_half d_qjl;             // residual L2 norm (QJL part)
-+    uint8_t qs[TBQ_K128/4];     // 2-bit packed Lloyd-Max indices (32 bytes)
-+    uint8_t qjl[TBQ_K128/8];    // 1-bit QJL signs (16 bytes)
-+} block_tbqp3_1;
-+static_assert(sizeof(block_tbqp3_1) == 2*sizeof(ggml_half) + TBQ_K128/4 + TBQ_K128/8, "wrong tbqp3_1 block size/padding");
-+
-+// TurboQuant_prod 4-bit, 128-block: 3-bit Lloyd-Max + 1-bit QJL
-+typedef struct {
-+    ggml_half d;                 // L2 norm (MSE part)
-+    ggml_half d_qjl;             // residual L2 norm (QJL part)
-+    uint8_t qs[TBQ_K128*3/8];   // 3-bit packed Lloyd-Max indices (48 bytes)
-+    uint8_t qjl[TBQ_K128/8];    // 1-bit QJL signs (16 bytes)
-+} block_tbqp4_1;
-+static_assert(sizeof(block_tbqp4_1) == 2*sizeof(ggml_half) + TBQ_K128*3/8 + TBQ_K128/8, "wrong tbqp4_1 block size/padding");
-+
-+// TurboQuant head_dim=64 variants (blck_size=64)
-+#define TBQ_K64 64
-+
-+typedef struct {
-+    ggml_half d;
-+    uint8_t qs[TBQ_K64*3/8];
-+} block_tbq3_2;
-+static_assert(sizeof(block_tbq3_2) == sizeof(ggml_half) + TBQ_K64*3/8, "wrong tbq3_2 block size/padding");
-+
-+typedef struct {
-+    ggml_half d;
-+    uint8_t qs[TBQ_K64/2];
-+} block_tbq4_2;
-+static_assert(sizeof(block_tbq4_2) == sizeof(ggml_half) + TBQ_K64/2, "wrong tbq4_2 block size/padding");
-+
-+typedef struct {
-+    ggml_half d;
-+    ggml_half d_qjl;
-+    uint8_t qs[TBQ_K64/4];
-+    uint8_t qjl[TBQ_K64/8];
-+} block_tbqp3_2;
-+static_assert(sizeof(block_tbqp3_2) == 2*sizeof(ggml_half) + TBQ_K64/4 + TBQ_K64/8, "wrong tbqp3_2 block size/padding");
-+
-+typedef struct {
-+    ggml_half d;
-+    ggml_half d_qjl;
-+    uint8_t qs[TBQ_K64*3/8];
-+    uint8_t qjl[TBQ_K64/8];
-+} block_tbqp4_2;
-+static_assert(sizeof(block_tbqp4_2) == 2*sizeof(ggml_half) + TBQ_K64*3/8 + TBQ_K64/8, "wrong tbqp4_2 block size/padding");
++typedef block_tbq3_2  block_tbq3_3;
++typedef block_tbq4_2  block_tbq4_3;
++typedef block_tbqp3_2 block_tbqp3_3;
++typedef block_tbqp4_2 block_tbqp4_3;
 +
  //
  // Super-block quantization structures
  //
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index ddf1737a3..3572fecc4 100644
+index 3572fecc4..2bd51bcf5 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
-@@ -466,6 +466,27 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
-         case GGML_OP_OUT_PROD:
-             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
-                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
-+        case GGML_OP_FLASH_ATTN_EXT:
-+        {
-+            // TurboQuant types are CUDA-only (no CPU to_float/vec_dot)
-+            const ggml_type type_k = op->src[1] ? op->src[1]->type : GGML_TYPE_F32;
-+            const ggml_type type_v = op->src[2] ? op->src[2]->type : GGML_TYPE_F32;
-+            if (type_k == GGML_TYPE_TBQ3_0  || type_k == GGML_TYPE_TBQ4_0  ||
-+                type_k == GGML_TYPE_TBQP3_0 || type_k == GGML_TYPE_TBQP4_0 ||
-+                type_k == GGML_TYPE_TBQ3_1  || type_k == GGML_TYPE_TBQ4_1  ||
-+                type_k == GGML_TYPE_TBQP3_1 || type_k == GGML_TYPE_TBQP4_1 ||
-+                type_v == GGML_TYPE_TBQ3_0  || type_v == GGML_TYPE_TBQ4_0  ||
-+                type_v == GGML_TYPE_TBQP3_0 || type_v == GGML_TYPE_TBQP4_0 ||
-+                type_v == GGML_TYPE_TBQ3_1  || type_v == GGML_TYPE_TBQ4_1  ||
-+                type_v == GGML_TYPE_TBQP3_1 || type_v == GGML_TYPE_TBQP4_1 ||
-+                type_k == GGML_TYPE_TBQ3_2  || type_k == GGML_TYPE_TBQ4_2  ||
-+                type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2 ||
-+                type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2  ||
-+                type_v == GGML_TYPE_TBQP3_2 || type_v == GGML_TYPE_TBQP4_2) {
-+                return false;
-+            }
-+            return true;
-+        }
-         default:
+@@ -482,7 +482,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+                 type_k == GGML_TYPE_TBQ3_2  || type_k == GGML_TYPE_TBQ4_2  ||
+                 type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2 ||
+                 type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2  ||
+-                type_v == GGML_TYPE_TBQP3_2 || type_v == GGML_TYPE_TBQP4_2) {
++                type_v == GGML_TYPE_TBQP3_2 || type_v == GGML_TYPE_TBQP4_2 ||
++                type_k == GGML_TYPE_TBQ3_3  || type_k == GGML_TYPE_TBQ4_3  ||
++                type_k == GGML_TYPE_TBQP3_3 || type_k == GGML_TYPE_TBQP4_3 ||
++                type_v == GGML_TYPE_TBQ3_3  || type_v == GGML_TYPE_TBQ4_3  ||
++                type_v == GGML_TYPE_TBQP3_3 || type_v == GGML_TYPE_TBQP4_3) {
+                 return false;
+             }
              return true;
-     }
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
-index 419862101..6007870a8 100644
+index df381866e..59591adac 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
-@@ -120,7 +120,55 @@ if (CUDAToolkit_FOUND)
-             template-instances/fattn-vec-instance-f16-f16.cu
-             template-instances/fattn-vec-instance-q4_0-q4_0.cu
-             template-instances/fattn-vec-instance-q8_0-q8_0.cu
--            template-instances/fattn-vec-instance-bf16-bf16.cu)
-+            template-instances/fattn-vec-instance-bf16-bf16.cu
-+            template-instances/fattn-vec-instance-tbq3_0-f16.cu
-+            template-instances/fattn-vec-instance-tbq3_0-q8_0.cu
-+            template-instances/fattn-vec-instance-tbq3_0-tbq3_0.cu
-+            template-instances/fattn-vec-instance-tbq3_0-tbq4_0.cu
-+            template-instances/fattn-vec-instance-tbq4_0-f16.cu
-+            template-instances/fattn-vec-instance-tbq4_0-q8_0.cu
-+            template-instances/fattn-vec-instance-tbq4_0-tbq3_0.cu
-+            template-instances/fattn-vec-instance-tbq4_0-tbq4_0.cu
-+            template-instances/fattn-vec-instance-tbqp3_0-f16.cu
-+            template-instances/fattn-vec-instance-tbqp3_0-q8_0.cu
-+            template-instances/fattn-vec-instance-tbqp3_0-tbq3_0.cu
-+            template-instances/fattn-vec-instance-tbqp3_0-tbq4_0.cu
-+            template-instances/fattn-vec-instance-tbqp4_0-f16.cu
-+            template-instances/fattn-vec-instance-tbqp4_0-q8_0.cu
-+            template-instances/fattn-vec-instance-tbqp4_0-tbq3_0.cu
-+            template-instances/fattn-vec-instance-tbqp4_0-tbq4_0.cu
-+            template-instances/fattn-vec-instance-tbq3_1-f16.cu
-+            template-instances/fattn-vec-instance-tbq3_1-q8_0.cu
-+            template-instances/fattn-vec-instance-tbq3_1-tbq3_1.cu
-+            template-instances/fattn-vec-instance-tbq3_1-tbq4_1.cu
-+            template-instances/fattn-vec-instance-tbq4_1-f16.cu
-+            template-instances/fattn-vec-instance-tbq4_1-q8_0.cu
-+            template-instances/fattn-vec-instance-tbq4_1-tbq3_1.cu
-+            template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu
-+            template-instances/fattn-vec-instance-tbqp3_1-f16.cu
-+            template-instances/fattn-vec-instance-tbqp3_1-q8_0.cu
-+            template-instances/fattn-vec-instance-tbqp3_1-tbq3_1.cu
-+            template-instances/fattn-vec-instance-tbqp3_1-tbq4_1.cu
-+            template-instances/fattn-vec-instance-tbqp4_1-f16.cu
-+            template-instances/fattn-vec-instance-tbqp4_1-q8_0.cu
-+            template-instances/fattn-vec-instance-tbqp4_1-tbq3_1.cu
-+            template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu
-+            template-instances/fattn-vec-instance-tbq3_2-f16.cu
-+            template-instances/fattn-vec-instance-tbq3_2-q8_0.cu
-+            template-instances/fattn-vec-instance-tbq3_2-tbq3_2.cu
-+            template-instances/fattn-vec-instance-tbq3_2-tbq4_2.cu
-+            template-instances/fattn-vec-instance-tbq4_2-f16.cu
-+            template-instances/fattn-vec-instance-tbq4_2-q8_0.cu
-+            template-instances/fattn-vec-instance-tbq4_2-tbq3_2.cu
-+            template-instances/fattn-vec-instance-tbq4_2-tbq4_2.cu
-+            template-instances/fattn-vec-instance-tbqp3_2-f16.cu
-+            template-instances/fattn-vec-instance-tbqp3_2-q8_0.cu
-+            template-instances/fattn-vec-instance-tbqp3_2-tbq3_2.cu
-+            template-instances/fattn-vec-instance-tbqp3_2-tbq4_2.cu
-+            template-instances/fattn-vec-instance-tbqp4_2-f16.cu
-+            template-instances/fattn-vec-instance-tbqp4_2-q8_0.cu
-+            template-instances/fattn-vec-instance-tbqp4_2-tbq3_2.cu
-+            template-instances/fattn-vec-instance-tbqp4_2-tbq4_2.cu)
-     endif()
- 
-     ggml_add_backend_library(ggml-cuda
+@@ -169,6 +169,30 @@ if (CUDAToolkit_FOUND)
+             template-instances/fattn-vec-instance-tbqp4_2-q8_0.cu
+             template-instances/fattn-vec-instance-tbqp4_2-tbq3_2.cu
+             template-instances/fattn-vec-instance-tbqp4_2-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbq3_3-f16.cu
++            template-instances/fattn-vec-instance-tbq3_3-q8_0.cu
++            template-instances/fattn-vec-instance-tbq3_3-tbq3_2.cu
++            template-instances/fattn-vec-instance-tbq3_3-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbq4_3-f16.cu
++            template-instances/fattn-vec-instance-tbq4_3-q8_0.cu
++            template-instances/fattn-vec-instance-tbq4_3-tbq3_2.cu
++            template-instances/fattn-vec-instance-tbq4_3-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbqp3_3-f16.cu
++            template-instances/fattn-vec-instance-tbqp3_3-q8_0.cu
++            template-instances/fattn-vec-instance-tbqp3_3-tbq3_2.cu
++            template-instances/fattn-vec-instance-tbqp3_3-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbqp4_3-f16.cu
++            template-instances/fattn-vec-instance-tbqp4_3-q8_0.cu
++            template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu
++            template-instances/fattn-vec-instance-tbqp4_3-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbq3_3-tbq3_3.cu
++            template-instances/fattn-vec-instance-tbq3_3-tbq4_3.cu
++            template-instances/fattn-vec-instance-tbq4_3-tbq3_3.cu
++            template-instances/fattn-vec-instance-tbq4_3-tbq4_3.cu
++            template-instances/fattn-vec-instance-tbqp3_3-tbq3_3.cu
++            template-instances/fattn-vec-instance-tbqp3_3-tbq4_3.cu
++            template-instances/fattn-vec-instance-tbqp4_3-tbq3_3.cu
++            template-instances/fattn-vec-instance-tbqp4_3-tbq4_3.cu
+             template-instances/fattn-vec-instance-f16-tbq3_0.cu
+             template-instances/fattn-vec-instance-f16-tbq4_0.cu
+             template-instances/fattn-vec-instance-f16-tbq3_1.cu
 diff --git a/ggml/src/ggml-cuda/cpy-utils.cuh b/ggml/src/ggml-cuda/cpy-utils.cuh
-index 7697c292d..3e6ca6cef 100644
+index 3e6ca6cef..6d1101b0c 100644
 --- a/ggml/src/ggml-cuda/cpy-utils.cuh
 +++ b/ggml/src/ggml-cuda/cpy-utils.cuh
-@@ -153,6 +153,593 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
+@@ -740,6 +740,240 @@ static __device__ void quantize_f32_tbqp4_2_block(const float * __restrict__ x,
+     for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) y->qjl[j/8] |= (1<<(j%8)); }
+ }
+ 
++// ============================================================
++// TurboQuant cross-head WHT (8 heads × 64 = 512-element WHT)
++// H_512 = H_8 ⊗ H_64 — CLT convergence at d=512 for head_dim=64
++// ============================================================
++
++// 512-bit random sign pattern (first 8 bytes match tbq_signs for _2)
++static __device__ constexpr uint8_t tbq_signs_512[64] = {
++    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0
++    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
++    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
++    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
++    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
++    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
++    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
++    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
++};
++
++// Cross-head TBQ3: 8×64=512-element WHT, 3-bit Lloyd-Max
++static __device__ void quantize_f32_tbq3_3_xhead(
++    const float * __restrict__ x0, const float * __restrict__ x1,
++    const float * __restrict__ x2, const float * __restrict__ x3,
++    const float * __restrict__ x4, const float * __restrict__ x5,
++    const float * __restrict__ x6, const float * __restrict__ x7,
++    block_tbq3_3 * __restrict__ y0, block_tbq3_3 * __restrict__ y1,
++    block_tbq3_3 * __restrict__ y2, block_tbq3_3 * __restrict__ y3,
++    block_tbq3_3 * __restrict__ y4, block_tbq3_3 * __restrict__ y5,
++    block_tbq3_3 * __restrict__ y6, block_tbq3_3 * __restrict__ y7) {
++
++    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
++    const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
++    block_tbq3_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
++
++    float tmp[512];
++    float sum_sq = 0.0f;
++    for (int h = 0; h < 8; h++)
++        for (int j = 0; j < TBQ_K64; j++) {
++            float v = heads[h][j];
++            tmp[h*TBQ_K64 + j] = v;
++            sum_sq += v * v;
++        }
++    float norm = sqrtf(sum_sq);
++    ggml_half norm_h = __float2half(norm);
++    if (norm < 1e-10f) {
++        for (int h = 0; h < 8; h++) { outs[h]->d = norm_h; for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0; }
++        return;
++    }
++    float inv_norm = 1.0f / norm;
++    for (int j = 0; j < 512; j++) {
++        int sign = ((tbq_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
++        tmp[j] *= inv_norm * sign;
++    }
++    // 512-element serial WHT (9 stages)
++    for (int len = 1; len < 512; len *= 2)
++        for (int i = 0; i < 512; i += 2*len)
++            for (int j = 0; j < len; j++) {
++                float u = tmp[i+j], v = tmp[i+j+len];
++                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
++            }
++    // Quantize into 8 blocks of 64 elements each
++    for (int h = 0; h < 8; h++) {
++        outs[h]->d = norm_h;
++        int bit_pos = 0;
++        for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
++        for (int j = 0; j < TBQ_K64; j++) {
++            uint8_t idx = 7;
++            for (int b = 0; b < 7; b++) { if (tmp[h*TBQ_K64+j] < b3[b]) { idx = b; break; } }
++            int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
++            outs[h]->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
++            if (bit_off > 5) outs[h]->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
++            bit_pos += 3;
++        }
++    }
++}
++
++// Cross-head TBQ4: 8×64=512-element WHT, 4-bit Lloyd-Max
++static __device__ void quantize_f32_tbq4_3_xhead(
++    const float * __restrict__ x0, const float * __restrict__ x1,
++    const float * __restrict__ x2, const float * __restrict__ x3,
++    const float * __restrict__ x4, const float * __restrict__ x5,
++    const float * __restrict__ x6, const float * __restrict__ x7,
++    block_tbq4_3 * __restrict__ y0, block_tbq4_3 * __restrict__ y1,
++    block_tbq4_3 * __restrict__ y2, block_tbq4_3 * __restrict__ y3,
++    block_tbq4_3 * __restrict__ y4, block_tbq4_3 * __restrict__ y5,
++    block_tbq4_3 * __restrict__ y6, block_tbq4_3 * __restrict__ y7) {
++
++    static constexpr float b4[15] = { -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,0.0f,0.2583f,0.5225f,0.7996f,1.0993f,1.4371f,1.8435f,2.4008f };
++    const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
++    block_tbq4_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
++
++    float tmp[512];
++    float sum_sq = 0.0f;
++    for (int h = 0; h < 8; h++)
++        for (int j = 0; j < TBQ_K64; j++) { float v = heads[h][j]; tmp[h*TBQ_K64+j] = v; sum_sq += v*v; }
++    float norm = sqrtf(sum_sq);
++    ggml_half norm_h = __float2half(norm);
++    if (norm < 1e-10f) {
++        for (int h = 0; h < 8; h++) { outs[h]->d = norm_h; for (int j = 0; j < TBQ_K64/2; j++) outs[h]->qs[j] = 0; }
++        return;
++    }
++    float inv_norm = 1.0f / norm;
++    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= inv_norm * sign; }
++    for (int len = 1; len < 512; len *= 2)
++        for (int i = 0; i < 512; i += 2*len)
++            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
++    for (int h = 0; h < 8; h++) {
++        outs[h]->d = norm_h;
++        for (int j = 0; j < TBQ_K64/2; j++) {
++            uint8_t idx0 = 15, idx1 = 15;
++            for (int b = 0; b < 15; b++) { if (tmp[h*TBQ_K64+2*j]   < b4[b]) { idx0 = b; break; } }
++            for (int b = 0; b < 15; b++) { if (tmp[h*TBQ_K64+2*j+1] < b4[b]) { idx1 = b; break; } }
++            outs[h]->qs[j] = idx0 | (idx1 << 4);
++        }
++    }
++}
++
++// Cross-head TBQP3: 8×64=512-element WHT, 2-bit Lloyd-Max + 1-bit Direct Sign
++static __device__ void quantize_f32_tbqp3_3_xhead(
++    const float * __restrict__ x0, const float * __restrict__ x1,
++    const float * __restrict__ x2, const float * __restrict__ x3,
++    const float * __restrict__ x4, const float * __restrict__ x5,
++    const float * __restrict__ x6, const float * __restrict__ x7,
++    block_tbqp3_3 * __restrict__ y0, block_tbqp3_3 * __restrict__ y1,
++    block_tbqp3_3 * __restrict__ y2, block_tbqp3_3 * __restrict__ y3,
++    block_tbqp3_3 * __restrict__ y4, block_tbqp3_3 * __restrict__ y5,
++    block_tbqp3_3 * __restrict__ y6, block_tbqp3_3 * __restrict__ y7) {
++
++    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
++    static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
++    const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
++    block_tbqp3_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
++
++    float tmp[512];
++    float sum_sq = 0.0f;
++    for (int h = 0; h < 8; h++)
++        for (int j = 0; j < TBQ_K64; j++) { float v = heads[h][j]; tmp[h*TBQ_K64+j] = v; sum_sq += v*v; }
++    float norm = sqrtf(sum_sq);
++    ggml_half norm_h = __float2half(norm);
++    if (norm < 1e-10f) {
++        for (int h = 0; h < 8; h++) {
++            outs[h]->d = norm_h; outs[h]->d_qjl = __float2half(0.0f);
++            for (int j = 0; j < TBQ_K64/4; j++) outs[h]->qs[j] = 0;
++            for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++        }
++        return;
++    }
++    float inv_norm = 1.0f / norm;
++    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= inv_norm * sign; }
++    for (int len = 1; len < 512; len *= 2)
++        for (int i = 0; i < 512; i += 2*len)
++            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
++    // Quantize per 64-element block: 2-bit centroid + direct sign
++    for (int h = 0; h < 8; h++) {
++        outs[h]->d = norm_h;
++        float * seg = &tmp[h*TBQ_K64];
++        float recon[TBQ_K64];
++        // 2-bit Lloyd-Max
++        for (int j = 0; j < TBQ_K64/4; j++) {
++            uint8_t packed = 0;
++            for (int k = 0; k < 4; k++) {
++                uint8_t idx = 3;
++                for (int b = 0; b < 3; b++) { if (seg[j*4+k] < b2[b]) { idx = b; break; } }
++                packed |= (idx & 0x3) << (k*2);
++                recon[j*4+k] = c2[idx];
++            }
++            outs[h]->qs[j] = packed;
++        }
++        // Residual + Direct Sign
++        float res_abs = 0.0f;
++        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] - recon[j]);
++        outs[h]->d_qjl = __float2half((res_abs / TBQ_K64) * norm);
++        for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++        for (int j = 0; j < TBQ_K64; j++) {
++            if (seg[j] - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1 << (j%8));
++        }
++    }
++}
++
++// Cross-head TBQP4: 8×64=512-element WHT, 3-bit Lloyd-Max + 1-bit Direct Sign
++static __device__ void quantize_f32_tbqp4_3_xhead(
++    const float * __restrict__ x0, const float * __restrict__ x1,
++    const float * __restrict__ x2, const float * __restrict__ x3,
++    const float * __restrict__ x4, const float * __restrict__ x5,
++    const float * __restrict__ x6, const float * __restrict__ x7,
++    block_tbqp4_3 * __restrict__ y0, block_tbqp4_3 * __restrict__ y1,
++    block_tbqp4_3 * __restrict__ y2, block_tbqp4_3 * __restrict__ y3,
++    block_tbqp4_3 * __restrict__ y4, block_tbqp4_3 * __restrict__ y5,
++    block_tbqp4_3 * __restrict__ y6, block_tbqp4_3 * __restrict__ y7) {
++
++    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
++    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
++    const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
++    block_tbqp4_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
++
++    float tmp[512];
++    float sum_sq = 0.0f;
++    for (int h = 0; h < 8; h++)
++        for (int j = 0; j < TBQ_K64; j++) { float v = heads[h][j]; tmp[h*TBQ_K64+j] = v; sum_sq += v*v; }
++    float norm = sqrtf(sum_sq);
++    ggml_half norm_h = __float2half(norm);
++    if (norm < 1e-10f) {
++        for (int h = 0; h < 8; h++) {
++            outs[h]->d = norm_h; outs[h]->d_qjl = __float2half(0.0f);
++            for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
++            for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++        }
++        return;
++    }
++    float inv_norm = 1.0f / norm;
++    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= inv_norm * sign; }
++    for (int len = 1; len < 512; len *= 2)
++        for (int i = 0; i < 512; i += 2*len)
++            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
++    for (int h = 0; h < 8; h++) {
++        outs[h]->d = norm_h;
++        float * seg = &tmp[h*TBQ_K64];
++        float recon[TBQ_K64];
++        int bit_pos = 0;
++        for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
++        for (int j = 0; j < TBQ_K64; j++) {
++            uint8_t idx = 7;
++            for (int b = 0; b < 7; b++) { if (seg[j] < b3[b]) { idx = b; break; } }
++            int byte_idx = bit_pos/8, bit_off = bit_pos%8;
++            outs[h]->qs[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
++            if (bit_off > 5) outs[h]->qs[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
++            recon[j] = c3[idx]; bit_pos += 3;
++        }
++        float res_abs = 0.0f;
++        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] - recon[j]);
++        outs[h]->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
++        for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++        for (int j = 0; j < TBQ_K64; j++) { if (seg[j]-recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1<<(j%8)); }
++    }
++}
++
+ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
+     float amax = 0.0f;
+     float vmax = 0.0f;
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index f2f9f47b0..304aaa15f 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1245,6 +1245,14 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
+         return vec_dot_fattn_vec_KQ_tbqp3_2<D, nthreads>;
+     } else if constexpr (type_K == GGML_TYPE_TBQP4_2) {
+         return vec_dot_fattn_vec_KQ_tbqp4_2<D, nthreads>;
++    } else if constexpr (type_K == GGML_TYPE_TBQ3_3) {
++        return vec_dot_fattn_vec_KQ_tbq3_2<D, nthreads>;  // base function (used for per-group scoring)
++    } else if constexpr (type_K == GGML_TYPE_TBQ4_3) {
++        return vec_dot_fattn_vec_KQ_tbq4_2<D, nthreads>;
++    } else if constexpr (type_K == GGML_TYPE_TBQP3_3) {
++        return vec_dot_fattn_vec_KQ_tbqp3_2<D, nthreads>;
++    } else if constexpr (type_K == GGML_TYPE_TBQP4_3) {
++        return vec_dot_fattn_vec_KQ_tbqp4_2<D, nthreads>;
+     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
+         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
+     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
+@@ -1291,6 +1299,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
+         return dequantize_V_tbq4_2<T, ne>;
+     } else if constexpr (type_V == GGML_TYPE_TBQ3_2) {
+         return dequantize_V_tbq3_2<T, ne>;
++    } else if constexpr (type_V == GGML_TYPE_TBQ4_3) {
++        return dequantize_V_tbq4_2<T, ne>;
++    } else if constexpr (type_V == GGML_TYPE_TBQ3_3) {
++        return dequantize_V_tbq3_2<T, ne>;
+     } else {
+         static_assert(type_V == -1, "bad type");
+         return nullptr;
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 0291ab686..10002abb6 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -91,7 +91,12 @@ static __global__ void flash_attn_ext_vec(
+         && type_K != GGML_TYPE_TBQ4_1 && type_K != GGML_TYPE_TBQ3_1
+         && type_K != GGML_TYPE_TBQP3_1 && type_K != GGML_TYPE_TBQP4_1
+         && type_K != GGML_TYPE_TBQ4_2 && type_K != GGML_TYPE_TBQ3_2
+-        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2;
++        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2
++        && type_K != GGML_TYPE_TBQ4_3 && type_K != GGML_TYPE_TBQ3_3
++        && type_K != GGML_TYPE_TBQP3_3 && type_K != GGML_TYPE_TBQP4_3;
++    constexpr bool is_cross_head_K = type_K == GGML_TYPE_TBQ3_3 || type_K == GGML_TYPE_TBQ4_3
++        || type_K == GGML_TYPE_TBQP3_3 || type_K == GGML_TYPE_TBQP4_3;
++    constexpr bool is_cross_head_V = type_V == GGML_TYPE_TBQ3_3 || type_V == GGML_TYPE_TBQ4_3;
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
+ #else
+@@ -400,12 +405,25 @@ static __global__ void flash_attn_ext_vec(
+             // vec_dot reuses Q_reg (MSE WHT'd query) directly for sign correction
+         }
+     } else if constexpr (type_K == GGML_TYPE_TBQ4_2 || type_K == GGML_TYPE_TBQ3_2
+-                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2) {
++                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2
++                      || type_K == GGML_TYPE_TBQ4_3 || type_K == GGML_TYPE_TBQ3_3
++                      || type_K == GGML_TYPE_TBQP4_3 || type_K == GGML_TYPE_TBQP3_3) {
+         // TurboQuant 64-block: D=64, nthreads=128, tid 0-63 participate in WHT
+         // WHT has 6 stages: stages 0-4 warp shuffle, stage 5 shared memory
+-        static constexpr uint8_t tbq_signs[8] = {
+-            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++        // For cross-head _3: use kv_head-specific 64-bit sign slice from 512-bit pattern
++        static constexpr uint8_t tbq_signs_full[64] = {
++            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0 (same as _2)
++            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
++            0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
++            0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
++            0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
++            0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
++            0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
++            0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
+         };
++        // For _2 types: always use head 0's signs. For _3: use kv_head-specific slice.
++        const int q_signs_offset = (is_cross_head_K) ? ((head / gqa_ratio) % 8) * 8 : 0;
++        const uint8_t * tbq_signs = tbq_signs_full + q_signs_offset;
+ 
+         for (int j = 0; j < ncols; ++j) {
+             float * Q_wht = (float *) &KQ[0];
+@@ -500,6 +518,9 @@ static __global__ void flash_attn_ext_vec(
+ #endif // V_DOT2_F32_F16_AVAILABLE
+     }
+ 
++    // Cross-head WHT: kv_head_idx within group of 8 for H_8 sign computation
++    [[maybe_unused]] const int kv_head_idx = (is_cross_head_K || is_cross_head_V) ? ((head / gqa_ratio) % 8) : 0;
++
+     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+     K     += blockIdx.y*nthreads * nb11;
+     V     += blockIdx.y*nthreads * nb21;
+@@ -523,8 +544,24 @@ static __global__ void flash_attn_ext_vec(
+ 
+ #pragma unroll
+             for (int j = 0; j < ncols; ++j) {
+-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+-                sum = warp_reduce_sum<nthreads_KQ>(sum);
++                float sum;
++                if constexpr (is_cross_head_K) {
++                    // Cross-head scoring: combine 8 groups with H_8 signs
++                    // H_512 = H_8 ⊗ H_64 → score = (1/8)Σ_g H_8[h][g] · vec_dot(K_g, Q_wht)
++                    sum = 0.0f;
++                    #pragma unroll
++                    for (int g = 0; g < 8; g++) {
++                        const char * K_g = K + (int64_t)(g - kv_head_idx) * nb12 + (int64_t)i_KQ * nb11;
++                        float partial = vec_dot_KQ(K_g, Q_reg[j], Q_i32[j], Q_ds[j]);
++                        const int h8_sign = (__popc(kv_head_idx & g) & 1) ? -1 : 1;
++                        sum += h8_sign * partial;
++                    }
++                    sum = warp_reduce_sum<nthreads_KQ>(sum);
++                    sum *= 0.125f; // 1/8
++                } else {
++                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
++                    sum = warp_reduce_sum<nthreads_KQ>(sum);
++                }
+ 
+                 if (use_logit_softcap) {
+                     sum = logit_softcap*tanhf(sum);
+@@ -587,17 +624,36 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                 half2 tmp[V_rows_per_thread/2];
+-                if constexpr (type_V == GGML_TYPE_BF16) {
++                const int v_elem = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
++                if constexpr (is_cross_head_V) {
++                    // Cross-head V: load 8 V blocks, combine with (1/8)H_8 inverse
++                    float2 v_sum[V_rows_per_thread/2];
++#pragma unroll
++                    for (int iv = 0; iv < V_rows_per_thread/2; iv++) v_sum[iv] = make_float2(0.0f, 0.0f);
++#pragma unroll
++                    for (int g = 0; g < 8; g++) {
++                        half2 v_g[V_rows_per_thread/2];
++                        dequantize_V(V + (int64_t)(g - kv_head_idx) * nb22 + k*nb21, v_g, v_elem);
++                        const float sign = (__popc(kv_head_idx & g) & 1) ? -0.125f : 0.125f;
++#pragma unroll
++                        for (int iv = 0; iv < V_rows_per_thread/2; iv++) {
++                            float2 vf = __half22float2(v_g[iv]);
++                            v_sum[iv].x += sign * vf.x;
++                            v_sum[iv].y += sign * vf.y;
++                        }
++                    }
++#pragma unroll
++                    for (int iv = 0; iv < V_rows_per_thread/2; iv++)
++                        tmp[iv] = __float22half2_rn(v_sum[iv]);
++                } else if constexpr (type_V == GGML_TYPE_BF16) {
+                     float2 tmp_f[V_rows_per_thread/2];
+-                    dequantize_V(V + k*nb21, tmp_f,
+-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
++                    dequantize_V(V + k*nb21, tmp_f, v_elem);
+ #pragma unroll
+                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
+                     }
+                 } else {
+-                    dequantize_V(V + k*nb21, tmp,
+-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
++                    dequantize_V(V + k*nb21, tmp, v_elem);
+                 }
+ #pragma unroll
+                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+@@ -616,8 +672,25 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                 float2 tmp[V_rows_per_thread/2];
+-                dequantize_V(V + k*nb21, tmp,
+-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
++                const int v_elem = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
++                if constexpr (is_cross_head_V) {
++                    // Cross-head V: load 8 V blocks, combine with (1/8)H_8 inverse
++#pragma unroll
++                    for (int iv = 0; iv < V_rows_per_thread/2; iv++) tmp[iv] = make_float2(0.0f, 0.0f);
++#pragma unroll
++                    for (int g = 0; g < 8; g++) {
++                        float2 v_g[V_rows_per_thread/2];
++                        dequantize_V(V + (int64_t)(g - kv_head_idx) * nb22 + k*nb21, v_g, v_elem);
++                        const float sign = (__popc(kv_head_idx & g) & 1) ? -0.125f : 0.125f;
++#pragma unroll
++                        for (int iv = 0; iv < V_rows_per_thread/2; iv++) {
++                            tmp[iv].x += sign * v_g[iv].x;
++                            tmp[iv].y += sign * v_g[iv].y;
++                        }
++                    }
++                } else {
++                    dequantize_V(V + k*nb21, tmp, v_elem);
++                }
+ #pragma unroll
+                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+ #pragma unroll
+@@ -756,7 +829,8 @@ static __global__ void flash_attn_ext_vec(
+                 // For TBQ V: store to shared memory for IWHT post-processing
+                 if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0
+                            || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
+-                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
++                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
++                           || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3) {
+                     KQ[i0 + tid] = dst_val; // reuse KQ shared memory
+                 } else {
+                     dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+@@ -874,10 +948,20 @@ static __global__ void flash_attn_ext_vec(
+             }
+ 
+             // TBQ V 64-block IWHT: D=64, tid 0-63 participate
+-            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
+-                static constexpr uint8_t tbq_signs_v[8] = {
+-                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
++                      || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3) {
++                // Full 512-bit sign pattern: _2 uses head 0 (offset 0), _3 uses head-specific slice
++                static constexpr uint8_t tbq_signs_v_full[64] = {
++                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0
++                    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
++                    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
++                    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
++                    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
++                    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
++                    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
++                    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
+                 };
++                const int v_signs_offset = is_cross_head_V ? ((head / gqa_ratio) % 8) * 8 : 0;
+                 __syncthreads();
+                 {
+                     float * buf = (float *) &KQ[0];
+@@ -899,7 +983,7 @@ static __global__ void flash_attn_ext_vec(
+                     }
+                     __syncthreads();
+                     if (tid < D) {
+-                        float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                        float sign0 = ((tbq_signs_v_full[v_signs_offset + (tid >> 3)] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                         buf[tid] = __half2float(h0) * sign0 / (float)D;
+                     }
+                 }
+@@ -1055,6 +1139,20 @@ EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ4_2)
+ EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP3_2)
+ EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP4_2)
+ 
++// TurboQuant cross-head (_3) extern declarations: D=64, K=_3, V=_2/_3 or standard
++#define EXTERN_DECL_FATTN_VEC_TBQ3(type_K)                            \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_F16);            \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_Q8_0);           \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ3_2);         \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ4_2);         \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ3_3);         \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ4_3);         \
++
++EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQ3_3)
++EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQ4_3)
++EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQP3_3)
++EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQP4_3)
++
+ // Asymmetric: standard K + TBQ V extern declarations
+ // D=256: only _0 V types
+ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ3_0);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 126e4d56f..743573c37 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -344,6 +344,32 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_2)
+     FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_2)
+     FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_2)
++
++    // Cross-head _3 (ALL_QUANTS path)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_3)
+ #else
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+@@ -400,6 +426,31 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_F16)
+     FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_Q8_0)
+     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_Q8_0)
++    // TurboQuant cross-head (_3): D=64
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_3)
+     // Asymmetric: standard K + TBQ V (e.g. q8_0 K + tbq3 V)
+     // D=256 (_0)
+     FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ3_0)
+@@ -504,10 +555,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+                         || K->type == GGML_TYPE_TBQ3_1 || K->type == GGML_TYPE_TBQ4_1
+                         || K->type == GGML_TYPE_TBQP3_1 || K->type == GGML_TYPE_TBQP4_1
+                         || K->type == GGML_TYPE_TBQ3_2 || K->type == GGML_TYPE_TBQ4_2
+-                        || K->type == GGML_TYPE_TBQP3_2 || K->type == GGML_TYPE_TBQP4_2;
++                        || K->type == GGML_TYPE_TBQP3_2 || K->type == GGML_TYPE_TBQP4_2
++                        || K->type == GGML_TYPE_TBQ3_3 || K->type == GGML_TYPE_TBQ4_3
++                        || K->type == GGML_TYPE_TBQP3_3 || K->type == GGML_TYPE_TBQP4_3;
+         const bool tbq_v = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0
+                         || V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQ4_1
+-                        || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2;
++                        || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2
++                        || V->type == GGML_TYPE_TBQ3_3 || V->type == GGML_TYPE_TBQ4_3;
+         const bool std_k = K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0
+                         || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_BF16;
+         const bool std_v = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0;
+@@ -543,6 +597,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         case GGML_TYPE_TBQ4_2:
+         case GGML_TYPE_TBQP3_2:
+         case GGML_TYPE_TBQP4_2:
++        case GGML_TYPE_TBQ3_3:
++        case GGML_TYPE_TBQ4_3:
++        case GGML_TYPE_TBQP3_3:
++        case GGML_TYPE_TBQP4_3:
+             break;
+         default:
+             return BEST_FATTN_KERNEL_NONE;
+@@ -552,13 +610,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         return BEST_FATTN_KERNEL_NONE;
+     }
+ 
+-    // TBQ4_0: only vec kernel is implemented (no MMA/tile/WMMA support)
+-    if (K->type == GGML_TYPE_TBQ4_0 || K->type == GGML_TYPE_TBQ3_0
++    // TBQ: only vec kernel is implemented (no MMA/tile/WMMA support)
++    const bool tbq_k_type = K->type == GGML_TYPE_TBQ4_0 || K->type == GGML_TYPE_TBQ3_0
+      || K->type == GGML_TYPE_TBQP4_0 || K->type == GGML_TYPE_TBQP3_0
+      || K->type == GGML_TYPE_TBQ4_1 || K->type == GGML_TYPE_TBQ3_1
+      || K->type == GGML_TYPE_TBQP4_1 || K->type == GGML_TYPE_TBQP3_1
+      || K->type == GGML_TYPE_TBQ4_2 || K->type == GGML_TYPE_TBQ3_2
+-     || K->type == GGML_TYPE_TBQP4_2 || K->type == GGML_TYPE_TBQP3_2) {
++     || K->type == GGML_TYPE_TBQP4_2 || K->type == GGML_TYPE_TBQP3_2
++     || K->type == GGML_TYPE_TBQ4_3 || K->type == GGML_TYPE_TBQ3_3
++     || K->type == GGML_TYPE_TBQP4_3 || K->type == GGML_TYPE_TBQP3_3;
++    const bool tbq_v_type = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_TBQ3_0
++     || V->type == GGML_TYPE_TBQ4_1 || V->type == GGML_TYPE_TBQ3_1
++     || V->type == GGML_TYPE_TBQ4_2 || V->type == GGML_TYPE_TBQ3_2
++     || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3;
++    if (tbq_k_type || tbq_v_type) {
+         if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+             return BEST_FATTN_KERNEL_VEC;
+         }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 415a9f90d..e9630229d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4843,7 +4843,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                        op->type == GGML_TYPE_TBQ3_1 || op->type == GGML_TYPE_TBQ4_1 ||
+                        op->type == GGML_TYPE_TBQP3_1 || op->type == GGML_TYPE_TBQP4_1 ||
+                        op->type == GGML_TYPE_TBQ3_2 || op->type == GGML_TYPE_TBQ4_2 ||
+-                       op->type == GGML_TYPE_TBQP3_2 || op->type == GGML_TYPE_TBQP4_2) &&
++                       op->type == GGML_TYPE_TBQP3_2 || op->type == GGML_TYPE_TBQP4_2 ||
++                       op->type == GGML_TYPE_TBQ3_3 || op->type == GGML_TYPE_TBQ4_3 ||
++                       op->type == GGML_TYPE_TBQP3_3 || op->type == GGML_TYPE_TBQP4_3) &&
+                        op->src[0]->type == GGML_TYPE_F32 &&
+                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
+             } break;
+diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
+index 4ae4ffe3b..1e643d49b 100644
+--- a/ggml/src/ggml-cuda/set-rows.cu
++++ b/ggml/src/ggml-cuda/set-rows.cu
+@@ -109,6 +109,349 @@ static void set_rows_cuda_quant(
      }
  }
  
-+// TurboQuant 3-bit: L2 norm + random signs + serial WHT + Lloyd-Max quantization
-+static __device__ void quantize_f32_tbq3_0_block(const float * __restrict__ x, block_tbq3_0 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[32] = {
-+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
-+        0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
-+    };
-+    static constexpr float tbq3_boundaries[7] = {
-+        -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
-+    };
++// ============================================================
++// Cross-head WHT kernel v1: simple 1-thread-per-group (proven correct, PPL=1340)
++// ============================================================
++template <typename idx_t, typename block_type,
++    void (*quantize_xhead)(const float*, const float*, const float*, const float*,
++                           const float*, const float*, const float*, const float*,
++                           block_type*, block_type*, block_type*, block_type*,
++                           block_type*, block_type*, block_type*, block_type*)>
++static __global__ void k_set_rows_xhead_v1(
++        const float * __restrict__ src0, const idx_t * __restrict__ src1, block_type * __restrict__ dst,
++        const int64_t ne_total_groups,
++        const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t s10, const int64_t s11, const int64_t s12,
++        const int64_t ne11, const int64_t ne12,
++        const int64_t s1, const int64_t s2, const int64_t s3,
++        const int64_t groups_per_ne00,
++        const uint3 ne01_fd, const uint3 ne02_fd, const uint3 ne11_fd, const uint3 ne12_fd) {
++    const int64_t ig = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
++    if (ig >= ne_total_groups) return;
++    const int64_t i_g00 = ig % groups_per_ne00;
++    const int64_t r1 = ig / groups_per_ne00;
++    uint2 div_mod = fast_div_modulo((uint32_t)r1, ne01_fd);
++    const int64_t i01 = div_mod.y; uint32_t tmp2 = div_mod.x;
++    div_mod = fast_div_modulo(tmp2, ne02_fd);
++    const int64_t i02 = div_mod.y, i03 = div_mod.x;
++    const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
++    const int64_t i11v = fastmodulo((uint32_t)i02, ne11_fd);
++    const idx_t dst_row = *(src1 + i01*s10 + i11v*s11 + i12*s12);
++    const int64_t blk_base = i_g00 * 8;
++    const float * sb = src0 + i01*s01 + i02*s02 + i03*s03;
++    block_type * db = (block_type *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
++    quantize_xhead(
++        sb+(blk_base+0)*TBQ_K64, sb+(blk_base+1)*TBQ_K64, sb+(blk_base+2)*TBQ_K64, sb+(blk_base+3)*TBQ_K64,
++        sb+(blk_base+4)*TBQ_K64, sb+(blk_base+5)*TBQ_K64, sb+(blk_base+6)*TBQ_K64, sb+(blk_base+7)*TBQ_K64,
++        db+blk_base+0, db+blk_base+1, db+blk_base+2, db+blk_base+3,
++        db+blk_base+4, db+blk_base+5, db+blk_base+6, db+blk_base+7);
++    GGML_UNUSED(ne11); GGML_UNUSED(ne12);
++}
 +
-+    float tmp[QK_K];
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
++template<typename idx_t, typename block_type,
++    void (*quantize_xhead)(const float*, const float*, const float*, const float*,
++                           const float*, const float*, const float*, const float*,
++                           block_type*, block_type*, block_type*, block_type*,
++                           block_type*, block_type*, block_type*, block_type*)>
++static void set_rows_cuda_xhead_v1(
++        const float * src0_d, const idx_t * src1_d, block_type * dst_d,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
++        const size_t nb01, const size_t nb02, const size_t nb03,
++        const size_t nb10, const size_t nb11, const size_t nb12,
++        const size_t nb1, const size_t nb2, const size_t nb3,
++        cudaStream_t stream) {
++    GGML_ASSERT(ne00 % TBQ_K64 == 0);
++    const int64_t blks_per_ne00 = ne00 / TBQ_K64;
++    GGML_ASSERT(blks_per_ne00 % 8 == 0);
++    const int64_t groups_per_ne00 = blks_per_ne00 / 8;
++    const int64_t n_total = groups_per_ne00 * ne01 * ne02 * ne03;
++    if (n_total == 0) return;
++    constexpr int BS = 1; // 1 thread/block: heavy per-thread work (2KB+ stack)
++    const int nb = (n_total + BS - 1) / BS;
++    const uint3 ne01_fd = init_fastdiv_values((uint32_t)ne01);
++    const uint3 ne02_fd = init_fastdiv_values((uint32_t)ne02);
++    const uint3 ne11_fd = init_fastdiv_values((uint32_t)ne11);
++    const uint3 ne12_fd = init_fastdiv_values((uint32_t)ne12);
++    k_set_rows_xhead_v1<idx_t, block_type, quantize_xhead><<<nb, BS, 0, stream>>>(
++        src0_d, src1_d, dst_d, n_total,
++        nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
++        nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),
++        ne11, ne12, (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
++        groups_per_ne00, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
++    GGML_UNUSED(ne00); GGML_UNUSED(ne10); GGML_UNUSED(ne13);
++}
 +
-+    if (norm < 1e-10f) {
-+        for (int j = 0; j < QK_K*3/8; j++) y->qs[j] = 0;
-+        return;
-+    }
++// ============================================================
++// Cross-head WHT kernel v2: Kronecker decomposition + shared memory
++// H_512 = H_8 ⊗ H_64 → 8 parallel per-head WHTs + 3-stage cross-head WHT
++// 8 threads per group, each handles one head's 64-element WHT
++// Shared memory: 8×64 floats = 2KB per group for cross-head exchange
++// ============================================================
 +
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < QK_K; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
-+    }
-+
-+    // Serial WHT
-+    for (int len = 1; len < QK_K; len *= 2)
-+        for (int i = 0; i < QK_K; i += 2*len)
-+            for (int j = 0; j < len; j++) {
-+                float u = tmp[i+j], v = tmp[i+j+len];
-+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
-+            }
-+
-+    // 3-bit quantization + packing
++// Per-head quantize helpers (called by each thread for its 64 elements)
++// These operate on tmp[64] in registers, writing to the output block
++template<typename block_type>
++static __device__ void xhead_quantize_tbq3(float * tmp, block_type * out, float norm) {
++    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
++    out->d = __float2half(norm);
 +    int bit_pos = 0;
-+    for (int j = 0; j < QK_K*3/8; j++) y->qs[j] = 0;
-+    for (int j = 0; j < QK_K; j++) {
-+        uint8_t idx = 7;
-+        for (int b = 0; b < 7; b++) { if (tmp[j] < tbq3_boundaries[b]) { idx = b; break; } }
-+        int byte_idx = bit_pos / 8;
-+        int bit_off = bit_pos % 8;
-+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
-+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
-+        bit_pos += 3;
-+    }
-+}
-+
-+// TurboQuant 4-bit: L2 norm + random signs + serial WHT + Lloyd-Max quantization
-+// Single-thread implementation for set_rows (called once per token, performance uncritical)
-+static __device__ void quantize_f32_tbq4_0_block(const float * __restrict__ x, block_tbq4_0 * __restrict__ y) {
-+    // Random sign pattern (must match CPU and turboquant.cu exactly)
-+    static constexpr uint8_t tbq_signs[32] = {
-+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
-+        0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
-+    };
-+    // Lloyd-Max decision boundaries for N(0,1), 4-bit (15 boundaries)
-+    static constexpr float tbq4_boundaries[15] = {
-+        -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,
-+         0.0f,
-+         0.2583f, 0.5225f, 0.7996f, 1.0993f, 1.4371f, 1.8435f, 2.4008f,
-+    };
-+
-+    float tmp[QK_K];
-+
-+    // Step 1: L2 norm
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+
-+    if (norm < 1e-10f) {
-+        for (int j = 0; j < QK_K/2; j++) y->qs[j] = 0;
-+        return;
-+    }
-+
-+    // Step 2: Normalize + random signs
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < QK_K; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
-+    }
-+
-+    // Step 3: Serial WHT (single thread, QK_K=256)
-+    for (int len = 1; len < QK_K; len *= 2) {
-+        for (int i = 0; i < QK_K; i += 2 * len) {
-+            for (int j = 0; j < len; j++) {
-+                float u = tmp[i + j], v = tmp[i + j + len];
-+                tmp[i + j] = u + v;
-+                tmp[i + j + len] = u - v;
-+            }
-+        }
-+    }
-+
-+    // Step 4: Lloyd-Max 4-bit quantization + packing
-+    for (int j = 0; j < QK_K/2; j++) {
-+        uint8_t idx0 = 15, idx1 = 15;
-+        for (int b = 0; b < 15; b++) { if (tmp[2*j]   < tbq4_boundaries[b]) { idx0 = b; break; } }
-+        for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < tbq4_boundaries[b]) { idx1 = b; break; } }
-+        y->qs[j] = idx0 | (idx1 << 4);
-+    }
-+}
-+
-+// TurboQuant_prod 3-bit: 2-bit Lloyd-Max + 1-bit QJL residual correction
-+// QJL uses SRHT: S = D2 * H * D1 (two sign patterns + WHT)
-+static __device__ void quantize_f32_tbqp3_0_block(const float * __restrict__ x, block_tbqp3_0 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[32] = {
-+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
-+    };
-+    // Second sign pattern for QJL SRHT (different from WHT signs)
-+    static constexpr uint8_t qjl_signs[32] = {
-+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
-+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
-+    };
-+    // 2-bit Lloyd-Max centroids for N(0,1)
-+    static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
-+    static constexpr float b2[3] = { -0.9816f, 0.0f, 0.9816f };
-+
-+    float tmp[QK_K], recon[QK_K];
-+
-+    // Step 1: L2 norm + normalize + signs + WHT
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+    if (norm < 1e-10f) {
-+        for (int j = 0; j < QK_K/4; j++) y->qs[j] = 0;
-+        for (int j = 0; j < QK_K/8; j++) y->qjl[j] = 0;
-+        y->d_qjl = __float2half(0.0f);
-+        return;
-+    }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < QK_K; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
-+    }
-+    for (int len = 1; len < QK_K; len *= 2)
-+        for (int i = 0; i < QK_K; i += 2*len)
-+            for (int j = 0; j < len; j++) {
-+                float u = tmp[i+j], v = tmp[i+j+len];
-+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
-+            }
-+
-+    // Step 2: 2-bit Lloyd-Max quantization
-+    for (int j = 0; j < QK_K/4; j++) {
-+        uint8_t packed = 0;
-+        for (int k = 0; k < 4; k++) {
-+            uint8_t idx = 3;
-+            for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } }
-+            packed |= (idx & 0x3) << (k*2);
-+            recon[j*4+k] = c2[idx]; // reconstructed centroid for residual
-+        }
-+        y->qs[j] = packed;
-+    }
-+
-+    // Step 3: Compute residual in WHT domain
-+    float res[QK_K];
-+    float res_sq = 0.0f;
-+    for (int j = 0; j < QK_K; j++) {
-+        res[j] = tmp[j] - recon[j];
-+        res_sq += res[j] * res[j];
-+    }
-+    float gamma = sqrtf(res_sq);
-+    y->d_qjl = __float2half(gamma * norm); // store gamma*norm for direct use
-+
-+    // Step 4: QJL = sign(SRHT(residual)) where SRHT = D2 * H * D1
-+    // Apply D1 (first sign pattern for QJL)
-+    for (int j = 0; j < QK_K; j++) {
-+        int sign = ((qjl_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        res[j] *= sign;
-+    }
-+    // WHT
-+    for (int len = 1; len < QK_K; len *= 2)
-+        for (int i = 0; i < QK_K; i += 2*len)
-+            for (int j = 0; j < len; j++) {
-+                float u = res[i+j], v = res[i+j+len];
-+                res[i+j] = u+v; res[i+j+len] = u-v;
-+            }
-+    // Store sign bits
-+    for (int j = 0; j < QK_K/8; j++) y->qjl[j] = 0;
-+    for (int j = 0; j < QK_K; j++) {
-+        if (res[j] >= 0.0f) y->qjl[j/8] |= (1 << (j%8));
-+    }
-+}
-+
-+// TurboQuant_prod 4-bit: 3-bit Lloyd-Max + 1-bit QJL
-+static __device__ void quantize_f32_tbqp4_0_block(const float * __restrict__ x, block_tbqp4_0 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[32] = {
-+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
-+    };
-+    static constexpr uint8_t qjl_signs[32] = {
-+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
-+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
-+    };
-+    static constexpr float c3[8] = {
-+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
-+    };
-+    static constexpr float b3[7] = {
-+        -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
-+    };
-+
-+    float tmp[QK_K], recon[QK_K];
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+    if (norm < 1e-10f) {
-+        for (int j = 0; j < QK_K*3/8; j++) y->qs[j] = 0;
-+        for (int j = 0; j < QK_K/8; j++) y->qjl[j] = 0;
-+        y->d_qjl = __float2half(0.0f);
-+        return;
-+    }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < QK_K; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
-+    }
-+    for (int len = 1; len < QK_K; len *= 2)
-+        for (int i = 0; i < QK_K; i += 2*len)
-+            for (int j = 0; j < len; j++) {
-+                float u = tmp[i+j], v = tmp[i+j+len];
-+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
-+            }
-+
-+    // 3-bit Lloyd-Max + 3-bit packing
-+    int bit_pos = 0;
-+    for (int j = 0; j < QK_K*3/8; j++) y->qs[j] = 0;
-+    for (int j = 0; j < QK_K; j++) {
++    for (int j = 0; j < TBQ_K64*3/8; j++) out->qs[j] = 0;
++    for (int j = 0; j < TBQ_K64; j++) {
 +        uint8_t idx = 7;
 +        for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
-+        int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
-+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
-+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
-+        recon[j] = c3[idx];
-+        bit_pos += 3;
-+    }
-+
-+    // Residual + QJL
-+    float res[QK_K], res_sq = 0.0f;
-+    for (int j = 0; j < QK_K; j++) { res[j] = tmp[j] - recon[j]; res_sq += res[j]*res[j]; }
-+    float gamma = sqrtf(res_sq);
-+    y->d_qjl = __float2half(gamma * norm);
-+    for (int j = 0; j < QK_K; j++) {
-+        int sign = ((qjl_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        res[j] *= sign;
-+    }
-+    for (int len = 1; len < QK_K; len *= 2)
-+        for (int i = 0; i < QK_K; i += 2*len)
-+            for (int j = 0; j < len; j++) {
-+                float u = res[i+j], v = res[i+j+len];
-+                res[i+j] = u+v; res[i+j+len] = u-v;
-+            }
-+    for (int j = 0; j < QK_K/8; j++) y->qjl[j] = 0;
-+    for (int j = 0; j < QK_K; j++) {
-+        if (res[j] >= 0.0f) y->qjl[j/8] |= (1 << (j%8));
-+    }
-+}
-+
-+// ============================================================
-+// TurboQuant 128-element (head_dim=128) quantization functions
-+// ============================================================
-+
-+// TBQ3_1: 128-element WHT + 3-bit Lloyd-Max
-+static __device__ void quantize_f32_tbq3_1_block(const float * __restrict__ x, block_tbq3_1 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[16] = {
-+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+    };
-+    static constexpr float tbq3_boundaries[7] = {
-+        -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
-+    };
-+
-+    float tmp[TBQ_K128];
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+
-+    if (norm < 1e-10f) {
-+        for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
-+        return;
-+    }
-+
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < TBQ_K128; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
-+    }
-+
-+    // Serial WHT (128 elements, 7 stages)
-+    for (int len = 1; len < TBQ_K128; len *= 2)
-+        for (int i = 0; i < TBQ_K128; i += 2*len)
-+            for (int j = 0; j < len; j++) {
-+                float u = tmp[i+j], v = tmp[i+j+len];
-+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
-+            }
-+
-+    // 3-bit quantization + packing
-+    int bit_pos = 0;
-+    for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
-+    for (int j = 0; j < TBQ_K128; j++) {
-+        uint8_t idx = 7;
-+        for (int b = 0; b < 7; b++) { if (tmp[j] < tbq3_boundaries[b]) { idx = b; break; } }
-+        int byte_idx = bit_pos / 8;
-+        int bit_off = bit_pos % 8;
-+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
-+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
++        int byte_idx = bit_pos/8, bit_off = bit_pos%8;
++        out->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
++        if (bit_off > 5) out->qs[byte_idx+1] |= (uint8_t)((idx & 0x7) >> (8-bit_off));
 +        bit_pos += 3;
 +    }
 +}
 +
-+// TBQ4_1: 128-element WHT + 4-bit Lloyd-Max
-+static __device__ void quantize_f32_tbq4_1_block(const float * __restrict__ x, block_tbq4_1 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[16] = {
-+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+    };
-+    static constexpr float tbq4_boundaries[15] = {
-+        -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,
-+         0.0f,
-+         0.2583f, 0.5225f, 0.7996f, 1.0993f, 1.4371f, 1.8435f, 2.4008f,
-+    };
-+
-+    float tmp[TBQ_K128];
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+
-+    if (norm < 1e-10f) {
-+        for (int j = 0; j < TBQ_K128/2; j++) y->qs[j] = 0;
-+        return;
-+    }
-+
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < TBQ_K128; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
-+    }
-+
-+    // Serial WHT (128 elements, 7 stages)
-+    for (int len = 1; len < TBQ_K128; len *= 2)
-+        for (int i = 0; i < TBQ_K128; i += 2*len)
-+            for (int j = 0; j < len; j++) {
-+                float u = tmp[i+j], v = tmp[i+j+len];
-+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
-+            }
-+
-+    // 4-bit quantization + packing
-+    for (int j = 0; j < TBQ_K128/2; j++) {
++template<typename block_type>
++static __device__ void xhead_quantize_tbq4(float * tmp, block_type * out, float norm) {
++    static constexpr float b4[15] = { -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,0.0f,0.2583f,0.5225f,0.7996f,1.0993f,1.4371f,1.8435f,2.4008f };
++    out->d = __float2half(norm);
++    for (int j = 0; j < TBQ_K64/2; j++) {
 +        uint8_t idx0 = 15, idx1 = 15;
-+        for (int b = 0; b < 15; b++) { if (tmp[2*j]   < tbq4_boundaries[b]) { idx0 = b; break; } }
-+        for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < tbq4_boundaries[b]) { idx1 = b; break; } }
-+        y->qs[j] = idx0 | (idx1 << 4);
++        for (int b = 0; b < 15; b++) { if (tmp[2*j]   < b4[b]) { idx0 = b; break; } }
++        for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < b4[b]) { idx1 = b; break; } }
++        out->qs[j] = idx0 | (idx1 << 4);
 +    }
 +}
 +
-+// TBQP3_1: 128-element 2-bit Lloyd-Max + 1-bit QJL
-+static __device__ void quantize_f32_tbqp3_1_block(const float * __restrict__ x, block_tbqp3_1 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[16] = {
-+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+    };
-+    static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
-+    static constexpr float b2[3] = { -0.9816f, 0.0f, 0.9816f };
-+
-+    float tmp[TBQ_K128], recon[TBQ_K128];
-+
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+    if (norm < 1e-10f) {
-+        for (int j = 0; j < TBQ_K128/4; j++) y->qs[j] = 0;
-+        for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
-+        y->d_qjl = __float2half(0.0f);
-+        return;
-+    }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < TBQ_K128; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
-+    }
-+    for (int len = 1; len < TBQ_K128; len *= 2)
-+        for (int i = 0; i < TBQ_K128; i += 2*len)
-+            for (int j = 0; j < len; j++) {
-+                float u = tmp[i+j], v = tmp[i+j+len];
-+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
-+            }
-+
-+    // 2-bit Lloyd-Max quantization
-+    for (int j = 0; j < TBQ_K128/4; j++) {
++template<typename block_type>
++static __device__ void xhead_quantize_tbqp3(float * tmp, block_type * out, float norm) {
++    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
++    static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
++    out->d = __float2half(norm);
++    float recon[TBQ_K64];
++    for (int j = 0; j < TBQ_K64/4; j++) {
 +        uint8_t packed = 0;
 +        for (int k = 0; k < 4; k++) {
 +            uint8_t idx = 3;
@@ -658,1838 +1029,283 @@ index 7697c292d..3e6ca6cef 100644
 +            packed |= (idx & 0x3) << (k*2);
 +            recon[j*4+k] = c2[idx];
 +        }
-+        y->qs[j] = packed;
++        out->qs[j] = packed;
 +    }
-+
-+    // Residual + Direct Sign (no SRHT — lower variance than QJL for d≤128)
-+    float res[TBQ_K128], res_abs_sum = 0.0f;
-+    for (int j = 0; j < TBQ_K128; j++) {
-+        res[j] = tmp[j] - recon[j];
-+        res_abs_sum += fabsf(res[j]);
-+    }
-+    float gamma = res_abs_sum / TBQ_K128; // mean(|residual|)
-+    y->d_qjl = __float2half(gamma * norm);
-+
-+    // Store sign(residual) directly — no random rotation needed
-+    for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
-+    for (int j = 0; j < TBQ_K128; j++) {
-+        if (res[j] >= 0.0f) y->qjl[j/8] |= (1 << (j%8));
-+    }
++    float res_abs = 0.0f;
++    for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(tmp[j] - recon[j]);
++    out->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
++    for (int j = 0; j < TBQ_K64/8; j++) out->qjl[j] = 0;
++    for (int j = 0; j < TBQ_K64; j++) { if (tmp[j]-recon[j] >= 0.0f) out->qjl[j/8] |= (1<<(j%8)); }
 +}
 +
-+// TBQP4_1: 128-element 3-bit Lloyd-Max + 1-bit QJL
-+static __device__ void quantize_f32_tbqp4_1_block(const float * __restrict__ x, block_tbqp4_1 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[16] = {
++template<typename block_type>
++static __device__ void xhead_quantize_tbqp4(float * tmp, block_type * out, float norm) {
++    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
++    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
++    out->d = __float2half(norm);
++    float recon[TBQ_K64];
++    int bit_pos = 0;
++    for (int j = 0; j < TBQ_K64*3/8; j++) out->qs[j] = 0;
++    for (int j = 0; j < TBQ_K64; j++) {
++        uint8_t idx = 7;
++        for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
++        int byte_idx = bit_pos/8, bit_off = bit_pos%8;
++        out->qs[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
++        if (bit_off > 5) out->qs[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
++        recon[j] = c3[idx]; bit_pos += 3;
++    }
++    float res_abs = 0.0f;
++    for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(tmp[j] - recon[j]);
++    out->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
++    for (int j = 0; j < TBQ_K64/8; j++) out->qjl[j] = 0;
++    for (int j = 0; j < TBQ_K64; j++) { if (tmp[j]-recon[j] >= 0.0f) out->qjl[j/8] |= (1<<(j%8)); }
++}
++
++// Quantize type tag for template dispatch
++enum xhead_qtype { XHEAD_TBQ3, XHEAD_TBQ4, XHEAD_TBQP3, XHEAD_TBQP4 };
++
++template <typename idx_t, typename block_type, xhead_qtype QT>
++static __global__ void k_set_rows_xhead_v2(
++        const float * __restrict__ src0,
++        const idx_t * __restrict__ src1,
++        block_type  * __restrict__ dst,
++        const int64_t ne_total_groups,
++        const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t s10, const int64_t s11, const int64_t s12,
++        const int64_t ne11, const int64_t ne12,
++        const int64_t s1, const int64_t s2, const int64_t s3,
++        const int64_t groups_per_ne00,
++        const uint3 ne01_fd, const uint3 ne02_fd,
++        const uint3 ne11_fd, const uint3 ne12_fd) {
++
++    // 8 threads per group. threadIdx.x % 8 = head index within group.
++    const int h = threadIdx.x % 8;          // head index within 8-head group
++    const int local_group = threadIdx.x / 8; // which group within this block
++    const int64_t ig = int64_t(blockIdx.x) * (blockDim.x / 8) + local_group;
++    const bool active = (ig < ne_total_groups);
++
++    // Shared memory: 8×64 floats per group for cross-head WHT exchange
++    extern __shared__ float smem[];
++    float * xhead_smem = smem + local_group * 8 * TBQ_K64; // this group's 512-float region
++
++    // Decompose group index (only meaningful if active, but compute anyway to avoid branching)
++    int64_t i_g00 = 0, i01 = 0, i02 = 0, i03 = 0;
++    idx_t dst_row = 0;
++    int64_t blk_base = 0;
++    float tmp[TBQ_K64];
++    float sum_sq_local = 0.0f;
++
++    if (active) {
++        i_g00 = ig % groups_per_ne00;
++        const int64_t r1 = ig / groups_per_ne00;
++        uint2 div_mod = fast_div_modulo((uint32_t)r1, ne01_fd);
++        i01 = div_mod.y;
++        uint32_t tmp2 = div_mod.x;
++        div_mod = fast_div_modulo(tmp2, ne02_fd);
++        i02 = div_mod.y;
++        i03 = div_mod.x;
++
++        const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
++        const int64_t i11_val = fastmodulo((uint32_t)i02, ne11_fd);
++        dst_row = *(src1 + i01*s10 + i11_val*s11 + i12*s12);
++        blk_base = i_g00 * 8;
++
++        // Each thread loads its head's 64 floats
++        const float * src_head = src0 + i01*s01 + i02*s02 + i03*s03 + (blk_base + h)*TBQ_K64;
++        for (int j = 0; j < TBQ_K64; j++) {
++            float v = src_head[j];
++            tmp[j] = v;
++            sum_sq_local += v * v;
++        }
++    } else {
++        for (int j = 0; j < TBQ_K64; j++) tmp[j] = 0.0f;
++    }
++
++    // Warp-level reduction for shared norm (sum across 8 heads)
++    float sum_sq = sum_sq_local;
++    #pragma unroll
++    for (int offset = 4; offset >= 1; offset >>= 1) {
++        sum_sq += __shfl_xor_sync(0xff << (local_group*8), sum_sq, offset);
++    }
++    // Now all 8 threads have the same sum_sq (total across all heads)
++    float norm = sqrtf(sum_sq);
++
++    const bool zero_norm = (norm < 1e-10f);
++    if (active && zero_norm) {
++        block_type * out = (block_type *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3) + blk_base + h;
++        out->d = __float2half(0.0f);
++        for (int j = 0; j < (int)sizeof(out->qs); j++) out->qs[j] = 0;
++    }
++    // Don't return early — must participate in __syncthreads below
++    if (!active || zero_norm) {
++        // Still need to participate in all syncthreads
++        for (int j = 0; j < TBQ_K64; j++) tmp[j] = 0;
++    } else {
++
++    // Apply per-head signs + normalize
++    static __device__ constexpr uint8_t tbq_signs_512_k[64] = {
 +        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
 +        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
++        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
++        0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
++        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
++        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
++        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
++        0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
 +    };
-+    static constexpr float c3[8] = {
-+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
-+    };
-+    static constexpr float b3[7] = {
-+        -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
-+    };
++    const float inv_norm = 1.0f / norm;
++    const int sign_offset = h * 8; // byte offset for this head's 64-bit signs
++    for (int j = 0; j < TBQ_K64; j++) {
++        const int global_j = h * TBQ_K64 + j;
++        int sign = ((tbq_signs_512_k[global_j >> 3] >> (global_j & 7)) & 1) ? -1 : 1;
++        tmp[j] *= inv_norm * sign;
++    }
 +
-+    float tmp[TBQ_K128], recon[TBQ_K128];
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+    if (norm < 1e-10f) {
-+        for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
-+        for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
-+        y->d_qjl = __float2half(0.0f);
-+        return;
-+    }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < TBQ_K128; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
-+    }
-+    for (int len = 1; len < TBQ_K128; len *= 2)
-+        for (int i = 0; i < TBQ_K128; i += 2*len)
++    // Phase 1: Per-head 64-element serial WHT (6 stages) — each thread independent
++    for (int len = 1; len < TBQ_K64; len *= 2)
++        for (int i = 0; i < TBQ_K64; i += 2*len)
 +            for (int j = 0; j < len; j++) {
 +                float u = tmp[i+j], v = tmp[i+j+len];
 +                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
 +            }
++    } // end else (active && !zero_norm)
 +
-+    // 3-bit Lloyd-Max + packing
-+    int bit_pos = 0;
-+    for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
-+    for (int j = 0; j < TBQ_K128; j++) {
-+        uint8_t idx = 7;
-+        for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
-+        int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
-+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
-+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
-+        recon[j] = c3[idx];
-+        bit_pos += 3;
-+    }
-+
-+    // Residual + Direct Sign (no SRHT — lower variance than QJL for d≤128)
-+    float res[TBQ_K128], res_abs_sum = 0.0f;
-+    for (int j = 0; j < TBQ_K128; j++) { res[j] = tmp[j] - recon[j]; res_abs_sum += fabsf(res[j]); }
-+    float gamma = res_abs_sum / TBQ_K128;
-+    y->d_qjl = __float2half(gamma * norm);
-+    for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
-+    for (int j = 0; j < TBQ_K128; j++) {
-+        if (res[j] >= 0.0f) y->qjl[j/8] |= (1 << (j%8));
-+    }
-+}
-+
-+// ============================================================
-+// TurboQuant 64-element (head_dim=64) quantization functions
-+// ============================================================
-+
-+static __device__ void quantize_f32_tbq3_2_block(const float * __restrict__ x, block_tbq3_2 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
-+    static constexpr float tbq3_boundaries[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
-+    float tmp[TBQ_K64];
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < TBQ_K64; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+    if (norm < 1e-10f) { for (int j = 0; j < TBQ_K64*3/8; j++) y->qs[j] = 0; return; }
-+    float inv_norm = 1.0f / norm;
++    // Phase 2: Cross-head 8-element WHT (3 stages) via shared memory
++    // All threads participate in syncthreads (including inactive ones)
++    // Store per-head WHT results to shared memory
 +    for (int j = 0; j < TBQ_K64; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
++        xhead_smem[h * TBQ_K64 + j] = tmp[j];
 +    }
-+    for (int len = 1; len < TBQ_K64; len *= 2)
-+        for (int i = 0; i < TBQ_K64; i += 2*len)
-+            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-+    int bit_pos = 0;
-+    for (int j = 0; j < TBQ_K64*3/8; j++) y->qs[j] = 0;
-+    for (int j = 0; j < TBQ_K64; j++) {
-+        uint8_t idx = 7;
-+        for (int b = 0; b < 7; b++) { if (tmp[j] < tbq3_boundaries[b]) { idx = b; break; } }
-+        int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
-+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
-+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
-+        bit_pos += 3;
-+    }
-+}
++    __syncthreads();
 +
-+static __device__ void quantize_f32_tbq4_2_block(const float * __restrict__ x, block_tbq4_2 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
-+    static constexpr float tbq4_boundaries[15] = { -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,0.0f,0.2583f,0.5225f,0.7996f,1.0993f,1.4371f,1.8435f,2.4008f };
-+    float tmp[TBQ_K64];
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < TBQ_K64; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+    if (norm < 1e-10f) { for (int j = 0; j < TBQ_K64/2; j++) y->qs[j] = 0; return; }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < TBQ_K64; j++) {
-+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] = x[j] * inv_norm * sign;
-+    }
-+    for (int len = 1; len < TBQ_K64; len *= 2)
-+        for (int i = 0; i < TBQ_K64; i += 2*len)
-+            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-+    for (int j = 0; j < TBQ_K64/2; j++) {
-+        uint8_t idx0 = 15, idx1 = 15;
-+        for (int b = 0; b < 15; b++) { if (tmp[2*j]   < tbq4_boundaries[b]) { idx0 = b; break; } }
-+        for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < tbq4_boundaries[b]) { idx1 = b; break; } }
-+        y->qs[j] = idx0 | (idx1 << 4);
-+    }
-+}
-+
-+static __device__ void quantize_f32_tbqp3_2_block(const float * __restrict__ x, block_tbqp3_2 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
-+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
-+    static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
-+    float tmp[TBQ_K64], recon[TBQ_K64];
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < TBQ_K64; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+    if (norm < 1e-10f) { for (int j = 0; j < TBQ_K64/4; j++) y->qs[j] = 0; for (int j = 0; j < TBQ_K64/8; j++) y->qjl[j] = 0; y->d_qjl = __float2half(0.0f); return; }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < TBQ_K64; j++) { int sign = ((tbq_signs[j>>3]>>(j&7))&1)?-1:1; tmp[j] = x[j]*inv_norm*sign; }
-+    for (int len = 1; len < TBQ_K64; len *= 2) for (int i = 0; i < TBQ_K64; i += 2*len) for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-+    for (int j = 0; j < TBQ_K64/4; j++) { uint8_t packed = 0; for (int k = 0; k < 4; k++) { uint8_t idx = 3; for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } } packed |= (idx&0x3)<<(k*2); recon[j*4+k] = c2[idx]; } y->qs[j] = packed; }
-+    float res[TBQ_K64], res_abs = 0.0f;
-+    for (int j = 0; j < TBQ_K64; j++) { res[j] = tmp[j]-recon[j]; res_abs += fabsf(res[j]); }
-+    y->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
-+    for (int j = 0; j < TBQ_K64/8; j++) y->qjl[j] = 0;
-+    for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) y->qjl[j/8] |= (1<<(j%8)); }
-+}
-+
-+static __device__ void quantize_f32_tbqp4_2_block(const float * __restrict__ x, block_tbqp4_2 * __restrict__ y) {
-+    static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
-+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
-+    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
-+    float tmp[TBQ_K64], recon[TBQ_K64];
-+    float sum_sq = 0.0f;
-+    for (int j = 0; j < TBQ_K64; j++) sum_sq += x[j] * x[j];
-+    float norm = sqrtf(sum_sq);
-+    y->d = __float2half(norm);
-+    if (norm < 1e-10f) { for (int j = 0; j < TBQ_K64*3/8; j++) y->qs[j] = 0; for (int j = 0; j < TBQ_K64/8; j++) y->qjl[j] = 0; y->d_qjl = __float2half(0.0f); return; }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < TBQ_K64; j++) { int sign = ((tbq_signs[j>>3]>>(j&7))&1)?-1:1; tmp[j] = x[j]*inv_norm*sign; }
-+    for (int len = 1; len < TBQ_K64; len *= 2) for (int i = 0; i < TBQ_K64; i += 2*len) for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-+    int bit_pos = 0;
-+    for (int j = 0; j < TBQ_K64*3/8; j++) y->qs[j] = 0;
-+    for (int j = 0; j < TBQ_K64; j++) { uint8_t idx = 7; for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } } int byte_idx = bit_pos/8, bit_off = bit_pos%8; y->qs[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off); if (bit_off > 5) y->qs[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off)); recon[j] = c3[idx]; bit_pos += 3; }
-+    float res[TBQ_K64], res_abs = 0.0f;
-+    for (int j = 0; j < TBQ_K64; j++) { res[j] = tmp[j]-recon[j]; res_abs += fabsf(res[j]); }
-+    y->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
-+    for (int j = 0; j < TBQ_K64/8; j++) y->qjl[j] = 0;
-+    for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) y->qjl[j/8] |= (1<<(j%8)); }
-+}
-+
- static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
-     float amax = 0.0f;
-     float vmax = 0.0f;
-diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index c59a4db39..f2f9f47b0 100644
---- a/ggml/src/ggml-cuda/fattn-common.cuh
-+++ b/ggml/src/ggml-cuda/fattn-common.cuh
-@@ -577,10 +577,674 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
-     }
- }
- 
-+// TurboQuant V dequantization: centroid lookup in WHT domain (no IWHT here)
-+// IWHT is applied ONCE to the final attention output (after softmax*V sum)
-+template <typename T, int ne>
-+static __device__ __forceinline__ void dequantize_V_tbq4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-+    const block_tbq4_0 * x = (const block_tbq4_0 *) vx;
-+    static constexpr float c4[16] = {
-+        -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,
-+         0.1284f, 0.3881f, 0.6568f, 0.9424f, 1.2562f, 1.6180f, 2.0690f, 2.7326f,
-+    };
-+
-+    const int64_t ib = i0 / QK_K;
-+    const int elem = i0 % QK_K;
-+    const float norm = __half2float(x[ib].d);
-+
-+#pragma unroll
-+    for (int l = 0; l < ne; l += 2) {
-+        const int byte_idx = (elem + l) / 2;
-+        const uint8_t packed = x[ib].qs[byte_idx];
-+        const float c0 = c4[packed & 0xF] * norm;
-+        const float c1 = c4[packed >> 4] * norm;
-+        if constexpr (std::is_same_v<T, float>) {
-+            ((float *) dst)[l]   = c0;
-+            ((float *) dst)[l+1] = c1;
-+        }
-+#ifdef FP16_AVAILABLE
-+        else if constexpr (std::is_same_v<T, half>) {
-+            ((half *) dst)[l]   = __float2half(c0);
-+            ((half *) dst)[l+1] = __float2half(c1);
-+        }
-+#endif
-+    }
-+}
-+
-+template <typename T, int ne>
-+static __device__ __forceinline__ void dequantize_V_tbq3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-+    const block_tbq3_0 * x = (const block_tbq3_0 *) vx;
-+    static constexpr float c3[8] = {
-+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
-+    };
-+
-+    const int64_t ib = i0 / QK_K;
-+    const int elem = i0 % QK_K;
-+    const float norm = __half2float(x[ib].d);
-+
-+#pragma unroll
-+    for (int l = 0; l < ne; ++l) {
-+        const int e = elem + l;
-+        const int bp = e * 3;
-+        const int by = bp / 8, bo = bp % 8;
-+        uint32_t v = (uint32_t)x[ib].qs[by] >> bo;
-+        if (bo > 5 && by + 1 < QK_K*3/8) v |= (uint32_t)x[ib].qs[by+1] << (8-bo);
-+        const float cent = c3[v & 0x7] * norm;
-+        if constexpr (std::is_same_v<T, float>) {
-+            ((float *) dst)[l] = cent;
-+        }
-+#ifdef FP16_AVAILABLE
-+        else if constexpr (std::is_same_v<T, half>) {
-+            ((half *) dst)[l] = __float2half(cent);
-+        }
-+#endif
-+    }
-+}
-+
-+// TurboQuant_prod: fused score = MSE_term + QJL_term
-+// Q_v = WHT(signs1*q)*scale/D (MSE query, in Q_reg)
-+// Q_ds_v = WHT(signs2*q)*sqrt(pi/2)/D (QJL query, in Q_ds -- independent random projection)
-+// score = sum(cent[idx]*Q_mse[j])*norm + sum(qjl_sign[j]*Q_qjl[j])*d_qjl
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_0(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+
-+    const block_tbqp3_0 * K = (const block_tbqp3_0 *) K_c;
-+    GGML_UNUSED(Q_q8);
-+
-+    static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
-+
-+    float sum = 0.0f;
-+
++    // 3-stage butterfly: each thread reads partner's values, computes in registers
 +    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-+        const int elem = k * 2;
-+        const int ib = elem / QK_K;
-+
-+        // Read both norms once
-+        const float norm = __half2float(K[ib].d);
-+        const float d_qjl = __half2float(K[ib].d_qjl);
-+
-+        // 2-bit centroid lookup
-+        const int byte_idx0 = (elem % QK_K) / 4;
-+        const int byte_idx1 = ((elem+1) % QK_K) / 4;
-+        const float cent0 = c2[(K[ib].qs[byte_idx0] >> (((elem % QK_K) % 4) * 2)) & 0x3];
-+        const float cent1 = c2[(K[ib].qs[byte_idx1] >> ((((elem+1) % QK_K) % 4) * 2)) & 0x3];
-+
-+        // QJL: sign-flip instead of multiply (branchless via XOR on float sign bit)
-+        const float2 q_qjl = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-+        const int qjl0 = (K[ib].qjl[(elem%QK_K)/8] >> ((elem%QK_K)%8)) & 1;
-+        const int qjl1 = (K[ib].qjl[((elem+1)%QK_K)/8] >> (((elem+1)%QK_K)%8)) & 1;
-+        // sign-flip: if qjl==0 negate, if qjl==1 keep -> equivalent to *(2*qjl-1)
-+        const float qc0 = qjl0 ? q_qjl.x : -q_qjl.x;
-+        const float qc1 = qjl1 ? q_qjl.y : -q_qjl.y;
-+
-+        // MSE query
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q_mse = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q_mse = ((const float2 *) Q_v)[k_KQ_0/nthreads];
-+#endif
-+
-+        // Combined: MSE + QJL in single accumulation
-+        sum += norm * (q_mse.x * cent0 + q_mse.y * cent1)
-+             + d_qjl * (qc0 + qc1);
++    for (int stage = 0; stage < 3; stage++) {
++        const int partner = h ^ (1 << stage);
++        for (int j = 0; j < TBQ_K64; j++) {
++            float my_val = xhead_smem[h * TBQ_K64 + j];
++            float partner_val = xhead_smem[partner * TBQ_K64 + j];
++            tmp[j] = (h & (1 << stage)) ? (partner_val - my_val) : (my_val + partner_val);
++        }
++        __syncthreads();
++        for (int j = 0; j < TBQ_K64; j++) {
++            xhead_smem[h * TBQ_K64 + j] = tmp[j];
++        }
++        __syncthreads();
 +    }
 +
-+    return sum;
++    // Quantize this thread's 64 elements to output block
++    if (active && !zero_norm) {
++        block_type * out = (block_type *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3) + blk_base + h;
++        if constexpr (QT == XHEAD_TBQ3)  { xhead_quantize_tbq3(tmp, out, norm); }
++        if constexpr (QT == XHEAD_TBQ4)  { xhead_quantize_tbq4(tmp, out, norm); }
++        if constexpr (QT == XHEAD_TBQP3) { xhead_quantize_tbqp3(tmp, out, norm); }
++        if constexpr (QT == XHEAD_TBQP4) { xhead_quantize_tbqp4(tmp, out, norm); }
++    }
++
++    GGML_UNUSED(ne11); GGML_UNUSED(ne12);
 +}
 +
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_0(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
++template<typename idx_t, typename block_type, xhead_qtype QT>
++static void set_rows_cuda_xhead(
++        const float * src0_d, const idx_t * src1_d, block_type * dst_d,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
++        const size_t nb01, const size_t nb02, const size_t nb03,
++        const size_t nb10, const size_t nb11, const size_t nb12,
++        const size_t nb1, const size_t nb2, const size_t nb3,
++        cudaStream_t stream) {
 +
-+    const block_tbqp4_0 * K = (const block_tbqp4_0 *) K_c;
-+    GGML_UNUSED(Q_q8);
++    GGML_ASSERT(ne00 % TBQ_K64 == 0);
++    const int64_t blks_per_ne00 = ne00 / TBQ_K64;
++    GGML_ASSERT(blks_per_ne00 % 8 == 0 && "cross-head WHT requires n_kv_head divisible by 8");
 +
-+    static constexpr float c3[8] = {
-+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
-+    };
++    const int64_t groups_per_ne00 = blks_per_ne00 / 8;
++    const int64_t ne_total_groups = groups_per_ne00 * ne01 * ne02 * ne03;
++    if (ne_total_groups == 0) return;
 +
-+    float sum = 0.0f;
++    // 8 threads per group, multiple groups per block
++    constexpr int GROUPS_PER_BLOCK = 4;  // 4 groups × 8 threads = 32 threads/block
++    constexpr int THREADS_PER_BLOCK = GROUPS_PER_BLOCK * 8;
++    const int num_blocks = (ne_total_groups + GROUPS_PER_BLOCK - 1) / GROUPS_PER_BLOCK;
++    const size_t smem_size = GROUPS_PER_BLOCK * 8 * TBQ_K64 * sizeof(float); // 4 × 2KB = 8KB
 +
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-+        const int elem = k * 2;
-+        const int ib = elem / QK_K;
++    const uint3 ne01_fd = init_fastdiv_values((uint32_t)ne01);
++    const uint3 ne02_fd = init_fastdiv_values((uint32_t)ne02);
++    const uint3 ne11_fd = init_fastdiv_values((uint32_t)ne11);
++    const uint3 ne12_fd = init_fastdiv_values((uint32_t)ne12);
 +
-+        const float norm = __half2float(K[ib].d);
-+        const float d_qjl = __half2float(K[ib].d_qjl);
++    k_set_rows_xhead_v2<idx_t, block_type, QT><<<num_blocks, THREADS_PER_BLOCK, smem_size, stream>>>(
++        src0_d, src1_d, dst_d,
++        ne_total_groups,
++        nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
++        nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),
++        ne11, ne12,
++        (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
++        groups_per_ne00,
++        ne01_fd, ne02_fd, ne11_fd, ne12_fd);
 +
-+        // 3-bit centroid unpack
-+        float cent0, cent1;
-+        {
-+            int bp = (elem%QK_K)*3, by = bp/8, bo = bp%8;
-+            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
-+            if (bo > 5 && by+1 < QK_K*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
-+            cent0 = c3[v & 0x7];
-+        }
-+        {
-+            int bp = ((elem+1)%QK_K)*3, by = bp/8, bo = bp%8;
-+            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
-+            if (bo > 5 && by+1 < QK_K*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
-+            cent1 = c3[v & 0x7];
-+        }
-+
-+        // QJL: sign-flip (no float multiply)
-+        const float2 q_qjl = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-+        const int qjl0 = (K[ib].qjl[(elem%QK_K)/8] >> ((elem%QK_K)%8)) & 1;
-+        const int qjl1 = (K[ib].qjl[((elem+1)%QK_K)/8] >> (((elem+1)%QK_K)%8)) & 1;
-+        const float qc0 = qjl0 ? q_qjl.x : -q_qjl.x;
-+        const float qc1 = qjl1 ? q_qjl.y : -q_qjl.y;
-+
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q_mse = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q_mse = ((const float2 *) Q_v)[k_KQ_0/nthreads];
-+#endif
-+
-+        sum += norm * (q_mse.x * cent0 + q_mse.y * cent1)
-+             + d_qjl * (qc0 + qc1);
-+    }
-+
-+    return sum;
++    GGML_UNUSED(ne00); GGML_UNUSED(ne10); GGML_UNUSED(ne13);
 +}
 +
-+// TurboQuant KV: fused attention score (TBQ_mse variant, no QJL)
-+// score = sum_j( centroid[K_idx[j]] * Q_wht[j] ) * norm
-+// Note: scale/D already applied to Q_wht during query preprocessing
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+    const block_tbq4_0 * K_tbq = (const block_tbq4_0 *) K_c;
-+    GGML_UNUSED(Q_q8);
-+    GGML_UNUSED(Q_ds_v);
-+
-+    static constexpr float c4[16] = {
-+        -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9424f, -0.6568f, -0.3881f, -0.1284f,
-+         0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
-+    };
-+
-+    const float norm = __half2float(K_tbq[0].d);
-+    float sum = 0.0f;
-+
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-+        const int byte_idx = k; // D=QK_K, so elem%QK_K/2 = k
-+
-+        const uint8_t packed = K_tbq[0].qs[byte_idx];
-+        const float cent_lo = c4[packed & 0xF];
-+        const float cent_hi = c4[packed >> 4];
-+
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
-+#endif
-+
-+        sum += q.x * cent_lo + q.y * cent_hi;
-+    }
-+
-+    return norm * sum;
-+}
-+
-+// TBQ3_0: 3-bit fused attention score
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+    const block_tbq3_0 * K_tbq = (const block_tbq3_0 *) K_c;
-+    GGML_UNUSED(Q_q8);
-+    GGML_UNUSED(Q_ds_v);
-+
-+    static constexpr float c3[8] = {
-+        -2.1520f, -1.3440f, -0.7560f, -0.2451f,
-+         0.2451f,  0.7560f,  1.3440f,  2.1520f,
-+    };
-+
-+    const float norm = __half2float(K_tbq[0].d);
-+    float sum = 0.0f;
-+
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-+        const int elem = k * 2;
-+
-+        float cent0, cent1;
-+        {
-+            const int bp0 = elem * 3;
-+            const int by0 = bp0 / 8, bo0 = bp0 % 8;
-+            uint32_t v0 = (uint32_t)K_tbq[0].qs[by0] >> bo0;
-+            if (bo0 > 5) v0 |= (uint32_t)K_tbq[0].qs[by0+1] << (8-bo0);
-+            cent0 = c3[v0 & 0x7];
-+        }
-+        {
-+            const int bp1 = (elem + 1) * 3;
-+            const int by1 = bp1 / 8, bo1 = bp1 % 8;
-+            uint32_t v1 = (uint32_t)K_tbq[0].qs[by1] >> bo1;
-+            if (bo1 > 5) v1 |= (uint32_t)K_tbq[0].qs[by1+1] << (8-bo1);
-+            cent1 = c3[v1 & 0x7];
-+        }
-+
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
-+#endif
-+
-+        sum += q.x * cent0 + q.y * cent1;
-+    }
-+
-+    return norm * sum;
-+}
-+
-+// ============================================================
-+// TurboQuant 128-block (_1) variants for head_dim=128
-+// ============================================================
-+
-+template <typename T, int ne>
-+static __device__ __forceinline__ void dequantize_V_tbq4_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-+    const block_tbq4_1 * x = (const block_tbq4_1 *) vx;
-+    static constexpr float c4[16] = {
-+        -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,
-+         0.1284f, 0.3881f, 0.6568f, 0.9424f, 1.2562f, 1.6180f, 2.0690f, 2.7326f,
-+    };
-+
-+    const int64_t ib = i0 / TBQ_K128;
-+    const int elem = i0 % TBQ_K128;
-+    const float norm = __half2float(x[ib].d);
-+
-+#pragma unroll
-+    for (int l = 0; l < ne; l += 2) {
-+        const int byte_idx = (elem + l) / 2;
-+        const uint8_t packed = x[ib].qs[byte_idx];
-+        const float c0 = c4[packed & 0xF] * norm;
-+        const float c1 = c4[packed >> 4] * norm;
-+        if constexpr (std::is_same_v<T, float>) {
-+            ((float *) dst)[l]   = c0;
-+            ((float *) dst)[l+1] = c1;
-+        }
-+#ifdef FP16_AVAILABLE
-+        else if constexpr (std::is_same_v<T, half>) {
-+            ((half *) dst)[l]   = __float2half(c0);
-+            ((half *) dst)[l+1] = __float2half(c1);
-+        }
-+#endif
-+    }
-+}
-+
-+template <typename T, int ne>
-+static __device__ __forceinline__ void dequantize_V_tbq3_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-+    const block_tbq3_1 * x = (const block_tbq3_1 *) vx;
-+    static constexpr float c3[8] = {
-+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
-+    };
-+
-+    const int64_t ib = i0 / TBQ_K128;
-+    const int elem = i0 % TBQ_K128;
-+    const float norm = __half2float(x[ib].d);
-+
-+#pragma unroll
-+    for (int l = 0; l < ne; ++l) {
-+        const int e = elem + l;
-+        const int bp = e * 3;
-+        const int by = bp / 8, bo = bp % 8;
-+        uint32_t v = (uint32_t)x[ib].qs[by] >> bo;
-+        if (bo > 5 && by + 1 < TBQ_K128*3/8) v |= (uint32_t)x[ib].qs[by+1] << (8-bo);
-+        const float cent = c3[v & 0x7] * norm;
-+        if constexpr (std::is_same_v<T, float>) {
-+            ((float *) dst)[l] = cent;
-+        }
-+#ifdef FP16_AVAILABLE
-+        else if constexpr (std::is_same_v<T, half>) {
-+            ((half *) dst)[l] = __float2half(cent);
-+        }
-+#endif
-+    }
-+}
-+
-+// TBQP3_1: fused MSE + Direct Sign score (128-block)
-+// Direct Sign: sign(residual) stored directly, no SRHT — uses Q_v (MSE query) instead of Q_ds
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_1(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+
-+    const block_tbqp3_1 * K = (const block_tbqp3_1 *) K_c;
-+    GGML_UNUSED(Q_q8);
-+    GGML_UNUSED(Q_ds_v); // Direct Sign uses Q_v directly, no separate QJL projection needed
-+
-+    static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
-+
-+    float sum = 0.0f;
-+
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-+        const int elem = k * 2;
-+        const int ib = elem / TBQ_K128;
-+
-+        const float norm = __half2float(K[ib].d);
-+        const float d_direct = __half2float(K[ib].d_qjl); // mean(|residual|) * ||k||
-+
-+        const int byte_idx0 = (elem % TBQ_K128) / 4;
-+        const int byte_idx1 = ((elem+1) % TBQ_K128) / 4;
-+        const float cent0 = c2[(K[ib].qs[byte_idx0] >> (((elem % TBQ_K128) % 4) * 2)) & 0x3];
-+        const float cent1 = c2[(K[ib].qs[byte_idx1] >> ((((elem+1) % TBQ_K128) % 4) * 2)) & 0x3];
-+
-+        // Direct Sign: use same Q_v (WHT'd query) for both MSE and sign correction
-+        const int sign0 = (K[ib].qjl[(elem%TBQ_K128)/8] >> ((elem%TBQ_K128)%8)) & 1;
-+        const int sign1 = (K[ib].qjl[((elem+1)%TBQ_K128)/8] >> (((elem+1)%TBQ_K128)%8)) & 1;
-+
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
-+#endif
-+
-+        // MSE: norm * centroid * q_wht + Direct Sign: d_direct * sign(r) * q_wht
-+        const float sc0 = sign0 ? q.x : -q.x;
-+        const float sc1 = sign1 ? q.y : -q.y;
-+        sum += norm * (q.x * cent0 + q.y * cent1)
-+             + d_direct * (sc0 + sc1);
-+    }
-+
-+    return sum;
-+}
-+
-+// TBQP4_1: fused MSE + Direct Sign score (128-block)
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_1(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+
-+    const block_tbqp4_1 * K = (const block_tbqp4_1 *) K_c;
-+    GGML_UNUSED(Q_q8);
-+    GGML_UNUSED(Q_ds_v);
-+
-+    static constexpr float c3[8] = {
-+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
-+    };
-+
-+    float sum = 0.0f;
-+
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-+        const int elem = k * 2;
-+        const int ib = elem / TBQ_K128;
-+
-+        const float norm = __half2float(K[ib].d);
-+        const float d_direct = __half2float(K[ib].d_qjl);
-+
-+        float cent0, cent1;
-+        {
-+            int bp = (elem%TBQ_K128)*3, by = bp/8, bo = bp%8;
-+            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
-+            if (bo > 5 && by+1 < TBQ_K128*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
-+            cent0 = c3[v & 0x7];
-+        }
-+        {
-+            int bp = ((elem+1)%TBQ_K128)*3, by = bp/8, bo = bp%8;
-+            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
-+            if (bo > 5 && by+1 < TBQ_K128*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
-+            cent1 = c3[v & 0x7];
-+        }
-+
-+        const int sign0 = (K[ib].qjl[(elem%TBQ_K128)/8] >> ((elem%TBQ_K128)%8)) & 1;
-+        const int sign1 = (K[ib].qjl[((elem+1)%TBQ_K128)/8] >> (((elem+1)%TBQ_K128)%8)) & 1;
-+
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
-+#endif
-+
-+        const float sc0 = sign0 ? q.x : -q.x;
-+        const float sc1 = sign1 ? q.y : -q.y;
-+        sum += norm * (q.x * cent0 + q.y * cent1)
-+             + d_direct * (sc0 + sc1);
-+    }
-+
-+    return sum;
-+}
-+
-+// TBQ4_1: 4-bit fused attention score (128-block)
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_1(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+    const block_tbq4_1 * K_tbq = (const block_tbq4_1 *) K_c;
-+    GGML_UNUSED(Q_q8);
-+    GGML_UNUSED(Q_ds_v);
-+
-+    static constexpr float c4[16] = {
-+        -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9424f, -0.6568f, -0.3881f, -0.1284f,
-+         0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
-+    };
-+
-+    const float norm = __half2float(K_tbq[0].d);
-+    float sum = 0.0f;
-+
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-+        const int byte_idx = k;
-+
-+        const uint8_t packed = K_tbq[0].qs[byte_idx];
-+        const float cent_lo = c4[packed & 0xF];
-+        const float cent_hi = c4[packed >> 4];
-+
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
-+#endif
-+
-+        sum += q.x * cent_lo + q.y * cent_hi;
-+    }
-+
-+    return norm * sum;
-+}
-+
-+// TBQ3_1: 3-bit fused attention score (128-block)
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_1(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+    const block_tbq3_1 * K_tbq = (const block_tbq3_1 *) K_c;
-+    GGML_UNUSED(Q_q8);
-+    GGML_UNUSED(Q_ds_v);
-+
-+    static constexpr float c3[8] = {
-+        -2.1520f, -1.3440f, -0.7560f, -0.2451f,
-+         0.2451f,  0.7560f,  1.3440f,  2.1520f,
-+    };
-+
-+    const float norm = __half2float(K_tbq[0].d);
-+    float sum = 0.0f;
-+
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-+        const int elem = k * 2;
-+
-+        float cent0, cent1;
-+        {
-+            const int bp0 = elem * 3;
-+            const int by0 = bp0 / 8, bo0 = bp0 % 8;
-+            uint32_t v0 = (uint32_t)K_tbq[0].qs[by0] >> bo0;
-+            if (bo0 > 5) v0 |= (uint32_t)K_tbq[0].qs[by0+1] << (8-bo0);
-+            cent0 = c3[v0 & 0x7];
-+        }
-+        {
-+            const int bp1 = (elem + 1) * 3;
-+            const int by1 = bp1 / 8, bo1 = bp1 % 8;
-+            uint32_t v1 = (uint32_t)K_tbq[0].qs[by1] >> bo1;
-+            if (bo1 > 5) v1 |= (uint32_t)K_tbq[0].qs[by1+1] << (8-bo1);
-+            cent1 = c3[v1 & 0x7];
-+        }
-+
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
-+#endif
-+
-+        sum += q.x * cent0 + q.y * cent1;
-+    }
-+
-+    return norm * sum;
-+}
-+
-+// ============================================================
-+// TurboQuant 64-block (_2) variants for head_dim=64
-+// ============================================================
-+
-+template <typename T, int ne>
-+static __device__ __forceinline__ void dequantize_V_tbq4_2(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-+    const block_tbq4_2 * x = (const block_tbq4_2 *) vx;
-+    static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
-+    const int64_t ib = i0 / TBQ_K64; const int elem = i0 % TBQ_K64; const float norm = __half2float(x[ib].d);
-+#pragma unroll
-+    for (int l = 0; l < ne; l += 2) { const uint8_t packed = x[ib].qs[(elem+l)/2]; const float c0 = c4[packed&0xF]*norm; const float c1 = c4[packed>>4]*norm;
-+        if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l]=c0; ((float*)dst)[l+1]=c1; }
-+#ifdef FP16_AVAILABLE
-+        else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l]=__float2half(c0); ((half*)dst)[l+1]=__float2half(c1); }
-+#endif
-+    }
-+}
-+
-+template <typename T, int ne>
-+static __device__ __forceinline__ void dequantize_V_tbq3_2(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-+    const block_tbq3_2 * x = (const block_tbq3_2 *) vx;
-+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
-+    const int64_t ib = i0 / TBQ_K64; const int elem = i0 % TBQ_K64; const float norm = __half2float(x[ib].d);
-+#pragma unroll
-+    for (int l = 0; l < ne; ++l) { const int e = elem+l; const int bp = e*3; const int by = bp/8, bo = bp%8;
-+        uint32_t v = (uint32_t)x[ib].qs[by]>>bo; if (bo > 5 && by+1 < TBQ_K64*3/8) v |= (uint32_t)x[ib].qs[by+1]<<(8-bo);
-+        const float cent = c3[v&0x7]*norm;
-+        if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l]=cent; }
-+#ifdef FP16_AVAILABLE
-+        else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l]=__float2half(cent); }
-+#endif
-+    }
-+}
-+
-+// TBQP3_2: fused MSE + Direct Sign (64-block)
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_2(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+    const block_tbqp3_2 * K = (const block_tbqp3_2 *) K_c;
-+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
-+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f }; float sum = 0.0f;
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2; const int ib = elem/TBQ_K64;
-+        const float norm = __half2float(K[ib].d); const float d_direct = __half2float(K[ib].d_qjl);
-+        const float cent0 = c2[(K[ib].qs[(elem%TBQ_K64)/4]>>(((elem%TBQ_K64)%4)*2))&0x3];
-+        const float cent1 = c2[(K[ib].qs[((elem+1)%TBQ_K64)/4]>>((((elem+1)%TBQ_K64)%4)*2))&0x3];
-+        const int s0 = (K[ib].qjl[(elem%TBQ_K64)/8]>>((elem%TBQ_K64)%8))&1;
-+        const int s1 = (K[ib].qjl[((elem+1)%TBQ_K64)/8]>>(((elem+1)%TBQ_K64)%8))&1;
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
-+#endif
-+        sum += norm*(q.x*cent0+q.y*cent1) + d_direct*((s0?q.x:-q.x)+(s1?q.y:-q.y));
-+    }
-+    return sum;
-+}
-+
-+// TBQP4_2: fused MSE + Direct Sign (64-block)
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_2(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+    const block_tbqp4_2 * K = (const block_tbqp4_2 *) K_c;
-+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
-+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f }; float sum = 0.0f;
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2; const int ib = elem/TBQ_K64;
-+        const float norm = __half2float(K[ib].d); const float d_direct = __half2float(K[ib].d_qjl);
-+        float cent0, cent1;
-+        { int bp=(elem%TBQ_K64)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K[ib].qs[by]>>bo; if(bo>5&&by+1<TBQ_K64*3/8) v|=(uint32_t)K[ib].qs[by+1]<<(8-bo); cent0=c3[v&0x7]; }
-+        { int bp=((elem+1)%TBQ_K64)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K[ib].qs[by]>>bo; if(bo>5&&by+1<TBQ_K64*3/8) v|=(uint32_t)K[ib].qs[by+1]<<(8-bo); cent1=c3[v&0x7]; }
-+        const int s0 = (K[ib].qjl[(elem%TBQ_K64)/8]>>((elem%TBQ_K64)%8))&1;
-+        const int s1 = (K[ib].qjl[((elem+1)%TBQ_K64)/8]>>(((elem+1)%TBQ_K64)%8))&1;
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
-+#endif
-+        sum += norm*(q.x*cent0+q.y*cent1) + d_direct*((s0?q.x:-q.x)+(s1?q.y:-q.y));
-+    }
-+    return sum;
-+}
-+
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_2(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+    const block_tbq4_2 * K_tbq = (const block_tbq4_2 *) K_c; GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
-+    static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
-+    const float norm = __half2float(K_tbq[0].d); float sum = 0.0f;
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads);
-+        const uint8_t packed = K_tbq[0].qs[k];
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
-+#endif
-+        sum += q.x*c4[packed&0xF] + q.y*c4[packed>>4];
-+    }
-+    return norm*sum;
-+}
-+
-+template <int D, int nthreads>
-+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_2(
-+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-+    const block_tbq3_2 * K_tbq = (const block_tbq3_2 *) K_c; GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
-+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
-+    const float norm = __half2float(K_tbq[0].d); float sum = 0.0f;
-+    #pragma unroll
-+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2;
-+        float cent0, cent1;
-+        { int bp0=elem*3,by0=bp0/8,bo0=bp0%8; uint32_t v0=(uint32_t)K_tbq[0].qs[by0]>>bo0; if(bo0>5) v0|=(uint32_t)K_tbq[0].qs[by0+1]<<(8-bo0); cent0=c3[v0&0x7]; }
-+        { int bp1=(elem+1)*3,by1=bp1/8,bo1=bp1%8; uint32_t v1=(uint32_t)K_tbq[0].qs[by1]>>bo1; if(bo1>5) v1|=(uint32_t)K_tbq[0].qs[by1+1]<<(8-bo1); cent1=c3[v1&0x7]; }
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
-+#else
-+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
-+#endif
-+        sum += q.x*cent0 + q.y*cent1;
-+    }
-+    return norm*sum;
-+}
-+
- template <ggml_type type_K, int D, int nthreads>
- constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
-     if constexpr (type_K == GGML_TYPE_F16) {
-         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQ4_0) {
-+        return vec_dot_fattn_vec_KQ_tbq4_0<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQ3_0) {
-+        return vec_dot_fattn_vec_KQ_tbq3_0<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQP3_0) {
-+        return vec_dot_fattn_vec_KQ_tbqp3_0<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQP4_0) {
-+        return vec_dot_fattn_vec_KQ_tbqp4_0<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQ4_1) {
-+        return vec_dot_fattn_vec_KQ_tbq4_1<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQ3_1) {
-+        return vec_dot_fattn_vec_KQ_tbq3_1<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQP3_1) {
-+        return vec_dot_fattn_vec_KQ_tbqp3_1<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQP4_1) {
-+        return vec_dot_fattn_vec_KQ_tbqp4_1<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQ4_2) {
-+        return vec_dot_fattn_vec_KQ_tbq4_2<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQ3_2) {
-+        return vec_dot_fattn_vec_KQ_tbq3_2<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQP3_2) {
-+        return vec_dot_fattn_vec_KQ_tbqp3_2<D, nthreads>;
-+    } else if constexpr (type_K == GGML_TYPE_TBQP4_2) {
-+        return vec_dot_fattn_vec_KQ_tbqp4_2<D, nthreads>;
-     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
-         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
-     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
-@@ -615,6 +1279,18 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
-         return dequantize_V_q8_0<T, ne>;
-     } else if constexpr (type_V == GGML_TYPE_BF16) {
-         return dequantize_V_bf16<float, ne>;
-+    } else if constexpr (type_V == GGML_TYPE_TBQ4_0) {
-+        return dequantize_V_tbq4_0<T, ne>;
-+    } else if constexpr (type_V == GGML_TYPE_TBQ3_0) {
-+        return dequantize_V_tbq3_0<T, ne>;
-+    } else if constexpr (type_V == GGML_TYPE_TBQ4_1) {
-+        return dequantize_V_tbq4_1<T, ne>;
-+    } else if constexpr (type_V == GGML_TYPE_TBQ3_1) {
-+        return dequantize_V_tbq3_1<T, ne>;
-+    } else if constexpr (type_V == GGML_TYPE_TBQ4_2) {
-+        return dequantize_V_tbq4_2<T, ne>;
-+    } else if constexpr (type_V == GGML_TYPE_TBQ3_2) {
-+        return dequantize_V_tbq3_2<T, ne>;
-     } else {
-         static_assert(type_V == -1, "bad type");
-         return nullptr;
-diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
-index f0bd42a57..0ce815410 100644
---- a/ggml/src/ggml-cuda/fattn-vec.cuh
-+++ b/ggml/src/ggml-cuda/fattn-vec.cuh
-@@ -85,7 +85,13 @@ static __global__ void flash_attn_ext_vec(
-     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
- 
-     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
--    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
-+    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16
-+        && type_K != GGML_TYPE_TBQ4_0 && type_K != GGML_TYPE_TBQ3_0
-+        && type_K != GGML_TYPE_TBQP3_0 && type_K != GGML_TYPE_TBQP4_0
-+        && type_K != GGML_TYPE_TBQ4_1 && type_K != GGML_TYPE_TBQ3_1
-+        && type_K != GGML_TYPE_TBQP3_1 && type_K != GGML_TYPE_TBQP4_1
-+        && type_K != GGML_TYPE_TBQ4_2 && type_K != GGML_TYPE_TBQ3_2
-+        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2;
- #ifdef V_DOT2_F32_F16_AVAILABLE
-     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
- #else
-@@ -135,7 +141,13 @@ static __global__ void flash_attn_ext_vec(
-     __align__(16) float2 Q_reg[ncols][(D/2)/nthreads_KQ] = {{{0.0f, 0.0f}}}; // May be only partially initialized.
- #endif // V_DOT2_F32_F16_AVAILABLE
-     int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
--    float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
-+    // For TBQP: Q_ds stores QJL WHT'd query (needs same size as Q_reg)
-+    constexpr int Q_ds_size = (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0
-+                            || type_K == GGML_TYPE_TBQP3_1 || type_K == GGML_TYPE_TBQP4_1
-+                            || type_K == GGML_TYPE_TBQP3_2 || type_K == GGML_TYPE_TBQP4_2)
-+        ? (D/2)/nthreads_KQ
-+        : (1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ));
-+    float2  Q_ds[ncols][Q_ds_size];
-     if constexpr (Q_q8_1) {
- #pragma unroll
-         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
-@@ -190,6 +202,258 @@ static __global__ void flash_attn_ext_vec(
-         }
- 
-         __syncthreads();
-+    } else if constexpr (type_K == GGML_TYPE_TBQ4_0 || type_K == GGML_TYPE_TBQ3_0
-+                      || type_K == GGML_TYPE_TBQP4_0 || type_K == GGML_TYPE_TBQP3_0) {
-+        // TurboQuant KV: pre-compute WHT(sign1*query) for MSE, store in Q_reg
-+        // For TBQP: also compute WHT(sign2*query) for QJL, store in Q_ds
-+        static constexpr uint8_t tbq_signs[32] = {
-+            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+            0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
-+            0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
-+        };
-+        // Second sign pattern for QJL SRHT (must match quantize_f32_tbqp*_block)
-+        static constexpr uint8_t qjl_signs[32] = {
-+            0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
-+            0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
-+            0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
-+            0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
-+        };
-+
-+        for (int j = 0; j < ncols; ++j) {
-+            float * Q_wht = (float *) &KQ[0];
-+            const float * Q_f = (const float *) (Q + j*nb01);
-+
-+            // === WHT 1: MSE part (signs1) ===
-+            // FP16 hybrid WHT: stage 7 register, stages 0-4 warp shuffle (half),
-+            //                  stages 5-6 shared memory (half). 3 syncthreads.
-+            {
-+                half * smem_h = (half *) &KQ[0]; // reuse KQ as half shared memory
-+                half h0, h1;
-+                {
-+                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-+                    float sign1 = ((tbq_signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
-+                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
-+                    float q1 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid + 128];
-+                    h0 = __float2half(q0 * sign0);
-+                    h1 = __float2half(q1 * sign1);
-+                }
-+                // Stage 7 (stride 128): register-local in half
-+                { half u = h0, v = h1; h0 = __hadd(u, v); h1 = __hsub(u, v); }
-+                // Stages 0-4: warp shuffle in half
-+                #pragma unroll
-+                for (int s = 0; s < 5; s++) {
-+                    half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-+                    half o1 = __shfl_xor_sync(0xffffffff, h1, 1 << s);
-+                    if (tid & (1 << s)) { h0 = __hsub(o0, h0); h1 = __hsub(o1, h1); }
-+                    else                { h0 = __hadd(h0, o0); h1 = __hadd(h1, o1); }
-+                }
-+                // Stages 5-6: shared memory in half (halves bandwidth vs float)
-+                smem_h[tid] = h0; smem_h[tid + 128] = h1;
-+                __syncthreads();
-+                {
-+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-+                    half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 32];
-+                    h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                    h1 = (tid & 32) ? __hsub(v1, u1) : __hadd(u1, v1);
-+                }
-+                smem_h[tid] = h0; smem_h[tid + 128] = h1;
-+                __syncthreads();
-+                {
-+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 64];
-+                    half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 64];
-+                    h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                    h1 = (tid & 64) ? __hsub(v1, u1) : __hadd(u1, v1);
-+                }
-+                __syncthreads(); // ensure all warps finished reading smem_h before float write
-+                // Store back as float for Q_reg consumption (aliases smem_h)
-+                Q_wht[tid] = __half2float(h0); Q_wht[tid + 128] = __half2float(h1);
-+                __syncthreads();
-+            }
-+
-+            // Store MSE WHT'd query in Q_reg (scale/D applied)
-+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
-+                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
-+                const float v0 = Q_wht[2*i] * scale / (float)D;
-+                const float v1 = Q_wht[2*i+1] * scale / (float)D;
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
-+#else
-+                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
-+#endif
-+            }
-+            // Q_wht still contains WHT'd query -- needed for TBQP QJL below
-+
-+            // === WHT 2: QJL part (signs2) -- only for TBQP types ===
-+            if constexpr (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0) {
-+                __syncthreads();
-+                half * smem_h = (half *) &KQ[0];
-+                half h0, h1;
-+                {
-+                    float sign0 = ((qjl_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-+                    float sign1 = ((qjl_signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
-+                    h0 = __float2half(Q_wht[tid] * sign0);
-+                    h1 = __float2half(Q_wht[tid + 128] * sign1);
-+                }
-+                { half u = h0, v = h1; h0 = __hadd(u, v); h1 = __hsub(u, v); }
-+                #pragma unroll
-+                for (int s = 0; s < 5; s++) {
-+                    half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-+                    half o1 = __shfl_xor_sync(0xffffffff, h1, 1 << s);
-+                    if (tid & (1 << s)) { h0 = __hsub(o0, h0); h1 = __hsub(o1, h1); }
-+                    else                { h0 = __hadd(h0, o0); h1 = __hadd(h1, o1); }
-+                }
-+                smem_h[tid] = h0; smem_h[tid + 128] = h1;
-+                __syncthreads();
-+                {
-+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-+                    half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 32];
-+                    h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                    h1 = (tid & 32) ? __hsub(v1, u1) : __hadd(u1, v1);
-+                }
-+                smem_h[tid] = h0; smem_h[tid + 128] = h1;
-+                __syncthreads();
-+                {
-+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 64];
-+                    half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 64];
-+                    h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                    h1 = (tid & 64) ? __hsub(v1, u1) : __hadd(u1, v1);
-+                }
-+                __syncthreads(); // ensure all warps finished reading smem_h
-+                constexpr float qjl_factor = 1.2533f; // sqrt(pi/2), scale applied below
-+                const float sf = scale * qjl_factor / ((float)D * (float)D);
-+                Q_wht[tid] = __half2float(h0); Q_wht[tid + 128] = __half2float(h1);
-+                __syncthreads();
-+
-+                for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
-+                    const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
-+                    Q_ds[j][i0/nthreads_KQ] = make_float2(Q_wht[2*i] * sf, Q_wht[2*i+1] * sf);
-+                }
-+                __syncthreads();
-+            }
-+        }
-+    } else if constexpr (type_K == GGML_TYPE_TBQ4_1 || type_K == GGML_TYPE_TBQ3_1
-+                      || type_K == GGML_TYPE_TBQP4_1 || type_K == GGML_TYPE_TBQP3_1) {
-+        // TurboQuant 128-block: D=128, nthreads=128, 1:1 thread-element mapping
-+        // WHT has 7 stages: stages 0-4 warp shuffle, stages 5-6 shared memory
-+        // No stage 7 (stride 128) needed — each thread handles exactly 1 element
-+        static constexpr uint8_t tbq_signs[16] = {
-+            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+        };
-+
-+        for (int j = 0; j < ncols; ++j) {
-+            float * Q_wht = (float *) &KQ[0];
-+            const float * Q_f = (const float *) (Q + j*nb01);
-+
-+            // === WHT 1: MSE part (signs1) ===
-+            // FP16 hybrid WHT for 128 elements: stages 0-4 warp shuffle, stages 5-6 shared memory
-+            {
-+                half * smem_h = (half *) &KQ[0];
-+                half h0;
-+                {
-+                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-+                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
-+                    h0 = __float2half(q0 * sign0);
-+                }
-+                // Stages 0-4: warp shuffle in half
-+                #pragma unroll
-+                for (int s = 0; s < 5; s++) {
-+                    half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-+                    if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
-+                    else                { h0 = __hadd(h0, o0); }
-+                }
-+                // Stage 5 (stride 32): shared memory
-+                smem_h[tid] = h0;
-+                __syncthreads();
-+                {
-+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-+                    h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                }
-+                // Stage 6 (stride 64): shared memory
-+                smem_h[tid] = h0;
-+                __syncthreads();
-+                {
-+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 64];
-+                    h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                }
-+                __syncthreads();
-+                Q_wht[tid] = __half2float(h0);
-+                __syncthreads();
-+            }
-+
-+            // Store MSE WHT'd query in Q_reg (scale/D applied)
-+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
-+                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
-+                const float v0 = Q_wht[2*i] * scale / (float)D;
-+                const float v1 = Q_wht[2*i+1] * scale / (float)D;
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
-+#else
-+                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
-+#endif
-+            }
-+
-+            __syncthreads(); // ensure all warps finished Q_reg load before next j overwrites KQ
-+
-+            // Direct Sign: no second WHT needed for _1 TBQP types
-+            // vec_dot reuses Q_reg (MSE WHT'd query) directly for sign correction
-+        }
-+    } else if constexpr (type_K == GGML_TYPE_TBQ4_2 || type_K == GGML_TYPE_TBQ3_2
-+                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2) {
-+        // TurboQuant 64-block: D=64, nthreads=128, tid 0-63 participate in WHT
-+        // WHT has 6 stages: stages 0-4 warp shuffle, stage 5 shared memory
-+        static constexpr uint8_t tbq_signs[8] = {
-+            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+        };
-+
-+        for (int j = 0; j < ncols; ++j) {
-+            float * Q_wht = (float *) &KQ[0];
-+            const float * Q_f = (const float *) (Q + j*nb01);
-+
-+            // === WHT 1: MSE part ===
-+            {
-+                half * smem_h = (half *) &KQ[0];
-+                half h0 = __float2half(0.0f);
-+                if (tid < D) {
-+                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-+                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
-+                    h0 = __float2half(q0 * sign0);
-+                }
-+                // Stages 0-4: warp shuffle (tid >= 64 carries h0=0, no data corruption)
-+                #pragma unroll
-+                for (int s = 0; s < 5; s++) {
-+                    half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-+                    if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
-+                    else                { h0 = __hadd(h0, o0); }
-+                }
-+                // Stage 5 (stride 32): shared memory
-+                if (tid < D) { smem_h[tid] = h0; }
-+                __syncthreads();
-+                if (tid < D) {
-+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-+                    h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                }
-+                __syncthreads();
-+                if (tid < D) { Q_wht[tid] = __half2float(h0); }
-+                __syncthreads();
-+            }
-+
-+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
-+                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
-+                const float v0 = Q_wht[2*i] * scale / (float)D;
-+                const float v1 = Q_wht[2*i+1] * scale / (float)D;
-+#ifdef V_DOT2_F32_F16_AVAILABLE
-+                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
-+#else
-+                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
-+#endif
-+            }
-+
-+            __syncthreads(); // ensure all warps finished Q_reg load before next j overwrites KQ
-+
-+            // Direct Sign: no second WHT needed for _2 TBQP types
-+        }
-     } else {
- #ifdef V_DOT2_F32_F16_AVAILABLE
-         const half2 scale_h2 = make_half2(scale, scale);
-@@ -489,7 +753,163 @@ static __global__ void flash_attn_ext_vec(
-                 if (gridDim.y == 1) {
-                     dst_val /= KQ_sum[j_VKQ];
-                 }
--                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
-+                // For TBQ V: store to shared memory for IWHT post-processing
-+                if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0
-+                           || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
-+                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
-+                    KQ[i0 + tid] = dst_val; // reuse KQ shared memory
-+                } else {
-+                    dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
-+                }
-+            }
-+
-+            // TBQ V post-processing: IWHT on the WHT-domain weighted sum
-+            if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0) {
-+                static constexpr uint8_t tbq_signs_v[32] = {
-+                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+                    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+                    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
-+                    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
-+                };
-+                __syncthreads();
-+
-+                // FP16 hybrid IWHT + sign undo + 1/D
-+                {
-+                    float * buf = (float *) &KQ[0];
-+                    half * smem_h = (half *) &KQ[0];
-+                    // Load float values first, sync (buf/smem_h alias same memory),
-+                    // then convert to half for butterfly
-+                    float f0 = buf[tid], f1 = buf[tid + 128];
-+                    __syncthreads();
-+                    half h0 = __float2half(f0), h1 = __float2half(f1);
-+                    { half u = h0, v = h1; h0 = __hadd(u, v); h1 = __hsub(u, v); }
-+                    #pragma unroll
-+                    for (int s = 0; s < 5; s++) {
-+                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-+                        half o1 = __shfl_xor_sync(0xffffffff, h1, 1 << s);
-+                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); h1 = __hsub(o1, h1); }
-+                        else                { h0 = __hadd(h0, o0); h1 = __hadd(h1, o1); }
-+                    }
-+                    smem_h[tid] = h0; smem_h[tid + 128] = h1;
-+                    __syncthreads();
-+                    {
-+                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-+                        half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 32];
-+                        h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                        h1 = (tid & 32) ? __hsub(v1, u1) : __hadd(u1, v1);
-+                    }
-+                    smem_h[tid] = h0; smem_h[tid + 128] = h1;
-+                    __syncthreads();
-+                    {
-+                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 64];
-+                        half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 64];
-+                        h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                        h1 = (tid & 64) ? __hsub(v1, u1) : __hadd(u1, v1);
-+                    }
-+                    __syncthreads(); // ensure all warps finished reading smem_h before float write
-+                    // Convert back to float, apply sign undo + 1/D
-+                    float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-+                    float sign1 = ((tbq_signs_v[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
-+                    buf[tid] = __half2float(h0) * sign0 / (float)D;
-+                    buf[tid + 128] = __half2float(h1) * sign1 / (float)D;
-+                }
-+                __syncthreads();
-+
-+                // Write IWHT'd result to dst
-+                for (int i0 = 0; i0 < D; i0 += nthreads) {
-+                    if (i0 + tid < D) {
-+                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
-+                            ((float *)&KQ[0])[i0 + tid];
-+                    }
-+                }
-+            }
-+
-+            // TBQ V 128-block IWHT: D=128, 1:1 thread mapping, no stage 7
-+            if constexpr (type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1) {
-+                static constexpr uint8_t tbq_signs_v[16] = {
-+                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+                    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-+                };
-+                __syncthreads();
-+
-+                {
-+                    float * buf = (float *) &KQ[0];
-+                    half * smem_h = (half *) &KQ[0];
-+                    float f0 = buf[tid];
-+                    __syncthreads();
-+                    half h0 = __float2half(f0);
-+                    // Stages 0-4: warp shuffle
-+                    #pragma unroll
-+                    for (int s = 0; s < 5; s++) {
-+                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-+                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
-+                        else                { h0 = __hadd(h0, o0); }
-+                    }
-+                    // Stage 5 (stride 32)
-+                    smem_h[tid] = h0;
-+                    __syncthreads();
-+                    {
-+                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-+                        h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                    }
-+                    // Stage 6 (stride 64)
-+                    smem_h[tid] = h0;
-+                    __syncthreads();
-+                    {
-+                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 64];
-+                        h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                    }
-+                    __syncthreads();
-+                    float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-+                    buf[tid] = __half2float(h0) * sign0 / (float)D;
-+                }
-+                __syncthreads();
-+
-+                for (int i0 = 0; i0 < D; i0 += nthreads) {
-+                    if (i0 + tid < D) {
-+                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
-+                            ((float *)&KQ[0])[i0 + tid];
-+                    }
-+                }
-+            }
-+
-+            // TBQ V 64-block IWHT: D=64, tid 0-63 participate
-+            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
-+                static constexpr uint8_t tbq_signs_v[8] = {
-+                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-+                };
-+                __syncthreads();
-+                {
-+                    float * buf = (float *) &KQ[0];
-+                    half * smem_h = (half *) &KQ[0];
-+                    float f0 = (tid < D) ? buf[tid] : 0.0f;
-+                    __syncthreads();
-+                    half h0 = __float2half(f0);
-+                    #pragma unroll
-+                    for (int s = 0; s < 5; s++) {
-+                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-+                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
-+                        else                { h0 = __hadd(h0, o0); }
-+                    }
-+                    if (tid < D) { smem_h[tid] = h0; }
-+                    __syncthreads();
-+                    if (tid < D) {
-+                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-+                        h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
-+                    }
-+                    __syncthreads();
-+                    if (tid < D) {
-+                        float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-+                        buf[tid] = __half2float(h0) * sign0 / (float)D;
-+                    }
-+                }
-+                __syncthreads();
-+                for (int i0 = 0; i0 < D; i0 += nthreads) {
-+                    if (i0 + tid < D) {
-+                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
-+                            ((float *)&KQ[0])[i0 + tid];
-+                    }
-+                }
-             }
-         }
- 
-@@ -598,3 +1018,39 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
- EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
- EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
- EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
-+
-+// TurboQuant 256-block (_0) extern declarations: D=256 only
-+#define EXTERN_DECL_FATTN_VEC_TBQ0(type_K)                           \
-+    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_F16);          \
-+    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_Q8_0);         \
-+    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_TBQ3_0);       \
-+    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_TBQ4_0);       \
-+
-+EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQ3_0)
-+EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQ4_0)
-+EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQP3_0)
-+EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQP4_0)
-+
-+// TurboQuant 128-block (_1) extern declarations: D=128 only
-+#define EXTERN_DECL_FATTN_VEC_TBQ1(type_K)                           \
-+    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_F16);          \
-+    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_Q8_0);         \
-+    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_TBQ3_1);       \
-+    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_TBQ4_1);       \
-+
-+EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQ3_1)
-+EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQ4_1)
-+EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQP3_1)
-+EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQP4_1)
-+
-+// TurboQuant 64-block (_2) extern declarations: D=64 only
-+#define EXTERN_DECL_FATTN_VEC_TBQ2(type_K)                            \
-+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_F16);            \
-+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_Q8_0);           \
-+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ3_2);         \
-+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ4_2);         \
-+
-+EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ3_2)
-+EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ4_2)
-+EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP3_2)
-+EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP4_2)
-diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index a25a890db..9d85a570d 100644
---- a/ggml/src/ggml-cuda/fattn.cu
-+++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -219,6 +219,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
- 
- #ifdef GGML_CUDA_FA_ALL_QUANTS
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_F16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_F16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_F16)
-@@ -273,11 +275,109 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
-+
-+    // TurboQuant 256-block (_0): D=256 only
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
-+
-+    // TurboQuant 128-block (_1): D=128 only
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_TBQ3_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_TBQ4_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_TBQ3_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_TBQ4_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ3_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ4_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ3_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ4_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_Q8_0)
-+
-+    // TurboQuant 64-block (_2): D=64 only
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_TBQ3_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_TBQ4_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_TBQ3_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_TBQ4_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQ3_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQ4_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQ3_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQ4_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_Q8_0)
- #else
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
-+    // TurboQuant 256-block (_0): D=256 only
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ4_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ3_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_Q8_0)
-+    // TurboQuant 128-block (_1): D=128 only
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_TBQ3_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_TBQ4_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_TBQ3_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_TBQ4_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ3_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ4_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ3_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ4_1)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_Q8_0)
-+    // TurboQuant 64-block (_2): D=64 only
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_TBQ3_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_TBQ4_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_TBQ3_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_TBQ4_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQ3_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQ4_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQ3_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQ4_2)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_F16)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_Q8_0)
- #endif // GGML_CUDA_FA_ALL_QUANTS
- 
-     GGML_ABORT("fatal error");
-@@ -354,7 +454,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
- 
- #ifndef GGML_CUDA_FA_ALL_QUANTS
-     if (K->type != V->type) {
--        return BEST_FATTN_KERNEL_NONE;
-+        // TBQ/TBQP K allows mixed V types: F16, Q8_0, or matching TBQ bit-width
-+        const bool tbq_k = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0
-+                        || K->type == GGML_TYPE_TBQP3_0 || K->type == GGML_TYPE_TBQP4_0
-+                        || K->type == GGML_TYPE_TBQ3_1 || K->type == GGML_TYPE_TBQ4_1
-+                        || K->type == GGML_TYPE_TBQP3_1 || K->type == GGML_TYPE_TBQP4_1
-+                        || K->type == GGML_TYPE_TBQ3_2 || K->type == GGML_TYPE_TBQ4_2
-+                        || K->type == GGML_TYPE_TBQP3_2 || K->type == GGML_TYPE_TBQP4_2;
-+        const bool v_ok = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0
-+            || V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0
-+            || V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQ4_1
-+            || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2;
-+        if (!tbq_k || !v_ok) {
-+            return BEST_FATTN_KERNEL_NONE;
-+        }
-     }
- #endif // GGML_CUDA_FA_ALL_QUANTS
- 
-@@ -371,6 +484,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
-         case GGML_TYPE_Q4_0:
-         case GGML_TYPE_Q8_0:
-         case GGML_TYPE_BF16:
-+        case GGML_TYPE_TBQ3_0:
-+        case GGML_TYPE_TBQ4_0:
-+        case GGML_TYPE_TBQP3_0:
-+        case GGML_TYPE_TBQP4_0:
-+        case GGML_TYPE_TBQ3_1:
-+        case GGML_TYPE_TBQ4_1:
-+        case GGML_TYPE_TBQP3_1:
-+        case GGML_TYPE_TBQP4_1:
-+        case GGML_TYPE_TBQ3_2:
-+        case GGML_TYPE_TBQ4_2:
-+        case GGML_TYPE_TBQP3_2:
-+        case GGML_TYPE_TBQP4_2:
-             break;
-         default:
-             return BEST_FATTN_KERNEL_NONE;
-@@ -380,6 +505,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
-         return BEST_FATTN_KERNEL_NONE;
-     }
- 
-+    // TBQ4_0: only vec kernel is implemented (no MMA/tile/WMMA support)
-+    if (K->type == GGML_TYPE_TBQ4_0 || K->type == GGML_TYPE_TBQ3_0
-+     || K->type == GGML_TYPE_TBQP4_0 || K->type == GGML_TYPE_TBQP3_0
-+     || K->type == GGML_TYPE_TBQ4_1 || K->type == GGML_TYPE_TBQ3_1
-+     || K->type == GGML_TYPE_TBQP4_1 || K->type == GGML_TYPE_TBQP3_1
-+     || K->type == GGML_TYPE_TBQ4_2 || K->type == GGML_TYPE_TBQ3_2
-+     || K->type == GGML_TYPE_TBQP4_2 || K->type == GGML_TYPE_TBQP3_2) {
-+        if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
-+            return BEST_FATTN_KERNEL_VEC;
-+        }
-+        return BEST_FATTN_KERNEL_NONE;
-+    }
-+
-     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
-     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
- 
-diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index cc80eb3ff..415a9f90d 100644
---- a/ggml/src/ggml-cuda/ggml-cuda.cu
-+++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4837,7 +4837,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
-             {
-                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
-                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
--                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
-+                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
-+                       op->type == GGML_TYPE_TBQ3_0 || op->type == GGML_TYPE_TBQ4_0 ||
-+                       op->type == GGML_TYPE_TBQP3_0 || op->type == GGML_TYPE_TBQP4_0 ||
-+                       op->type == GGML_TYPE_TBQ3_1 || op->type == GGML_TYPE_TBQ4_1 ||
-+                       op->type == GGML_TYPE_TBQP3_1 || op->type == GGML_TYPE_TBQP4_1 ||
-+                       op->type == GGML_TYPE_TBQ3_2 || op->type == GGML_TYPE_TBQ4_2 ||
-+                       op->type == GGML_TYPE_TBQP3_2 || op->type == GGML_TYPE_TBQP4_2) &&
-                        op->src[0]->type == GGML_TYPE_F32 &&
-                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
-             } break;
-diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
-index 631de7e8f..4ae4ffe3b 100644
---- a/ggml/src/ggml-cuda/set-rows.cu
-+++ b/ggml/src/ggml-cuda/set-rows.cu
-@@ -309,6 +309,96 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
-             nb1, nb2, nb3,
-             stream
-         );
-+    } else if (dst->type == GGML_TYPE_TBQ4_0) {
-+        set_rows_cuda_quant<idx_t, block_tbq4_0, QK_K, quantize_f32_tbq4_0_block>(
-+            src0_d, src1_d, (block_tbq4_0*)dst->data,
-+            ne00, ne01, ne02, ne03,
-+            ne10, ne11, ne12, ne13,
-+            nb01, nb02, nb03,
-+            nb10, nb11, nb12,
-+            nb1, nb2, nb3,
-+            stream
-+        );
-+    } else if (dst->type == GGML_TYPE_TBQP3_0) {
-+        set_rows_cuda_quant<idx_t, block_tbqp3_0, QK_K, quantize_f32_tbqp3_0_block>(
-+            src0_d, src1_d, (block_tbqp3_0*)dst->data,
-+            ne00, ne01, ne02, ne03,
-+            ne10, ne11, ne12, ne13,
-+            nb01, nb02, nb03,
-+            nb10, nb11, nb12,
-+            nb1, nb2, nb3,
-+            stream
-+        );
-+    } else if (dst->type == GGML_TYPE_TBQP4_0) {
-+        set_rows_cuda_quant<idx_t, block_tbqp4_0, QK_K, quantize_f32_tbqp4_0_block>(
-+            src0_d, src1_d, (block_tbqp4_0*)dst->data,
-+            ne00, ne01, ne02, ne03,
-+            ne10, ne11, ne12, ne13,
-+            nb01, nb02, nb03,
-+            nb10, nb11, nb12,
-+            nb1, nb2, nb3,
-+            stream
-+        );
-+    } else if (dst->type == GGML_TYPE_TBQ3_0) {
-+        set_rows_cuda_quant<idx_t, block_tbq3_0, QK_K, quantize_f32_tbq3_0_block>(
-+            src0_d, src1_d, (block_tbq3_0*)dst->data,
-+            ne00, ne01, ne02, ne03,
-+            ne10, ne11, ne12, ne13,
-+            nb01, nb02, nb03,
-+            nb10, nb11, nb12,
-+            nb1, nb2, nb3,
-+            stream
-+        );
-+    } else if (dst->type == GGML_TYPE_TBQ3_1) {
-+        set_rows_cuda_quant<idx_t, block_tbq3_1, TBQ_K128, quantize_f32_tbq3_1_block>(
-+            src0_d, src1_d, (block_tbq3_1*)dst->data,
-+            ne00, ne01, ne02, ne03,
-+            ne10, ne11, ne12, ne13,
-+            nb01, nb02, nb03,
-+            nb10, nb11, nb12,
-+            nb1, nb2, nb3,
-+            stream
-+        );
-+    } else if (dst->type == GGML_TYPE_TBQ4_1) {
-+        set_rows_cuda_quant<idx_t, block_tbq4_1, TBQ_K128, quantize_f32_tbq4_1_block>(
-+            src0_d, src1_d, (block_tbq4_1*)dst->data,
-+            ne00, ne01, ne02, ne03,
-+            ne10, ne11, ne12, ne13,
-+            nb01, nb02, nb03,
-+            nb10, nb11, nb12,
-+            nb1, nb2, nb3,
-+            stream
-+        );
-+    } else if (dst->type == GGML_TYPE_TBQP3_1) {
-+        set_rows_cuda_quant<idx_t, block_tbqp3_1, TBQ_K128, quantize_f32_tbqp3_1_block>(
-+            src0_d, src1_d, (block_tbqp3_1*)dst->data,
-+            ne00, ne01, ne02, ne03,
-+            ne10, ne11, ne12, ne13,
-+            nb01, nb02, nb03,
-+            nb10, nb11, nb12,
-+            nb1, nb2, nb3,
-+            stream
-+        );
-+    } else if (dst->type == GGML_TYPE_TBQP4_1) {
-+        set_rows_cuda_quant<idx_t, block_tbqp4_1, TBQ_K128, quantize_f32_tbqp4_1_block>(
-+            src0_d, src1_d, (block_tbqp4_1*)dst->data,
+ template <typename src_t, typename idx_t, typename dst_t>
+ static __global__ void k_set_rows(const src_t * __restrict__ src0,
+                                   const idx_t * __restrict__ src1,
+@@ -399,6 +742,22 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+         set_rows_cuda_quant<idx_t, block_tbqp4_2, TBQ_K64, quantize_f32_tbqp4_2_block>(
+             src0_d, src1_d, (block_tbqp4_2*)dst->data,
+             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++    } else if (dst->type == GGML_TYPE_TBQ3_3) {
++        set_rows_cuda_xhead_v1<idx_t, block_tbq3_3, quantize_f32_tbq3_3_xhead>(
++            src0_d, src1_d, (block_tbq3_3*)dst->data,
 +            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-+    } else if (dst->type == GGML_TYPE_TBQ3_2) {
-+        set_rows_cuda_quant<idx_t, block_tbq3_2, TBQ_K64, quantize_f32_tbq3_2_block>(
-+            src0_d, src1_d, (block_tbq3_2*)dst->data,
++    } else if (dst->type == GGML_TYPE_TBQ4_3) {
++        set_rows_cuda_xhead_v1<idx_t, block_tbq4_3, quantize_f32_tbq4_3_xhead>(
++            src0_d, src1_d, (block_tbq4_3*)dst->data,
 +            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-+    } else if (dst->type == GGML_TYPE_TBQ4_2) {
-+        set_rows_cuda_quant<idx_t, block_tbq4_2, TBQ_K64, quantize_f32_tbq4_2_block>(
-+            src0_d, src1_d, (block_tbq4_2*)dst->data,
++    } else if (dst->type == GGML_TYPE_TBQP3_3) {
++        set_rows_cuda_xhead_v1<idx_t, block_tbqp3_3, quantize_f32_tbqp3_3_xhead>(
++            src0_d, src1_d, (block_tbqp3_3*)dst->data,
 +            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-+    } else if (dst->type == GGML_TYPE_TBQP3_2) {
-+        set_rows_cuda_quant<idx_t, block_tbqp3_2, TBQ_K64, quantize_f32_tbqp3_2_block>(
-+            src0_d, src1_d, (block_tbqp3_2*)dst->data,
-+            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-+    } else if (dst->type == GGML_TYPE_TBQP4_2) {
-+        set_rows_cuda_quant<idx_t, block_tbqp4_2, TBQ_K64, quantize_f32_tbqp4_2_block>(
-+            src0_d, src1_d, (block_tbqp4_2*)dst->data,
++    } else if (dst->type == GGML_TYPE_TBQP4_3) {
++        set_rows_cuda_xhead_v1<idx_t, block_tbqp4_3, quantize_f32_tbqp4_3_xhead>(
++            src0_d, src1_d, (block_tbqp4_3*)dst->data,
 +            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
      } else {
          GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
      }
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index e9b6720c0..c332edef8 100644
+index a1671b0db..fcfd63cb1 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -904,6 +904,78 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
-         .type_size                = 0,
-         .is_quantized             = false,
+@@ -978,6 +978,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .type_size                = sizeof(block_tbqp4_2),
+         .is_quantized             = true,
      },
-+    [GGML_TYPE_TBQ3_0] = {
-+        .type_name                = "tbq3_0",
-+        .blck_size                = QK_K,
-+        .type_size                = sizeof(block_tbq3_0),
-+        .is_quantized             = true,
-+    },
-+    [GGML_TYPE_TBQ4_0] = {
-+        .type_name                = "tbq4_0",
-+        .blck_size                = QK_K,
-+        .type_size                = sizeof(block_tbq4_0),
-+        .is_quantized             = true,
-+    },
-+    [GGML_TYPE_TBQP3_0] = {
-+        .type_name                = "tbqp3_0",
-+        .blck_size                = QK_K,
-+        .type_size                = sizeof(block_tbqp3_0),
-+        .is_quantized             = true,
-+    },
-+    [GGML_TYPE_TBQP4_0] = {
-+        .type_name                = "tbqp4_0",
-+        .blck_size                = QK_K,
-+        .type_size                = sizeof(block_tbqp4_0),
-+        .is_quantized             = true,
-+    },
-+    [GGML_TYPE_TBQ3_1] = {
-+        .type_name                = "tbq3_1",
-+        .blck_size                = TBQ_K128,
-+        .type_size                = sizeof(block_tbq3_1),
-+        .is_quantized             = true,
-+    },
-+    [GGML_TYPE_TBQ4_1] = {
-+        .type_name                = "tbq4_1",
-+        .blck_size                = TBQ_K128,
-+        .type_size                = sizeof(block_tbq4_1),
-+        .is_quantized             = true,
-+    },
-+    [GGML_TYPE_TBQP3_1] = {
-+        .type_name                = "tbqp3_1",
-+        .blck_size                = TBQ_K128,
-+        .type_size                = sizeof(block_tbqp3_1),
-+        .is_quantized             = true,
-+    },
-+    [GGML_TYPE_TBQP4_1] = {
-+        .type_name                = "tbqp4_1",
-+        .blck_size                = TBQ_K128,
-+        .type_size                = sizeof(block_tbqp4_1),
-+        .is_quantized             = true,
-+    },
-+    [GGML_TYPE_TBQ3_2] = {
-+        .type_name                = "tbq3_2",
++    [GGML_TYPE_TBQ3_3] = {
++        .type_name                = "tbq3_3",
 +        .blck_size                = TBQ_K64,
-+        .type_size                = sizeof(block_tbq3_2),
++        .type_size                = sizeof(block_tbq3_3),
 +        .is_quantized             = true,
 +    },
-+    [GGML_TYPE_TBQ4_2] = {
-+        .type_name                = "tbq4_2",
++    [GGML_TYPE_TBQ4_3] = {
++        .type_name                = "tbq4_3",
 +        .blck_size                = TBQ_K64,
-+        .type_size                = sizeof(block_tbq4_2),
++        .type_size                = sizeof(block_tbq4_3),
 +        .is_quantized             = true,
 +    },
-+    [GGML_TYPE_TBQP3_2] = {
-+        .type_name                = "tbqp3_2",
++    [GGML_TYPE_TBQP3_3] = {
++        .type_name                = "tbqp3_3",
 +        .blck_size                = TBQ_K64,
-+        .type_size                = sizeof(block_tbqp3_2),
++        .type_size                = sizeof(block_tbqp3_3),
 +        .is_quantized             = true,
 +    },
-+    [GGML_TYPE_TBQP4_2] = {
-+        .type_name                = "tbqp4_2",
++    [GGML_TYPE_TBQP4_3] = {
++        .type_name                = "tbqp4_3",
 +        .blck_size                = TBQ_K64,
-+        .type_size                = sizeof(block_tbqp4_2),
++        .type_size                = sizeof(block_tbqp4_3),
 +        .is_quantized             = true,
 +    },
  };
  
  const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
-diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f6ce2817a..83773e041 100644
---- a/src/llama-context.cpp
-+++ b/src/llama-context.cpp
-@@ -2942,6 +2942,49 @@ llama_context * llama_init_from_model(
-         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-     }
- 
-+    // TurboQuant head_dim auto-detection: map _0 types (blck_size=256) to _1 types (blck_size=128)
-+    {
-+        auto tbq_map = [&](ggml_type & t, uint32_t head_dim) {
-+            if (head_dim == 128) {
-+                ggml_type orig = t;
-+                switch (t) {
-+                    case GGML_TYPE_TBQ3_0:  t = GGML_TYPE_TBQ3_1;  break;
-+                    case GGML_TYPE_TBQ4_0:  t = GGML_TYPE_TBQ4_1;  break;
-+                    case GGML_TYPE_TBQP3_0: t = GGML_TYPE_TBQP3_1; break;
-+                    case GGML_TYPE_TBQP4_0: t = GGML_TYPE_TBQP4_1; break;
-+                    default: return;
-+                }
-+                LLAMA_LOG_INFO("%s: TurboQuant auto-map: %s -> %s (head_dim=%u)\n",
-+                        __func__, ggml_type_name(orig), ggml_type_name(t), head_dim);
-+            } else if (head_dim == 64) {
-+                ggml_type orig = t;
-+                switch (t) {
-+                    case GGML_TYPE_TBQ3_0:  t = GGML_TYPE_TBQ3_2;  break;
-+                    case GGML_TYPE_TBQ4_0:  t = GGML_TYPE_TBQ4_2;  break;
-+                    case GGML_TYPE_TBQP3_0: t = GGML_TYPE_TBQP3_2; break;
-+                    case GGML_TYPE_TBQP4_0: t = GGML_TYPE_TBQP4_2; break;
-+                    default: return;
-+                }
-+                LLAMA_LOG_INFO("%s: TurboQuant auto-map: %s -> %s (head_dim=%u)\n",
-+                        __func__, ggml_type_name(orig), ggml_type_name(t), head_dim);
-+            } else if (head_dim != 256) {
-+                switch (t) {
-+                    case GGML_TYPE_TBQ3_0:
-+                    case GGML_TYPE_TBQ4_0:
-+                    case GGML_TYPE_TBQP3_0:
-+                    case GGML_TYPE_TBQP4_0:
-+                        LLAMA_LOG_WARN("%s: TurboQuant unsupported head_dim=%u, falling back to F16\n",
-+                                __func__, head_dim);
-+                        t = GGML_TYPE_F16;
-+                        break;
-+                    default: break;
-+                }
-+            }
-+        };
-+        tbq_map(params.type_k, model->hparams.n_embd_head_k());
-+        tbq_map(params.type_v, model->hparams.n_embd_head_v());
-+    }
-+
-     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
-         const uint32_t blck_size = ggml_blck_size(params.type_k);
-         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
-diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 5f57ba9e1..a59884f4a 100644
---- a/src/llama-kv-cache.cpp
-+++ b/src/llama-kv-cache.cpp
-@@ -36,6 +36,9 @@ llama_kv_cache::llama_kv_cache(
- 
-     GGML_ASSERT(kv_size % n_pad == 0);
- 
-+    // Note: TurboQuant head_dim auto-mapping (_0 → _1/_2) is done in llama_init_from_model()
-+    // before this constructor is called. No duplicate mapping needed here.
-+
-     const uint32_t n_layer_kv = hparams.n_layer_kv();
- 
-     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:

@@ -391,9 +391,29 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TBQ4_0,
     GGML_TYPE_TBQP3_0,
     GGML_TYPE_TBQP4_0,
+    GGML_TYPE_TBQ3_1,
+    GGML_TYPE_TBQ4_1,
+    GGML_TYPE_TBQP3_1,
+    GGML_TYPE_TBQP4_1,
+    GGML_TYPE_TBQ3_2,
+    GGML_TYPE_TBQ4_2,
+    GGML_TYPE_TBQP3_2,
+    GGML_TYPE_TBQP4_2,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    // TurboQuant shorthand: "tbq3" → tbq3_0 (resolved to correct _N by head_dim later)
+    // Users don't need to know about _0/_1/_2 suffixes
+    static const std::unordered_map<std::string, ggml_type> tbq_shortcuts = {
+        {"tbq3",  GGML_TYPE_TBQ3_0},
+        {"tbq4",  GGML_TYPE_TBQ4_0},
+        {"tbqp3", GGML_TYPE_TBQP3_0},
+        {"tbqp4", GGML_TYPE_TBQP4_0},
+    };
+    auto it = tbq_shortcuts.find(s);
+    if (it != tbq_shortcuts.end()) {
+        return it->second;
+    }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;

@@ -9,7 +9,41 @@
 
 Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
 
-### 🆕 v1.1.0 — head_dim 64/128 지원 + Direct Sign 잔차 보정
+### 🆕 v1.2.0 — Auto head_dim Mapping + head_dim=64 Quality Fix + V Cross-Head WHT
+
+**자동 head_dim 매핑 — 사용자가 숫자 접미사를 알 필요 없음:**
+```bash
+# v1.2.0: 그냥 tbq3/tbqp3 입력하면 head_dim에 따라 자동 선택
+--cache-type-k tbqp3 --cache-type-v tbq3
+```
+- `head_dim=256`: K=tbqp3_0 (QJL), V=tbq3_0 → **5.2x 압축**
+- `head_dim=128`: K=tbqp3_1 (Direct Sign), V=tbq3_1 → **5.0x 압축**
+- `head_dim=64`: K=**q8_0** (자동 fallback), V=tbq3_2 → **2.7x 압축**
+
+**head_dim=64 품질 문제 발견 및 해결:**
+
+과학자 이름 테스트(독일어→한국어 표준 표기)에서 WHT 양자화의 근본적 한계를 발견:
+- PPL은 개선되어도(2195 < 4008) 실제 생성은 깨지는 현상 (attention smoothing)
+- TurboQuant 논문은 head_dim=128만 검증 — head_dim=64는 CLT 수렴 부족
+- **해결: K cache를 q8_0으로 자동 fallback** + V는 WHT 유지 (V는 가중합이라 노이즈에 관대)
+
+| Model | head_dim | Config | KV Memory | Compress | Prompt t/s | Gen t/s | "볼프강 파울리" |
+|:------|:---------|:-------|----------:|---------:|---------:|--------:|:---:|
+| GPT OSS 120B | 64 | F16/F16 | 4,608 MiB | 1.0x | 133 | 47 | ✅ |
+| GPT OSS 120B | 64 | **q8_0/tbq3 (auto)** | **1,692 MiB** | **2.7x** | **145** | **46** | **✅** |
+| GPT OSS 20B | 64 | F16/F16 | 3,072 MiB | 1.0x | 412 | 74 | ✅ |
+| GPT OSS 20B | 64 | **q8_0/tbq3 (auto)** | **1,128 MiB** | **2.7x** | **421** | **75** | **✅** |
+| Qwen3.5-122B | 256 | F16/F16 | 6,144 MiB | 1.0x | 91 | 23 | ✅ |
+| Qwen3.5-122B | 256 | **tbqp3/tbq3 (auto)** | **1,188 MiB** | **5.2x** | **102** | **22** | **✅** |
+
+**입력 검증 — 잘못된 조합도 크래시 없이 안전 처리:**
+- V에 TBQP(QJL) 지정 → 자동으로 TBQ로 다운그레이드
+- 잘못된 _N 접미사 → head_dim에 맞게 자동 수정 또는 fallback
+- 미지원 head_dim → q8_0/f16 fallback + 경고
+
+---
+
+### v1.1.0 — head_dim 64/128 지원 + Direct Sign 잔차 보정
 
 **멀티 head_dim 지원:**
 - `head_dim=256`: 기존 (Qwen3.5, Qwen3-Next) — QJL 잔차 보정
@@ -115,7 +149,7 @@ cmake --build build -j$(nproc)
 
 # 추천: QJL Key + TBQ Value (5.2x 압축, F16급 품질)
 ./build/bin/llama-cli -m model.gguf -ngl 99 \
-  --cache-type-k tbqp3_0 --cache-type-v tbq3_0
+  --cache-type-k tbqp3 --cache-type-v tbq3
 
 # 속도 우선 (5.2x 압축, 최고 속도)
 ./build/bin/llama-cli -m model.gguf -ngl 99 \
@@ -153,7 +187,41 @@ cmake --build build -j$(nproc)
 
 This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
 
-### 🆕 v1.1.0 — head_dim 64/128 Support + Direct Sign Residual Correction
+### 🆕 v1.2.0 — Auto head_dim Mapping + head_dim=64 Quality Fix + V Cross-Head WHT
+
+**Automatic head_dim mapping — no suffix numbers needed:**
+```bash
+# v1.2.0: just use tbq3/tbqp3, auto-selects based on head_dim
+--cache-type-k tbqp3 --cache-type-v tbq3
+```
+- `head_dim=256`: K=tbqp3_0 (QJL), V=tbq3_0 → **5.2x compression**
+- `head_dim=128`: K=tbqp3_1 (Direct Sign), V=tbq3_1 → **5.0x compression**
+- `head_dim=64`: K=**q8_0** (auto fallback), V=tbq3_2 → **2.7x compression**
+
+**head_dim=64 quality issue discovered and fixed:**
+
+Scientist name test (German→Korean transliteration) revealed a fundamental WHT limitation:
+- PPL improved (2195 < 4008) but generation broke (attention smoothing artifact)
+- TurboQuant paper only validated head_dim=128 — CLT convergence fails at d=64
+- **Fix: K cache auto-falls back to q8_0** + V keeps WHT (values tolerate noise in weighted sums)
+
+| Model | head_dim | Config | KV Memory | Compress | Prompt t/s | Gen t/s | "Pauli" Test |
+|:------|:---------|:-------|----------:|---------:|---------:|--------:|:---:|
+| GPT OSS 120B | 64 | F16/F16 | 4,608 MiB | 1.0x | 133 | 47 | ✅ |
+| GPT OSS 120B | 64 | **q8_0/tbq3 (auto)** | **1,692 MiB** | **2.7x** | **145** | **46** | **✅** |
+| GPT OSS 20B | 64 | F16/F16 | 3,072 MiB | 1.0x | 412 | 74 | ✅ |
+| GPT OSS 20B | 64 | **q8_0/tbq3 (auto)** | **1,128 MiB** | **2.7x** | **421** | **75** | **✅** |
+| Qwen3.5-122B | 256 | F16/F16 | 6,144 MiB | 1.0x | 91 | 23 | ✅ |
+| Qwen3.5-122B | 256 | **tbqp3/tbq3 (auto)** | **1,188 MiB** | **5.2x** | **102** | **22** | **✅** |
+
+**Input validation — safe handling of all invalid combinations:**
+- TBQP (QJL) for V → auto-downgrade to TBQ
+- Wrong _N suffix → auto-correct or fallback based on head_dim
+- Unsupported head_dim → q8_0/f16 fallback with warning
+
+---
+
+### v1.1.0 — head_dim 64/128 Support + Direct Sign Residual Correction
 
 **Multi head_dim support:**
 - `head_dim=256`: existing (Qwen3.5, Qwen3-Next) — QJL residual correction
@@ -259,7 +327,7 @@ cmake --build build -j$(nproc)
 
 # Recommended: QJL Key + TBQ Value (5.2x compression, FP16-level quality)
 ./build/bin/llama-cli -m model.gguf -ngl 99 \
-  --cache-type-k tbqp3_0 --cache-type-v tbq3_0
+  --cache-type-k tbqp3 --cache-type-v tbq3
 
 # Speed priority (5.2x compression, fastest)
 ./build/bin/llama-cli -m model.gguf -ngl 99 \

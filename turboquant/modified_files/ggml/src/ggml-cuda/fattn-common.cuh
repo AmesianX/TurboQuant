@@ -1245,6 +1245,14 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_tbqp3_2<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP4_2) {
         return vec_dot_fattn_vec_KQ_tbqp4_2<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ3_3) {
+        return vec_dot_fattn_vec_KQ_tbq3_2<D, nthreads>;  // base function (used for per-group scoring)
+    } else if constexpr (type_K == GGML_TYPE_TBQ4_3) {
+        return vec_dot_fattn_vec_KQ_tbq4_2<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP3_3) {
+        return vec_dot_fattn_vec_KQ_tbqp3_2<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP4_3) {
+        return vec_dot_fattn_vec_KQ_tbqp4_2<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -1290,6 +1298,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     } else if constexpr (type_V == GGML_TYPE_TBQ4_2) {
         return dequantize_V_tbq4_2<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ3_2) {
+        return dequantize_V_tbq3_2<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ4_3) {
+        return dequantize_V_tbq4_2<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ3_3) {
         return dequantize_V_tbq3_2<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");

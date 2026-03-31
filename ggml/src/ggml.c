@@ -978,6 +978,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(block_tbqp4_2),
         .is_quantized             = true,
     },
+    [GGML_TYPE_TBQ3_3] = {
+        .type_name                = "tbq3_3",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbq3_3),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQ4_3] = {
+        .type_name                = "tbq4_3",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbq4_3),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQP3_3] = {
+        .type_name                = "tbqp3_3",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbqp3_3),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQP4_3] = {
+        .type_name                = "tbqp4_3",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbqp4_3),
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

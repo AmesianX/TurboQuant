@@ -91,7 +91,12 @@ static __global__ void flash_attn_ext_vec(
         && type_K != GGML_TYPE_TBQ4_1 && type_K != GGML_TYPE_TBQ3_1
         && type_K != GGML_TYPE_TBQP3_1 && type_K != GGML_TYPE_TBQP4_1
         && type_K != GGML_TYPE_TBQ4_2 && type_K != GGML_TYPE_TBQ3_2
-        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2;
+        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2
+        && type_K != GGML_TYPE_TBQ4_3 && type_K != GGML_TYPE_TBQ3_3
+        && type_K != GGML_TYPE_TBQP3_3 && type_K != GGML_TYPE_TBQP4_3;
+    constexpr bool is_cross_head_K = type_K == GGML_TYPE_TBQ3_3 || type_K == GGML_TYPE_TBQ4_3
+        || type_K == GGML_TYPE_TBQP3_3 || type_K == GGML_TYPE_TBQP4_3;
+    constexpr bool is_cross_head_V = type_V == GGML_TYPE_TBQ3_3 || type_V == GGML_TYPE_TBQ4_3;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -400,12 +405,25 @@ static __global__ void flash_attn_ext_vec(
             // vec_dot reuses Q_reg (MSE WHT'd query) directly for sign correction
         }
     } else if constexpr (type_K == GGML_TYPE_TBQ4_2 || type_K == GGML_TYPE_TBQ3_2
-                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2) {
+                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2
+                      || type_K == GGML_TYPE_TBQ4_3 || type_K == GGML_TYPE_TBQ3_3
+                      || type_K == GGML_TYPE_TBQP4_3 || type_K == GGML_TYPE_TBQP3_3) {
         // TurboQuant 64-block: D=64, nthreads=128, tid 0-63 participate in WHT
         // WHT has 6 stages: stages 0-4 warp shuffle, stage 5 shared memory
-        static constexpr uint8_t tbq_signs[8] = {
-            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+        // For cross-head _3: use kv_head-specific 64-bit sign slice from 512-bit pattern
+        static constexpr uint8_t tbq_signs_full[64] = {
+            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0 (same as _2)
+            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
+            0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
+            0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
+            0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
+            0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
+            0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
+            0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
         };
+        // For _2 types: always use head 0's signs. For _3: use kv_head-specific slice.
+        const int q_signs_offset = (is_cross_head_K) ? ((head / gqa_ratio) % 8) * 8 : 0;
+        const uint8_t * tbq_signs = tbq_signs_full + q_signs_offset;
 
         for (int j = 0; j < ncols; ++j) {
             float * Q_wht = (float *) &KQ[0];
@@ -500,6 +518,9 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
+    // Cross-head WHT: kv_head_idx within group of 8 for H_8 sign computation
+    [[maybe_unused]] const int kv_head_idx = (is_cross_head_K || is_cross_head_V) ? ((head / gqa_ratio) % 8) : 0;
+
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
@@ -523,8 +544,24 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
-                sum = warp_reduce_sum<nthreads_KQ>(sum);
+                float sum;
+                if constexpr (is_cross_head_K) {
+                    // Cross-head scoring: combine 8 groups with H_8 signs
+                    // H_512 = H_8 ⊗ H_64 → score = (1/8)Σ_g H_8[h][g] · vec_dot(K_g, Q_wht)
+                    sum = 0.0f;
+                    #pragma unroll
+                    for (int g = 0; g < 8; g++) {
+                        const char * K_g = K + (int64_t)(g - kv_head_idx) * nb12 + (int64_t)i_KQ * nb11;
+                        float partial = vec_dot_KQ(K_g, Q_reg[j], Q_i32[j], Q_ds[j]);
+                        const int h8_sign = (__popc(kv_head_idx & g) & 1) ? -1 : 1;
+                        sum += h8_sign * partial;
+                    }
+                    sum = warp_reduce_sum<nthreads_KQ>(sum);
+                    sum *= 0.125f; // 1/8
+                } else {
+                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                    sum = warp_reduce_sum<nthreads_KQ>(sum);
+                }
 
                 if (use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
@@ -587,17 +624,36 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 half2 tmp[V_rows_per_thread/2];
-                if constexpr (type_V == GGML_TYPE_BF16) {
+                const int v_elem = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
+                if constexpr (is_cross_head_V) {
+                    // Cross-head V: load 8 V blocks, combine with (1/8)H_8 inverse
+                    float2 v_sum[V_rows_per_thread/2];
+#pragma unroll
+                    for (int iv = 0; iv < V_rows_per_thread/2; iv++) v_sum[iv] = make_float2(0.0f, 0.0f);
+#pragma unroll
+                    for (int g = 0; g < 8; g++) {
+                        half2 v_g[V_rows_per_thread/2];
+                        dequantize_V(V + (int64_t)(g - kv_head_idx) * nb22 + k*nb21, v_g, v_elem);
+                        const float sign = (__popc(kv_head_idx & g) & 1) ? -0.125f : 0.125f;
+#pragma unroll
+                        for (int iv = 0; iv < V_rows_per_thread/2; iv++) {
+                            float2 vf = __half22float2(v_g[iv]);
+                            v_sum[iv].x += sign * vf.x;
+                            v_sum[iv].y += sign * vf.y;
+                        }
+                    }
+#pragma unroll
+                    for (int iv = 0; iv < V_rows_per_thread/2; iv++)
+                        tmp[iv] = __float22half2_rn(v_sum[iv]);
+                } else if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                    dequantize_V(V + k*nb21, tmp_f, v_elem);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                    dequantize_V(V + k*nb21, tmp, v_elem);
                 }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -616,8 +672,25 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                const int v_elem = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
+                if constexpr (is_cross_head_V) {
+                    // Cross-head V: load 8 V blocks, combine with (1/8)H_8 inverse
+#pragma unroll
+                    for (int iv = 0; iv < V_rows_per_thread/2; iv++) tmp[iv] = make_float2(0.0f, 0.0f);
+#pragma unroll
+                    for (int g = 0; g < 8; g++) {
+                        float2 v_g[V_rows_per_thread/2];
+                        dequantize_V(V + (int64_t)(g - kv_head_idx) * nb22 + k*nb21, v_g, v_elem);
+                        const float sign = (__popc(kv_head_idx & g) & 1) ? -0.125f : 0.125f;
+#pragma unroll
+                        for (int iv = 0; iv < V_rows_per_thread/2; iv++) {
+                            tmp[iv].x += sign * v_g[iv].x;
+                            tmp[iv].y += sign * v_g[iv].y;
+                        }
+                    }
+                } else {
+                    dequantize_V(V + k*nb21, tmp, v_elem);
+                }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
@@ -756,7 +829,8 @@ static __global__ void flash_attn_ext_vec(
                 // For TBQ V: store to shared memory for IWHT post-processing
                 if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0
                            || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
-                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
+                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
+                           || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3) {
                     KQ[i0 + tid] = dst_val; // reuse KQ shared memory
                 } else {
                     dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
@@ -874,10 +948,20 @@ static __global__ void flash_attn_ext_vec(
             }
 
             // TBQ V 64-block IWHT: D=64, tid 0-63 participate
-            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
-                static constexpr uint8_t tbq_signs_v[8] = {
-                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
+                      || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3) {
+                // Full 512-bit sign pattern: _2 uses head 0 (offset 0), _3 uses head-specific slice
+                static constexpr uint8_t tbq_signs_v_full[64] = {
+                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0
+                    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
+                    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
+                    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
+                    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
+                    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
+                    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
+                    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
                 };
+                const int v_signs_offset = is_cross_head_V ? ((head / gqa_ratio) % 8) * 8 : 0;
                 __syncthreads();
                 {
                     float * buf = (float *) &KQ[0];
@@ -899,7 +983,7 @@ static __global__ void flash_attn_ext_vec(
                     }
                     __syncthreads();
                     if (tid < D) {
-                        float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                        float sign0 = ((tbq_signs_v_full[v_signs_offset + (tid >> 3)] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
                         buf[tid] = __half2float(h0) * sign0 / (float)D;
                     }
                 }
@@ -1054,6 +1138,20 @@ EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ3_2)
 EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ4_2)
 EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP3_2)
 EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP4_2)
+
+// TurboQuant cross-head (_3) extern declarations: D=64, K=_3, V=_2/_3 or standard
+#define EXTERN_DECL_FATTN_VEC_TBQ3(type_K)                            \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_F16);            \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_Q8_0);           \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ3_2);         \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ4_2);         \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ3_3);         \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ4_3);         \
+
+EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQ3_3)
+EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQ4_3)
+EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQP3_3)
+EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQP4_3)
 
 // Asymmetric: standard K + TBQ V extern declarations
 // D=256: only _0 V types
