@@ -87,7 +87,11 @@ static __global__ void flash_attn_ext_vec(
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
     constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16
         && type_K != GGML_TYPE_TBQ4_0 && type_K != GGML_TYPE_TBQ3_0
-        && type_K != GGML_TYPE_TBQP3_0 && type_K != GGML_TYPE_TBQP4_0;
+        && type_K != GGML_TYPE_TBQP3_0 && type_K != GGML_TYPE_TBQP4_0
+        && type_K != GGML_TYPE_TBQ4_1 && type_K != GGML_TYPE_TBQ3_1
+        && type_K != GGML_TYPE_TBQP3_1 && type_K != GGML_TYPE_TBQP4_1
+        && type_K != GGML_TYPE_TBQ4_2 && type_K != GGML_TYPE_TBQ3_2
+        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -138,7 +142,9 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
     // For TBQP: Q_ds stores QJL WHT'd query (needs same size as Q_reg)
-    constexpr int Q_ds_size = (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0)
+    constexpr int Q_ds_size = (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0
+                            || type_K == GGML_TYPE_TBQP3_1 || type_K == GGML_TYPE_TBQP4_1
+                            || type_K == GGML_TYPE_TBQP3_2 || type_K == GGML_TYPE_TBQP4_2)
         ? (D/2)/nthreads_KQ
         : (1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ));
     float2  Q_ds[ncols][Q_ds_size];
@@ -325,6 +331,128 @@ static __global__ void flash_attn_ext_vec(
                 }
                 __syncthreads();
             }
+        }
+    } else if constexpr (type_K == GGML_TYPE_TBQ4_1 || type_K == GGML_TYPE_TBQ3_1
+                      || type_K == GGML_TYPE_TBQP4_1 || type_K == GGML_TYPE_TBQP3_1) {
+        // TurboQuant 128-block: D=128, nthreads=128, 1:1 thread-element mapping
+        // WHT has 7 stages: stages 0-4 warp shuffle, stages 5-6 shared memory
+        // No stage 7 (stride 128) needed — each thread handles exactly 1 element
+        static constexpr uint8_t tbq_signs[16] = {
+            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        };
+
+        for (int j = 0; j < ncols; ++j) {
+            float * Q_wht = (float *) &KQ[0];
+            const float * Q_f = (const float *) (Q + j*nb01);
+
+            // === WHT 1: MSE part (signs1) ===
+            // FP16 hybrid WHT for 128 elements: stages 0-4 warp shuffle, stages 5-6 shared memory
+            {
+                half * smem_h = (half *) &KQ[0];
+                half h0;
+                {
+                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
+                    h0 = __float2half(q0 * sign0);
+                }
+                // Stages 0-4: warp shuffle in half
+                #pragma unroll
+                for (int s = 0; s < 5; s++) {
+                    half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
+                    if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
+                    else                { h0 = __hadd(h0, o0); }
+                }
+                // Stage 5 (stride 32): shared memory
+                smem_h[tid] = h0;
+                __syncthreads();
+                {
+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
+                    h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
+                }
+                // Stage 6 (stride 64): shared memory
+                smem_h[tid] = h0;
+                __syncthreads();
+                {
+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 64];
+                    h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0);
+                }
+                __syncthreads();
+                Q_wht[tid] = __half2float(h0);
+                __syncthreads();
+            }
+
+            // Store MSE WHT'd query in Q_reg (scale/D applied)
+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
+                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                const float v0 = Q_wht[2*i] * scale / (float)D;
+                const float v1 = Q_wht[2*i+1] * scale / (float)D;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
+#else
+                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
+#endif
+            }
+
+            __syncthreads(); // ensure all warps finished Q_reg load before next j overwrites KQ
+
+            // Direct Sign: no second WHT needed for _1 TBQP types
+            // vec_dot reuses Q_reg (MSE WHT'd query) directly for sign correction
+        }
+    } else if constexpr (type_K == GGML_TYPE_TBQ4_2 || type_K == GGML_TYPE_TBQ3_2
+                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2) {
+        // TurboQuant 64-block: D=64, nthreads=128, tid 0-63 participate in WHT
+        // WHT has 6 stages: stages 0-4 warp shuffle, stage 5 shared memory
+        static constexpr uint8_t tbq_signs[8] = {
+            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+        };
+
+        for (int j = 0; j < ncols; ++j) {
+            float * Q_wht = (float *) &KQ[0];
+            const float * Q_f = (const float *) (Q + j*nb01);
+
+            // === WHT 1: MSE part ===
+            {
+                half * smem_h = (half *) &KQ[0];
+                half h0 = __float2half(0.0f);
+                if (tid < D) {
+                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
+                    h0 = __float2half(q0 * sign0);
+                }
+                // Stages 0-4: warp shuffle (tid >= 64 carries h0=0, no data corruption)
+                #pragma unroll
+                for (int s = 0; s < 5; s++) {
+                    half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
+                    if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
+                    else                { h0 = __hadd(h0, o0); }
+                }
+                // Stage 5 (stride 32): shared memory
+                if (tid < D) { smem_h[tid] = h0; }
+                __syncthreads();
+                if (tid < D) {
+                    half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
+                    h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
+                }
+                __syncthreads();
+                if (tid < D) { Q_wht[tid] = __half2float(h0); }
+                __syncthreads();
+            }
+
+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
+                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                const float v0 = Q_wht[2*i] * scale / (float)D;
+                const float v1 = Q_wht[2*i+1] * scale / (float)D;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
+#else
+                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
+#endif
+            }
+
+            __syncthreads(); // ensure all warps finished Q_reg load before next j overwrites KQ
+
+            // Direct Sign: no second WHT needed for _2 TBQP types
         }
     } else {
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -626,7 +754,9 @@ static __global__ void flash_attn_ext_vec(
                     dst_val /= KQ_sum[j_VKQ];
                 }
                 // For TBQ V: store to shared memory for IWHT post-processing
-                if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0) {
+                if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0
+                           || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
+                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
                     KQ[i0 + tid] = dst_val; // reuse KQ shared memory
                 } else {
                     dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
@@ -686,6 +816,94 @@ static __global__ void flash_attn_ext_vec(
                 __syncthreads();
 
                 // Write IWHT'd result to dst
+                for (int i0 = 0; i0 < D; i0 += nthreads) {
+                    if (i0 + tid < D) {
+                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
+                            ((float *)&KQ[0])[i0 + tid];
+                    }
+                }
+            }
+
+            // TBQ V 128-block IWHT: D=128, 1:1 thread mapping, no stage 7
+            if constexpr (type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1) {
+                static constexpr uint8_t tbq_signs_v[16] = {
+                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+                    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+                };
+                __syncthreads();
+
+                {
+                    float * buf = (float *) &KQ[0];
+                    half * smem_h = (half *) &KQ[0];
+                    float f0 = buf[tid];
+                    __syncthreads();
+                    half h0 = __float2half(f0);
+                    // Stages 0-4: warp shuffle
+                    #pragma unroll
+                    for (int s = 0; s < 5; s++) {
+                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
+                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
+                        else                { h0 = __hadd(h0, o0); }
+                    }
+                    // Stage 5 (stride 32)
+                    smem_h[tid] = h0;
+                    __syncthreads();
+                    {
+                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
+                        h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
+                    }
+                    // Stage 6 (stride 64)
+                    smem_h[tid] = h0;
+                    __syncthreads();
+                    {
+                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 64];
+                        h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0);
+                    }
+                    __syncthreads();
+                    float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                    buf[tid] = __half2float(h0) * sign0 / (float)D;
+                }
+                __syncthreads();
+
+                for (int i0 = 0; i0 < D; i0 += nthreads) {
+                    if (i0 + tid < D) {
+                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
+                            ((float *)&KQ[0])[i0 + tid];
+                    }
+                }
+            }
+
+            // TBQ V 64-block IWHT: D=64, tid 0-63 participate
+            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
+                static constexpr uint8_t tbq_signs_v[8] = {
+                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+                };
+                __syncthreads();
+                {
+                    float * buf = (float *) &KQ[0];
+                    half * smem_h = (half *) &KQ[0];
+                    float f0 = (tid < D) ? buf[tid] : 0.0f;
+                    __syncthreads();
+                    half h0 = __float2half(f0);
+                    #pragma unroll
+                    for (int s = 0; s < 5; s++) {
+                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
+                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
+                        else                { h0 = __hadd(h0, o0); }
+                    }
+                    if (tid < D) { smem_h[tid] = h0; }
+                    __syncthreads();
+                    if (tid < D) {
+                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
+                        h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
+                    }
+                    __syncthreads();
+                    if (tid < D) {
+                        float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                        buf[tid] = __half2float(h0) * sign0 / (float)D;
+                    }
+                }
+                __syncthreads();
                 for (int i0 = 0; i0 < D; i0 += nthreads) {
                     if (i0 + tid < D) {
                         dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
@@ -800,3 +1018,39 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// TurboQuant 256-block (_0) extern declarations: D=256 only
+#define EXTERN_DECL_FATTN_VEC_TBQ0(type_K)                           \
+    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_F16);          \
+    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_Q8_0);         \
+    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_TBQ3_0);       \
+    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_TBQ4_0);       \
+
+EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQ3_0)
+EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQ4_0)
+EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQP3_0)
+EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQP4_0)
+
+// TurboQuant 128-block (_1) extern declarations: D=128 only
+#define EXTERN_DECL_FATTN_VEC_TBQ1(type_K)                           \
+    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_F16);          \
+    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_Q8_0);         \
+    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_TBQ3_1);       \
+    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_TBQ4_1);       \
+
+EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQ3_1)
+EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQ4_1)
+EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQP3_1)
+EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQP4_1)
+
+// TurboQuant 64-block (_2) extern declarations: D=64 only
+#define EXTERN_DECL_FATTN_VEC_TBQ2(type_K)                            \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_F16);            \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_Q8_0);           \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ3_2);         \
+    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ4_2);         \
+
+EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ3_2)
+EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ4_2)
+EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP3_2)
+EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP4_2)

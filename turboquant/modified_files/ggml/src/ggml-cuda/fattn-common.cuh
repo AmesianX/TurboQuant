@@ -839,6 +839,384 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
     return norm * sum;
 }
 
+// ============================================================
+// TurboQuant 128-block (_1) variants for head_dim=128
+// ============================================================
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbq4_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbq4_1 * x = (const block_tbq4_1 *) vx;
+    static constexpr float c4[16] = {
+        -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,
+         0.1284f, 0.3881f, 0.6568f, 0.9424f, 1.2562f, 1.6180f, 2.0690f, 2.7326f,
+    };
+
+    const int64_t ib = i0 / TBQ_K128;
+    const int elem = i0 % TBQ_K128;
+    const float norm = __half2float(x[ib].d);
+
+#pragma unroll
+    for (int l = 0; l < ne; l += 2) {
+        const int byte_idx = (elem + l) / 2;
+        const uint8_t packed = x[ib].qs[byte_idx];
+        const float c0 = c4[packed & 0xF] * norm;
+        const float c1 = c4[packed >> 4] * norm;
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l]   = c0;
+            ((float *) dst)[l+1] = c1;
+        }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l]   = __float2half(c0);
+            ((half *) dst)[l+1] = __float2half(c1);
+        }
+#endif
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbq3_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbq3_1 * x = (const block_tbq3_1 *) vx;
+    static constexpr float c3[8] = {
+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
+    };
+
+    const int64_t ib = i0 / TBQ_K128;
+    const int elem = i0 % TBQ_K128;
+    const float norm = __half2float(x[ib].d);
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int e = elem + l;
+        const int bp = e * 3;
+        const int by = bp / 8, bo = bp % 8;
+        uint32_t v = (uint32_t)x[ib].qs[by] >> bo;
+        if (bo > 5 && by + 1 < TBQ_K128*3/8) v |= (uint32_t)x[ib].qs[by+1] << (8-bo);
+        const float cent = c3[v & 0x7] * norm;
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l] = cent;
+        }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l] = __float2half(cent);
+        }
+#endif
+    }
+}
+
+// TBQP3_1: fused MSE + Direct Sign score (128-block)
+// Direct Sign: sign(residual) stored directly, no SRHT — uses Q_v (MSE query) instead of Q_ds
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_1(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbqp3_1 * K = (const block_tbqp3_1 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v); // Direct Sign uses Q_v directly, no separate QJL projection needed
+
+    static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
+
+    float sum = 0.0f;
+
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = k * 2;
+        const int ib = elem / TBQ_K128;
+
+        const float norm = __half2float(K[ib].d);
+        const float d_direct = __half2float(K[ib].d_qjl); // mean(|residual|) * ||k||
+
+        const int byte_idx0 = (elem % TBQ_K128) / 4;
+        const int byte_idx1 = ((elem+1) % TBQ_K128) / 4;
+        const float cent0 = c2[(K[ib].qs[byte_idx0] >> (((elem % TBQ_K128) % 4) * 2)) & 0x3];
+        const float cent1 = c2[(K[ib].qs[byte_idx1] >> ((((elem+1) % TBQ_K128) % 4) * 2)) & 0x3];
+
+        // Direct Sign: use same Q_v (WHT'd query) for both MSE and sign correction
+        const int sign0 = (K[ib].qjl[(elem%TBQ_K128)/8] >> ((elem%TBQ_K128)%8)) & 1;
+        const int sign1 = (K[ib].qjl[((elem+1)%TBQ_K128)/8] >> (((elem+1)%TBQ_K128)%8)) & 1;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
+#endif
+
+        // MSE: norm * centroid * q_wht + Direct Sign: d_direct * sign(r) * q_wht
+        const float sc0 = sign0 ? q.x : -q.x;
+        const float sc1 = sign1 ? q.y : -q.y;
+        sum += norm * (q.x * cent0 + q.y * cent1)
+             + d_direct * (sc0 + sc1);
+    }
+
+    return sum;
+}
+
+// TBQP4_1: fused MSE + Direct Sign score (128-block)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_1(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbqp4_1 * K = (const block_tbqp4_1 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    static constexpr float c3[8] = {
+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
+    };
+
+    float sum = 0.0f;
+
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = k * 2;
+        const int ib = elem / TBQ_K128;
+
+        const float norm = __half2float(K[ib].d);
+        const float d_direct = __half2float(K[ib].d_qjl);
+
+        float cent0, cent1;
+        {
+            int bp = (elem%TBQ_K128)*3, by = bp/8, bo = bp%8;
+            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
+            if (bo > 5 && by+1 < TBQ_K128*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
+            cent0 = c3[v & 0x7];
+        }
+        {
+            int bp = ((elem+1)%TBQ_K128)*3, by = bp/8, bo = bp%8;
+            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
+            if (bo > 5 && by+1 < TBQ_K128*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
+            cent1 = c3[v & 0x7];
+        }
+
+        const int sign0 = (K[ib].qjl[(elem%TBQ_K128)/8] >> ((elem%TBQ_K128)%8)) & 1;
+        const int sign1 = (K[ib].qjl[((elem+1)%TBQ_K128)/8] >> (((elem+1)%TBQ_K128)%8)) & 1;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
+#endif
+
+        const float sc0 = sign0 ? q.x : -q.x;
+        const float sc1 = sign1 ? q.y : -q.y;
+        sum += norm * (q.x * cent0 + q.y * cent1)
+             + d_direct * (sc0 + sc1);
+    }
+
+    return sum;
+}
+
+// TBQ4_1: 4-bit fused attention score (128-block)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_1(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbq4_1 * K_tbq = (const block_tbq4_1 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    static constexpr float c4[16] = {
+        -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9424f, -0.6568f, -0.3881f, -0.1284f,
+         0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
+    };
+
+    const float norm = __half2float(K_tbq[0].d);
+    float sum = 0.0f;
+
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int byte_idx = k;
+
+        const uint8_t packed = K_tbq[0].qs[byte_idx];
+        const float cent_lo = c4[packed & 0xF];
+        const float cent_hi = c4[packed >> 4];
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
+#endif
+
+        sum += q.x * cent_lo + q.y * cent_hi;
+    }
+
+    return norm * sum;
+}
+
+// TBQ3_1: 3-bit fused attention score (128-block)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_1(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbq3_1 * K_tbq = (const block_tbq3_1 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    static constexpr float c3[8] = {
+        -2.1520f, -1.3440f, -0.7560f, -0.2451f,
+         0.2451f,  0.7560f,  1.3440f,  2.1520f,
+    };
+
+    const float norm = __half2float(K_tbq[0].d);
+    float sum = 0.0f;
+
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = k * 2;
+
+        float cent0, cent1;
+        {
+            const int bp0 = elem * 3;
+            const int by0 = bp0 / 8, bo0 = bp0 % 8;
+            uint32_t v0 = (uint32_t)K_tbq[0].qs[by0] >> bo0;
+            if (bo0 > 5) v0 |= (uint32_t)K_tbq[0].qs[by0+1] << (8-bo0);
+            cent0 = c3[v0 & 0x7];
+        }
+        {
+            const int bp1 = (elem + 1) * 3;
+            const int by1 = bp1 / 8, bo1 = bp1 % 8;
+            uint32_t v1 = (uint32_t)K_tbq[0].qs[by1] >> bo1;
+            if (bo1 > 5) v1 |= (uint32_t)K_tbq[0].qs[by1+1] << (8-bo1);
+            cent1 = c3[v1 & 0x7];
+        }
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
+#endif
+
+        sum += q.x * cent0 + q.y * cent1;
+    }
+
+    return norm * sum;
+}
+
+// ============================================================
+// TurboQuant 64-block (_2) variants for head_dim=64
+// ============================================================
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbq4_2(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbq4_2 * x = (const block_tbq4_2 *) vx;
+    static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
+    const int64_t ib = i0 / TBQ_K64; const int elem = i0 % TBQ_K64; const float norm = __half2float(x[ib].d);
+#pragma unroll
+    for (int l = 0; l < ne; l += 2) { const uint8_t packed = x[ib].qs[(elem+l)/2]; const float c0 = c4[packed&0xF]*norm; const float c1 = c4[packed>>4]*norm;
+        if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l]=c0; ((float*)dst)[l+1]=c1; }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l]=__float2half(c0); ((half*)dst)[l+1]=__float2half(c1); }
+#endif
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbq3_2(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbq3_2 * x = (const block_tbq3_2 *) vx;
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    const int64_t ib = i0 / TBQ_K64; const int elem = i0 % TBQ_K64; const float norm = __half2float(x[ib].d);
+#pragma unroll
+    for (int l = 0; l < ne; ++l) { const int e = elem+l; const int bp = e*3; const int by = bp/8, bo = bp%8;
+        uint32_t v = (uint32_t)x[ib].qs[by]>>bo; if (bo > 5 && by+1 < TBQ_K64*3/8) v |= (uint32_t)x[ib].qs[by+1]<<(8-bo);
+        const float cent = c3[v&0x7]*norm;
+        if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l]=cent; }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l]=__float2half(cent); }
+#endif
+    }
+}
+
+// TBQP3_2: fused MSE + Direct Sign (64-block)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_2(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbqp3_2 * K = (const block_tbqp3_2 *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f }; float sum = 0.0f;
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2; const int ib = elem/TBQ_K64;
+        const float norm = __half2float(K[ib].d); const float d_direct = __half2float(K[ib].d_qjl);
+        const float cent0 = c2[(K[ib].qs[(elem%TBQ_K64)/4]>>(((elem%TBQ_K64)%4)*2))&0x3];
+        const float cent1 = c2[(K[ib].qs[((elem+1)%TBQ_K64)/4]>>((((elem+1)%TBQ_K64)%4)*2))&0x3];
+        const int s0 = (K[ib].qjl[(elem%TBQ_K64)/8]>>((elem%TBQ_K64)%8))&1;
+        const int s1 = (K[ib].qjl[((elem+1)%TBQ_K64)/8]>>(((elem+1)%TBQ_K64)%8))&1;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
+#endif
+        sum += norm*(q.x*cent0+q.y*cent1) + d_direct*((s0?q.x:-q.x)+(s1?q.y:-q.y));
+    }
+    return sum;
+}
+
+// TBQP4_2: fused MSE + Direct Sign (64-block)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_2(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbqp4_2 * K = (const block_tbqp4_2 *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f }; float sum = 0.0f;
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2; const int ib = elem/TBQ_K64;
+        const float norm = __half2float(K[ib].d); const float d_direct = __half2float(K[ib].d_qjl);
+        float cent0, cent1;
+        { int bp=(elem%TBQ_K64)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K[ib].qs[by]>>bo; if(bo>5&&by+1<TBQ_K64*3/8) v|=(uint32_t)K[ib].qs[by+1]<<(8-bo); cent0=c3[v&0x7]; }
+        { int bp=((elem+1)%TBQ_K64)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K[ib].qs[by]>>bo; if(bo>5&&by+1<TBQ_K64*3/8) v|=(uint32_t)K[ib].qs[by+1]<<(8-bo); cent1=c3[v&0x7]; }
+        const int s0 = (K[ib].qjl[(elem%TBQ_K64)/8]>>((elem%TBQ_K64)%8))&1;
+        const int s1 = (K[ib].qjl[((elem+1)%TBQ_K64)/8]>>(((elem+1)%TBQ_K64)%8))&1;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
+#endif
+        sum += norm*(q.x*cent0+q.y*cent1) + d_direct*((s0?q.x:-q.x)+(s1?q.y:-q.y));
+    }
+    return sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_2(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbq4_2 * K_tbq = (const block_tbq4_2 *) K_c; GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
+    const float norm = __half2float(K_tbq[0].d); float sum = 0.0f;
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads);
+        const uint8_t packed = K_tbq[0].qs[k];
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
+#endif
+        sum += q.x*c4[packed&0xF] + q.y*c4[packed>>4];
+    }
+    return norm*sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_2(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbq3_2 * K_tbq = (const block_tbq3_2 *) K_c; GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    const float norm = __half2float(K_tbq[0].d); float sum = 0.0f;
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2;
+        float cent0, cent1;
+        { int bp0=elem*3,by0=bp0/8,bo0=bp0%8; uint32_t v0=(uint32_t)K_tbq[0].qs[by0]>>bo0; if(bo0>5) v0|=(uint32_t)K_tbq[0].qs[by0+1]<<(8-bo0); cent0=c3[v0&0x7]; }
+        { int bp1=(elem+1)*3,by1=bp1/8,bo1=bp1%8; uint32_t v1=(uint32_t)K_tbq[0].qs[by1]>>bo1; if(bo1>5) v1|=(uint32_t)K_tbq[0].qs[by1+1]<<(8-bo1); cent1=c3[v1&0x7]; }
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
+#endif
+        sum += q.x*cent0 + q.y*cent1;
+    }
+    return norm*sum;
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -851,6 +1229,22 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_tbqp3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP4_0) {
         return vec_dot_fattn_vec_KQ_tbqp4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ4_1) {
+        return vec_dot_fattn_vec_KQ_tbq4_1<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ3_1) {
+        return vec_dot_fattn_vec_KQ_tbq3_1<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP3_1) {
+        return vec_dot_fattn_vec_KQ_tbqp3_1<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP4_1) {
+        return vec_dot_fattn_vec_KQ_tbqp4_1<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ4_2) {
+        return vec_dot_fattn_vec_KQ_tbq4_2<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ3_2) {
+        return vec_dot_fattn_vec_KQ_tbq3_2<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP3_2) {
+        return vec_dot_fattn_vec_KQ_tbqp3_2<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP4_2) {
+        return vec_dot_fattn_vec_KQ_tbqp4_2<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -889,6 +1283,14 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_tbq4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ3_0) {
         return dequantize_V_tbq3_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ4_1) {
+        return dequantize_V_tbq4_1<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ3_1) {
+        return dequantize_V_tbq3_1<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ4_2) {
+        return dequantize_V_tbq4_2<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ3_2) {
+        return dequantize_V_tbq3_2<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
