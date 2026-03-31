@@ -928,6 +928,54 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(block_tbqp4_0),
         .is_quantized             = true,
     },
+    [GGML_TYPE_TBQ3_1] = {
+        .type_name                = "tbq3_1",
+        .blck_size                = TBQ_K128,
+        .type_size                = sizeof(block_tbq3_1),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQ4_1] = {
+        .type_name                = "tbq4_1",
+        .blck_size                = TBQ_K128,
+        .type_size                = sizeof(block_tbq4_1),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQP3_1] = {
+        .type_name                = "tbqp3_1",
+        .blck_size                = TBQ_K128,
+        .type_size                = sizeof(block_tbqp3_1),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQP4_1] = {
+        .type_name                = "tbqp4_1",
+        .blck_size                = TBQ_K128,
+        .type_size                = sizeof(block_tbqp4_1),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQ3_2] = {
+        .type_name                = "tbq3_2",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbq3_2),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQ4_2] = {
+        .type_name                = "tbq4_2",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbq4_2),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQP3_2] = {
+        .type_name                = "tbqp3_2",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbqp3_2),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQP4_2] = {
+        .type_name                = "tbqp4_2",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbqp4_2),
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

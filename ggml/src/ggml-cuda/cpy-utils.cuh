@@ -418,6 +418,338 @@ static __device__ void quantize_f32_tbqp4_0_block(const float * __restrict__ x, 
     }
 }
 
+// ============================================================
+// TurboQuant 128-element (head_dim=128) quantization functions
+// ============================================================
+
+// TBQ3_1: 128-element WHT + 3-bit Lloyd-Max
+static __device__ void quantize_f32_tbq3_1_block(const float * __restrict__ x, block_tbq3_1 * __restrict__ y) {
+    static constexpr uint8_t tbq_signs[16] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    };
+    static constexpr float tbq3_boundaries[7] = {
+        -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
+    };
+
+    float tmp[TBQ_K128];
+    float sum_sq = 0.0f;
+    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq);
+    y->d = __float2half(norm);
+
+    if (norm < 1e-10f) {
+        for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
+        return;
+    }
+
+    float inv_norm = 1.0f / norm;
+    for (int j = 0; j < TBQ_K128; j++) {
+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * inv_norm * sign;
+    }
+
+    // Serial WHT (128 elements, 7 stages)
+    for (int len = 1; len < TBQ_K128; len *= 2)
+        for (int i = 0; i < TBQ_K128; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // 3-bit quantization + packing
+    int bit_pos = 0;
+    for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
+    for (int j = 0; j < TBQ_K128; j++) {
+        uint8_t idx = 7;
+        for (int b = 0; b < 7; b++) { if (tmp[j] < tbq3_boundaries[b]) { idx = b; break; } }
+        int byte_idx = bit_pos / 8;
+        int bit_off = bit_pos % 8;
+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
+        bit_pos += 3;
+    }
+}
+
+// TBQ4_1: 128-element WHT + 4-bit Lloyd-Max
+static __device__ void quantize_f32_tbq4_1_block(const float * __restrict__ x, block_tbq4_1 * __restrict__ y) {
+    static constexpr uint8_t tbq_signs[16] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    };
+    static constexpr float tbq4_boundaries[15] = {
+        -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,
+         0.0f,
+         0.2583f, 0.5225f, 0.7996f, 1.0993f, 1.4371f, 1.8435f, 2.4008f,
+    };
+
+    float tmp[TBQ_K128];
+    float sum_sq = 0.0f;
+    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq);
+    y->d = __float2half(norm);
+
+    if (norm < 1e-10f) {
+        for (int j = 0; j < TBQ_K128/2; j++) y->qs[j] = 0;
+        return;
+    }
+
+    float inv_norm = 1.0f / norm;
+    for (int j = 0; j < TBQ_K128; j++) {
+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * inv_norm * sign;
+    }
+
+    // Serial WHT (128 elements, 7 stages)
+    for (int len = 1; len < TBQ_K128; len *= 2)
+        for (int i = 0; i < TBQ_K128; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // 4-bit quantization + packing
+    for (int j = 0; j < TBQ_K128/2; j++) {
+        uint8_t idx0 = 15, idx1 = 15;
+        for (int b = 0; b < 15; b++) { if (tmp[2*j]   < tbq4_boundaries[b]) { idx0 = b; break; } }
+        for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < tbq4_boundaries[b]) { idx1 = b; break; } }
+        y->qs[j] = idx0 | (idx1 << 4);
+    }
+}
+
+// TBQP3_1: 128-element 2-bit Lloyd-Max + 1-bit QJL
+static __device__ void quantize_f32_tbqp3_1_block(const float * __restrict__ x, block_tbqp3_1 * __restrict__ y) {
+    static constexpr uint8_t tbq_signs[16] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    };
+    static constexpr uint8_t qjl_signs[16] = {
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
+        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+    };
+    static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
+    static constexpr float b2[3] = { -0.9816f, 0.0f, 0.9816f };
+
+    float tmp[TBQ_K128], recon[TBQ_K128];
+
+    float sum_sq = 0.0f;
+    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq);
+    y->d = __float2half(norm);
+    if (norm < 1e-10f) {
+        for (int j = 0; j < TBQ_K128/4; j++) y->qs[j] = 0;
+        for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
+        y->d_qjl = __float2half(0.0f);
+        return;
+    }
+    float inv_norm = 1.0f / norm;
+    for (int j = 0; j < TBQ_K128; j++) {
+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * inv_norm * sign;
+    }
+    for (int len = 1; len < TBQ_K128; len *= 2)
+        for (int i = 0; i < TBQ_K128; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // 2-bit Lloyd-Max quantization
+    for (int j = 0; j < TBQ_K128/4; j++) {
+        uint8_t packed = 0;
+        for (int k = 0; k < 4; k++) {
+            uint8_t idx = 3;
+            for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } }
+            packed |= (idx & 0x3) << (k*2);
+            recon[j*4+k] = c2[idx];
+        }
+        y->qs[j] = packed;
+    }
+
+    // Residual + Direct Sign (no SRHT — lower variance than QJL for d≤128)
+    float res[TBQ_K128], res_abs_sum = 0.0f;
+    for (int j = 0; j < TBQ_K128; j++) {
+        res[j] = tmp[j] - recon[j];
+        res_abs_sum += fabsf(res[j]);
+    }
+    float gamma = res_abs_sum / TBQ_K128; // mean(|residual|)
+    y->d_qjl = __float2half(gamma * norm);
+
+    // Store sign(residual) directly — no random rotation needed
+    for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
+    for (int j = 0; j < TBQ_K128; j++) {
+        if (res[j] >= 0.0f) y->qjl[j/8] |= (1 << (j%8));
+    }
+}
+
+// TBQP4_1: 128-element 3-bit Lloyd-Max + 1-bit QJL
+static __device__ void quantize_f32_tbqp4_1_block(const float * __restrict__ x, block_tbqp4_1 * __restrict__ y) {
+    static constexpr uint8_t tbq_signs[16] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    };
+    static constexpr uint8_t qjl_signs[16] = {
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
+        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+    };
+    static constexpr float c3[8] = {
+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
+    };
+    static constexpr float b3[7] = {
+        -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
+    };
+
+    float tmp[TBQ_K128], recon[TBQ_K128];
+    float sum_sq = 0.0f;
+    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq);
+    y->d = __float2half(norm);
+    if (norm < 1e-10f) {
+        for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
+        for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
+        y->d_qjl = __float2half(0.0f);
+        return;
+    }
+    float inv_norm = 1.0f / norm;
+    for (int j = 0; j < TBQ_K128; j++) {
+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * inv_norm * sign;
+    }
+    for (int len = 1; len < TBQ_K128; len *= 2)
+        for (int i = 0; i < TBQ_K128; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // 3-bit Lloyd-Max + packing
+    int bit_pos = 0;
+    for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
+    for (int j = 0; j < TBQ_K128; j++) {
+        uint8_t idx = 7;
+        for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
+        int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
+        recon[j] = c3[idx];
+        bit_pos += 3;
+    }
+
+    // Residual + Direct Sign (no SRHT — lower variance than QJL for d≤128)
+    float res[TBQ_K128], res_abs_sum = 0.0f;
+    for (int j = 0; j < TBQ_K128; j++) { res[j] = tmp[j] - recon[j]; res_abs_sum += fabsf(res[j]); }
+    float gamma = res_abs_sum / TBQ_K128;
+    y->d_qjl = __float2half(gamma * norm);
+    for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
+    for (int j = 0; j < TBQ_K128; j++) {
+        if (res[j] >= 0.0f) y->qjl[j/8] |= (1 << (j%8));
+    }
+}
+
+// ============================================================
+// TurboQuant 64-element (head_dim=64) quantization functions
+// ============================================================
+
+static __device__ void quantize_f32_tbq3_2_block(const float * __restrict__ x, block_tbq3_2 * __restrict__ y) {
+    static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+    static constexpr float tbq3_boundaries[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
+    float tmp[TBQ_K64];
+    float sum_sq = 0.0f;
+    for (int j = 0; j < TBQ_K64; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq);
+    y->d = __float2half(norm);
+    if (norm < 1e-10f) { for (int j = 0; j < TBQ_K64*3/8; j++) y->qs[j] = 0; return; }
+    float inv_norm = 1.0f / norm;
+    for (int j = 0; j < TBQ_K64; j++) {
+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * inv_norm * sign;
+    }
+    for (int len = 1; len < TBQ_K64; len *= 2)
+        for (int i = 0; i < TBQ_K64; i += 2*len)
+            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+    int bit_pos = 0;
+    for (int j = 0; j < TBQ_K64*3/8; j++) y->qs[j] = 0;
+    for (int j = 0; j < TBQ_K64; j++) {
+        uint8_t idx = 7;
+        for (int b = 0; b < 7; b++) { if (tmp[j] < tbq3_boundaries[b]) { idx = b; break; } }
+        int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
+        bit_pos += 3;
+    }
+}
+
+static __device__ void quantize_f32_tbq4_2_block(const float * __restrict__ x, block_tbq4_2 * __restrict__ y) {
+    static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+    static constexpr float tbq4_boundaries[15] = { -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,0.0f,0.2583f,0.5225f,0.7996f,1.0993f,1.4371f,1.8435f,2.4008f };
+    float tmp[TBQ_K64];
+    float sum_sq = 0.0f;
+    for (int j = 0; j < TBQ_K64; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq);
+    y->d = __float2half(norm);
+    if (norm < 1e-10f) { for (int j = 0; j < TBQ_K64/2; j++) y->qs[j] = 0; return; }
+    float inv_norm = 1.0f / norm;
+    for (int j = 0; j < TBQ_K64; j++) {
+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * inv_norm * sign;
+    }
+    for (int len = 1; len < TBQ_K64; len *= 2)
+        for (int i = 0; i < TBQ_K64; i += 2*len)
+            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+    for (int j = 0; j < TBQ_K64/2; j++) {
+        uint8_t idx0 = 15, idx1 = 15;
+        for (int b = 0; b < 15; b++) { if (tmp[2*j]   < tbq4_boundaries[b]) { idx0 = b; break; } }
+        for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < tbq4_boundaries[b]) { idx1 = b; break; } }
+        y->qs[j] = idx0 | (idx1 << 4);
+    }
+}
+
+static __device__ void quantize_f32_tbqp3_2_block(const float * __restrict__ x, block_tbqp3_2 * __restrict__ y) {
+    static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+    static constexpr uint8_t qjl_signs[8] = { 0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31 };
+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
+    static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
+    float tmp[TBQ_K64], recon[TBQ_K64];
+    float sum_sq = 0.0f;
+    for (int j = 0; j < TBQ_K64; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq);
+    y->d = __float2half(norm);
+    if (norm < 1e-10f) { for (int j = 0; j < TBQ_K64/4; j++) y->qs[j] = 0; for (int j = 0; j < TBQ_K64/8; j++) y->qjl[j] = 0; y->d_qjl = __float2half(0.0f); return; }
+    float inv_norm = 1.0f / norm;
+    for (int j = 0; j < TBQ_K64; j++) { int sign = ((tbq_signs[j>>3]>>(j&7))&1)?-1:1; tmp[j] = x[j]*inv_norm*sign; }
+    for (int len = 1; len < TBQ_K64; len *= 2) for (int i = 0; i < TBQ_K64; i += 2*len) for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+    for (int j = 0; j < TBQ_K64/4; j++) { uint8_t packed = 0; for (int k = 0; k < 4; k++) { uint8_t idx = 3; for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } } packed |= (idx&0x3)<<(k*2); recon[j*4+k] = c2[idx]; } y->qs[j] = packed; }
+    float res[TBQ_K64], res_abs = 0.0f;
+    for (int j = 0; j < TBQ_K64; j++) { res[j] = tmp[j]-recon[j]; res_abs += fabsf(res[j]); }
+    y->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
+    for (int j = 0; j < TBQ_K64/8; j++) y->qjl[j] = 0;
+    for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) y->qjl[j/8] |= (1<<(j%8)); }
+}
+
+static __device__ void quantize_f32_tbqp4_2_block(const float * __restrict__ x, block_tbqp4_2 * __restrict__ y) {
+    static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+    static constexpr uint8_t qjl_signs[8] = { 0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31 };
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
+    float tmp[TBQ_K64], recon[TBQ_K64];
+    float sum_sq = 0.0f;
+    for (int j = 0; j < TBQ_K64; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq);
+    y->d = __float2half(norm);
+    if (norm < 1e-10f) { for (int j = 0; j < TBQ_K64*3/8; j++) y->qs[j] = 0; for (int j = 0; j < TBQ_K64/8; j++) y->qjl[j] = 0; y->d_qjl = __float2half(0.0f); return; }
+    float inv_norm = 1.0f / norm;
+    for (int j = 0; j < TBQ_K64; j++) { int sign = ((tbq_signs[j>>3]>>(j&7))&1)?-1:1; tmp[j] = x[j]*inv_norm*sign; }
+    for (int len = 1; len < TBQ_K64; len *= 2) for (int i = 0; i < TBQ_K64; i += 2*len) for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+    int bit_pos = 0;
+    for (int j = 0; j < TBQ_K64*3/8; j++) y->qs[j] = 0;
+    for (int j = 0; j < TBQ_K64; j++) { uint8_t idx = 7; for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } } int byte_idx = bit_pos/8, bit_off = bit_pos%8; y->qs[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off); if (bit_off > 5) y->qs[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off)); recon[j] = c3[idx]; bit_pos += 3; }
+    float res[TBQ_K64], res_abs = 0.0f;
+    for (int j = 0; j < TBQ_K64; j++) { res[j] = tmp[j]-recon[j]; res_abs += fabsf(res[j]); }
+    y->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
+    for (int j = 0; j < TBQ_K64/8; j++) y->qjl[j] = 0;
+    for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) y->qjl[j/8] |= (1<<(j%8)); }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
