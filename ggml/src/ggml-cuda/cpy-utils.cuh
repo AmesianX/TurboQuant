@@ -523,10 +523,6 @@ static __device__ void quantize_f32_tbqp3_1_block(const float * __restrict__ x, 
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
         0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
     };
-    static constexpr uint8_t qjl_signs[16] = {
-        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
-        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
-    };
     static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
     static constexpr float b2[3] = { -0.9816f, 0.0f, 0.9816f };
 
@@ -587,10 +583,6 @@ static __device__ void quantize_f32_tbqp4_1_block(const float * __restrict__ x, 
     static constexpr uint8_t tbq_signs[16] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
         0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-    };
-    static constexpr uint8_t qjl_signs[16] = {
-        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
-        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
     };
     static constexpr float c3[8] = {
         -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
@@ -706,7 +698,6 @@ static __device__ void quantize_f32_tbq4_2_block(const float * __restrict__ x, b
 
 static __device__ void quantize_f32_tbqp3_2_block(const float * __restrict__ x, block_tbqp3_2 * __restrict__ y) {
     static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
-    static constexpr uint8_t qjl_signs[8] = { 0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31 };
     static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
     static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
     float tmp[TBQ_K64], recon[TBQ_K64];
@@ -728,7 +719,6 @@ static __device__ void quantize_f32_tbqp3_2_block(const float * __restrict__ x, 
 
 static __device__ void quantize_f32_tbqp4_2_block(const float * __restrict__ x, block_tbqp4_2 * __restrict__ y) {
     static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
-    static constexpr uint8_t qjl_signs[8] = { 0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31 };
     static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
     static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
     float tmp[TBQ_K64], recon[TBQ_K64];
