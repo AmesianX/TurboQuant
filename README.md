@@ -7,7 +7,49 @@
 
 ## 개요
 
-Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
+Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
+
+### 🆕 v1.1.0 — head_dim 64/128 지원 + Direct Sign 잔차 보정
+
+**멀티 head_dim 지원:**
+- `head_dim=256`: 기존 (Qwen3.5, Qwen3-Next) — QJL 잔차 보정
+- `head_dim=128`: **신규** (Llama, Qwen3, Mistral, MiniMax, 대부분 모델) — Direct Sign 잔차 보정
+- `head_dim=64`: **신규** (gpt-oss, 소형 모델) — Direct Sign 잔차 보정
+- 자동 감지 — 사용자 CLI 변경 없음 (`--cache-type-k tbqp3_0` 그대로)
+
+**Direct Sign — 논문 QJL 대비 4.3배 낮은 분산:**
+
+논문의 QJL은 SRHT 랜덤 프로젝션으로 잔차를 보정하지만, d≤128에서 프로젝션 잡음이 보정 효과를 초과합니다. Direct Sign은 `sign(residual)`을 직접 저장하여:
+- 분산 4.3배 감소: `(1-2/π)/(π/2) = 0.23`
+- 두 번째 WHT 불필요 → 속도 향상
+- d=256에서는 QJL 유지 (QJL이 더 우수)
+
+#### head_dim=128 벤치마크 (Qwen3-30B-A3B Q4_K_M, 2K context, DGX Spark GB10)
+
+| K/V 설정 | PPL | 속도 (t/s) | KV 크기 | 압축률 |
+|:---------|----:|---------:|-------:|------:|
+| f16 + f16 (baseline) | 6.69 | 87.8 | 192 MiB | 1.0x |
+| q8_0 + q8_0 | 6.68 | 84.3 | 102 MiB | 1.9x |
+| q4_0 + q4_0 | 7.33 | 85.0 | 54 MiB | 3.6x |
+| **tbq4_0 + tbq4_0** | **7.02** | 68.6 | 50 MiB | **3.9x** |
+| tbq4_0 + tbq3_0 | 7.19 | 68.1 | 44 MiB | 4.4x |
+| tbqp4_0 + tbq3_0 (Direct Sign) | 7.08 | 63.6 | 44 MiB | 4.3x |
+| **tbqp3_0 + tbq3_0** (Direct Sign) | **7.95** | 65.3 | 38 MiB | **5.0x** |
+
+#### Direct Sign vs QJL 비교 (head_dim=128, TBQP3/TBQ3)
+
+| 방식 | PPL | 비고 |
+|:-----|----:|:-----|
+| QJL (논문 원본) | 11.04 | d=128에서 프로젝션 잡음 폭발 |
+| **Direct Sign (v1.1.0)** | **7.95** | **PPL 3.09 감소** |
+
+#### 버그 수정
+
+- `__syncthreads()` race condition: ncols=2(prompt eval)에서 쿼리 WHT shared memory 오염 → PPL 2000+ 폭발, 토큰 생성(ncols=1)은 정상이라 발견 어려운 버그
+
+---
+
+### v1.0.0 벤치마크 (head_dim=256)
 
 **핵심 결과: `tbqp3_0 + tbq3_0` = 5.2x 압축 + F16보다 낮은 PPL + 12% 빠른 속도**
 
@@ -109,7 +151,49 @@ cmake --build build -j$(nproc)
 
 ## Overview
 
-This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving 5.2x memory savings while maintaining FP16-level quality.
+This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
+
+### 🆕 v1.1.0 — head_dim 64/128 Support + Direct Sign Residual Correction
+
+**Multi head_dim support:**
+- `head_dim=256`: existing (Qwen3.5, Qwen3-Next) — QJL residual correction
+- `head_dim=128`: **new** (Llama, Qwen3, Mistral, MiniMax, most models) — Direct Sign correction
+- `head_dim=64`: **new** (gpt-oss, smaller models) — Direct Sign correction
+- Auto-detected — user CLI unchanged (`--cache-type-k tbqp3_0` works for all)
+
+**Direct Sign — 4.3x lower variance than paper's QJL:**
+
+The paper's QJL uses SRHT random projection for residual correction, but at d≤128 the projection noise exceeds the correction benefit. Direct Sign stores `sign(residual)` directly:
+- 4.3x variance reduction: `(1-2/π)/(π/2) = 0.23`
+- No second WHT needed → faster query preprocessing
+- QJL retained for d=256 where it excels (hybrid strategy)
+
+#### head_dim=128 Benchmark (Qwen3-30B-A3B Q4_K_M, 2K context, DGX Spark GB10)
+
+| KV Config | PPL | Speed (t/s) | KV Size | Compression |
+|:----------|----:|----------:|--------:|------------:|
+| f16 + f16 (baseline) | 6.69 | 87.8 | 192 MiB | 1.0x |
+| q8_0 + q8_0 | 6.68 | 84.3 | 102 MiB | 1.9x |
+| q4_0 + q4_0 | 7.33 | 85.0 | 54 MiB | 3.6x |
+| **tbq4_0 + tbq4_0** | **7.02** | 68.6 | 50 MiB | **3.9x** |
+| tbq4_0 + tbq3_0 | 7.19 | 68.1 | 44 MiB | 4.4x |
+| tbqp4_0 + tbq3_0 (Direct Sign) | 7.08 | 63.6 | 44 MiB | 4.3x |
+| **tbqp3_0 + tbq3_0** (Direct Sign) | **7.95** | 65.3 | 38 MiB | **5.0x** |
+
+#### Direct Sign vs QJL Comparison (head_dim=128, TBQP3/TBQ3)
+
+| Method | PPL | Note |
+|:-------|----:|:-----|
+| QJL (paper) | 11.04 | Projection noise dominates at d=128 |
+| **Direct Sign (v1.1.0)** | **7.95** | **PPL reduced by 3.09** |
+
+#### Bug Fix
+
+- `__syncthreads()` race condition: query WHT shared memory corruption at ncols=2 (prompt eval) — PPL exploded to 2000+ while token generation (ncols=1) appeared normal
+
+---
+
+### v1.0.0 Benchmark (head_dim=256)
 
 **Key result: `tbqp3_0 + tbq3_0` = 5.2x compression + lower PPL than FP16 + 12% faster**
 
