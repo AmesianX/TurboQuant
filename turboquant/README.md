@@ -31,10 +31,10 @@ Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐�
 | f16 + f16 (baseline) | 6.69 | 87.8 | 192 MiB | 1.0x |
 | q8_0 + q8_0 | 6.68 | 84.3 | 102 MiB | 1.9x |
 | q4_0 + q4_0 | 7.33 | 85.0 | 54 MiB | 3.6x |
-| **tbq4_0 + tbq4_0** | **7.02** | 68.6 | 50 MiB | **3.9x** |
+| tbq4_0 + tbq4_0 | 7.02 | 68.6 | 50 MiB | 3.9x |
 | tbq4_0 + tbq3_0 | 7.19 | 68.1 | 44 MiB | 4.4x |
-| tbqp4_0 + tbq3_0 (Direct Sign) | 7.08 | 63.6 | 44 MiB | 4.3x |
-| **tbqp3_0 + tbq3_0** (Direct Sign) | **7.95** | 65.3 | 38 MiB | **5.0x** |
+| **tbqp4_0 + tbq3_0 (Direct Sign)** | **7.08** | **63.6** | **44 MiB** | **4.3x** |
+| tbqp3_0 + tbq3_0 (Direct Sign) | 7.95 | 65.3 | 38 MiB | 5.0x |
 
 #### Direct Sign vs QJL 비교 (head_dim=128, TBQP3/TBQ3)
 
@@ -175,10 +175,10 @@ The paper's QJL uses SRHT random projection for residual correction, but at d≤
 | f16 + f16 (baseline) | 6.69 | 87.8 | 192 MiB | 1.0x |
 | q8_0 + q8_0 | 6.68 | 84.3 | 102 MiB | 1.9x |
 | q4_0 + q4_0 | 7.33 | 85.0 | 54 MiB | 3.6x |
-| **tbq4_0 + tbq4_0** | **7.02** | 68.6 | 50 MiB | **3.9x** |
+| tbq4_0 + tbq4_0 | 7.02 | 68.6 | 50 MiB | 3.9x |
 | tbq4_0 + tbq3_0 | 7.19 | 68.1 | 44 MiB | 4.4x |
-| tbqp4_0 + tbq3_0 (Direct Sign) | 7.08 | 63.6 | 44 MiB | 4.3x |
-| **tbqp3_0 + tbq3_0** (Direct Sign) | **7.95** | 65.3 | 38 MiB | **5.0x** |
+| **tbqp4_0 + tbq3_0 (Direct Sign)** | **7.08** | **63.6** | **44 MiB** | **4.3x** |
+| tbqp3_0 + tbq3_0 (Direct Sign) | 7.95 | 65.3 | 38 MiB | 5.0x |
 
 #### Direct Sign vs QJL Comparison (head_dim=128, TBQP3/TBQ3)
 
