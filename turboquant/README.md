@@ -9,7 +9,54 @@
 
 Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
 
-### 🆕 v1.2.0 — Auto head_dim Mapping + head_dim=64 Quality Fix + V Cross-Head WHT
+### 🆕 v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
+
+**P1→P5 Priority Cascade로 head_dim 자동 감지 완전 재설계:**
+
+기존에는 GGUF `{arch}.attention.key_length` 메타데이터만 읽었으나, 대부분의 모델(Phi-4, DeepSeek, Gemma, Mistral)은 이 값을 저장하지 않아 TurboQuant가 조용히 비활성화되는 문제가 있었습니다.
+
+이제 6개 감지 신호를 엄격한 우선순위 캐스케이드로 사용:
+- **P1**: `attention.key_length` (100% — GGUF 공식값)
+- **P2**: `attention.key_length_mla` (100% — DeepSeek V2 등 MLA 모델)
+- **P3**: `attention.key_length_swa` (100% — Gemma 2/3 등 SWA 모델)
+- **P4**: `attention.value_length` (95% — 교차 검증)
+- **P5**: `n_embd / n_head` (70% — 폴백, MoE에서 오류 가능)
+
+신호 간 교차 검증 + 진단 로깅. 예: `[P1✓ P5✗] key_length=128 but n_embd/n_head=64`
+
+**실제 사례:** Qwen3-MoE는 n_embd/n_head=64이지만 실제 head_dim=128. Qwen3.5-27B는 n_embd/n_head=213이지만 실제 head_dim=256. P1 없이는 잘못된 WHT 블록 크기 → 쓰레기 출력.
+
+Power-of-2 검증으로 WHT 비호환 차원(head_dim=80, 576) 조기 감지.
+
+**해결된 이슈:**
+
+| 이슈 | 보고자 | 상태 |
+|------|--------|------|
+| Phi-4, DeepSeek 자동 head_dim 감지 실패 | @fritolays | 수정 — P1→P5 캐스케이드 |
+| turbo4-K PPL 폭발 (Cydonia-24B에서 18,202) | @TheTom | 수정 — head_dim 오감지 원인 |
+| GLM head_dim=576, Qwen3-4B head_dim=80 | @fritolays, @sztlink | 수정 — pow2 검사 + q8_0 폴백 |
+| Qwen3.5-27B-UD에서 "////" 출력 | @modderBUG | v1.3.0에서 재현 불가 |
+| llama-bench TBQ 타입 미지원 | @sztlink | 수정 — 16개 타입 + 4개 약어 |
+| Windows OpenSSL DLL 의존성 | @sztlink | 수정 — 독립 빌드 추가 |
+
+**기타 개선:**
+- llama-bench: -ctk/-ctv로 TBQ/TBQP 타입 완전 지원 (16개 타입 + 4개 약어)
+- 미지원 head_dim: f16이 아닌 q8_0으로 폴백하여 압축 유지
+- 독립 빌드: 외부 DLL 의존성 없음 (OpenSSL 비활성화)
+
+**벤치마크 (v1.3.0, Qwen3-30B-A3B Q4_K_M, DGX Spark GB10):**
+
+| 설정 | PPL | vs F16 |
+|------|-----|--------|
+| f16/f16 | 6.26 | 기준 |
+| tbq4/tbq4 | 6.73 | +7.5% |
+| tbq3/tbq3 | 8.49 | +35.6% |
+
+turbo4-K 정상 동작 확인 (PPL 6.73, 폭발 없음).
+
+---
+
+### v1.2.0 — Auto head_dim Mapping + head_dim=64 Quality Fix + V Cross-Head WHT
 
 **자동 head_dim 매핑 — 사용자가 숫자 접미사를 알 필요 없음:**
 ```bash
@@ -231,7 +278,55 @@ cmake --build build -j$(nproc)
 
 This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
 
-### 🆕 v1.2.0 — Auto head_dim Mapping + head_dim=64 Quality Fix + V Cross-Head WHT
+### 🆕 v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
+
+**P1→P5 Priority Cascade — complete redesign of head_dim auto-detection:**
+
+Previously only read GGUF `{arch}.attention.key_length` metadata — most models (Phi-4, DeepSeek, Gemma, Mistral) don't store this, causing TurboQuant to silently disable.
+
+Now uses 6 detection signals with strict priority cascade:
+- **P1**: `attention.key_length` (100% — GGUF authoritative)
+- **P2**: `attention.key_length_mla` (100% — MLA models like DeepSeek V2)
+- **P3**: `attention.key_length_swa` (100% — SWA models like Gemma 2/3)
+- **P4**: `attention.value_length` (95% — cross-check)
+- **P5**: `n_embd / n_head` (70% — fallback, can be wrong for MoE)
+
+Cross-validation between signals with diagnostic logging. E.g. `[P1✓ P5✗] key_length=128 but n_embd/n_head=64`
+
+**Proven critical:** Qwen3-MoE has n_embd/n_head=64 but actual head_dim=128. Qwen3.5-27B has n_embd/n_head=213 but actual head_dim=256. Without P1, wrong WHT block size → garbage output.
+
+Power-of-2 validation catches non-WHT-compatible dimensions (head_dim=80, 576) early.
+
+**Issues Resolved:**
+
+| Issue | Reporter | Status |
+|-------|----------|--------|
+| Phi-4, DeepSeek auto head_dim detection failure | @fritolays | Fixed — P1→P5 cascade |
+| turbo4-K PPL explosion (18,202 on Cydonia-24B) | @TheTom | Fixed — was head_dim misdetection |
+| GLM head_dim=576, Qwen3-4B head_dim=80 | @fritolays, @sztlink | Fixed — pow2 check + q8_0 fallback |
+| "////" output on Qwen3.5-27B-UD | @modderBUG | Not reproducible on v1.3.0 |
+| llama-bench doesn't accept TBQ types | @sztlink | Fixed — 16 types + 4 shorthands |
+| Windows OpenSSL DLL dependency | @sztlink | Fixed — standalone builds added |
+
+**Other Improvements:**
+- llama-bench: full TBQ/TBQP type support via -ctk/-ctv (16 types + 4 shorthands)
+- Unsupported head_dim: falls back to q8_0 (not f16), preserving compression
+- Standalone builds: no external DLL dependencies (OpenSSL disabled)
+- All signals logged for diagnostics (e.g. `[P1✓ P5✗] key_length=128 but n_embd/n_head=64`)
+
+**Benchmark (v1.3.0, Qwen3-30B-A3B Q4_K_M, DGX Spark GB10):**
+
+| Config | PPL | vs F16 |
+|--------|-----|--------|
+| f16/f16 | 6.26 | baseline |
+| tbq4/tbq4 | 6.73 | +7.5% |
+| tbq3/tbq3 | 8.49 | +35.6% |
+
+turbo4-K confirmed working (PPL 6.73, not exploding).
+
+---
+
+### v1.2.0 — Auto head_dim Mapping + head_dim=64 Quality Fix + V Cross-Head WHT
 
 **Automatic head_dim mapping — no suffix numbers needed:**
 ```bash

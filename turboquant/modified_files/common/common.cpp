@@ -1228,13 +1228,87 @@ common_init_result::common_init_result(common_params & params) :
     // TurboQuant auto-mapping: resolve _0 placeholder to correct _N based on head_dim
     // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
     {
-        // Get KV head dimension from GGUF metadata: {arch}.attention.key_length
+        // Detect KV head dimension with multi-signal cross-validation
+        // TurboQuant WHT requires exact head_dim — wrong value = garbage output
         int32_t head_dim = 0;
         {
             char arch[64] = {}, buf[64] = {};
             llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
-            if (llama_model_meta_val_str(model, (std::string(arch) + ".attention.key_length").c_str(), buf, sizeof(buf)) > 0) {
-                head_dim = std::atoi(buf);
+            auto read_meta = [&](const char * key) -> int32_t {
+                return (llama_model_meta_val_str(model, (std::string(arch) + key).c_str(),
+                        buf, sizeof(buf)) > 0) ? std::atoi(buf) : 0;
+            };
+
+            // Gather all available signals
+            int32_t s_key     = read_meta(".attention.key_length");       // GGUF key dim (authoritative)
+            int32_t s_val     = read_meta(".attention.value_length");     // GGUF value dim (cross-check)
+            int32_t s_key_mla = read_meta(".attention.key_length_mla");   // MLA compressed key dim
+            int32_t s_val_mla = read_meta(".attention.value_length_mla"); // MLA compressed value dim
+            int32_t s_key_swa = read_meta(".attention.key_length_swa");   // SWA key dim
+            int32_t s_computed = 0;
+            {
+                int32_t n_embd = llama_model_n_embd(model);
+                int32_t n_head = llama_model_n_head(model);
+                if (n_head > 0) s_computed = n_embd / n_head;
+            }
+
+            // Log all signals for diagnostics
+            LOG_INF("%s: TurboQuant head_dim signals — key=%d val=%d computed=%d mla_k=%d mla_v=%d swa_k=%d\n",
+                    __func__, s_key, s_val, s_computed, s_key_mla, s_val_mla, s_key_swa);
+
+            // Priority cascade — most reliable first, cross-check against others
+            //
+            //   Priority 1: attention.key_length     (100% — GGUF converter sets directly)
+            //   Priority 2: attention.key_length_mla  (100% — MLA-specific, authoritative)
+            //   Priority 3: attention.key_length_swa  (100% — SWA-specific, authoritative)
+            //   Priority 4: attention.value_length    ( 95% — usually == key, but can differ)
+            //   Priority 5: n_embd / n_head           ( 70% — wrong for MoE/GQA/MLA)
+            //
+            //   Qwen3-MoE proof: n_embd/n_head=64 but actual head_dim=128
+            //   Without priority cascade, WHT would use wrong block size
+
+            if (s_key > 0) {
+                // P1: strongest — use it, cross-check lower signals
+                head_dim = s_key;
+                if (s_val > 0 && s_val != s_key)
+                    LOG_INF("%s: [P1] asymmetric K=%d V=%d\n", __func__, s_key, s_val);
+                if (s_computed > 0 && s_computed != s_key)
+                    LOG_WRN("%s: [P1✓ P5✗] key_length=%d but n_embd/n_head=%d — using P1\n",
+                            __func__, s_key, s_computed);
+            } else if (s_key_mla > 0) {
+                // P2: MLA model — use compressed key dim
+                head_dim = s_key_mla;
+                if (s_val_mla > 0 && s_val_mla != s_key_mla)
+                    LOG_INF("%s: [P2] MLA asymmetric K=%d V=%d\n", __func__, s_key_mla, s_val_mla);
+                if (s_computed > 0 && s_computed != s_key_mla)
+                    LOG_INF("%s: [P2✓ P5✗] MLA key=%d vs n_embd/n_head=%d — using P2\n",
+                            __func__, s_key_mla, s_computed);
+            } else if (s_key_swa > 0) {
+                // P3: SWA model without key_length or MLA — use SWA key dim
+                head_dim = s_key_swa;
+                if (s_computed > 0 && s_computed != s_key_swa)
+                    LOG_INF("%s: [P3✓ P5✗] SWA key=%d vs n_embd/n_head=%d — using P3\n",
+                            __func__, s_key_swa, s_computed);
+            } else if (s_val > 0) {
+                // P4: no key metadata but value_length exists — likely same
+                head_dim = s_val;
+                if (s_computed > 0 && s_computed != s_val)
+                    LOG_WRN("%s: [P4✓ P5✗] value_length=%d but n_embd/n_head=%d — using P4\n",
+                            __func__, s_val, s_computed);
+                else if (s_computed > 0)
+                    LOG_INF("%s: [P4+P5] value_length=%d confirmed by n_embd/n_head\n",
+                            __func__, s_val);
+            } else if (s_computed > 0) {
+                // P5: last resort — no metadata at all, only computation
+                head_dim = s_computed;
+                LOG_INF("%s: [P5 only] no GGUF metadata, using n_embd/n_head=%d\n",
+                        __func__, s_computed);
+            }
+
+            // Final: power-of-2 validation (WHT hard requirement)
+            if (head_dim > 0 && (head_dim & (head_dim - 1)) != 0) {
+                LOG_WRN("%s: head_dim=%d is not power-of-2 — TurboQuant WHT cannot operate\n",
+                        __func__, head_dim);
             }
         }
 
@@ -1341,9 +1415,14 @@ common_init_result::common_init_result(common_params & params) :
                                 __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
                         return m.to_64;
                     } else {
-                        LOG_WRN("%s: unsupported head_dim=%d for TurboQuant, falling back to %s\n",
-                                __func__, head_dim, is_key ? "q8_0" : "f16");
-                        return is_key ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+                        // Unsupported head_dim: disable TurboQuant, fallback to q8_0
+                        LOG_WRN("\n");
+                        LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
+                        LOG_WRN("║  TurboQuant: head_dim=%d is not supported                   ║\n", head_dim);
+                        LOG_WRN("║  WHT requires power-of-2 dimensions (64, 128, or 256).      ║\n");
+                        LOG_WRN("║  Falling back to q8_0 for KV cache.                         ║\n");
+                        LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
+                        return GGML_TYPE_Q8_0;
                     }
                 }
             }
@@ -1352,9 +1431,9 @@ common_init_result::common_init_result(common_params & params) :
 
         if (is_tbq_type(cparams.type_k) || is_tbq_type(cparams.type_v)) {
             if (head_dim <= 0) {
-                LOG_WRN("%s: could not determine head_dim from model metadata, TurboQuant disabled\n", __func__);
+                LOG_WRN("%s: could not determine head_dim, TurboQuant disabled (falling back to q8_0)\n", __func__);
                 if (is_tbq_type(cparams.type_k)) cparams.type_k = GGML_TYPE_Q8_0;
-                if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_F16;
+                if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_Q8_0;
             } else {
                 cparams.type_k = tbq_resolve(cparams.type_k, true);
                 cparams.type_v = tbq_resolve(cparams.type_v, false);

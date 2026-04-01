@@ -957,12 +957,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = TBQ_K64,
         .type_size                = sizeof(block_tbq3_2),
         .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tbq3_2,
     },
     [GGML_TYPE_TBQ4_2] = {
         .type_name                = "tbq4_2",
         .blck_size                = TBQ_K64,
         .type_size                = sizeof(block_tbq4_2),
         .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tbq4_2,
     },
     [GGML_TYPE_TBQP3_2] = {
         .type_name                = "tbqp3_2",
@@ -974,6 +976,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_name                = "tbqp4_2",
         .blck_size                = TBQ_K64,
         .type_size                = sizeof(block_tbqp4_2),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQ3_3] = {
+        .type_name                = "tbq3_3",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbq3_3),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQ4_3] = {
+        .type_name                = "tbq4_3",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbq4_3),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQP3_3] = {
+        .type_name                = "tbqp3_3",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbqp3_3),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TBQP4_3] = {
+        .type_name                = "tbqp4_3",
+        .blck_size                = TBQ_K64,
+        .type_size                = sizeof(block_tbqp4_3),
         .is_quantized             = true,
     },
 };

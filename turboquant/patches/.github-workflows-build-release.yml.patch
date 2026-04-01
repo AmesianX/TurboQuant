@@ -1,0 +1,235 @@
+diff --git a/.github/workflows/build-release.yml b/.github/workflows/build-release.yml
+new file mode 100644
+index 000000000..bbcbaf1d7
+--- /dev/null
++++ b/.github/workflows/build-release.yml
+@@ -0,0 +1,229 @@
++name: Build Release Binaries
++
++on:
++  workflow_dispatch:
++    inputs:
++      tag:
++        description: 'Release tag to attach binaries to (e.g. v1.2.0)'
++        required: true
++        default: 'v1.2.0'
++
++permissions:
++  contents: write
++
++jobs:
++  # ============================================================
++  # Linux x64 + CUDA 12.8
++  # ============================================================
++  build-linux-x64-cuda128:
++    runs-on: ubuntu-22.04
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Install CUDA Toolkit 12.8
++        uses: Jimver/cuda-toolkit@v0.2.21
++        with:
++          cuda: '12.8.0'
++          method: 'network'
++
++      - name: Build
++        run: |
++          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
++          cmake --build build -j$(nproc)
++
++      - name: Package
++        run: |
++          PKG="turboquant-bin-linux-x64-cuda-cu12.8"
++          mkdir -p $PKG
++          for bin in llama-cli llama-server llama-perplexity llama-bench \
++                     llama-quantize llama-gguf-split llama-imatrix llama-tokenize; do
++            cp build/bin/$bin $PKG/ 2>/dev/null || true
++          done
++          cp -P build/bin/lib*.so* $PKG/ 2>/dev/null || true
++          zip -r $PKG.zip $PKG/
++
++      - name: Upload to Release
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          gh release upload ${{ github.event.inputs.tag }} \
++            turboquant-bin-linux-x64-cuda-cu12.8.zip \
++            --clobber
++
++  build-linux-x64-cuda128-standalone:
++    runs-on: ubuntu-22.04
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Install CUDA Toolkit 12.8
++        uses: Jimver/cuda-toolkit@v0.2.21
++        with:
++          cuda: '12.8.0'
++          method: 'network'
++
++      - name: Build (no OpenSSL)
++        run: |
++          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF
++          cmake --build build -j$(nproc)
++
++      - name: Package
++        run: |
++          PKG="turboquant-bin-linux-x64-cuda-cu12.8-standalone"
++          mkdir -p $PKG
++          for bin in llama-cli llama-server llama-perplexity llama-bench \
++                     llama-quantize llama-gguf-split llama-imatrix llama-tokenize; do
++            cp build/bin/$bin $PKG/ 2>/dev/null || true
++          done
++          cp -P build/bin/lib*.so* $PKG/ 2>/dev/null || true
++          echo "Built without OpenSSL — llama-server HTTPS is disabled." > $PKG/STANDALONE-NOTE.txt
++          zip -r $PKG.zip $PKG/
++
++      - name: Upload to Release
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          gh release upload ${{ github.event.inputs.tag }} \
++            turboquant-bin-linux-x64-cuda-cu12.8-standalone.zip \
++            --clobber
++
++  # ============================================================
++  # Linux arm64 + CUDA 12.8
++  # ============================================================
++  build-linux-arm64-cuda128:
++    runs-on: ubuntu-22.04-arm
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Install CUDA Toolkit 12.8
++        uses: Jimver/cuda-toolkit@v0.2.21
++        with:
++          cuda: '12.8.0'
++          method: 'network'
++
++      - name: Build
++        run: |
++          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
++          cmake --build build -j$(nproc)
++
++      - name: Package
++        run: |
++          PKG="turboquant-bin-linux-arm64-cuda-cu12.8"
++          mkdir -p $PKG
++          for bin in llama-cli llama-server llama-perplexity llama-bench \
++                     llama-quantize llama-gguf-split llama-imatrix llama-tokenize; do
++            cp build/bin/$bin $PKG/ 2>/dev/null || true
++          done
++          cp -P build/bin/lib*.so* $PKG/ 2>/dev/null || true
++          zip -r $PKG.zip $PKG/
++
++      - name: Upload to Release
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          gh release upload ${{ github.event.inputs.tag }} \
++            turboquant-bin-linux-arm64-cuda-cu12.8.zip \
++            --clobber
++
++  build-linux-arm64-cuda128-standalone:
++    runs-on: ubuntu-22.04-arm
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Install CUDA Toolkit 12.8
++        uses: Jimver/cuda-toolkit@v0.2.21
++        with:
++          cuda: '12.8.0'
++          method: 'network'
++
++      - name: Build (no OpenSSL)
++        run: |
++          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF
++          cmake --build build -j$(nproc)
++
++      - name: Package
++        run: |
++          PKG="turboquant-bin-linux-arm64-cuda-cu12.8-standalone"
++          mkdir -p $PKG
++          for bin in llama-cli llama-server llama-perplexity llama-bench \
++                     llama-quantize llama-gguf-split llama-imatrix llama-tokenize; do
++            cp build/bin/$bin $PKG/ 2>/dev/null || true
++          done
++          cp -P build/bin/lib*.so* $PKG/ 2>/dev/null || true
++          echo "Built without OpenSSL — llama-server HTTPS is disabled." > $PKG/STANDALONE-NOTE.txt
++          zip -r $PKG.zip $PKG/
++
++      - name: Upload to Release
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          gh release upload ${{ github.event.inputs.tag }} \
++            turboquant-bin-linux-arm64-cuda-cu12.8-standalone.zip \
++            --clobber
++
++  # ============================================================
++  # Windows x64 + CUDA 12.8
++  # ============================================================
++  build-windows-x64-cuda128:
++    runs-on: windows-2022
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Install CUDA Toolkit 12.8
++        uses: Jimver/cuda-toolkit@v0.2.21
++        with:
++          cuda: '12.8.0'
++          method: 'network'
++
++      - name: Build
++        run: |
++          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
++          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
++
++      - name: Package
++        run: |
++          $PKG = "turboquant-bin-win-x64-cuda-cu12.8"
++          New-Item -ItemType Directory -Path $PKG -Force
++          Get-ChildItem build/bin/Release/*.exe | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
++          Get-ChildItem build/bin/Release/*.dll | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
++          Compress-Archive -Path $PKG -DestinationPath "$PKG.zip"
++
++      - name: Upload to Release
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          gh release upload ${{ github.event.inputs.tag }} `
++            turboquant-bin-win-x64-cuda-cu12.8.zip `
++            --clobber
++
++  build-windows-x64-cuda128-standalone:
++    runs-on: windows-2022
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Install CUDA Toolkit 12.8
++        uses: Jimver/cuda-toolkit@v0.2.21
++        with:
++          cuda: '12.8.0'
++          method: 'network'
++
++      - name: Build (no OpenSSL)
++        run: |
++          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF
++          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
++
++      - name: Package
++        run: |
++          $PKG = "turboquant-bin-win-x64-cuda-cu12.8-standalone"
++          New-Item -ItemType Directory -Path $PKG -Force
++          Get-ChildItem build/bin/Release/*.exe | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
++          Get-ChildItem build/bin/Release/*.dll | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
++          "Built without OpenSSL — llama-server HTTPS is disabled." | Out-File -FilePath "$PKG/STANDALONE-NOTE.txt"
++          Compress-Archive -Path $PKG -DestinationPath "$PKG.zip"
++
++      - name: Upload to Release
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          gh release upload ${{ github.event.inputs.tag }} `
++            turboquant-bin-win-x64-cuda-cu12.8-standalone.zip `
++            --clobber
