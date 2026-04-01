@@ -1350,44 +1350,25 @@ common_init_result::common_init_result(common_params & params) :
                                 __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
                         return m.to_64;
                     } else {
-                        // Unsupported head_dim: fall back to nearest standard type
-                        // tbq3/tbqp3 (3-bit intent) → q4_0, tbq4/tbqp4 (4-bit intent) → q8_0
-                        bool is_3bit = (m.from == GGML_TYPE_TBQ3_0 || m.from == GGML_TYPE_TBQP3_0);
-                        ggml_type fallback = is_3bit ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
+                        // Unsupported head_dim: disable TurboQuant, revert to f16
                         LOG_WRN("\n");
                         LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
                         LOG_WRN("║  TurboQuant: head_dim=%d is not supported                   ║\n", head_dim);
                         LOG_WRN("║  WHT requires power-of-2 dimensions (64, 128, or 256).      ║\n");
-                        LOG_WRN("║  Falling back to %s for both K and V.                     ║\n",
-                                ggml_type_name(fallback));
+                        LOG_WRN("║  TurboQuant disabled. Use -ctk q8_0/q4_0 for compression.   ║\n");
                         LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
-                        return fallback;
+                        return GGML_TYPE_F16;
                     }
                 }
             }
             return type; // not a _0 TBQ type, pass through
         };
 
-        // Helper: get nearest standard type for a TBQ type based on bit budget
-        auto tbq_standard_fallback = [](ggml_type t) -> ggml_type {
-            // 3-bit intent → q4_0 (closest standard low-bit type)
-            if (t == GGML_TYPE_TBQ3_0  || t == GGML_TYPE_TBQ3_1  || t == GGML_TYPE_TBQ3_2  || t == GGML_TYPE_TBQ3_3 ||
-                t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP3_3) {
-                return GGML_TYPE_Q4_0;
-            }
-            // 4-bit intent → q4_0
-            if (t == GGML_TYPE_TBQ4_0  || t == GGML_TYPE_TBQ4_1  || t == GGML_TYPE_TBQ4_2  || t == GGML_TYPE_TBQ4_3 ||
-                t == GGML_TYPE_TBQP4_0 || t == GGML_TYPE_TBQP4_1 || t == GGML_TYPE_TBQP4_2 || t == GGML_TYPE_TBQP4_3) {
-                return GGML_TYPE_Q4_0;
-            }
-            return t;
-        };
-
         if (is_tbq_type(cparams.type_k) || is_tbq_type(cparams.type_v)) {
             if (head_dim <= 0) {
-                LOG_WRN("%s: could not determine head_dim, TurboQuant disabled — falling back to q4_0\n", __func__);
-                if (is_tbq_type(cparams.type_k)) cparams.type_k = tbq_standard_fallback(cparams.type_k);
-                if (is_tbq_type(cparams.type_v)) cparams.type_v = tbq_standard_fallback(cparams.type_v);
+                LOG_WRN("%s: could not determine head_dim, TurboQuant disabled (reverting to f16)\n", __func__);
+                if (is_tbq_type(cparams.type_k)) cparams.type_k = GGML_TYPE_F16;
+                if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_F16;
             } else {
                 cparams.type_k = tbq_resolve(cparams.type_k, true);
                 cparams.type_v = tbq_resolve(cparams.type_v, false);
