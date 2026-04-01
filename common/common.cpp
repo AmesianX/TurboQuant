@@ -1228,6 +1228,19 @@ common_init_result::common_init_result(common_params & params) :
     // TurboQuant auto-mapping: resolve _0 placeholder to correct _N based on head_dim
     // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
     {
+        // Quick check: skip entirely if neither K nor V uses TBQ types
+        auto is_any_tbq = [](ggml_type t) -> bool {
+            return t == GGML_TYPE_TBQ3_0  || t == GGML_TYPE_TBQ4_0
+                || t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP4_0
+                || t == GGML_TYPE_TBQ3_1  || t == GGML_TYPE_TBQ4_1
+                || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
+                || t == GGML_TYPE_TBQ3_2  || t == GGML_TYPE_TBQ4_2
+                || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
+                || t == GGML_TYPE_TBQ3_3  || t == GGML_TYPE_TBQ4_3
+                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3;
+        };
+
+      if (is_any_tbq(cparams.type_k) || is_any_tbq(cparams.type_v)) {
         // Detect KV head dimension with multi-signal cross-validation
         // TurboQuant WHT requires exact head_dim — wrong value = garbage output
         int32_t head_dim = 0;
@@ -1309,6 +1322,7 @@ common_init_result::common_init_result(common_params & params) :
             if (head_dim > 0 && (head_dim & (head_dim - 1)) != 0) {
                 LOG_WRN("%s: head_dim=%d is not power-of-2 — TurboQuant WHT cannot operate\n",
                         __func__, head_dim);
+                head_dim = 0; // force fallback path
             }
         }
 
@@ -1382,10 +1396,9 @@ common_init_result::common_init_result(common_params & params) :
                 return false;
             };
             if (is_wrong_suffix(type)) {
-                const ggml_type fallback = is_key ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
-                LOG_WRN("%s: %s does not match head_dim=%d, falling back to %s\n",
-                        __func__, ggml_type_name(type), head_dim, ggml_type_name(fallback));
-                return fallback;
+                LOG_WRN("%s: %s does not match head_dim=%d, falling back to q8_0\n",
+                        __func__, ggml_type_name(type), head_dim);
+                return GGML_TYPE_Q8_0;
             }
 
             for (const auto & m : maps) {
@@ -1439,6 +1452,7 @@ common_init_result::common_init_result(common_params & params) :
                 cparams.type_v = tbq_resolve(cparams.type_v, false);
             }
         }
+      } // end is_any_tbq
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);
