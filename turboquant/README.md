@@ -44,13 +44,19 @@ Power-of-2 검증으로 WHT 비호환 차원(head_dim=80, 576) 조기 감지.
 - 미지원 head_dim: f16이 아닌 q8_0으로 폴백하여 압축 유지
 - 독립 빌드: 외부 DLL 의존성 없음 (OpenSSL 비활성화)
 
-**벤치마크 (v1.3.0, Qwen3-30B-A3B Q4_K_M, DGX Spark GB10):**
+**벤치마크 (v1.3.0, Qwen3-30B-A3B Q4_K_M, DGX Spark GB10, head_dim=128):**
 
-| 설정 | PPL | vs F16 |
-|------|-----|--------|
-| f16/f16 | 6.26 | 기준 |
-| tbq4/tbq4 | 6.73 | +7.5% |
-| tbq3/tbq3 | 8.49 | +35.6% |
+| 설정 | PPL | vs F16 | 비고 |
+|------|-----|--------|------|
+| f16/f16 | 6.26 | 기준 | |
+| tbqp4/tbq4 | 6.70 | +7.1% | +Direct Sign 보정 (head_dim=128) |
+| tbq4/tbq4 | 6.73 | +7.5% | MSE only |
+| tbqp3/tbq3 | 7.91 | +26.3% | +Direct Sign 보정 (head_dim=128) |
+| tbq3/tbq3 | 8.49 | +35.6% | MSE only |
+
+> **참고:** TBQP의 잔차 보정 방식은 head_dim에 따라 다릅니다:
+> - head_dim=256: **QJL** (논문 원본, SRHT 기반)
+> - head_dim=128/64: **Direct Sign** (QJL 분산 문제 해결, 분산 4.3배 감소)
 
 turbo4-K 정상 동작 확인 (PPL 6.73, 폭발 없음).
 
@@ -314,15 +320,23 @@ Power-of-2 validation catches non-WHT-compatible dimensions (head_dim=80, 576) e
 - Standalone builds: no external DLL dependencies (OpenSSL disabled)
 - All signals logged for diagnostics (e.g. `[P1✓ P5✗] key_length=128 but n_embd/n_head=64`)
 
-**Benchmark (v1.3.0, Qwen3-30B-A3B Q4_K_M, DGX Spark GB10):**
+**Benchmark (v1.3.0, Qwen3-30B-A3B Q4_K_M, DGX Spark GB10, head_dim=128):**
 
-| Config | PPL | vs F16 |
-|--------|-----|--------|
-| f16/f16 | 6.26 | baseline |
-| tbq4/tbq4 | 6.73 | +7.5% |
-| tbq3/tbq3 | 8.49 | +35.6% |
+| Config | PPL | vs F16 | Note |
+|--------|-----|--------|------|
+| f16/f16 | 6.26 | baseline | |
+| **tbqp4/tbq4** | **6.70** | **+7.1%** | +Direct Sign correction (head_dim=128) |
+| tbq4/tbq4 | 6.73 | +7.5% | MSE only |
+| **tbqp3/tbq3** | **7.91** | **+26.3%** | +Direct Sign correction (head_dim=128) |
+| tbq3/tbq3 | 8.49 | +35.6% | MSE only |
 
-turbo4-K confirmed working (PPL 6.73, not exploding).
+> **Important:** TBQP residual correction method varies by head_dim:
+> - **head_dim=256**: QJL (original paper, SRHT-based)
+> - **head_dim=128/64**: Direct Sign (our fix for QJL variance issue — 4.3x lower variance)
+>
+> PPL numbers above reflect head_dim=128 on a **MoE model** (only 3.7B active params per token). PPL is higher than dense models of similar size — this is expected and not a TurboQuant issue. For comparison, this model's F16 baseline is already 6.26.
+
+turbo4-K confirmed working (PPL 6.70 with TBQP, not exploding).
 
 ---
 
