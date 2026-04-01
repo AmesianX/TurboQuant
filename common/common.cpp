@@ -1350,14 +1350,14 @@ common_init_result::common_init_result(common_params & params) :
                                 __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
                         return m.to_64;
                     } else {
-                        // Unsupported head_dim: disable TurboQuant, revert to f16
+                        // Unsupported head_dim: disable TurboQuant, fallback to q8_0
                         LOG_WRN("\n");
                         LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
                         LOG_WRN("║  TurboQuant: head_dim=%d is not supported                   ║\n", head_dim);
                         LOG_WRN("║  WHT requires power-of-2 dimensions (64, 128, or 256).      ║\n");
-                        LOG_WRN("║  TurboQuant disabled. Use -ctk q8_0/q4_0 for compression.   ║\n");
+                        LOG_WRN("║  Falling back to q8_0 for KV cache.                         ║\n");
                         LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
-                        return GGML_TYPE_F16;
+                        return GGML_TYPE_Q8_0;
                     }
                 }
             }
@@ -1366,9 +1366,9 @@ common_init_result::common_init_result(common_params & params) :
 
         if (is_tbq_type(cparams.type_k) || is_tbq_type(cparams.type_v)) {
             if (head_dim <= 0) {
-                LOG_WRN("%s: could not determine head_dim, TurboQuant disabled (reverting to f16)\n", __func__);
-                if (is_tbq_type(cparams.type_k)) cparams.type_k = GGML_TYPE_F16;
-                if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_F16;
+                LOG_WRN("%s: could not determine head_dim, TurboQuant disabled (falling back to q8_0)\n", __func__);
+                if (is_tbq_type(cparams.type_k)) cparams.type_k = GGML_TYPE_Q8_0;
+                if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_Q8_0;
             } else {
                 cparams.type_k = tbq_resolve(cparams.type_k, true);
                 cparams.type_v = tbq_resolve(cparams.type_v, false);
