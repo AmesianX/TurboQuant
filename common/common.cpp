@@ -1228,13 +1228,22 @@ common_init_result::common_init_result(common_params & params) :
     // TurboQuant auto-mapping: resolve _0 placeholder to correct _N based on head_dim
     // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
     {
-        // Get KV head dimension from GGUF metadata: {arch}.attention.key_length
+        // Get KV head dimension from GGUF metadata or model API
         int32_t head_dim = 0;
         {
+            // Try GGUF metadata first: {arch}.attention.key_length
             char arch[64] = {}, buf[64] = {};
             llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
             if (llama_model_meta_val_str(model, (std::string(arch) + ".attention.key_length").c_str(), buf, sizeof(buf)) > 0) {
                 head_dim = std::atoi(buf);
+            }
+            // Fallback: compute from n_embd / n_head (works for all architectures)
+            if (head_dim <= 0) {
+                int32_t n_embd = llama_model_n_embd(model);
+                int32_t n_head = llama_model_n_head(model);
+                if (n_head > 0) {
+                    head_dim = n_embd / n_head;
+                }
             }
         }
 
@@ -1341,8 +1350,13 @@ common_init_result::common_init_result(common_params & params) :
                                 __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
                         return m.to_64;
                     } else {
-                        LOG_WRN("%s: unsupported head_dim=%d for TurboQuant, falling back to %s\n",
-                                __func__, head_dim, is_key ? "q8_0" : "f16");
+                        LOG_WRN("\n");
+                        LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
+                        LOG_WRN("║  TurboQuant: head_dim=%d is not supported                   ║\n", head_dim);
+                        LOG_WRN("║  WHT requires power-of-2 dimensions (64, 128, or 256).      ║\n");
+                        LOG_WRN("║  Falling back to %s. Use q8_0 or q4_0 for this model.     ║\n",
+                                is_key ? "q8_0 (K)" : "f16  (V)");
+                        LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
                         return is_key ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
                     }
                 }
