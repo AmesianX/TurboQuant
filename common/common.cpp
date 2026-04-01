@@ -1229,53 +1229,76 @@ common_init_result::common_init_result(common_params & params) :
     // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
     {
         // Detect KV head dimension with multi-signal cross-validation
+        // TurboQuant WHT requires exact head_dim — wrong value = garbage output
         int32_t head_dim = 0;
         {
             char arch[64] = {}, buf[64] = {};
             llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+            auto read_meta = [&](const char * key) -> int32_t {
+                return (llama_model_meta_val_str(model, (std::string(arch) + key).c_str(),
+                        buf, sizeof(buf)) > 0) ? std::atoi(buf) : 0;
+            };
 
-            // Signal 1 (strongest): GGUF metadata {arch}.attention.key_length
-            // If present, this is authoritative — set by the model converter
-            int32_t dim_from_meta = 0;
-            if (llama_model_meta_val_str(model, (std::string(arch) + ".attention.key_length").c_str(), buf, sizeof(buf)) > 0) {
-                dim_from_meta = std::atoi(buf);
-            }
-
-            // Signal 2: n_embd / n_head (standard computation, matches llama-model.cpp:465)
-            int32_t dim_from_embd = 0;
+            // Gather all available signals
+            int32_t s_key     = read_meta(".attention.key_length");       // GGUF key dim (authoritative)
+            int32_t s_val     = read_meta(".attention.value_length");     // GGUF value dim (cross-check)
+            int32_t s_key_mla = read_meta(".attention.key_length_mla");   // MLA compressed key dim
+            int32_t s_val_mla = read_meta(".attention.value_length_mla"); // MLA compressed value dim
+            int32_t s_key_swa = read_meta(".attention.key_length_swa");   // SWA key dim
+            int32_t s_computed = 0;
             {
                 int32_t n_embd = llama_model_n_embd(model);
                 int32_t n_head = llama_model_n_head(model);
-                if (n_head > 0) {
-                    dim_from_embd = n_embd / n_head;
+                if (n_head > 0) s_computed = n_embd / n_head;
+            }
+
+            // Log all signals for diagnostics
+            LOG_INF("%s: TurboQuant head_dim detection — key=%d val=%d computed=%d mla_k=%d mla_v=%d swa_k=%d\n",
+                    __func__, s_key, s_val, s_computed, s_key_mla, s_val_mla, s_key_swa);
+
+            // Decision logic (strongest signal first, cross-validate weaker ones)
+            if (s_key > 0) {
+                // GGUF key_length is authoritative — but cross-check anyway
+                head_dim = s_key;
+                if (s_computed > 0 && s_computed != s_key) {
+                    LOG_WRN("%s: GGUF key_length=%d differs from n_embd/n_head=%d (MLA or non-standard arch)\n",
+                            __func__, s_key, s_computed);
+                }
+                if (s_val > 0 && s_val != s_key) {
+                    LOG_INF("%s: asymmetric K/V dims: key=%d, value=%d\n", __func__, s_key, s_val);
+                }
+            } else if (s_key_mla > 0) {
+                // MLA model without standard key_length — use MLA key dim
+                head_dim = s_key_mla;
+                LOG_INF("%s: using MLA key dimension=%d\n", __func__, s_key_mla);
+            } else if (s_computed > 0) {
+                // Computed value — cross-check with all available signals
+                head_dim = s_computed;
+                int n_agree = 1; // s_computed itself
+                int n_signals = 1;
+                if (s_val > 0) {
+                    n_signals++;
+                    if (s_val == s_computed) n_agree++;
+                    else LOG_WRN("%s: value_length=%d != computed=%d (possible asymmetric K/V)\n",
+                                 __func__, s_val, s_computed);
+                }
+                if (s_key_swa > 0) {
+                    n_signals++;
+                    if (s_key_swa == s_computed) n_agree++;
+                    else LOG_INF("%s: SWA key_length=%d differs from dense=%d\n",
+                                 __func__, s_key_swa, s_computed);
+                }
+                if (n_signals > 1 && n_agree == n_signals) {
+                    LOG_INF("%s: head_dim=%d confirmed by %d/%d signals\n",
+                            __func__, head_dim, n_agree, n_signals);
                 }
             }
 
-            // Signal 3: cross-check with {arch}.attention.value_length
-            int32_t dim_from_val = 0;
-            if (llama_model_meta_val_str(model, (std::string(arch) + ".attention.value_length").c_str(), buf, sizeof(buf)) > 0) {
-                dim_from_val = std::atoi(buf);
-            }
-
-            // Decision logic:
-            if (dim_from_meta > 0) {
-                // Strongest signal — trust it unconditionally
-                head_dim = dim_from_meta;
-            } else if (dim_from_embd > 0) {
-                // Computed value — cross-check with value_length if available
-                if (dim_from_val > 0 && dim_from_val == dim_from_embd) {
-                    // Both signals agree — high confidence
-                    head_dim = dim_from_embd;
-                } else if (dim_from_val > 0 && dim_from_val != dim_from_embd) {
-                    // Signals disagree (asymmetric K/V dims, e.g. MLA)
-                    // Use key dim (n_embd/n_head) as K determines WHT block size
-                    head_dim = dim_from_embd;
-                    LOG_WRN("%s: head_dim K=%d vs V=%d (asymmetric) — using K dim for TurboQuant\n",
-                            __func__, dim_from_embd, dim_from_val);
-                } else {
-                    // No cross-check available, use computed value
-                    head_dim = dim_from_embd;
-                }
+            // Final validation: power-of-2 check for WHT compatibility
+            if (head_dim > 0 && (head_dim & (head_dim - 1)) != 0) {
+                LOG_WRN("%s: head_dim=%d is not power-of-2 — TurboQuant WHT cannot operate\n",
+                        __func__, head_dim);
+                // Keep head_dim as-is; the auto-mapping logic will handle the fallback
             }
         }
 
