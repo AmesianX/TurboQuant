@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Work Log 2026-04-01</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {
+    --bg: #fafbfc;
+    --fg: #1a1a2e;
+    --accent: #3b82f6;
+    --accent2: #8b5cf6;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --muted: #64748b;
+    --card-bg: #ffffff;
+    --border: #e2e8f0;
+  }
+
+  .reveal {
+    font-family: 'Noto Sans KR', sans-serif;
+    font-size: 28px;
+    color: var(--fg);
+  }
+
+  .reveal .slides { text-align: left; }
+
+  .reveal .slides section {
+    padding: 40px 50px;
+    box-sizing: border-box;
+  }
+
+  .reveal h1, .reveal h2, .reveal h3 {
+    font-family: 'Noto Sans KR', sans-serif;
+    font-weight: 700;
+    color: var(--fg);
+    text-transform: none;
+    letter-spacing: -0.02em;
+  }
+
+  .reveal h1 { font-size: 2.0em; margin-bottom: 0.2em; }
+  .reveal h2 { font-size: 1.4em; margin-bottom: 0.5em; }
+  .reveal h3 { font-size: 1.1em; margin-bottom: 0.4em; color: var(--accent); }
+
+  /* Cover slide */
+  .cover {
+    text-align: center !important;
+    display: flex !important;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  .cover h1 {
+    font-size: 2.2em;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 0.1em;
+  }
+  .cover .subtitle {
+    font-size: 1.0em;
+    color: var(--muted);
+    font-weight: 300;
+    margin-bottom: 1.5em;
+  }
+  .cover .meta {
+    font-size: 0.7em;
+    color: var(--muted);
+    line-height: 1.8;
+  }
+  .cover .meta span {
+    display: inline-block;
+    background: #f1f5f9;
+    padding: 4px 14px;
+    border-radius: 20px;
+    margin: 3px 4px;
+  }
+
+  /* Divider line */
+  .divider {
+    width: 60px;
+    height: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border: none;
+    border-radius: 2px;
+    margin: 10px 0 20px 0;
+  }
+  .cover .divider { margin: 10px auto 20px auto; }
+
+  /* Tag / badge */
+  .tag {
+    display: inline-block;
+    font-size: 0.55em;
+    font-weight: 500;
+    padding: 2px 10px;
+    border-radius: 12px;
+    vertical-align: middle;
+    margin-left: 8px;
+  }
+  .tag-blue { background: #dbeafe; color: #1d4ed8; }
+  .tag-green { background: #d1fae5; color: #065f46; }
+  .tag-red { background: #fee2e2; color: #991b1b; }
+  .tag-yellow { background: #fef3c7; color: #92400e; }
+  .tag-purple { background: #ede9fe; color: #5b21b6; }
+
+  /* Timeline */
+  .timeline {
+    position: relative;
+    padding-left: 24px;
+    margin: 0;
+  }
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 6px;
+    top: 4px;
+    bottom: 4px;
+    width: 2px;
+    background: var(--border);
+  }
+  .timeline li {
+    list-style: none;
+    position: relative;
+    margin-bottom: 12px;
+    font-size: 0.78em;
+    line-height: 1.6;
+  }
+  .timeline li::before {
+    content: '';
+    position: absolute;
+    left: -22px;
+    top: 8px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid white;
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  .timeline .time {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85em;
+    color: var(--muted);
+    font-weight: 500;
+  }
+
+  /* Items list */
+  .items {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .items li {
+    position: relative;
+    padding-left: 20px;
+    margin-bottom: 10px;
+    font-size: 0.78em;
+    line-height: 1.7;
+  }
+  .items li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 10px;
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    background: var(--accent);
+    opacity: 0.6;
+  }
+  .items li.check::before {
+    background: var(--success);
+    opacity: 1;
+    border-radius: 50%;
+  }
+  .items li.warn::before {
+    background: var(--warning);
+    opacity: 1;
+  }
+  .items li.fail::before {
+    background: var(--danger);
+    opacity: 1;
+    border-radius: 50%;
+  }
+
+  /* Card grid */
+  .card-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 12px;
+  }
+  .card-grid.three { grid-template-columns: 1fr 1fr 1fr; }
+
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .card h4 {
+    margin: 0 0 8px 0;
+    font-size: 0.75em;
+    font-weight: 700;
+    color: var(--fg);
+  }
+  .card p, .card ul {
+    margin: 0;
+    font-size: 0.65em;
+    line-height: 1.7;
+    color: #475569;
+  }
+  .card ul { padding-left: 16px; }
+
+  /* Highlight box */
+  .highlight-box {
+    border-left: 4px solid;
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin: 14px 0;
+    font-size: 0.78em;
+    line-height: 1.7;
+  }
+  .highlight-box.blue { border-color: var(--accent); background: #eff6ff; }
+  .highlight-box.green { border-color: var(--success); background: #ecfdf5; }
+  .highlight-box.red { border-color: var(--danger); background: #fef2f2; }
+  .highlight-box.yellow { border-color: var(--warning); background: #fffbeb; }
+  .highlight-box.purple { border-color: var(--accent2); background: #f5f3ff; }
+
+  /* Code */
+  .reveal code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.88em;
+    background: #f1f5f9;
+    padding: 1px 6px;
+    border-radius: 4px;
+    color: var(--accent2);
+  }
+
+  /* Table */
+  .reveal table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.65em;
+    margin-top: 10px;
+  }
+  .reveal table th {
+    background: #f8fafc;
+    font-weight: 600;
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 2px solid var(--border);
+    color: var(--muted);
+    font-size: 0.9em;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .reveal table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    line-height: 1.5;
+  }
+  .reveal table tr:last-child td { border-bottom: none; }
+  .reveal table .ok { color: var(--success); font-weight: 600; }
+  .reveal table .ng { color: var(--danger); font-weight: 600; }
+  .reveal table .mid { color: var(--warning); font-weight: 600; }
+
+  /* Result label */
+  .result {
+    display: inline-block;
+    font-size: 0.7em;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+  .result-pass { background: #d1fae5; color: #065f46; }
+  .result-fail { background: #fee2e2; color: #991b1b; }
+
+  /* Metric number */
+  .metric {
+    text-align: center;
+    padding: 10px;
+  }
+  .metric .num {
+    font-size: 2.0em;
+    font-weight: 700;
+    line-height: 1.1;
+  }
+  .metric .label {
+    font-size: 0.6em;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .metric .num.blue { color: var(--accent); }
+  .metric .num.green { color: var(--success); }
+  .metric .num.purple { color: var(--accent2); }
+  .metric .num.red { color: var(--danger); }
+
+  /* Footer */
+  .slide-footer {
+    font-size: 0.5em;
+    color: #94a3b8;
+    text-align: right;
+    margin-top: auto;
+    padding-top: 20px;
+  }
+
+  /* Section divider slide */
+  .section-divider {
+    display: flex !important;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center !important;
+  }
+  .section-divider h2 {
+    font-size: 1.8em;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .section-divider p {
+    color: var(--muted);
+    font-size: 0.85em;
+  }
+
+  /* Print / PDF */
+  @media print {
+    .reveal .slides section {
+      page-break-after: always;
+    }
+  }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- ============ COVER ============ -->
+<section class="cover">
+  <h1>TurboQuant v1.2.0</h1>
+  <p class="subtitle">Work Log</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-03-31 21:00 ~ 04-01 05:47</span>
+    <span>Total 8h 47m</span>
+    <br>
+    <span>llama.cpp KV Cache Compression</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- ============ OVERVIEW ============ -->
+<section>
+  <h2>Session Overview</h2>
+  <hr class="divider">
+  <ul class="timeline">
+    <li><span class="time">21:00 ~ 21:30</span> &mdash; Status review + work planning</li>
+    <li><span class="time">21:30 ~ 22:30</span> &mdash; v2 Kronecker bug analysis</li>
+    <li><span class="time">22:30 ~ 00:30</span> &mdash; V cross-head WHT implementation</li>
+    <li><span class="time">00:30 ~ 02:00</span> &mdash; Scientist name test (quality verification)</li>
+    <li><span class="time">02:00 ~ 02:30</span> &mdash; Paper verification + head_dim limitation confirmed</li>
+    <li><span class="time">02:30 ~ 03:00</span> &mdash; head_dim=64 solution</li>
+    <li><span class="time">03:00 ~ 04:00</span> &mdash; Auto head_dim Mapping implementation</li>
+    <li><span class="time">04:00 ~ 05:47</span> &mdash; Review, benchmark, deployment, community</li>
+  </ul>
+</section>
+
+<!-- ============ KRONECKER ============ -->
+<section>
+  <h2>v2 Kronecker Bug Analysis <span class="tag tag-blue">Debug</span></h2>
+  <hr class="divider">
+
+  <ul class="items">
+    <li>Deep comparison of v1 (serial 512-WHT) vs v2 (Kronecker H<sub>8</sub>&otimes;H<sub>64</sub>) in <code>set-rows.cu</code></li>
+    <li>Full verification of sign patterns, butterfly direction, <code>__syncthreads__</code> placement, warp shuffle mask</li>
+    <li>Standalone CUDA test written &mdash; <code>test-xhead-v1-v2.cu</code></li>
+  </ul>
+
+  <div class="highlight-box green">
+    <strong>Conclusion:</strong> v1 == v2 (max error 1e-6) &mdash; Algorithm itself is correct. PPL difference was a build/integration issue.
+  </div>
+</section>
+
+<!-- ============ V CROSS-HEAD ============ -->
+<section>
+  <h2>V Cross-Head WHT Implementation <span class="tag tag-purple">New Feature</span></h2>
+  <hr class="divider">
+
+  <h3>Core Math</h3>
+  <div class="highlight-box purple">
+    V<sub>real,h</sub>[j] = (1/8) &Sigma;<sub>g</sub> H<sub>8</sub>[h,g] &times; dequant(V<sub>block,g</sub>[j])
+  </div>
+
+  <h3>Modified Files</h3>
+  <div class="card-grid">
+    <div class="card">
+      <h4>fattn-vec.cuh</h4>
+      <p>Integrated 8-head load + H<sub>8</sub> inverse into V accumulation loop<br>Applied head-specific signs to V IWHT</p>
+    </div>
+    <div class="card">
+      <h4>fattn.cu</h4>
+      <p>Added V=_3 FATTN_VEC_CASE dispatch (8 combinations)<br>Added V TBQ type check to VEC routing</p>
+    </div>
+    <div class="card">
+      <h4>CMakeLists.txt</h4>
+      <p>Registered 8 new template instances</p>
+    </div>
+    <div class="card">
+      <h4>Result</h4>
+      <p style="font-size:0.85em"><strong style="color: var(--success)">PPL improved by 20%</strong><br>3315 &rarr; 2649 (vs per-head V)</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PAULI TEST ============ -->
+<section>
+  <h2>Scientist Name Test <span class="tag tag-red">Key Finding</span></h2>
+  <hr class="divider">
+
+  <p style="font-size:0.75em; color:var(--muted); margin-bottom: 14px">
+    Token-level quality verification via Korean transliteration accuracy of German physicist name "Wolfgang Pauli"
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Quantization</th><th>PPL</th><th>Output</th><th>Verdict</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>F16 / F16</td>
+        <td>4008</td>
+        <td>"Bolpeugang Paulli" (correct)</td>
+        <td class="ok">PASS</td>
+      </tr>
+      <tr>
+        <td>tbqp3_3 / f16</td>
+        <td><strong>2195</strong></td>
+        <td>"2."</td>
+        <td class="ng">FAIL</td>
+      </tr>
+      <tr>
+        <td>tbq4_0 / f16</td>
+        <td>3421</td>
+        <td>"Bolpeugang Pauri" (1 syllable off)</td>
+        <td class="mid">1 syllable diff</td>
+      </tr>
+      <tr>
+        <td>tbq3_0 / f16</td>
+        <td>3089</td>
+        <td>"Paibeuraseu" (garbage)</td>
+        <td class="ng">FAIL</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="highlight-box red" style="margin-top: 14px;">
+    <strong>PPL Trap Discovered:</strong> WHT improves PPL via attention smoothing, but destroys peak precision &mdash; PPL and generation quality are inversely correlated
+  </div>
+</section>
+
+<!-- ============ HEAD_DIM ANALYSIS ============ -->
+<section>
+  <h2>head_dim Limitation Confirmed <span class="tag tag-yellow">Analysis</span></h2>
+  <hr class="divider">
+
+  <div class="highlight-box blue">
+    <strong>Paper scope:</strong> TurboQuant paper only validated head_dim=128 (Gemma, Mistral, Llama-3.1-8B)<br>
+    head_dim=64 fails due to insufficient CLT (Central Limit Theorem) convergence
+  </div>
+
+  <h3 style="margin-top:18px">Test Results by head_dim</h3>
+  <div class="card-grid three">
+    <div class="card metric">
+      <div class="num red">64</div>
+      <div class="label">Generation broken<br><span class="result result-fail">NOT OK</span></div>
+    </div>
+    <div class="card metric">
+      <div class="num green">128</div>
+      <div class="label">Scientist names correct<br><span class="result result-pass">PASS</span></div>
+    </div>
+    <div class="card metric">
+      <div class="num green">256</div>
+      <div class="label">Scientist names correct<br><span class="result result-pass">PASS</span></div>
+    </div>
+  </div>
+
+  <p style="font-size:0.72em; margin-top:18px; color: var(--fg)">
+    <strong>Conclusion:</strong> TurboQuant WHT is only practical at <strong>head_dim &ge; 128</strong>
+  </p>
+</section>
+
+<!-- ============ HEAD_DIM=64 FIX ============ -->
+<section>
+  <h2>head_dim=64 Fix + Auto Mapping <span class="tag tag-green">Resolved</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>head_dim=64 Solution</h4>
+      <ul>
+        <li>K = <code>q8_0</code> (standard 8-bit)</li>
+        <li>V = <code>tbq3_2</code> (WHT 3-bit)</li>
+        <li>"Wolfgang Pauli" correctly output in Korean</li>
+        <li>2.7x compression ratio maintained</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Auto head_dim Mapping</h4>
+      <ul>
+        <li>User input: <code>tbq3</code> (shorthand)</li>
+        <li>Auto-detect head_dim from GGUF metadata</li>
+        <li>256 &rarr; <code>_0</code> / 128 &rarr; <code>_1</code> / 64 &rarr; K=<code>q8_0</code>+V=<code>_2</code></li>
+        <li>Input validation + fallback + warning box</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3 style="margin-top:18px">Modified Files</h3>
+  <ul class="items" style="columns: 2;">
+    <li><code>arg.cpp</code> &mdash; shorthand mapping</li>
+    <li><code>common.cpp</code> &mdash; head_dim detection + auto selection</li>
+  </ul>
+
+  <div class="highlight-box green" style="margin-top: 10px">
+    GPT OSS 20B/120B, Qwen3.5-27B/122B &mdash; all models passed testing
+  </div>
+</section>
+
+<!-- ============ REVIEW & DEPLOY ============ -->
+<section>
+  <h2>Review / Benchmark / Deployment <span class="tag tag-green">Complete</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Code Review + Bug Fixes</h4>
+      <ul>
+        <li>Full code review using Agent (4 files)</li>
+        <li>V wrong-suffix fallback: <code>q8_0</code> &rarr; <code>f16</code> fix</li>
+        <li>TBQP V downgrade logic cleanup</li>
+        <li>Rebuild + verification passed</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Benchmark Collection</h4>
+      <ul>
+        <li>GPT OSS 20B/120B: F16 vs auto-mapped</li>
+        <li>Qwen3.5-122B: F16 vs tbqp3/tbq3</li>
+        <li>KV size, compression ratio, speed, PPL comparison</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3 style="margin-top: 18px">Deployment</h3>
+  <ul class="items">
+    <li>Patch files generated (full + 13 per-file), modified_files updated (68 files)</li>
+    <li>main push &rarr; <strong>v1.2.0 tag</strong> &rarr; GitHub release created &rarr; workflow triggered</li>
+    <li>Updates shared on llama.cpp discussion #21155, #20969</li>
+  </ul>
+</section>
+
+<!-- ============ SUMMARY ============ -->
+<section>
+  <h2>Key Achievements Summary</h2>
+  <hr class="divider">
+
+  <div class="card-grid three">
+    <div class="card metric">
+      <div class="num purple">6</div>
+      <div class="label">Key Achievements</div>
+    </div>
+    <div class="card metric">
+      <div class="num blue">8h 47m</div>
+      <div class="label">Work Duration</div>
+    </div>
+    <div class="card metric">
+      <div class="num green">v1.2.0</div>
+      <div class="label">Release Deployed</div>
+    </div>
+  </div>
+
+  <div style="margin-top: 24px;">
+    <ul class="items">
+      <li class="check"><strong>V cross-head WHT implemented</strong> &mdash; 20% PPL improvement vs per-head V</li>
+      <li class="check"><strong>PPL trap discovered</strong> &mdash; head_dim=64: PPL&darr; but generation quality&darr; (inverse correlation)</li>
+      <li class="check"><strong>Auto head_dim mapping</strong> &mdash; Just input <code>tbq3</code> for automatic head_dim selection</li>
+      <li class="check"><strong>head_dim=64 resolved</strong> &mdash; K=q8_0 fallback + V=tbq3, Pauli test passed</li>
+      <li class="check"><strong>Input validation hardened</strong> &mdash; Any combination handled safely without crashes</li>
+      <li class="check"><strong>v1.2.0 released + community update</strong></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============ END ============ -->
+<section class="cover">
+  <h1 style="font-size:1.6em">Thank You</h1>
+  <hr class="divider">
+  <p class="meta">
+    <span>TurboQuant v1.2.0</span>
+    <span>2026-04-01</span>
+  </p>
+</section>
+
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>
+Reveal.initialize({
+  hash: true,
+  slideNumber: 'c/t',
+  width: 1280,
+  height: 720,
+  margin: 0.04,
+  transition: 'fade',
+  transitionSpeed: 'fast',
+  pdfSeparateFragments: false,
+  pdfMaxPagesPerSlide: 1
+});
+</script>
+</body>
+</html>
