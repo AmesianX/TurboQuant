@@ -1253,52 +1253,62 @@ common_init_result::common_init_result(common_params & params) :
             }
 
             // Log all signals for diagnostics
-            LOG_INF("%s: TurboQuant head_dim detection — key=%d val=%d computed=%d mla_k=%d mla_v=%d swa_k=%d\n",
+            LOG_INF("%s: TurboQuant head_dim signals — key=%d val=%d computed=%d mla_k=%d mla_v=%d swa_k=%d\n",
                     __func__, s_key, s_val, s_computed, s_key_mla, s_val_mla, s_key_swa);
 
-            // Decision logic (strongest signal first, cross-validate weaker ones)
+            // Priority cascade — most reliable first, cross-check against others
+            //
+            //   Priority 1: attention.key_length     (100% — GGUF converter sets directly)
+            //   Priority 2: attention.key_length_mla  (100% — MLA-specific, authoritative)
+            //   Priority 3: attention.key_length_swa  (100% — SWA-specific, authoritative)
+            //   Priority 4: attention.value_length    ( 95% — usually == key, but can differ)
+            //   Priority 5: n_embd / n_head           ( 70% — wrong for MoE/GQA/MLA)
+            //
+            //   Qwen3-MoE proof: n_embd/n_head=64 but actual head_dim=128
+            //   Without priority cascade, WHT would use wrong block size
+
             if (s_key > 0) {
-                // GGUF key_length is authoritative — but cross-check anyway
+                // P1: strongest — use it, cross-check lower signals
                 head_dim = s_key;
-                if (s_computed > 0 && s_computed != s_key) {
-                    LOG_WRN("%s: GGUF key_length=%d differs from n_embd/n_head=%d (MLA or non-standard arch)\n",
+                if (s_val > 0 && s_val != s_key)
+                    LOG_INF("%s: [P1] asymmetric K=%d V=%d\n", __func__, s_key, s_val);
+                if (s_computed > 0 && s_computed != s_key)
+                    LOG_WRN("%s: [P1✓ P5✗] key_length=%d but n_embd/n_head=%d — using P1\n",
                             __func__, s_key, s_computed);
-                }
-                if (s_val > 0 && s_val != s_key) {
-                    LOG_INF("%s: asymmetric K/V dims: key=%d, value=%d\n", __func__, s_key, s_val);
-                }
             } else if (s_key_mla > 0) {
-                // MLA model without standard key_length — use MLA key dim
+                // P2: MLA model — use compressed key dim
                 head_dim = s_key_mla;
-                LOG_INF("%s: using MLA key dimension=%d\n", __func__, s_key_mla);
+                if (s_val_mla > 0 && s_val_mla != s_key_mla)
+                    LOG_INF("%s: [P2] MLA asymmetric K=%d V=%d\n", __func__, s_key_mla, s_val_mla);
+                if (s_computed > 0 && s_computed != s_key_mla)
+                    LOG_INF("%s: [P2✓ P5✗] MLA key=%d vs n_embd/n_head=%d — using P2\n",
+                            __func__, s_key_mla, s_computed);
+            } else if (s_key_swa > 0) {
+                // P3: SWA model without key_length or MLA — use SWA key dim
+                head_dim = s_key_swa;
+                if (s_computed > 0 && s_computed != s_key_swa)
+                    LOG_INF("%s: [P3✓ P5✗] SWA key=%d vs n_embd/n_head=%d — using P3\n",
+                            __func__, s_key_swa, s_computed);
+            } else if (s_val > 0) {
+                // P4: no key metadata but value_length exists — likely same
+                head_dim = s_val;
+                if (s_computed > 0 && s_computed != s_val)
+                    LOG_WRN("%s: [P4✓ P5✗] value_length=%d but n_embd/n_head=%d — using P4\n",
+                            __func__, s_val, s_computed);
+                else if (s_computed > 0)
+                    LOG_INF("%s: [P4+P5] value_length=%d confirmed by n_embd/n_head\n",
+                            __func__, s_val);
             } else if (s_computed > 0) {
-                // Computed value — cross-check with all available signals
+                // P5: last resort — no metadata at all, only computation
                 head_dim = s_computed;
-                int n_agree = 1; // s_computed itself
-                int n_signals = 1;
-                if (s_val > 0) {
-                    n_signals++;
-                    if (s_val == s_computed) n_agree++;
-                    else LOG_WRN("%s: value_length=%d != computed=%d (possible asymmetric K/V)\n",
-                                 __func__, s_val, s_computed);
-                }
-                if (s_key_swa > 0) {
-                    n_signals++;
-                    if (s_key_swa == s_computed) n_agree++;
-                    else LOG_INF("%s: SWA key_length=%d differs from dense=%d\n",
-                                 __func__, s_key_swa, s_computed);
-                }
-                if (n_signals > 1 && n_agree == n_signals) {
-                    LOG_INF("%s: head_dim=%d confirmed by %d/%d signals\n",
-                            __func__, head_dim, n_agree, n_signals);
-                }
+                LOG_INF("%s: [P5 only] no GGUF metadata, using n_embd/n_head=%d\n",
+                        __func__, s_computed);
             }
 
-            // Final validation: power-of-2 check for WHT compatibility
+            // Final: power-of-2 validation (WHT hard requirement)
             if (head_dim > 0 && (head_dim & (head_dim - 1)) != 0) {
                 LOG_WRN("%s: head_dim=%d is not power-of-2 — TurboQuant WHT cannot operate\n",
                         __func__, head_dim);
-                // Keep head_dim as-is; the auto-mapping logic will handle the fallback
             }
         }
 
