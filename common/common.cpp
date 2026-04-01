@@ -1228,21 +1228,53 @@ common_init_result::common_init_result(common_params & params) :
     // TurboQuant auto-mapping: resolve _0 placeholder to correct _N based on head_dim
     // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
     {
-        // Get KV head dimension from GGUF metadata or model API
+        // Detect KV head dimension with multi-signal cross-validation
         int32_t head_dim = 0;
         {
-            // Try GGUF metadata first: {arch}.attention.key_length
             char arch[64] = {}, buf[64] = {};
             llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+
+            // Signal 1 (strongest): GGUF metadata {arch}.attention.key_length
+            // If present, this is authoritative — set by the model converter
+            int32_t dim_from_meta = 0;
             if (llama_model_meta_val_str(model, (std::string(arch) + ".attention.key_length").c_str(), buf, sizeof(buf)) > 0) {
-                head_dim = std::atoi(buf);
+                dim_from_meta = std::atoi(buf);
             }
-            // Fallback: compute from n_embd / n_head (works for all architectures)
-            if (head_dim <= 0) {
+
+            // Signal 2: n_embd / n_head (standard computation, matches llama-model.cpp:465)
+            int32_t dim_from_embd = 0;
+            {
                 int32_t n_embd = llama_model_n_embd(model);
                 int32_t n_head = llama_model_n_head(model);
                 if (n_head > 0) {
-                    head_dim = n_embd / n_head;
+                    dim_from_embd = n_embd / n_head;
+                }
+            }
+
+            // Signal 3: cross-check with {arch}.attention.value_length
+            int32_t dim_from_val = 0;
+            if (llama_model_meta_val_str(model, (std::string(arch) + ".attention.value_length").c_str(), buf, sizeof(buf)) > 0) {
+                dim_from_val = std::atoi(buf);
+            }
+
+            // Decision logic:
+            if (dim_from_meta > 0) {
+                // Strongest signal — trust it unconditionally
+                head_dim = dim_from_meta;
+            } else if (dim_from_embd > 0) {
+                // Computed value — cross-check with value_length if available
+                if (dim_from_val > 0 && dim_from_val == dim_from_embd) {
+                    // Both signals agree — high confidence
+                    head_dim = dim_from_embd;
+                } else if (dim_from_val > 0 && dim_from_val != dim_from_embd) {
+                    // Signals disagree (asymmetric K/V dims, e.g. MLA)
+                    // Use key dim (n_embd/n_head) as K determines WHT block size
+                    head_dim = dim_from_embd;
+                    LOG_WRN("%s: head_dim K=%d vs V=%d (asymmetric) — using K dim for TurboQuant\n",
+                            __func__, dim_from_embd, dim_from_val);
+                } else {
+                    // No cross-check available, use computed value
+                    head_dim = dim_from_embd;
                 }
             }
         }
