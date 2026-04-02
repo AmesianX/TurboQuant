@@ -4,12 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to attach binaries to (e.g. v1.2.0)'
+        description: 'Release tag to attach binaries to (e.g. v1.3.0)'
         required: true
-        default: 'v1.2.0'
+        default: 'v1.3.0'
 
 permissions:
   contents: write
+
+env:
+  CUDA_ARCHITECTURES: "75;80;86;89;90;120"
 
 jobs:
   # ============================================================
@@ -28,7 +31,8 @@ jobs:
 
       - name: Build
         run: |
-          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}"
           cmake --build build -j$(nproc)
 
       - name: Package
@@ -63,7 +67,8 @@ jobs:
 
       - name: Build (no OpenSSL)
         run: |
-          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}"
           cmake --build build -j$(nproc)
 
       - name: Package
@@ -102,7 +107,8 @@ jobs:
 
       - name: Build
         run: |
-          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}"
           cmake --build build -j$(nproc)
 
       - name: Package
@@ -137,7 +143,8 @@ jobs:
 
       - name: Build (no OpenSSL)
         run: |
-          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}"
           cmake --build build -j$(nproc)
 
       - name: Package
@@ -176,7 +183,8 @@ jobs:
 
       - name: Build
         run: |
-          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120"
           cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
 
       - name: Package
@@ -185,6 +193,13 @@ jobs:
           New-Item -ItemType Directory -Path $PKG -Force
           Get-ChildItem build/bin/Release/*.exe | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
           Get-ChildItem build/bin/Release/*.dll | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
+          # Include CUDA runtime DLLs
+          $cudaPath = $env:CUDA_PATH
+          if ($cudaPath) {
+            Copy-Item "$cudaPath\bin\cudart64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
+            Copy-Item "$cudaPath\bin\cublas64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
+            Copy-Item "$cudaPath\bin\cublasLt64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
+          }
           Compress-Archive -Path $PKG -DestinationPath "$PKG.zip"
 
       - name: Upload to Release
@@ -208,7 +223,8 @@ jobs:
 
       - name: Build (no OpenSSL)
         run: |
-          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF
+          cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF `
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120"
           cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
 
       - name: Package
@@ -217,6 +233,13 @@ jobs:
           New-Item -ItemType Directory -Path $PKG -Force
           Get-ChildItem build/bin/Release/*.exe | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
           Get-ChildItem build/bin/Release/*.dll | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
+          # Include CUDA runtime DLLs
+          $cudaPath = $env:CUDA_PATH
+          if ($cudaPath) {
+            Copy-Item "$cudaPath\bin\cudart64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
+            Copy-Item "$cudaPath\bin\cublas64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
+            Copy-Item "$cudaPath\bin\cublasLt64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
+          }
           "Built without OpenSSL — llama-server HTTPS is disabled." | Out-File -FilePath "$PKG/STANDALONE-NOTE.txt"
           Compress-Archive -Path $PKG -DestinationPath "$PKG.zip"
 
