@@ -1320,9 +1320,15 @@ common_init_result::common_init_result(common_params & params) :
                         __func__, s_computed);
             }
 
-            // Final: power-of-2 validation (WHT hard requirement)
-            if (head_dim > 0 && (head_dim & (head_dim - 1)) != 0) {
-                LOG_WRN("%s: head_dim=%d is not power-of-2 — TurboQuant WHT cannot operate\n",
+            // Dimension validation: power-of-2 OR supported split dimensions (e.g. 576=256+256+64)
+            auto is_supported_dim = [](int dim) -> bool {
+                if (dim <= 0) return false;
+                if ((dim & (dim - 1)) == 0) return true; // power-of-2
+                if (dim == 576) return true; // GLM-4.7-Flash: 256+256+64 block split
+                return false;
+            };
+            if (head_dim > 0 && !is_supported_dim(head_dim)) {
+                LOG_WRN("%s: head_dim=%d is not supported — TurboQuant WHT cannot operate\n",
                         __func__, head_dim);
                 head_dim = 0; // force fallback path
             }
