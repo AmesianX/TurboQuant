@@ -9,7 +9,41 @@
 
 Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
 
-### 🆕 v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
+### 🆕 v1.4.0 — GLM-4.7-Flash (head_dim=576) 지원 + V 캐시 IWHT 버그 수정
+
+**GLM-4.7-Flash 지원 — Non-power-of-2 head_dim 해결:**
+
+GLM-4.7-Flash는 head_dim=576을 사용합니다. WHT는 power-of-2만 지원하므로, **256+256+64 블록 분할** 기법으로 해결했습니다:
+
+| 블록 | 범위 | WHT | 보정 | 커널 |
+|------|------|-----|------|------|
+| Sub-block 1 | [0, 256) | WHT_256 | QJL SRHT | 기존 _0 재활용 |
+| Sub-block 2 | [256, 512) | WHT_256 | QJL SRHT | 기존 _0 재활용 |
+| Sub-block 3 | [512, 576) | WHT_64 | Direct Sign | 기존 _2 재활용 |
+
+- **시뮬레이션 검증:** MSE -3.4% vs Full QR 직교 회전, 메모리 오버헤드 0%
+- **256이 sweet spot인 이유:** CLT 수렴과 블록 단위 양자화 정밀도의 균형점
+- **범용 적용:** head_dim=80(64+16), 192(128+64) 등 임의 차원에 확장 가능
+
+```bash
+# GLM-4.7-Flash에서 자동 적용
+--cache-type-k tbqp3 --cache-type-v tbq3  # head_dim=576 자동 감지 → _4 타입 선택
+```
+
+**V 캐시 IWHT FP16 정밀도 버그 수정 (Issue #2):**
+
+~1500토큰 이후 출력이 깨지는 치명적 버그를 수정했습니다.
+
+- **원인:** V 캐시 역WHT(IWHT)의 butterfly 연산이 FP16으로 수행 → 누적된 WHT 도메인 값에서 catastrophic cancellation 발생
+- **증상:** ~1500-2300토큰 이후 `////` 또는 `???` 반복 출력
+- **수정:** 모든 IWHT를 FP32 butterfly로 변경. KV 캐시 압축률 변화 없음
+- 4096토큰 검증 완료 (Qwen3.5-27B tbqp3/tbq3 — corruption 없음)
+
+**새 타입:** TBQ3_4, TBQ4_4, TBQP3_4, TBQP4_4 (blck_size=576)
+
+---
+
+### v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
 
 **벤치마크 (Qwen3-30B-A3B Q4_K_M, DGX Spark GB10, head_dim=128):**
 
@@ -295,7 +329,41 @@ cmake --build build -j$(nproc)
 
 This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
 
-### 🆕 v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
+### 🆕 v1.4.0 — GLM-4.7-Flash (head_dim=576) Support + V Cache IWHT Bug Fix
+
+**GLM-4.7-Flash Support — Non-power-of-2 head_dim solved:**
+
+GLM-4.7-Flash uses head_dim=576. Since WHT only supports power-of-2 dimensions, we solve this with **256+256+64 block splitting**:
+
+| Block | Range | WHT | Correction | Kernel |
+|-------|-------|-----|------------|--------|
+| Sub-block 1 | [0, 256) | WHT_256 | QJL SRHT | Reuses existing _0 |
+| Sub-block 2 | [256, 512) | WHT_256 | QJL SRHT | Reuses existing _0 |
+| Sub-block 3 | [512, 576) | WHT_64 | Direct Sign | Reuses existing _2 |
+
+- **Simulation validated:** MSE -3.4% vs Full QR orthogonal rotation, 0% memory overhead
+- **Why 256 is the sweet spot:** Optimal balance between CLT convergence and block-level quantization precision. Two 256-blocks beat one 512-block in MSE.
+- **Generalizes:** Applies to any head_dim — e.g., 80(64+16), 192(128+64)
+
+```bash
+# Automatically applied for GLM-4.7-Flash
+--cache-type-k tbqp3 --cache-type-v tbq3  # head_dim=576 auto-detected → _4 types selected
+```
+
+**V Cache IWHT FP16 Precision Bug Fix (Issue #2):**
+
+Fixed a critical bug causing output corruption after ~1500 tokens.
+
+- **Root cause:** V cache inverse WHT (IWHT) butterfly operations used FP16 (half) precision, causing catastrophic cancellation when accumulated WHT-domain values exceeded FP16's ~3.3 decimal digits of precision
+- **Symptoms:** `////` or `???` repeated output after ~1500-2300 tokens
+- **Fix:** All IWHT paths (D=256, D=128, D=64, D=576) now use FP32 butterfly. KV cache compression ratio unchanged (IWHT is computation-only, not storage)
+- Verified: 4096 tokens with Qwen3.5-27B tbqp3/tbq3 — zero corruption
+
+**New types:** TBQ3_4, TBQ4_4, TBQP3_4, TBQP4_4 (blck_size=576)
+
+---
+
+### v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
 
 **Benchmark (Qwen3-30B-A3B Q4_K_M, DGX Spark GB10, head_dim=128):**
 
