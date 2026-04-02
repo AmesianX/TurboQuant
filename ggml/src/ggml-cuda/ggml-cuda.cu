@@ -4845,7 +4845,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        op->type == GGML_TYPE_TBQ3_2 || op->type == GGML_TYPE_TBQ4_2 ||
                        op->type == GGML_TYPE_TBQP3_2 || op->type == GGML_TYPE_TBQP4_2 ||
                        op->type == GGML_TYPE_TBQ3_3 || op->type == GGML_TYPE_TBQ4_3 ||
-                       op->type == GGML_TYPE_TBQP3_3 || op->type == GGML_TYPE_TBQP4_3) &&
+                       op->type == GGML_TYPE_TBQP3_3 || op->type == GGML_TYPE_TBQP4_3 ||
+                       op->type == GGML_TYPE_TBQ3_4 || op->type == GGML_TYPE_TBQ4_4 ||
+                       op->type == GGML_TYPE_TBQP3_4 || op->type == GGML_TYPE_TBQP4_4) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
