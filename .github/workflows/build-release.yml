@@ -193,14 +193,17 @@ jobs:
           New-Item -ItemType Directory -Path $PKG -Force
           Get-ChildItem build/bin/Release/*.exe | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
           Get-ChildItem build/bin/Release/*.dll | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
-          # Include CUDA runtime DLLs
+          Compress-Archive -Path $PKG -DestinationPath "$PKG.zip"
+          # Separate cudart package (same as official llama.cpp)
+          $CUDART = "cudart-turboquant-bin-win-cuda-cu12.8-x64"
+          New-Item -ItemType Directory -Path $CUDART -Force
           $cudaPath = $env:CUDA_PATH
           if ($cudaPath) {
-            Copy-Item "$cudaPath\bin\cudart64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
-            Copy-Item "$cudaPath\bin\cublas64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
-            Copy-Item "$cudaPath\bin\cublasLt64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
+            Copy-Item "$cudaPath\bin\cudart64_12.dll" -Destination $CUDART/ -ErrorAction SilentlyContinue
+            Copy-Item "$cudaPath\bin\cublas64_12.dll" -Destination $CUDART/ -ErrorAction SilentlyContinue
+            Copy-Item "$cudaPath\bin\cublasLt64_12.dll" -Destination $CUDART/ -ErrorAction SilentlyContinue
           }
-          Compress-Archive -Path $PKG -DestinationPath "$PKG.zip"
+          Compress-Archive -Path $CUDART -DestinationPath "$CUDART.zip"
 
       - name: Upload to Release
         env:
@@ -208,6 +211,7 @@ jobs:
         run: |
           gh release upload ${{ github.event.inputs.tag }} `
             turboquant-bin-win-x64-cuda-cu12.8.zip `
+            cudart-turboquant-bin-win-cuda-cu12.8-x64.zip `
             --clobber
 
   build-windows-x64-cuda128-standalone:
@@ -233,14 +237,8 @@ jobs:
           New-Item -ItemType Directory -Path $PKG -Force
           Get-ChildItem build/bin/Release/*.exe | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
           Get-ChildItem build/bin/Release/*.dll | Copy-Item -Destination $PKG/ -ErrorAction SilentlyContinue
-          # Include CUDA runtime DLLs
-          $cudaPath = $env:CUDA_PATH
-          if ($cudaPath) {
-            Copy-Item "$cudaPath\bin\cudart64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
-            Copy-Item "$cudaPath\bin\cublas64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
-            Copy-Item "$cudaPath\bin\cublasLt64_*.dll" -Destination $PKG/ -ErrorAction SilentlyContinue
-          }
           "Built without OpenSSL — llama-server HTTPS is disabled." | Out-File -FilePath "$PKG/STANDALONE-NOTE.txt"
+          "Download cudart-turboquant-bin-win-cuda-cu12.8-x64.zip separately for CUDA runtime DLLs." | Out-File -FilePath "$PKG/CUDART-NOTE.txt"
           Compress-Archive -Path $PKG -DestinationPath "$PKG.zip"
 
       - name: Upload to Release
