@@ -1069,45 +1069,44 @@ static __global__ void flash_attn_ext_vec(
                 };
                 __syncthreads();
 
-                // FP16 hybrid IWHT + sign undo + 1/D
+                // FP32 IWHT + sign undo + 1/D (FP16 causes precision loss with accumulated V values)
                 {
                     float * buf = (float *) &KQ[0];
-                    half * smem_h = (half *) &KQ[0];
-                    // Load float values first, sync (buf/smem_h alias same memory),
-                    // then convert to half for butterfly
                     float f0 = buf[tid], f1 = buf[tid + 128];
                     __syncthreads();
-                    half h0 = __float2half(f0), h1 = __float2half(f1);
-                    { half u = h0, v = h1; h0 = __hadd(u, v); h1 = __hsub(u, v); }
+                    // Stage 7 (stride 128): register-local
+                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
+                    // Stages 0-4: warp shuffle
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-                        half o1 = __shfl_xor_sync(0xffffffff, h1, 1 << s);
-                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); h1 = __hsub(o1, h1); }
-                        else                { h0 = __hadd(h0, o0); h1 = __hadd(h1, o1); }
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
+                        else                { f0 = f0 + o0; f1 = f1 + o1; }
                     }
-                    smem_h[tid] = h0; smem_h[tid + 128] = h1;
+                    // Stages 5-6: shared memory
+                    buf[tid] = f0; buf[tid + 128] = f1;
                     __syncthreads();
                     {
-                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-                        half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 32];
-                        h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
-                        h1 = (tid & 32) ? __hsub(v1, u1) : __hadd(u1, v1);
+                        float u0 = buf[tid], v0 = buf[tid ^ 32];
+                        float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 32];
+                        f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
+                        f1 = (tid & 32) ? (v1 - u1) : (u1 + v1);
                     }
-                    smem_h[tid] = h0; smem_h[tid + 128] = h1;
+                    buf[tid] = f0; buf[tid + 128] = f1;
                     __syncthreads();
                     {
-                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 64];
-                        half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 64];
-                        h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0);
-                        h1 = (tid & 64) ? __hsub(v1, u1) : __hadd(u1, v1);
+                        float u0 = buf[tid], v0 = buf[tid ^ 64];
+                        float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 64];
+                        f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
+                        f1 = (tid & 64) ? (v1 - u1) : (u1 + v1);
                     }
-                    __syncthreads(); // ensure all warps finished reading smem_h before float write
-                    // Convert back to float, apply sign undo + 1/D
+                    __syncthreads();
+                    // Apply sign undo + 1/D
                     float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
                     float sign1 = ((tbq_signs_v[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
-                    buf[tid] = __half2float(h0) * sign0 / (float)D;
-                    buf[tid + 128] = __half2float(h1) * sign1 / (float)D;
+                    buf[tid] = f0 * sign0 / (float)D;
+                    buf[tid + 128] = f1 * sign1 / (float)D;
                 }
                 __syncthreads();
 
@@ -1128,36 +1127,29 @@ static __global__ void flash_attn_ext_vec(
                 };
                 __syncthreads();
 
+                // FP32 IWHT (FP16 causes precision loss with accumulated V values)
                 {
                     float * buf = (float *) &KQ[0];
-                    half * smem_h = (half *) &KQ[0];
                     float f0 = buf[tid];
                     __syncthreads();
-                    half h0 = __float2half(f0);
                     // Stages 0-4: warp shuffle
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
-                        else                { h0 = __hadd(h0, o0); }
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                        if (tid & (1 << s)) { f0 = o0 - f0; }
+                        else                { f0 = f0 + o0; }
                     }
                     // Stage 5 (stride 32)
-                    smem_h[tid] = h0;
+                    buf[tid] = f0;
                     __syncthreads();
-                    {
-                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-                        h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
-                    }
+                    { float u0 = buf[tid], v0 = buf[tid ^ 32]; f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); }
                     // Stage 6 (stride 64)
-                    smem_h[tid] = h0;
+                    buf[tid] = f0;
                     __syncthreads();
-                    {
-                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 64];
-                        h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0);
-                    }
+                    { float u0 = buf[tid], v0 = buf[tid ^ 64]; f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); }
                     __syncthreads();
                     float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-                    buf[tid] = __half2float(h0) * sign0 / (float)D;
+                    buf[tid] = f0 * sign0 / (float)D;
                 }
                 __syncthreads();
 
@@ -1181,87 +1173,80 @@ static __global__ void flash_attn_ext_vec(
                 float * buf = (float *) &KQ[0];
                 const int dst_base = (((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D;
 
-                // === IWHT pass 1: sub-block 1, buf[0:255] → dst[0:255] ===
+                // === FP32 IWHT pass 1: sub-block 1, buf[0:255] → dst[0:255] ===
                 {
-                    half * smem_h = (half *) &KQ[0];
                     float f0 = buf[tid], f1 = buf[tid + 128];
                     __syncthreads();
-                    half h0 = __float2half(f0), h1 = __float2half(f1);
-                    { half u = h0, v = h1; h0 = __hadd(u, v); h1 = __hsub(u, v); }
+                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-                        half o1 = __shfl_xor_sync(0xffffffff, h1, 1 << s);
-                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); h1 = __hsub(o1, h1); }
-                        else                { h0 = __hadd(h0, o0); h1 = __hadd(h1, o1); }
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
+                        else                { f0 = f0 + o0; f1 = f1 + o1; }
                     }
-                    smem_h[tid] = h0; smem_h[tid + 128] = h1;
+                    buf[tid] = f0; buf[tid + 128] = f1;
                     __syncthreads();
-                    { half u0 = smem_h[tid], v0 = smem_h[tid ^ 32]; half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 32];
-                      h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0); h1 = (tid & 32) ? __hsub(v1, u1) : __hadd(u1, v1); }
-                    smem_h[tid] = h0; smem_h[tid + 128] = h1;
+                    { float u0 = buf[tid], v0 = buf[tid ^ 32]; float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 32];
+                      f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); f1 = (tid & 32) ? (v1 - u1) : (u1 + v1); }
+                    buf[tid] = f0; buf[tid + 128] = f1;
                     __syncthreads();
-                    { half u0 = smem_h[tid], v0 = smem_h[tid ^ 64]; half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 64];
-                      h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0); h1 = (tid & 64) ? __hsub(v1, u1) : __hadd(u1, v1); }
+                    { float u0 = buf[tid], v0 = buf[tid ^ 64]; float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 64];
+                      f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); f1 = (tid & 64) ? (v1 - u1) : (u1 + v1); }
                     __syncthreads();
                     float s0 = ((signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
                     float s1 = ((signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
-                    dst[dst_base + tid]       = __half2float(h0) * s0 / 256.0f;
-                    dst[dst_base + tid + 128] = __half2float(h1) * s1 / 256.0f;
+                    dst[dst_base + tid]       = f0 * s0 / 256.0f;
+                    dst[dst_base + tid + 128] = f1 * s1 / 256.0f;
                 }
 
-                // === IWHT pass 2: sub-block 2, buf[256:511] → dst[256:511] ===
-                // buf[256:511] was not touched by pass 1 (which only wrote to dst)
+                // === FP32 IWHT pass 2: sub-block 2, buf[256:511] → dst[256:511] ===
                 {
-                    half * smem_h = (half *) &KQ[0];
                     float f0 = buf[256 + tid], f1 = buf[256 + tid + 128];
                     __syncthreads();
-                    half h0 = __float2half(f0), h1 = __float2half(f1);
-                    { half u = h0, v = h1; h0 = __hadd(u, v); h1 = __hsub(u, v); }
+                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-                        half o1 = __shfl_xor_sync(0xffffffff, h1, 1 << s);
-                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); h1 = __hsub(o1, h1); }
-                        else                { h0 = __hadd(h0, o0); h1 = __hadd(h1, o1); }
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
+                        else                { f0 = f0 + o0; f1 = f1 + o1; }
                     }
-                    smem_h[tid] = h0; smem_h[tid + 128] = h1;
+                    buf[tid] = f0; buf[tid + 128] = f1;
                     __syncthreads();
-                    { half u0 = smem_h[tid], v0 = smem_h[tid ^ 32]; half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 32];
-                      h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0); h1 = (tid & 32) ? __hsub(v1, u1) : __hadd(u1, v1); }
-                    smem_h[tid] = h0; smem_h[tid + 128] = h1;
+                    { float u0 = buf[tid], v0 = buf[tid ^ 32]; float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 32];
+                      f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); f1 = (tid & 32) ? (v1 - u1) : (u1 + v1); }
+                    buf[tid] = f0; buf[tid + 128] = f1;
                     __syncthreads();
-                    { half u0 = smem_h[tid], v0 = smem_h[tid ^ 64]; half u1 = smem_h[tid+128], v1 = smem_h[(tid+128) ^ 64];
-                      h0 = (tid & 64) ? __hsub(v0, u0) : __hadd(u0, v0); h1 = (tid & 64) ? __hsub(v1, u1) : __hadd(u1, v1); }
+                    { float u0 = buf[tid], v0 = buf[tid ^ 64]; float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 64];
+                      f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); f1 = (tid & 64) ? (v1 - u1) : (u1 + v1); }
                     __syncthreads();
                     float s0 = ((signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
                     float s1 = ((signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
-                    dst[dst_base + 256 + tid]       = __half2float(h0) * s0 / 256.0f;
-                    dst[dst_base + 256 + tid + 128] = __half2float(h1) * s1 / 256.0f;
+                    dst[dst_base + 256 + tid]       = f0 * s0 / 256.0f;
+                    dst[dst_base + 256 + tid + 128] = f1 * s1 / 256.0f;
                 }
 
-                // === IWHT pass 3: sub-block 3, buf[512:575] → dst[512:575] ===
+                // === FP32 IWHT pass 3: sub-block 3, buf[512:575] → dst[512:575] ===
                 {
-                    half * smem_h = (half *) &KQ[0];
-                    half h0 = __float2half(0.0f);
-                    if (tid < 64) { h0 = __float2half(buf[512 + tid]); }
+                    float f0 = (tid < 64) ? buf[512 + tid] : 0.0f;
                     __syncthreads();
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
-                        else                { h0 = __hadd(h0, o0); }
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                        if (tid & (1 << s)) { f0 = o0 - f0; }
+                        else                { f0 = f0 + o0; }
                     }
-                    if (tid < 64) { smem_h[tid] = h0; }
+                    if (tid < 64) { buf[tid] = f0; }
                     __syncthreads();
                     if (tid < 64) {
-                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-                        h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
+                        float u0 = buf[tid], v0 = buf[tid ^ 32];
+                        f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
                     }
                     __syncthreads();
                     if (tid < 64) {
                         float s0 = ((signs_64[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-                        dst[dst_base + 512 + tid] = __half2float(h0) * s0 / 64.0f;
+                        dst[dst_base + 512 + tid] = f0 * s0 / 64.0f;
                     }
                 }
             }
@@ -1282,28 +1267,27 @@ static __global__ void flash_attn_ext_vec(
                 };
                 const int v_signs_offset = is_cross_head_V ? ((head / gqa_ratio) % 8) * 8 : 0;
                 __syncthreads();
+                // FP32 IWHT (FP16 causes precision loss with accumulated V values)
                 {
                     float * buf = (float *) &KQ[0];
-                    half * smem_h = (half *) &KQ[0];
                     float f0 = (tid < D) ? buf[tid] : 0.0f;
                     __syncthreads();
-                    half h0 = __float2half(f0);
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        half o0 = __shfl_xor_sync(0xffffffff, h0, 1 << s);
-                        if (tid & (1 << s)) { h0 = __hsub(o0, h0); }
-                        else                { h0 = __hadd(h0, o0); }
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                        if (tid & (1 << s)) { f0 = o0 - f0; }
+                        else                { f0 = f0 + o0; }
                     }
-                    if (tid < D) { smem_h[tid] = h0; }
+                    if (tid < D) { buf[tid] = f0; }
                     __syncthreads();
                     if (tid < D) {
-                        half u0 = smem_h[tid], v0 = smem_h[tid ^ 32];
-                        h0 = (tid & 32) ? __hsub(v0, u0) : __hadd(u0, v0);
+                        float u0 = buf[tid], v0 = buf[tid ^ 32];
+                        f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
                     }
                     __syncthreads();
                     if (tid < D) {
                         float sign0 = ((tbq_signs_v_full[v_signs_offset + (tid >> 3)] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-                        buf[tid] = __half2float(h0) * sign0 / (float)D;
+                        buf[tid] = f0 * sign0 / (float)D;
                     }
                 }
                 __syncthreads();
