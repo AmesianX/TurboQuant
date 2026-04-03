@@ -735,7 +735,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_VEC;
         }
         // GLM asymmetric: K=576, V=512 with TBQ types
+        // TBQ (no QJL): dequant+IWHT → spatial f16 → MMA tensor core (49 t/s)
+        // TBQP (QJL): vec kernel for full QJL quality (30 t/s)
         if (Q->ne[0] == 576 && V->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+            const bool is_tbq = K->type == GGML_TYPE_TBQ3_4 || K->type == GGML_TYPE_TBQ4_4;
+            if (is_tbq && (turing_mma_available(cc) || volta_mma_available(cc))) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
             return BEST_FATTN_KERNEL_VEC;
         }
         return BEST_FATTN_KERNEL_NONE;

@@ -698,6 +698,191 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+// ============================================================
+// TBQ _4 → spatial f16: fused dequant + cooperative IWHT
+// 1 CUDA block = 1 TBQ block. 256 threads cooperate on IWHT butterfly.
+// ============================================================
+template <typename block_type, int n_bits>
+static __device__ __forceinline__ void tbq_dequant_sub(const block_type * blk, float * buf, int tid, int sub) {
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,
+                                       0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
+    const float norm = __half2float(sub == 0 ? blk->d1 : blk->d2);
+    const uint8_t * qs = sub == 0 ? blk->qs1 : blk->qs2;
+    if constexpr (n_bits == 3) {
+        const int bp = tid*3, by = bp/8, bo = bp%8;
+        uint32_t r = (uint32_t)qs[by]>>bo; if (bo>5) r|=(uint32_t)qs[by+1]<<(8-bo);
+        buf[tid] = c3[r&7] * norm;
+    } else {
+        buf[tid] = c4[(qs[tid/2]>>((tid%2)*4))&0xF] * norm;
+    }
+}
+
+static __device__ __forceinline__ void tbq_iwht_256(float * buf, int tid) {
+    static constexpr uint8_t signs[32] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    };
+    __syncthreads();
+    for (int len = 1; len < 256; len *= 2) {
+        int grp = tid/(2*len), pos = tid%(2*len);
+        if (pos < len) { float u=buf[grp*2*len+pos], v=buf[grp*2*len+pos+len]; buf[grp*2*len+pos]=u+v; buf[grp*2*len+pos+len]=u-v; }
+        __syncthreads();
+    }
+    int s = ((signs[tid>>3]>>(tid&7))&1) ? -1 : 1;
+    buf[tid] = buf[tid]*s/256.0f;
+    __syncthreads();
+}
+
+template <typename block_type, int n_bits>
+static __global__ void dequantize_tbq_4_spatial_f16_kernel(const void * __restrict__ vx, half * __restrict__ y, int64_t n_blocks) {
+    int64_t bi = blockIdx.x;
+    if (bi >= n_blocks) return;
+    const block_type * blk = (const block_type *)vx + bi;
+    half * out = y + bi * TBQ_K576;
+    int tid = threadIdx.x;
+    __shared__ float buf[256];
+    // Sub-block 1: dequant → IWHT → f16
+    tbq_dequant_sub<block_type, n_bits>(blk, buf, tid, 0);
+    tbq_iwht_256(buf, tid);
+    out[tid] = __float2half(buf[tid]);
+    // Sub-block 2: dequant → IWHT → f16
+    tbq_dequant_sub<block_type, n_bits>(blk, buf, tid, 1);
+    tbq_iwht_256(buf, tid);
+    out[256+tid] = __float2half(buf[tid]);
+    // Sub-block 3 (rope): f16 passthrough
+    if (tid < 64) out[512+tid] = blk->rope[tid];
+}
+
+// TBQP → WHT-domain f16 with QJL correction (NO IWHT).
+// QJL is valid in WHT domain: value = centroid*norm + qjl_sign*d_qjl.
+// MMA computes WHT(Q)·WHT(K)^T = D×Q·K^T (correct by WHT orthogonality).
+// Q WHT and output IWHT are applied externally in launch_fattn.
+// Simple per-element kernel — 288 threads (576/2 half2), no shared memory needed.
+template <typename block_type, int n_bits>
+static __global__ void dequantize_tbqp_4_wht_f16_kernel(const void * __restrict__ vx, half * __restrict__ y, int64_t n_blocks) {
+    int64_t bi = blockIdx.x;
+    if (bi >= n_blocks) return;
+    const block_type * blk = (const block_type *)vx + bi;
+    half2 * out = (half2 *)(y + bi * TBQ_K576);
+    const int tid = threadIdx.x;
+    const int elem = tid * 2;
+
+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+
+    float v0, v1;
+    if (elem < 512) {
+        const int sub = elem < 256 ? 0 : 1;
+        const int e = elem - sub * 256;
+        const float norm = __half2float(sub == 0 ? blk->d1 : blk->d2);
+        const float dq   = __half2float(sub == 0 ? blk->d1_qjl : blk->d2_qjl);
+        const uint8_t * qs  = sub == 0 ? blk->qs1  : blk->qs2;
+        const uint8_t * qjl = sub == 0 ? blk->qjl1 : blk->qjl2;
+        const int s0 = ((qjl[e/8]>>(e%8))&1) ? 1 : -1;
+        const int s1 = ((qjl[(e+1)/8]>>((e+1)%8))&1) ? 1 : -1;
+        if constexpr (n_bits == 3) {
+            // TBQP3: 2-bit MSE + 1-bit QJL
+            v0 = c2[(qs[e/4]>>((e%4)*2))&0x3]*norm + s0*dq;
+            v1 = c2[(qs[(e+1)/4]>>(((e+1)%4)*2))&0x3]*norm + s1*dq;
+        } else {
+            // TBQP4: 3-bit MSE + 1-bit QJL
+            int bp0=e*3, by0=bp0/8, bo0=bp0%8;
+            int bp1=(e+1)*3, by1=bp1/8, bo1=bp1%8;
+            uint32_t r0=(uint32_t)qs[by0]>>bo0; if(bo0>5) r0|=(uint32_t)qs[by0+1]<<(8-bo0);
+            uint32_t r1=(uint32_t)qs[by1]>>bo1; if(bo1>5) r1|=(uint32_t)qs[by1+1]<<(8-bo1);
+            v0 = c3[r0&7]*norm + s0*dq;
+            v1 = c3[r1&7]*norm + s1*dq;
+        }
+    } else {
+        const int e = elem - 512;
+        v0 = __half2float(blk->rope[e]);
+        v1 = __half2float(blk->rope[e+1]);
+    }
+    out[tid] = make_half2(__float2half(v0), __float2half(v1));
+}
+
+// Q WHT: transform Q from spatial to WHT domain (for TBQP MMA pre-processing).
+// 1 CUDA block = 1 sub-block (256 elements). 256 threads cooperate on butterfly.
+static __global__ void tbq_q_wht_kernel(float * __restrict__ Q, int64_t n_rows, int64_t row_stride) {
+    int64_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const int sub = blockIdx.y;  // 0 or 1
+    const int tid = threadIdx.x;
+
+    static constexpr uint8_t signs[32] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    };
+
+    __shared__ float buf[256];
+    float * q = Q + row * row_stride + sub * 256;
+
+    int s = ((signs[tid>>3]>>(tid&7))&1) ? -1 : 1;
+    buf[tid] = q[tid] * s;
+    __syncthreads();
+
+    for (int len = 1; len < 256; len *= 2) {
+        int grp = tid/(2*len), pos = tid%(2*len);
+        if (pos < len) { float u=buf[grp*2*len+pos], v=buf[grp*2*len+pos+len]; buf[grp*2*len+pos]=u+v; buf[grp*2*len+pos+len]=u-v; }
+        __syncthreads();
+    }
+
+    q[tid] = buf[tid] / 256.0f;
+}
+
+// Output IWHT: transform attention output from WHT to spatial domain (for TBQP MMA post-processing).
+static __global__ void tbq_output_iwht_kernel(float * __restrict__ dst, int64_t n_rows, int64_t row_stride) {
+    int64_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const int sub = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    static constexpr uint8_t signs[32] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    };
+
+    __shared__ float buf[256];
+    float * out = dst + row * row_stride + sub * 256;
+
+    buf[tid] = out[tid];
+    __syncthreads();
+
+    for (int len = 1; len < 256; len *= 2) {
+        int grp = tid/(2*len), pos = tid%(2*len);
+        if (pos < len) { float u=buf[grp*2*len+pos], v=buf[grp*2*len+pos+len]; buf[grp*2*len+pos]=u+v; buf[grp*2*len+pos+len]=u-v; }
+        __syncthreads();
+    }
+
+    int s = ((signs[tid>>3]>>(tid&7))&1) ? -1 : 1;
+    out[tid] = buf[tid] * s / 256.0f;
+}
+
+// Host wrappers
+void tbq_q_wht_cuda(float * Q, int64_t DKQ, int64_t n_rows, int64_t row_stride, cudaStream_t stream) {
+    // row_stride = physical stride between Q vectors (may differ from DKQ due to permute)
+    tbq_q_wht_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(Q, n_rows, row_stride);
+}
+
+void tbq_output_iwht_cuda(float * dst, int64_t DV, int64_t n_rows, cudaStream_t stream) {
+    tbq_output_iwht_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(dst, n_rows, DV);
+}
+
+static void dequantize_row_tbq3_4_to_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_tbq_4_spatial_f16_kernel<block_tbq3_4, 3><<<k/TBQ_K576, 256, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+static void dequantize_row_tbq4_4_to_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_tbq_4_spatial_f16_kernel<block_tbq4_4, 4><<<k/TBQ_K576, 256, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+static void dequantize_row_tbqp3_4_to_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    // WHT-domain dequant with QJL. Q WHT + output IWHT applied externally.
+    dequantize_tbqp_4_wht_f16_kernel<block_tbqp3_4, 3><<<k/TBQ_K576, 288, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+static void dequantize_row_tbqp4_4_to_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_tbqp_4_wht_f16_kernel<block_tbqp4_4, 4><<<k/TBQ_K576, 288, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -760,10 +945,23 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TBQ3_4:
+            return dequantize_row_tbq3_4_to_f16_cuda;
+        case GGML_TYPE_TBQ4_4:
+            return dequantize_row_tbq4_4_to_f16_cuda;
+        case GGML_TYPE_TBQP3_4:
+            return dequantize_row_tbqp3_4_to_f16_cuda;
+        case GGML_TYPE_TBQP4_4:
+            return dequantize_row_tbqp4_4_to_f16_cuda;
         default:
             return nullptr;
     }
 }
+
+// ============================================================
+// TBQ _4 → spatial f16: fused dequant + cooperative IWHT
+// 1 CUDA block = 1 TBQ block (576 elements). 256 threads cooperate on IWHT butterfly.
+// (duplicate removed — definitions above)
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {

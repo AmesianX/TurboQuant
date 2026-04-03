@@ -2022,6 +2022,11 @@ void launch_fattn(
         }
     }
 
+    // TBQP WHT-domain MMA requires Q WHT preprocessing, but Q is a permuted view
+    // with non-trivial strides. Safe Q copy requires ggml graph-level integration
+    // (not launch_fattn level). TBQP routes to vec kernel for full QJL quality.
+    const bool tbqp_wht_mode = false;
+
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
@@ -2130,8 +2135,9 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
+    const char * Q_data_for_kernel = (const char *) Q->data;
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
-        (const char *) Q->data,
+        Q_data_for_kernel,
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
@@ -2166,4 +2172,13 @@ void launch_fattn(
             (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
+
+    // TBQP WHT-domain MMA: IWHT the output from WHT domain back to spatial domain.
+    if (tbqp_wht_mode) {
+        extern void tbq_output_iwht_cuda(float * dst, int64_t dv_dim, int64_t n_rows, cudaStream_t stream);
+        const int64_t n_out_rows = Q->ne[1] * Q->ne[2] * Q->ne[3];
+        tbq_output_iwht_cuda((float *) KQV->data, V->ne[0], n_out_rows, main_stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    // Q WHT buffer is persistent (thread_local), no free needed per call.
 }
