@@ -1,11 +1,15 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 97a56dc61..ec5da90ae 100644
+index 538d2a4b0..ec5da90ae 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -391,9 +391,29 @@ const std::vector<ggml_type> kv_cache_types = {
-     GGML_TYPE_TBQ4_0,
-     GGML_TYPE_TBQP3_0,
-     GGML_TYPE_TBQP4_0,
+@@ -387,9 +387,33 @@ const std::vector<ggml_type> kv_cache_types = {
+     GGML_TYPE_IQ4_NL,
+     GGML_TYPE_Q5_0,
+     GGML_TYPE_Q5_1,
++    GGML_TYPE_TBQ3_0,
++    GGML_TYPE_TBQ4_0,
++    GGML_TYPE_TBQP3_0,
++    GGML_TYPE_TBQP4_0,
 +    GGML_TYPE_TBQ3_1,
 +    GGML_TYPE_TBQ4_1,
 +    GGML_TYPE_TBQP3_1,

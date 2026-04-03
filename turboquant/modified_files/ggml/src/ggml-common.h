@@ -377,6 +377,77 @@ typedef block_tbq4_2  block_tbq4_3;
 typedef block_tbqp3_2 block_tbqp3_3;
 typedef block_tbqp4_2 block_tbqp4_3;
 
+// TurboQuant head_dim=576 variants (split 256+256+64, each sub-block WHT'd independently)
+#define TBQ_K576 576
+
+// TurboQuant 3-bit, 576-block: 3-bit Lloyd-Max, split 256+256+64
+typedef struct {
+    // Sub-block 1: 256 elements
+    ggml_half d1;
+    uint8_t qs1[QK_K*3/8];       // 3-bit packed indices (96 bytes for 256 elements)
+    // Sub-block 2: 256 elements
+    ggml_half d2;
+    uint8_t qs2[QK_K*3/8];       // 96 bytes
+    // Sub-block 3: 64 elements
+    ggml_half d3;
+    uint8_t qs3[TBQ_K64*3/8];    // 24 bytes
+} block_tbq3_4;
+static_assert(sizeof(block_tbq3_4) == 3*sizeof(ggml_half) + 2*(QK_K*3/8) + TBQ_K64*3/8, "wrong tbq3_4 block size/padding");
+
+// TurboQuant 4-bit, 576-block: 4-bit Lloyd-Max, split 256+256+64
+typedef struct {
+    // Sub-block 1: 256 elements
+    ggml_half d1;
+    uint8_t qs1[QK_K/2];         // 4-bit packed indices (128 bytes for 256 elements)
+    // Sub-block 2: 256 elements
+    ggml_half d2;
+    uint8_t qs2[QK_K/2];         // 128 bytes
+    // Sub-block 3: 64 elements
+    ggml_half d3;
+    uint8_t qs3[TBQ_K64/2];      // 32 bytes
+} block_tbq4_4;
+static_assert(sizeof(block_tbq4_4) == 3*sizeof(ggml_half) + 2*(QK_K/2) + TBQ_K64/2, "wrong tbq4_4 block size/padding");
+
+// TurboQuant_prod 3-bit, 576-block: 2-bit Lloyd-Max + 1-bit QJL(256)/DirectSign(64)
+typedef struct {
+    // Sub-block 1: 256 elements (QJL SRHT correction)
+    ggml_half d1;
+    ggml_half d1_qjl;
+    uint8_t qs1[QK_K/4];         // 2-bit packed Lloyd-Max indices (64 bytes)
+    uint8_t qjl1[QK_K/8];        // 1-bit QJL signs (32 bytes)
+    // Sub-block 2: 256 elements (QJL SRHT correction)
+    ggml_half d2;
+    ggml_half d2_qjl;
+    uint8_t qs2[QK_K/4];         // 64 bytes
+    uint8_t qjl2[QK_K/8];        // 32 bytes
+    // Sub-block 3: 64 elements (Direct Sign correction — lower variance than QJL at d<=128)
+    ggml_half d3;
+    ggml_half d3_qjl;
+    uint8_t qs3[TBQ_K64/4];      // 16 bytes
+    uint8_t qjl3[TBQ_K64/8];     // 8 bytes
+} block_tbqp3_4;
+static_assert(sizeof(block_tbqp3_4) == 6*sizeof(ggml_half) + 2*(QK_K/4 + QK_K/8) + TBQ_K64/4 + TBQ_K64/8, "wrong tbqp3_4 block size/padding");
+
+// TurboQuant_prod 4-bit, 576-block: 3-bit Lloyd-Max + 1-bit QJL(256)/DirectSign(64)
+typedef struct {
+    // Sub-block 1: 256 elements (QJL SRHT correction)
+    ggml_half d1;
+    ggml_half d1_qjl;
+    uint8_t qs1[QK_K*3/8];       // 3-bit packed Lloyd-Max indices (96 bytes)
+    uint8_t qjl1[QK_K/8];        // 1-bit QJL signs (32 bytes)
+    // Sub-block 2: 256 elements (QJL SRHT correction)
+    ggml_half d2;
+    ggml_half d2_qjl;
+    uint8_t qs2[QK_K*3/8];       // 96 bytes
+    uint8_t qjl2[QK_K/8];        // 32 bytes
+    // Sub-block 3: 64 elements (Direct Sign correction)
+    ggml_half d3;
+    ggml_half d3_qjl;
+    uint8_t qs3[TBQ_K64*3/8];    // 24 bytes
+    uint8_t qjl3[TBQ_K64/8];     // 8 bytes
+} block_tbqp4_4;
+static_assert(sizeof(block_tbqp4_4) == 6*sizeof(ggml_half) + 2*(QK_K*3/8 + QK_K/8) + TBQ_K64*3/8 + TBQ_K64/8, "wrong tbqp4_4 block size/padding");
+
 //
 // Super-block quantization structures
 //

@@ -1217,6 +1217,238 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_2(
     return norm*sum;
 }
 
+// ============================================================
+// TurboQuant 576-block (_4) K dot product and V dequantize
+// Split 256+256+64: sub-blocks processed independently
+// ============================================================
+
+// TBQP3_4: 2-bit Lloyd-Max + QJL(256) / DirectSign(64)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbqp3_4 * K = (const block_tbqp3_4 *) K_c;
+    GGML_UNUSED(Q_q8);
+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = k * 2;
+        // Determine sub-block
+        float norm, d_corr, cent0, cent1;
+        int corr0, corr1; // correction bits
+        bool use_qjl; // true for sub-blocks 1,2 (QJL), false for sub-block 3 (Direct Sign)
+        if (elem < 256) {
+            // Sub-block 1: elements [0, 256)
+            const int e = elem;
+            norm = __half2float(K->d1); d_corr = __half2float(K->d1_qjl);
+            cent0 = c2[(K->qs1[e/4]>>((e%4)*2))&0x3];
+            cent1 = c2[(K->qs1[(e+1)/4]>>(((e+1)%4)*2))&0x3];
+            corr0 = (K->qjl1[e/8]>>(e%8))&1;
+            corr1 = (K->qjl1[(e+1)/8]>>((e+1)%8))&1;
+            use_qjl = true;
+        } else if (elem < 512) {
+            // Sub-block 2: elements [256, 512)
+            const int e = elem - 256;
+            norm = __half2float(K->d2); d_corr = __half2float(K->d2_qjl);
+            cent0 = c2[(K->qs2[e/4]>>((e%4)*2))&0x3];
+            cent1 = c2[(K->qs2[(e+1)/4]>>(((e+1)%4)*2))&0x3];
+            corr0 = (K->qjl2[e/8]>>(e%8))&1;
+            corr1 = (K->qjl2[(e+1)/8]>>((e+1)%8))&1;
+            use_qjl = true;
+        } else {
+            // Sub-block 3: elements [512, 576)
+            const int e = elem - 512;
+            norm = __half2float(K->d3); d_corr = __half2float(K->d3_qjl);
+            cent0 = c2[(K->qs3[e/4]>>((e%4)*2))&0x3];
+            cent1 = c2[(K->qs3[(e+1)/4]>>(((e+1)%4)*2))&0x3];
+            corr0 = (K->qjl3[e/8]>>(e%8))&1;
+            corr1 = (K->qjl3[(e+1)/8]>>((e+1)%8))&1;
+            use_qjl = false;
+        }
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q_mse = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q_mse = ((const float2*)Q_v)[k_KQ_0/nthreads];
+#endif
+        if (use_qjl) {
+            const float2 q_qjl = ((const float2*)Q_ds_v)[k_KQ_0/nthreads];
+            sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
+                 + d_corr*((corr0?q_qjl.x:-q_qjl.x) + (corr1?q_qjl.y:-q_qjl.y));
+        } else {
+            // Direct Sign: use MSE query for correction too
+            sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
+                 + d_corr*((corr0?q_mse.x:-q_mse.x) + (corr1?q_mse.y:-q_mse.y));
+        }
+    }
+    return sum;
+}
+
+// TBQP4_4: 3-bit Lloyd-Max + QJL(256) / DirectSign(64)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbqp4_4 * K = (const block_tbqp4_4 *) K_c;
+    GGML_UNUSED(Q_q8);
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = k * 2;
+        float norm, d_corr, cent0, cent1;
+        int corr0, corr1;
+        bool use_qjl;
+        if (elem < 256) {
+            const int e = elem;
+            norm = __half2float(K->d1); d_corr = __half2float(K->d1_qjl);
+            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs1[by]>>bo; if(bo>5) v|=(uint32_t)K->qs1[by+1]<<(8-bo); cent0=c3[v&0x7]; }
+            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs1[by]>>bo; if(bo>5) v|=(uint32_t)K->qs1[by+1]<<(8-bo); cent1=c3[v&0x7]; }
+            corr0 = (K->qjl1[e/8]>>(e%8))&1;
+            corr1 = (K->qjl1[(e+1)/8]>>((e+1)%8))&1;
+            use_qjl = true;
+        } else if (elem < 512) {
+            const int e = elem - 256;
+            norm = __half2float(K->d2); d_corr = __half2float(K->d2_qjl);
+            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs2[by]>>bo; if(bo>5) v|=(uint32_t)K->qs2[by+1]<<(8-bo); cent0=c3[v&0x7]; }
+            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs2[by]>>bo; if(bo>5) v|=(uint32_t)K->qs2[by+1]<<(8-bo); cent1=c3[v&0x7]; }
+            corr0 = (K->qjl2[e/8]>>(e%8))&1;
+            corr1 = (K->qjl2[(e+1)/8]>>((e+1)%8))&1;
+            use_qjl = true;
+        } else {
+            const int e = elem - 512;
+            norm = __half2float(K->d3); d_corr = __half2float(K->d3_qjl);
+            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs3[by]>>bo; if(bo>5) v|=(uint32_t)K->qs3[by+1]<<(8-bo); cent0=c3[v&0x7]; }
+            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs3[by]>>bo; if(bo>5) v|=(uint32_t)K->qs3[by+1]<<(8-bo); cent1=c3[v&0x7]; }
+            corr0 = (K->qjl3[e/8]>>(e%8))&1;
+            corr1 = (K->qjl3[(e+1)/8]>>((e+1)%8))&1;
+            use_qjl = false;
+        }
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q_mse = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q_mse = ((const float2*)Q_v)[k_KQ_0/nthreads];
+#endif
+        if (use_qjl) {
+            const float2 q_qjl = ((const float2*)Q_ds_v)[k_KQ_0/nthreads];
+            sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
+                 + d_corr*((corr0?q_qjl.x:-q_qjl.x) + (corr1?q_qjl.y:-q_qjl.y));
+        } else {
+            sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
+                 + d_corr*((corr0?q_mse.x:-q_mse.x) + (corr1?q_mse.y:-q_mse.y));
+        }
+    }
+    return sum;
+}
+
+// TBQ3_4: 3-bit Lloyd-Max (no QJL), split 256+256+64
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbq3_4 * K = (const block_tbq3_4 *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = k * 2;
+        float norm; const uint8_t * qs;
+        int e;
+        if (elem < 256) { norm = __half2float(K->d1); qs = K->qs1; e = elem; }
+        else if (elem < 512) { norm = __half2float(K->d2); qs = K->qs2; e = elem - 256; }
+        else { norm = __half2float(K->d3); qs = K->qs3; e = elem - 512; }
+        float cent0, cent1;
+        { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent0=c3[v&0x7]; }
+        { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent1=c3[v&0x7]; }
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
+#endif
+        sum += norm*(q.x*cent0 + q.y*cent1);
+    }
+    return sum;
+}
+
+// TBQ4_4: 4-bit Lloyd-Max (no QJL), split 256+256+64
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbq4_4 * K = (const block_tbq4_4 *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = k * 2;
+        float norm; const uint8_t * qs;
+        int e;
+        if (elem < 256) { norm = __half2float(K->d1); qs = K->qs1; e = elem; }
+        else if (elem < 512) { norm = __half2float(K->d2); qs = K->qs2; e = elem - 256; }
+        else { norm = __half2float(K->d3); qs = K->qs3; e = elem - 512; }
+        const uint8_t packed = qs[e/2];
+        const float cent0 = (e % 2 == 0) ? c4[packed & 0xF] : c4[packed >> 4];
+        const uint8_t packed1 = qs[(e+1)/2];
+        const float cent1 = ((e+1) % 2 == 0) ? c4[packed1 & 0xF] : c4[packed1 >> 4];
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
+#endif
+        sum += norm*(q.x*cent0 + q.y*cent1);
+    }
+    return sum;
+}
+
+// V dequantize for TBQ3_4 (576-block, 3-bit Lloyd-Max)
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbq3_4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbq3_4 * x = (const block_tbq3_4 *) vx;
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    const int64_t ib = i0 / TBQ_K576;
+    const int elem = i0 % TBQ_K576;
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int global_e = elem + l;
+        float norm; const uint8_t * qs; int e; int qs_len;
+        if (global_e < 256)      { norm = __half2float(x[ib].d1); qs = x[ib].qs1; e = global_e;       qs_len = QK_K*3/8; }
+        else if (global_e < 512) { norm = __half2float(x[ib].d2); qs = x[ib].qs2; e = global_e - 256; qs_len = QK_K*3/8; }
+        else                     { norm = __half2float(x[ib].d3); qs = x[ib].qs3; e = global_e - 512; qs_len = TBQ_K64*3/8; }
+        const int bp = e*3, by = bp/8, bo = bp%8;
+        uint32_t v = (uint32_t)qs[by]>>bo;
+        if (bo > 5 && by+1 < qs_len) v |= (uint32_t)qs[by+1]<<(8-bo);
+        const float cent = c3[v&0x7] * norm;
+        if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = cent; }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(cent); }
+#endif
+    }
+}
+
+// V dequantize for TBQ4_4 (576-block, 4-bit Lloyd-Max)
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbq4_4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbq4_4 * x = (const block_tbq4_4 *) vx;
+    static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
+    const int64_t ib = i0 / TBQ_K576;
+    const int elem = i0 % TBQ_K576;
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int global_e = elem + l;
+        float norm; const uint8_t * qs; int e;
+        if (global_e < 256)      { norm = __half2float(x[ib].d1); qs = x[ib].qs1; e = global_e; }
+        else if (global_e < 512) { norm = __half2float(x[ib].d2); qs = x[ib].qs2; e = global_e - 256; }
+        else                     { norm = __half2float(x[ib].d3); qs = x[ib].qs3; e = global_e - 512; }
+        const float cent = c4[(qs[e/2] >> ((e%2)*4)) & 0xF] * norm;
+        if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = cent; }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(cent); }
+#endif
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -1253,6 +1485,14 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_tbqp3_2<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP4_3) {
         return vec_dot_fattn_vec_KQ_tbqp4_2<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ3_4) {
+        return vec_dot_fattn_vec_KQ_tbq3_4<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ4_4) {
+        return vec_dot_fattn_vec_KQ_tbq4_4<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP3_4) {
+        return vec_dot_fattn_vec_KQ_tbqp3_4<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQP4_4) {
+        return vec_dot_fattn_vec_KQ_tbqp4_4<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -1303,6 +1543,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_tbq4_2<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ3_3) {
         return dequantize_V_tbq3_2<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ3_4) {
+        return dequantize_V_tbq3_4<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ4_4) {
+        return dequantize_V_tbq4_4<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

@@ -741,6 +741,291 @@ static __device__ void quantize_f32_tbqp4_2_block(const float * __restrict__ x, 
 }
 
 // ============================================================
+// TurboQuant 576-element (head_dim=576) quantization functions
+// Split: 256+256+64, each sub-block WHT'd independently
+// Sub-blocks 1,2 (256): reuse _0 signs/logic
+// Sub-block 3 (64): reuse _2 signs/logic
+// ============================================================
+
+static __device__ void quantize_f32_tbq3_4_block(const float * __restrict__ x, block_tbq3_4 * __restrict__ y) {
+    static constexpr uint8_t signs_256[32] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    };
+    static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+    static constexpr float tbq3_boundaries[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
+
+    // Helper: quantize a sub-block with 3-bit Lloyd-Max
+    auto quant_sub = [&](const float * src, int dim, const uint8_t * signs, ggml_half * d_out, uint8_t * qs_out) {
+        float tmp[QK_K]; // max sub-block size is 256
+        float sum_sq = 0.0f;
+        for (int j = 0; j < dim; j++) sum_sq += src[j] * src[j];
+        float norm = sqrtf(sum_sq);
+        *d_out = __float2half(norm);
+        if (norm < 1e-10f) { for (int j = 0; j < dim*3/8; j++) qs_out[j] = 0; return; }
+        float inv_norm = 1.0f / norm;
+        for (int j = 0; j < dim; j++) {
+            int sign = ((signs[j>>3]>>(j&7))&1) ? -1 : 1;
+            tmp[j] = src[j] * inv_norm * sign;
+        }
+        for (int len = 1; len < dim; len *= 2)
+            for (int i = 0; i < dim; i += 2*len)
+                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+        int bit_pos = 0;
+        for (int j = 0; j < dim*3/8; j++) qs_out[j] = 0;
+        for (int j = 0; j < dim; j++) {
+            uint8_t idx = 7;
+            for (int b = 0; b < 7; b++) { if (tmp[j] < tbq3_boundaries[b]) { idx = b; break; } }
+            int byte_idx = bit_pos/8, bit_off = bit_pos%8;
+            qs_out[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
+            if (bit_off > 5) qs_out[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
+            bit_pos += 3;
+        }
+    };
+
+    quant_sub(x,       QK_K,    signs_256, &y->d1, y->qs1);
+    quant_sub(x + 256, QK_K,    signs_256, &y->d2, y->qs2);
+    quant_sub(x + 512, TBQ_K64, signs_64,  &y->d3, y->qs3);
+}
+
+static __device__ void quantize_f32_tbq4_4_block(const float * __restrict__ x, block_tbq4_4 * __restrict__ y) {
+    static constexpr uint8_t signs_256[32] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    };
+    static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+    static constexpr float tbq4_boundaries[15] = {
+        -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,0.0f,
+        0.2583f,0.5225f,0.7996f,1.0993f,1.4371f,1.8435f,2.4008f,
+    };
+
+    auto quant_sub = [&](const float * src, int dim, const uint8_t * signs, ggml_half * d_out, uint8_t * qs_out) {
+        float tmp[QK_K];
+        float sum_sq = 0.0f;
+        for (int j = 0; j < dim; j++) sum_sq += src[j] * src[j];
+        float norm = sqrtf(sum_sq);
+        *d_out = __float2half(norm);
+        if (norm < 1e-10f) { for (int j = 0; j < dim/2; j++) qs_out[j] = 0; return; }
+        float inv_norm = 1.0f / norm;
+        for (int j = 0; j < dim; j++) {
+            int sign = ((signs[j>>3]>>(j&7))&1) ? -1 : 1;
+            tmp[j] = src[j] * inv_norm * sign;
+        }
+        for (int len = 1; len < dim; len *= 2)
+            for (int i = 0; i < dim; i += 2*len)
+                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+        for (int j = 0; j < dim/2; j++) {
+            uint8_t idx0 = 15, idx1 = 15;
+            for (int b = 0; b < 15; b++) { if (tmp[2*j]   < tbq4_boundaries[b]) { idx0 = b; break; } }
+            for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < tbq4_boundaries[b]) { idx1 = b; break; } }
+            qs_out[j] = idx0 | (idx1 << 4);
+        }
+    };
+
+    quant_sub(x,       QK_K,    signs_256, &y->d1, y->qs1);
+    quant_sub(x + 256, QK_K,    signs_256, &y->d2, y->qs2);
+    quant_sub(x + 512, TBQ_K64, signs_64,  &y->d3, y->qs3);
+}
+
+static __device__ void quantize_f32_tbqp3_4_block(const float * __restrict__ x, block_tbqp3_4 * __restrict__ y) {
+    static constexpr uint8_t signs_256[32] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    };
+    static constexpr uint8_t qjl_signs_256[32] = {
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+    };
+    static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
+    static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
+
+    // Sub-block 1,2: 256-element, 2-bit Lloyd-Max + QJL SRHT correction
+    auto quant_sub_qjl = [&](const float * src, const uint8_t * signs, const uint8_t * qjl_s,
+                              ggml_half * d_out, ggml_half * d_qjl_out, uint8_t * qs_out, uint8_t * qjl_out) {
+        float tmp[QK_K], recon[QK_K];
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_K; j++) sum_sq += src[j] * src[j];
+        float norm = sqrtf(sum_sq);
+        *d_out = __float2half(norm);
+        if (norm < 1e-10f) {
+            for (int j = 0; j < QK_K/4; j++) qs_out[j] = 0;
+            for (int j = 0; j < QK_K/8; j++) qjl_out[j] = 0;
+            *d_qjl_out = __float2half(0.0f); return;
+        }
+        float inv_norm = 1.0f / norm;
+        for (int j = 0; j < QK_K; j++) {
+            int sign = ((signs[j>>3]>>(j&7))&1) ? -1 : 1;
+            tmp[j] = src[j] * inv_norm * sign;
+        }
+        for (int len = 1; len < QK_K; len *= 2)
+            for (int i = 0; i < QK_K; i += 2*len)
+                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+        for (int j = 0; j < QK_K/4; j++) {
+            uint8_t packed = 0;
+            for (int k = 0; k < 4; k++) {
+                uint8_t idx = 3;
+                for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } }
+                packed |= (idx&0x3)<<(k*2);
+                recon[j*4+k] = c2[idx];
+            }
+            qs_out[j] = packed;
+        }
+        float res[QK_K], res_sq = 0.0f;
+        for (int j = 0; j < QK_K; j++) { res[j] = tmp[j]-recon[j]; res_sq += res[j]*res[j]; }
+        float gamma = sqrtf(res_sq);
+        *d_qjl_out = __float2half(gamma * norm);
+        for (int j = 0; j < QK_K; j++) { int sign = ((qjl_s[j>>3]>>(j&7))&1)?-1:1; res[j] *= sign; }
+        for (int len = 1; len < QK_K; len *= 2)
+            for (int i = 0; i < QK_K; i += 2*len)
+                for (int j = 0; j < len; j++) { float u = res[i+j], v = res[i+j+len]; res[i+j] = u+v; res[i+j+len] = u-v; }
+        for (int j = 0; j < QK_K/8; j++) qjl_out[j] = 0;
+        for (int j = 0; j < QK_K; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
+    };
+
+    // Sub-block 3: 64-element, 2-bit Lloyd-Max + Direct Sign correction (lower variance at d<=128)
+    auto quant_sub_direct = [&](const float * src,
+                                 ggml_half * d_out, ggml_half * d_qjl_out, uint8_t * qs_out, uint8_t * qjl_out) {
+        float tmp[TBQ_K64], recon[TBQ_K64];
+        float sum_sq = 0.0f;
+        for (int j = 0; j < TBQ_K64; j++) sum_sq += src[j] * src[j];
+        float norm = sqrtf(sum_sq);
+        *d_out = __float2half(norm);
+        if (norm < 1e-10f) {
+            for (int j = 0; j < TBQ_K64/4; j++) qs_out[j] = 0;
+            for (int j = 0; j < TBQ_K64/8; j++) qjl_out[j] = 0;
+            *d_qjl_out = __float2half(0.0f); return;
+        }
+        float inv_norm = 1.0f / norm;
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((signs_64[j>>3]>>(j&7))&1) ? -1 : 1;
+            tmp[j] = src[j] * inv_norm * sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+        for (int j = 0; j < TBQ_K64/4; j++) {
+            uint8_t packed = 0;
+            for (int k = 0; k < 4; k++) {
+                uint8_t idx = 3;
+                for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } }
+                packed |= (idx&0x3)<<(k*2);
+                recon[j*4+k] = c2[idx];
+            }
+            qs_out[j] = packed;
+        }
+        float res[TBQ_K64], res_abs = 0.0f;
+        for (int j = 0; j < TBQ_K64; j++) { res[j] = tmp[j]-recon[j]; res_abs += fabsf(res[j]); }
+        *d_qjl_out = __float2half((res_abs/TBQ_K64)*norm);
+        for (int j = 0; j < TBQ_K64/8; j++) qjl_out[j] = 0;
+        for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
+    };
+
+    quant_sub_qjl(x,       signs_256, qjl_signs_256, &y->d1, &y->d1_qjl, y->qs1, y->qjl1);
+    quant_sub_qjl(x + 256, signs_256, qjl_signs_256, &y->d2, &y->d2_qjl, y->qs2, y->qjl2);
+    quant_sub_direct(x + 512, &y->d3, &y->d3_qjl, y->qs3, y->qjl3);
+}
+
+static __device__ void quantize_f32_tbqp4_4_block(const float * __restrict__ x, block_tbqp4_4 * __restrict__ y) {
+    static constexpr uint8_t signs_256[32] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    };
+    static constexpr uint8_t qjl_signs_256[32] = {
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+    };
+    static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
+
+    // Sub-block 1,2: 256-element, 3-bit Lloyd-Max + QJL SRHT correction
+    auto quant_sub_qjl = [&](const float * src, const uint8_t * signs, const uint8_t * qjl_s,
+                              ggml_half * d_out, ggml_half * d_qjl_out, uint8_t * qs_out, uint8_t * qjl_out) {
+        float tmp[QK_K], recon[QK_K];
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_K; j++) sum_sq += src[j] * src[j];
+        float norm = sqrtf(sum_sq);
+        *d_out = __float2half(norm);
+        if (norm < 1e-10f) {
+            for (int j = 0; j < QK_K*3/8; j++) qs_out[j] = 0;
+            for (int j = 0; j < QK_K/8; j++) qjl_out[j] = 0;
+            *d_qjl_out = __float2half(0.0f); return;
+        }
+        float inv_norm = 1.0f / norm;
+        for (int j = 0; j < QK_K; j++) {
+            int sign = ((signs[j>>3]>>(j&7))&1) ? -1 : 1;
+            tmp[j] = src[j] * inv_norm * sign;
+        }
+        for (int len = 1; len < QK_K; len *= 2)
+            for (int i = 0; i < QK_K; i += 2*len)
+                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+        int bit_pos = 0;
+        for (int j = 0; j < QK_K*3/8; j++) qs_out[j] = 0;
+        for (int j = 0; j < QK_K; j++) {
+            uint8_t idx = 7;
+            for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
+            int byte_idx = bit_pos/8, bit_off = bit_pos%8;
+            qs_out[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
+            if (bit_off > 5) qs_out[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
+            recon[j] = c3[idx]; bit_pos += 3;
+        }
+        float res[QK_K], res_sq = 0.0f;
+        for (int j = 0; j < QK_K; j++) { res[j] = tmp[j]-recon[j]; res_sq += res[j]*res[j]; }
+        float gamma = sqrtf(res_sq);
+        *d_qjl_out = __float2half(gamma * norm);
+        for (int j = 0; j < QK_K; j++) { int sign = ((qjl_s[j>>3]>>(j&7))&1)?-1:1; res[j] *= sign; }
+        for (int len = 1; len < QK_K; len *= 2)
+            for (int i = 0; i < QK_K; i += 2*len)
+                for (int j = 0; j < len; j++) { float u = res[i+j], v = res[i+j+len]; res[i+j] = u+v; res[i+j+len] = u-v; }
+        for (int j = 0; j < QK_K/8; j++) qjl_out[j] = 0;
+        for (int j = 0; j < QK_K; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
+    };
+
+    // Sub-block 3: 64-element, 3-bit Lloyd-Max + Direct Sign correction
+    auto quant_sub_direct = [&](const float * src,
+                                 ggml_half * d_out, ggml_half * d_qjl_out, uint8_t * qs_out, uint8_t * qjl_out) {
+        float tmp[TBQ_K64], recon[TBQ_K64];
+        float sum_sq = 0.0f;
+        for (int j = 0; j < TBQ_K64; j++) sum_sq += src[j] * src[j];
+        float norm = sqrtf(sum_sq);
+        *d_out = __float2half(norm);
+        if (norm < 1e-10f) {
+            for (int j = 0; j < TBQ_K64*3/8; j++) qs_out[j] = 0;
+            for (int j = 0; j < TBQ_K64/8; j++) qjl_out[j] = 0;
+            *d_qjl_out = __float2half(0.0f); return;
+        }
+        float inv_norm = 1.0f / norm;
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((signs_64[j>>3]>>(j&7))&1) ? -1 : 1;
+            tmp[j] = src[j] * inv_norm * sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+        int bit_pos = 0;
+        for (int j = 0; j < TBQ_K64*3/8; j++) qs_out[j] = 0;
+        for (int j = 0; j < TBQ_K64; j++) {
+            uint8_t idx = 7;
+            for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
+            int byte_idx = bit_pos/8, bit_off = bit_pos%8;
+            qs_out[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
+            if (bit_off > 5) qs_out[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
+            recon[j] = c3[idx]; bit_pos += 3;
+        }
+        float res[TBQ_K64], res_abs = 0.0f;
+        for (int j = 0; j < TBQ_K64; j++) { res[j] = tmp[j]-recon[j]; res_abs += fabsf(res[j]); }
+        *d_qjl_out = __float2half((res_abs/TBQ_K64)*norm);
+        for (int j = 0; j < TBQ_K64/8; j++) qjl_out[j] = 0;
+        for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
+    };
+
+    quant_sub_qjl(x,       signs_256, qjl_signs_256, &y->d1, &y->d1_qjl, y->qs1, y->qjl1);
+    quant_sub_qjl(x + 256, signs_256, qjl_signs_256, &y->d2, &y->d2_qjl, y->qs2, y->qjl2);
+    quant_sub_direct(x + 512, &y->d3, &y->d3_qjl, y->qs3, y->qjl3);
+}
+
+// ============================================================
 // TurboQuant cross-head WHT (8 heads × 64 = 512-element WHT)
 // H_512 = H_8 ⊗ H_64 — CLT convergence at d=512 for head_dim=64
 // ============================================================

@@ -1,33 +1,236 @@
 diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
-index 0291ab686..10002abb6 100644
+index f0bd42a57..96b0c6ace 100644
 --- a/ggml/src/ggml-cuda/fattn-vec.cuh
 +++ b/ggml/src/ggml-cuda/fattn-vec.cuh
-@@ -91,7 +91,12 @@ static __global__ void flash_attn_ext_vec(
-         && type_K != GGML_TYPE_TBQ4_1 && type_K != GGML_TYPE_TBQ3_1
-         && type_K != GGML_TYPE_TBQP3_1 && type_K != GGML_TYPE_TBQP4_1
-         && type_K != GGML_TYPE_TBQ4_2 && type_K != GGML_TYPE_TBQ3_2
--        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2;
+@@ -85,7 +85,20 @@ static __global__ void flash_attn_ext_vec(
+     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
+ 
+     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
+-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
++    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16
++        && type_K != GGML_TYPE_TBQ4_0 && type_K != GGML_TYPE_TBQ3_0
++        && type_K != GGML_TYPE_TBQP3_0 && type_K != GGML_TYPE_TBQP4_0
++        && type_K != GGML_TYPE_TBQ4_1 && type_K != GGML_TYPE_TBQ3_1
++        && type_K != GGML_TYPE_TBQP3_1 && type_K != GGML_TYPE_TBQP4_1
++        && type_K != GGML_TYPE_TBQ4_2 && type_K != GGML_TYPE_TBQ3_2
 +        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2
 +        && type_K != GGML_TYPE_TBQ4_3 && type_K != GGML_TYPE_TBQ3_3
-+        && type_K != GGML_TYPE_TBQP3_3 && type_K != GGML_TYPE_TBQP4_3;
++        && type_K != GGML_TYPE_TBQP3_3 && type_K != GGML_TYPE_TBQP4_3
++        && type_K != GGML_TYPE_TBQ4_4 && type_K != GGML_TYPE_TBQ3_4
++        && type_K != GGML_TYPE_TBQP3_4 && type_K != GGML_TYPE_TBQP4_4;
 +    constexpr bool is_cross_head_K = type_K == GGML_TYPE_TBQ3_3 || type_K == GGML_TYPE_TBQ4_3
 +        || type_K == GGML_TYPE_TBQP3_3 || type_K == GGML_TYPE_TBQP4_3;
 +    constexpr bool is_cross_head_V = type_V == GGML_TYPE_TBQ3_3 || type_V == GGML_TYPE_TBQ4_3;
  #ifdef V_DOT2_F32_F16_AVAILABLE
      constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
  #else
-@@ -400,12 +405,25 @@ static __global__ void flash_attn_ext_vec(
-             // vec_dot reuses Q_reg (MSE WHT'd query) directly for sign correction
+@@ -135,7 +148,14 @@ static __global__ void flash_attn_ext_vec(
+     __align__(16) float2 Q_reg[ncols][(D/2)/nthreads_KQ] = {{{0.0f, 0.0f}}}; // May be only partially initialized.
+ #endif // V_DOT2_F32_F16_AVAILABLE
+     int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
+-    float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
++    // For TBQP: Q_ds stores QJL WHT'd query (needs same size as Q_reg)
++    constexpr int Q_ds_size = (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0
++                            || type_K == GGML_TYPE_TBQP3_1 || type_K == GGML_TYPE_TBQP4_1
++                            || type_K == GGML_TYPE_TBQP3_2 || type_K == GGML_TYPE_TBQP4_2
++                            || type_K == GGML_TYPE_TBQP3_4 || type_K == GGML_TYPE_TBQP4_4)
++        ? (D/2)/nthreads_KQ
++        : (1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ));
++    float2  Q_ds[ncols][Q_ds_size];
+     if constexpr (Q_q8_1) {
+ #pragma unroll
+         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+@@ -190,6 +210,466 @@ static __global__ void flash_attn_ext_vec(
          }
-     } else if constexpr (type_K == GGML_TYPE_TBQ4_2 || type_K == GGML_TYPE_TBQ3_2
--                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2) {
+ 
+         __syncthreads();
++    } else if constexpr (type_K == GGML_TYPE_TBQ4_0 || type_K == GGML_TYPE_TBQ3_0
++                      || type_K == GGML_TYPE_TBQP4_0 || type_K == GGML_TYPE_TBQP3_0) {
++        // TurboQuant KV: pre-compute WHT(sign1*query) for MSE, store in Q_reg
++        // For TBQP: also compute WHT(sign2*query) for QJL, store in Q_ds
++        static constexpr uint8_t tbq_signs[32] = {
++            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
++            0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
++            0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
++        };
++        // Second sign pattern for QJL SRHT (must match quantize_f32_tbqp*_block)
++        static constexpr uint8_t qjl_signs[32] = {
++            0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
++            0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
++            0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
++            0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
++        };
++
++        for (int j = 0; j < ncols; ++j) {
++            float * Q_wht = (float *) &KQ[0];
++            const float * Q_f = (const float *) (Q + j*nb01);
++
++            // === WHT 1: MSE part (signs1) — FP32 butterfly ===
++            {
++                float f0, f1;
++                {
++                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float sign1 = ((tbq_signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
++                    float q1 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid + 128];
++                    f0 = q0 * sign0;
++                    f1 = q1 * sign1;
++                }
++                // Stage 7 (stride 128): register-local
++                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                // Stages 0-4: warp shuffle
++                #pragma unroll
++                for (int s = 0; s < 5; s++) {
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                    else                { f0 = f0 + o0; f1 = f1 + o1; }
++                }
++                // Stages 5-6: shared memory
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                {
++                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
++                    float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
++                    f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
++                    f1 = (tid & 32) ? (v1 - u1) : (u1 + v1);
++                }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                {
++                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64];
++                    float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
++                    f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
++                    f1 = (tid & 64) ? (v1 - u1) : (u1 + v1);
++                }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++            }
++
++            // Store MSE WHT'd query in Q_reg (scale/D applied)
++            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
++                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
++                const float v0 = Q_wht[2*i] * scale / (float)D;
++                const float v1 = Q_wht[2*i+1] * scale / (float)D;
++#ifdef V_DOT2_F32_F16_AVAILABLE
++                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
++#else
++                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
++#endif
++            }
++            // Q_wht still contains WHT'd query -- needed for TBQP QJL below
++
++            // === WHT 2: QJL part (signs2) -- only for TBQP types ===
++            if constexpr (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0) {
++                __syncthreads();
++                float f0, f1;
++                {
++                    float sign0 = ((qjl_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float sign1 = ((qjl_signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                    f0 = Q_wht[tid] * sign0;
++                    f1 = Q_wht[tid + 128] * sign1;
++                }
++                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                #pragma unroll
++                for (int s = 0; s < 5; s++) {
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                    else                { f0 = f0 + o0; f1 = f1 + o1; }
++                }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                {
++                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
++                    float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
++                    f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
++                    f1 = (tid & 32) ? (v1 - u1) : (u1 + v1);
++                }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                {
++                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64];
++                    float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
++                    f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
++                    f1 = (tid & 64) ? (v1 - u1) : (u1 + v1);
++                }
++                constexpr float qjl_factor = 1.2533f; // sqrt(pi/2), scale applied below
++                const float sf = scale * qjl_factor / ((float)D * (float)D);
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++
++                for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
++                    const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
++                    Q_ds[j][i0/nthreads_KQ] = make_float2(Q_wht[2*i] * sf, Q_wht[2*i+1] * sf);
++                }
++                __syncthreads();
++            }
++        }
++    } else if constexpr (type_K == GGML_TYPE_TBQ4_1 || type_K == GGML_TYPE_TBQ3_1
++                      || type_K == GGML_TYPE_TBQP4_1 || type_K == GGML_TYPE_TBQP3_1) {
++        // TurboQuant 128-block: D=128, nthreads=128, 1:1 thread-element mapping
++        // WHT has 7 stages: stages 0-4 warp shuffle, stages 5-6 shared memory
++        // No stage 7 (stride 128) needed — each thread handles exactly 1 element
++        static constexpr uint8_t tbq_signs[16] = {
++            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
++        };
++
++        for (int j = 0; j < ncols; ++j) {
++            float * Q_wht = (float *) &KQ[0];
++            const float * Q_f = (const float *) (Q + j*nb01);
++
++            // === WHT 1: MSE part (signs1) — FP32 butterfly ===
++            {
++                float f0;
++                {
++                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
++                    f0 = q0 * sign0;
++                }
++                // Stages 0-4: warp shuffle
++                #pragma unroll
++                for (int s = 0; s < 5; s++) {
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    if (tid & (1 << s)) { f0 = o0 - f0; }
++                    else                { f0 = f0 + o0; }
++                }
++                // Stage 5 (stride 32): shared memory
++                Q_wht[tid] = f0;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32]; f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); }
++                // Stage 6 (stride 64): shared memory
++                Q_wht[tid] = f0;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64]; f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); }
++                Q_wht[tid] = f0;
++                __syncthreads();
++            }
++
++            // Store MSE WHT'd query in Q_reg (scale/D applied)
++            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
++                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
++                const float v0 = Q_wht[2*i] * scale / (float)D;
++                const float v1 = Q_wht[2*i+1] * scale / (float)D;
++#ifdef V_DOT2_F32_F16_AVAILABLE
++                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
++#else
++                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
++#endif
++            }
++
++            __syncthreads(); // ensure all warps finished Q_reg load before next j overwrites KQ
++
++            // Direct Sign: no second WHT needed for _1 TBQP types
++            // vec_dot reuses Q_reg (MSE WHT'd query) directly for sign correction
++        }
++    } else if constexpr (type_K == GGML_TYPE_TBQ4_2 || type_K == GGML_TYPE_TBQ3_2
 +                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2
 +                      || type_K == GGML_TYPE_TBQ4_3 || type_K == GGML_TYPE_TBQ3_3
 +                      || type_K == GGML_TYPE_TBQP4_3 || type_K == GGML_TYPE_TBQP3_3) {
-         // TurboQuant 64-block: D=64, nthreads=128, tid 0-63 participate in WHT
-         // WHT has 6 stages: stages 0-4 warp shuffle, stage 5 shared memory
--        static constexpr uint8_t tbq_signs[8] = {
--            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++        // TurboQuant 64-block: D=64, nthreads=128, tid 0-63 participate in WHT
++        // WHT has 6 stages: stages 0-4 warp shuffle, stage 5 shared memory
 +        // For cross-head _3: use kv_head-specific 64-bit sign slice from 512-bit pattern
 +        static constexpr uint8_t tbq_signs_full[64] = {
 +            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0 (same as _2)
@@ -38,14 +241,273 @@ index 0291ab686..10002abb6 100644
 +            0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
 +            0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
 +            0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
-         };
++        };
 +        // For _2 types: always use head 0's signs. For _3: use kv_head-specific slice.
 +        const int q_signs_offset = (is_cross_head_K) ? ((head / gqa_ratio) % 8) * 8 : 0;
 +        const uint8_t * tbq_signs = tbq_signs_full + q_signs_offset;
- 
-         for (int j = 0; j < ncols; ++j) {
-             float * Q_wht = (float *) &KQ[0];
-@@ -500,6 +518,9 @@ static __global__ void flash_attn_ext_vec(
++
++        for (int j = 0; j < ncols; ++j) {
++            float * Q_wht = (float *) &KQ[0];
++            const float * Q_f = (const float *) (Q + j*nb01);
++
++            // === WHT 1: MSE part — FP32 butterfly ===
++            {
++                float f0 = 0.0f;
++                if (tid < D) {
++                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
++                    f0 = q0 * sign0;
++                }
++                // Stages 0-4: warp shuffle (tid >= 64 carries f0=0, no data corruption)
++                #pragma unroll
++                for (int s = 0; s < 5; s++) {
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    if (tid & (1 << s)) { f0 = o0 - f0; }
++                    else                { f0 = f0 + o0; }
++                }
++                // Stage 5 (stride 32): shared memory
++                if (tid < D) { Q_wht[tid] = f0; }
++                __syncthreads();
++                if (tid < D) {
++                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
++                    f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
++                }
++                if (tid < D) { Q_wht[tid] = f0; }
++                __syncthreads();
++            }
++
++            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
++                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
++                const float v0 = Q_wht[2*i] * scale / (float)D;
++                const float v1 = Q_wht[2*i+1] * scale / (float)D;
++#ifdef V_DOT2_F32_F16_AVAILABLE
++                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
++#else
++                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
++#endif
++            }
++
++            __syncthreads(); // ensure all warps finished Q_reg load before next j overwrites KQ
++
++            // Direct Sign: no second WHT needed for _2 TBQP types
++        }
++    } else if constexpr (type_K == GGML_TYPE_TBQ4_4 || type_K == GGML_TYPE_TBQ3_4
++                      || type_K == GGML_TYPE_TBQP4_4 || type_K == GGML_TYPE_TBQP3_4) {
++        // TurboQuant 576-block: D=576, split 256+256+64
++        // Three sub-block WHTs applied sequentially, each reuses smem
++        static constexpr uint8_t signs_256[32] = {
++            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
++            0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
++        };
++        static constexpr uint8_t qjl_signs_256[32] = {
++            0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
++            0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
++        };
++        static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
++
++        for (int j = 0; j < ncols; ++j) {
++            float * Q_wht = (float *) &KQ[0]; // 576 floats workspace
++            const float * Q_f = (const float *) (Q + j*nb01);
++
++            // === Sub-block 1: WHT_256 on Q[0:256] ===
++            {
++                float f0, f1;
++                {
++                    float sign0 = ((signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float sign1 = ((signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
++                    float q1 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid + 128];
++                    f0 = q0 * sign0; f1 = q1 * sign1;
++                }
++                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                #pragma unroll
++                for (int s = 0; s < 5; s++) {
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                    else                { f0 = f0 + o0; f1 = f1 + o1; }
++                }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
++                  f0 = (tid & 32) ? v0 - u0 : u0 + v0; f1 = (tid & 32) ? v1 - u1 : u1 + v1; }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
++                  f0 = (tid & 64) ? v0 - u0 : u0 + v0; f1 = (tid & 64) ? v1 - u1 : u1 + v1; }
++                __syncthreads();
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++            }
++            // Store sub-block 1 in Q_reg[0..3] (256/2/nthreads_KQ elements, scale/256)
++            for (int i0 = 0; i0 < 128; i0 += nthreads_KQ) {
++                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
++                const float v0 = Q_wht[2*i] * scale / 256.0f;
++                const float v1 = Q_wht[2*i+1] * scale / 256.0f;
++#ifdef V_DOT2_F32_F16_AVAILABLE
++                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
++#else
++                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
++#endif
++            }
++
++            // QJL WHT for sub-block 1 (TBQP only)
++            if constexpr (type_K == GGML_TYPE_TBQP3_4 || type_K == GGML_TYPE_TBQP4_4) {
++                __syncthreads();
++                float f0, f1;
++                { float sign0 = ((qjl_signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                  float sign1 = ((qjl_signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                  f0 = Q_wht[tid] * sign0; f1 = Q_wht[tid + 128] * sign1; }
++                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                #pragma unroll
++                for (int s = 0; s < 5; s++) {
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                    else                { f0 = f0 + o0; f1 = f1 + o1; }
++                }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
++                  f0 = (tid & 32) ? v0 - u0 : u0 + v0; f1 = (tid & 32) ? v1 - u1 : u1 + v1; }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
++                  f0 = (tid & 64) ? v0 - u0 : u0 + v0; f1 = (tid & 64) ? v1 - u1 : u1 + v1; }
++                __syncthreads();
++                constexpr float qjl_factor = 1.2533f;
++                const float sf = scale * qjl_factor / (256.0f * 256.0f);
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                for (int i0 = 0; i0 < 128; i0 += nthreads_KQ) {
++                    const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
++                    Q_ds[j][i0/nthreads_KQ] = make_float2(Q_wht[2*i] * sf, Q_wht[2*i+1] * sf);
++                }
++                __syncthreads();
++            }
++
++            // === Sub-block 2: WHT_256 on Q[256:512] ===
++            {
++                float f0, f1;
++                {
++                    float sign0 = ((signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float sign1 = ((signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[256 + tid];
++                    float q1 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[256 + tid + 128];
++                    f0 = q0 * sign0; f1 = q1 * sign1;
++                }
++                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                #pragma unroll
++                for (int s = 0; s < 5; s++) {
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                    else                { f0 = f0 + o0; f1 = f1 + o1; }
++                }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
++                  f0 = (tid & 32) ? v0 - u0 : u0 + v0; f1 = (tid & 32) ? v1 - u1 : u1 + v1; }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
++                  f0 = (tid & 64) ? v0 - u0 : u0 + v0; f1 = (tid & 64) ? v1 - u1 : u1 + v1; }
++                __syncthreads();
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++            }
++            // Store sub-block 2 in Q_reg[4..7]
++            for (int i0 = 0; i0 < 128; i0 += nthreads_KQ) {
++                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
++                const float v0 = Q_wht[2*i] * scale / 256.0f;
++                const float v1 = Q_wht[2*i+1] * scale / 256.0f;
++#ifdef V_DOT2_F32_F16_AVAILABLE
++                Q_reg[j][128/nthreads_KQ + i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
++#else
++                Q_reg[j][128/nthreads_KQ + i0/nthreads_KQ] = make_float2(v0, v1);
++#endif
++            }
++
++            // QJL WHT for sub-block 2 (TBQP only)
++            if constexpr (type_K == GGML_TYPE_TBQP3_4 || type_K == GGML_TYPE_TBQP4_4) {
++                __syncthreads();
++                float f0, f1;
++                { float sign0 = ((qjl_signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                  float sign1 = ((qjl_signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                  f0 = Q_wht[tid] * sign0; f1 = Q_wht[tid + 128] * sign1; }
++                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                #pragma unroll
++                for (int s = 0; s < 5; s++) {
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                    else                { f0 = f0 + o0; f1 = f1 + o1; }
++                }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
++                  f0 = (tid & 32) ? v0 - u0 : u0 + v0; f1 = (tid & 32) ? v1 - u1 : u1 + v1; }
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
++                  f0 = (tid & 64) ? v0 - u0 : u0 + v0; f1 = (tid & 64) ? v1 - u1 : u1 + v1; }
++                __syncthreads();
++                constexpr float qjl_factor = 1.2533f;
++                const float sf = scale * qjl_factor / (256.0f * 256.0f);
++                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
++                __syncthreads();
++                for (int i0 = 0; i0 < 128; i0 += nthreads_KQ) {
++                    const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
++                    Q_ds[j][128/nthreads_KQ + i0/nthreads_KQ] = make_float2(Q_wht[2*i] * sf, Q_wht[2*i+1] * sf);
++                }
++                __syncthreads();
++            }
++
++            // === Sub-block 3: WHT_64 on Q[512:576] ===
++            {
++                float f0 = 0.0f;
++                if (tid < 64) {
++                    float sign0 = ((signs_64[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[512 + tid];
++                    f0 = q0 * sign0;
++                }
++                #pragma unroll
++                for (int s = 0; s < 5; s++) {
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    if (tid & (1 << s)) { f0 = o0 - f0; }
++                    else                { f0 = f0 + o0; }
++                }
++                if (tid < 64) { Q_wht[tid] = f0; }
++                __syncthreads();
++                if (tid < 64) {
++                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
++                    f0 = (tid & 32) ? v0 - u0 : u0 + v0;
++                }
++                __syncthreads();
++                if (tid < 64) { Q_wht[tid] = f0; }
++                __syncthreads();
++            }
++            // Store sub-block 3 in Q_reg[8] (64/2/nthreads_KQ elements, scale/64)
++            for (int i0 = 0; i0 < 32; i0 += nthreads_KQ) {
++                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
++                if (i < 32) {
++                    const float v0 = Q_wht[2*i] * scale / 64.0f;
++                    const float v1 = Q_wht[2*i+1] * scale / 64.0f;
++#ifdef V_DOT2_F32_F16_AVAILABLE
++                    Q_reg[j][256/nthreads_KQ + i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
++#else
++                    Q_reg[j][256/nthreads_KQ + i0/nthreads_KQ] = make_float2(v0, v1);
++#endif
++                }
++            }
++            // Sub-block 3: Direct Sign, no QJL WHT needed (even for TBQP types)
++
++            __syncthreads();
++        }
+     } else {
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+         const half2 scale_h2 = make_half2(scale, scale);
+@@ -236,6 +716,9 @@ static __global__ void flash_attn_ext_vec(
  #endif // V_DOT2_F32_F16_AVAILABLE
      }
  
@@ -55,7 +517,7 @@ index 0291ab686..10002abb6 100644
      const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
      K     += blockIdx.y*nthreads * nb11;
      V     += blockIdx.y*nthreads * nb21;
-@@ -523,8 +544,24 @@ static __global__ void flash_attn_ext_vec(
+@@ -259,8 +742,24 @@ static __global__ void flash_attn_ext_vec(
  
  #pragma unroll
              for (int j = 0; j < ncols; ++j) {
@@ -82,7 +544,7 @@ index 0291ab686..10002abb6 100644
  
                  if (use_logit_softcap) {
                      sum = logit_softcap*tanhf(sum);
-@@ -587,17 +624,36 @@ static __global__ void flash_attn_ext_vec(
+@@ -323,17 +822,36 @@ static __global__ void flash_attn_ext_vec(
  #pragma unroll
              for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                  half2 tmp[V_rows_per_thread/2];
@@ -124,7 +586,7 @@ index 0291ab686..10002abb6 100644
                  }
  #pragma unroll
                  for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
-@@ -616,8 +672,25 @@ static __global__ void flash_attn_ext_vec(
+@@ -352,8 +870,25 @@ static __global__ void flash_attn_ext_vec(
  #pragma unroll
              for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                  float2 tmp[V_rows_per_thread/2];
@@ -152,23 +614,216 @@ index 0291ab686..10002abb6 100644
  #pragma unroll
                  for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
  #pragma unroll
-@@ -756,7 +829,8 @@ static __global__ void flash_attn_ext_vec(
-                 // For TBQ V: store to shared memory for IWHT post-processing
-                 if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0
-                            || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
--                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
+@@ -489,7 +1024,256 @@ static __global__ void flash_attn_ext_vec(
+                 if (gridDim.y == 1) {
+                     dst_val /= KQ_sum[j_VKQ];
+                 }
+-                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
++                // For TBQ V: store to shared memory for IWHT post-processing
++                if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0
++                           || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
 +                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
-+                           || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3) {
-                     KQ[i0 + tid] = dst_val; // reuse KQ shared memory
-                 } else {
-                     dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
-@@ -874,10 +948,20 @@ static __global__ void flash_attn_ext_vec(
-             }
- 
-             // TBQ V 64-block IWHT: D=64, tid 0-63 participate
--            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
--                static constexpr uint8_t tbq_signs_v[8] = {
--                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++                           || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3
++                           || type_V == GGML_TYPE_TBQ4_4 || type_V == GGML_TYPE_TBQ3_4) {
++                    KQ[i0 + tid] = dst_val; // reuse KQ shared memory
++                } else {
++                    dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
++                }
++            }
++
++            // TBQ V post-processing: IWHT on the WHT-domain weighted sum
++            if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0) {
++                static constexpr uint8_t tbq_signs_v[32] = {
++                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++                    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
++                    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
++                    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
++                };
++                __syncthreads();
++
++                // FP32 IWHT + sign undo + 1/D (FP16 causes precision loss with accumulated V values)
++                {
++                    float * buf = (float *) &KQ[0];
++                    float f0 = buf[tid], f1 = buf[tid + 128];
++                    __syncthreads();
++                    // Stage 7 (stride 128): register-local
++                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                    // Stages 0-4: warp shuffle
++                    #pragma unroll
++                    for (int s = 0; s < 5; s++) {
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                        else                { f0 = f0 + o0; f1 = f1 + o1; }
++                    }
++                    // Stages 5-6: shared memory
++                    buf[tid] = f0; buf[tid + 128] = f1;
++                    __syncthreads();
++                    {
++                        float u0 = buf[tid], v0 = buf[tid ^ 32];
++                        float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 32];
++                        f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
++                        f1 = (tid & 32) ? (v1 - u1) : (u1 + v1);
++                    }
++                    buf[tid] = f0; buf[tid + 128] = f1;
++                    __syncthreads();
++                    {
++                        float u0 = buf[tid], v0 = buf[tid ^ 64];
++                        float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 64];
++                        f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
++                        f1 = (tid & 64) ? (v1 - u1) : (u1 + v1);
++                    }
++                    __syncthreads();
++                    // Apply sign undo + 1/D
++                    float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float sign1 = ((tbq_signs_v[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                    buf[tid] = f0 * sign0 / (float)D;
++                    buf[tid + 128] = f1 * sign1 / (float)D;
++                }
++                __syncthreads();
++
++                // Write IWHT'd result to dst
++                for (int i0 = 0; i0 < D; i0 += nthreads) {
++                    if (i0 + tid < D) {
++                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
++                            ((float *)&KQ[0])[i0 + tid];
++                    }
++                }
++            }
++
++            // TBQ V 128-block IWHT: D=128, 1:1 thread mapping, no stage 7
++            if constexpr (type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1) {
++                static constexpr uint8_t tbq_signs_v[16] = {
++                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++                    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
++                };
++                __syncthreads();
++
++                // FP32 IWHT (FP16 causes precision loss with accumulated V values)
++                {
++                    float * buf = (float *) &KQ[0];
++                    float f0 = buf[tid];
++                    __syncthreads();
++                    // Stages 0-4: warp shuffle
++                    #pragma unroll
++                    for (int s = 0; s < 5; s++) {
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                        if (tid & (1 << s)) { f0 = o0 - f0; }
++                        else                { f0 = f0 + o0; }
++                    }
++                    // Stage 5 (stride 32)
++                    buf[tid] = f0;
++                    __syncthreads();
++                    { float u0 = buf[tid], v0 = buf[tid ^ 32]; f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); }
++                    // Stage 6 (stride 64)
++                    buf[tid] = f0;
++                    __syncthreads();
++                    { float u0 = buf[tid], v0 = buf[tid ^ 64]; f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); }
++                    __syncthreads();
++                    float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    buf[tid] = f0 * sign0 / (float)D;
++                }
++                __syncthreads();
++
++                for (int i0 = 0; i0 < D; i0 += nthreads) {
++                    if (i0 + tid < D) {
++                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
++                            ((float *)&KQ[0])[i0 + tid];
++                    }
++                }
++            }
++
++            // TBQ V 576-block IWHT: split 256+256+64, three passes
++            if constexpr (type_V == GGML_TYPE_TBQ4_4 || type_V == GGML_TYPE_TBQ3_4) {
++                static constexpr uint8_t signs_256[32] = {
++                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
++                    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
++                };
++                static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
++                __syncthreads();
++
++                float * buf = (float *) &KQ[0];
++                const int dst_base = (((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D;
++
++                // === FP32 IWHT pass 1: sub-block 1, buf[0:255] → dst[0:255] ===
++                {
++                    float f0 = buf[tid], f1 = buf[tid + 128];
++                    __syncthreads();
++                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                    #pragma unroll
++                    for (int s = 0; s < 5; s++) {
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                        else                { f0 = f0 + o0; f1 = f1 + o1; }
++                    }
++                    buf[tid] = f0; buf[tid + 128] = f1;
++                    __syncthreads();
++                    { float u0 = buf[tid], v0 = buf[tid ^ 32]; float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 32];
++                      f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); f1 = (tid & 32) ? (v1 - u1) : (u1 + v1); }
++                    buf[tid] = f0; buf[tid + 128] = f1;
++                    __syncthreads();
++                    { float u0 = buf[tid], v0 = buf[tid ^ 64]; float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 64];
++                      f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); f1 = (tid & 64) ? (v1 - u1) : (u1 + v1); }
++                    __syncthreads();
++                    float s0 = ((signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float s1 = ((signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                    dst[dst_base + tid]       = f0 * s0 / 256.0f;
++                    dst[dst_base + tid + 128] = f1 * s1 / 256.0f;
++                }
++
++                // === FP32 IWHT pass 2: sub-block 2, buf[256:511] → dst[256:511] ===
++                {
++                    float f0 = buf[256 + tid], f1 = buf[256 + tid + 128];
++                    __syncthreads();
++                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                    #pragma unroll
++                    for (int s = 0; s < 5; s++) {
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                        else                { f0 = f0 + o0; f1 = f1 + o1; }
++                    }
++                    buf[tid] = f0; buf[tid + 128] = f1;
++                    __syncthreads();
++                    { float u0 = buf[tid], v0 = buf[tid ^ 32]; float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 32];
++                      f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); f1 = (tid & 32) ? (v1 - u1) : (u1 + v1); }
++                    buf[tid] = f0; buf[tid + 128] = f1;
++                    __syncthreads();
++                    { float u0 = buf[tid], v0 = buf[tid ^ 64]; float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 64];
++                      f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); f1 = (tid & 64) ? (v1 - u1) : (u1 + v1); }
++                    __syncthreads();
++                    float s0 = ((signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                    float s1 = ((signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                    dst[dst_base + 256 + tid]       = f0 * s0 / 256.0f;
++                    dst[dst_base + 256 + tid + 128] = f1 * s1 / 256.0f;
++                }
++
++                // === FP32 IWHT pass 3: sub-block 3, buf[512:575] → dst[512:575] ===
++                {
++                    float f0 = (tid < 64) ? buf[512 + tid] : 0.0f;
++                    __syncthreads();
++                    #pragma unroll
++                    for (int s = 0; s < 5; s++) {
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                        if (tid & (1 << s)) { f0 = o0 - f0; }
++                        else                { f0 = f0 + o0; }
++                    }
++                    if (tid < 64) { buf[tid] = f0; }
++                    __syncthreads();
++                    if (tid < 64) {
++                        float u0 = buf[tid], v0 = buf[tid ^ 32];
++                        f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
++                    }
++                    __syncthreads();
++                    if (tid < 64) {
++                        float s0 = ((signs_64[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                        dst[dst_base + 512 + tid] = f0 * s0 / 64.0f;
++                    }
++                }
++            }
++
++            // TBQ V 64-block IWHT: D=64, tid 0-63 participate
 +            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
 +                      || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3) {
 +                // Full 512-bit sign pattern: _2 uses head 0 (offset 0), _3 uses head-specific slice
@@ -181,24 +836,83 @@ index 0291ab686..10002abb6 100644
 +                    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
 +                    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
 +                    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
-                 };
++                };
 +                const int v_signs_offset = is_cross_head_V ? ((head / gqa_ratio) % 8) * 8 : 0;
-                 __syncthreads();
-                 {
-                     float * buf = (float *) &KQ[0];
-@@ -899,7 +983,7 @@ static __global__ void flash_attn_ext_vec(
-                     }
-                     __syncthreads();
-                     if (tid < D) {
--                        float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                __syncthreads();
++                // FP32 IWHT (FP16 causes precision loss with accumulated V values)
++                {
++                    float * buf = (float *) &KQ[0];
++                    float f0 = (tid < D) ? buf[tid] : 0.0f;
++                    __syncthreads();
++                    #pragma unroll
++                    for (int s = 0; s < 5; s++) {
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                        if (tid & (1 << s)) { f0 = o0 - f0; }
++                        else                { f0 = f0 + o0; }
++                    }
++                    if (tid < D) { buf[tid] = f0; }
++                    __syncthreads();
++                    if (tid < D) {
++                        float u0 = buf[tid], v0 = buf[tid ^ 32];
++                        f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
++                    }
++                    __syncthreads();
++                    if (tid < D) {
 +                        float sign0 = ((tbq_signs_v_full[v_signs_offset + (tid >> 3)] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-                         buf[tid] = __half2float(h0) * sign0 / (float)D;
-                     }
-                 }
-@@ -1055,6 +1139,20 @@ EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ4_2)
- EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP3_2)
- EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP4_2)
++                        buf[tid] = f0 * sign0 / (float)D;
++                    }
++                }
++                __syncthreads();
++                for (int i0 = 0; i0 < D; i0 += nthreads) {
++                    if (i0 + tid < D) {
++                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
++                            ((float *)&KQ[0])[i0 + tid];
++                    }
++                }
+             }
+         }
  
+@@ -598,3 +1382,94 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
+ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
+ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
+ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
++
++// TurboQuant 256-block (_0) extern declarations: D=256 only
++#define EXTERN_DECL_FATTN_VEC_TBQ0(type_K)                           \
++    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_F16);          \
++    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_Q8_0);         \
++    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_TBQ3_0);       \
++    extern DECL_FATTN_VEC_CASE(256, type_K, GGML_TYPE_TBQ4_0);       \
++
++EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQ3_0)
++EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQ4_0)
++EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQP3_0)
++EXTERN_DECL_FATTN_VEC_TBQ0(GGML_TYPE_TBQP4_0)
++
++// TurboQuant 128-block (_1) extern declarations: D=128 only
++#define EXTERN_DECL_FATTN_VEC_TBQ1(type_K)                           \
++    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_F16);          \
++    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_Q8_0);         \
++    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_TBQ3_1);       \
++    extern DECL_FATTN_VEC_CASE(128, type_K, GGML_TYPE_TBQ4_1);       \
++
++EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQ3_1)
++EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQ4_1)
++EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQP3_1)
++EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQP4_1)
++
++// TurboQuant 64-block (_2) extern declarations: D=64 only
++#define EXTERN_DECL_FATTN_VEC_TBQ2(type_K)                            \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_F16);            \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_Q8_0);           \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ3_2);         \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ4_2);         \
++
++EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ3_2)
++EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ4_2)
++EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP3_2)
++EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP4_2)
++
 +// TurboQuant cross-head (_3) extern declarations: D=64, K=_3, V=_2/_3 or standard
 +#define EXTERN_DECL_FATTN_VEC_TBQ3(type_K)                            \
 +    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_F16);            \
@@ -213,6 +927,43 @@ index 0291ab686..10002abb6 100644
 +EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQP3_3)
 +EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQP4_3)
 +
- // Asymmetric: standard K + TBQ V extern declarations
- // D=256: only _0 V types
- extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ3_0);
++// Asymmetric: standard K + TBQ V extern declarations
++// D=256: only _0 V types
++extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ3_0);
++extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ4_0);
++extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_0);
++extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_0);
++extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_0);
++extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_0);
++// D=128: only _1 V types
++extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16,  GGML_TYPE_TBQ3_1);
++extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16,  GGML_TYPE_TBQ4_1);
++extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_1);
++extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_1);
++extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_1);
++extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_1);
++// D=64: only _2 V types
++extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16,  GGML_TYPE_TBQ3_2);
++extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16,  GGML_TYPE_TBQ4_2);
++extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_2);
++extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_2);
++extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_2);
++extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_2);
++
++// TurboQuant 576-block (_4) extern declarations: D=576 only
++#define EXTERN_DECL_FATTN_VEC_TBQ4_576(type_K)                            \
++    extern DECL_FATTN_VEC_CASE(576, type_K, GGML_TYPE_F16);               \
++    extern DECL_FATTN_VEC_CASE(576, type_K, GGML_TYPE_Q8_0);              \
++    extern DECL_FATTN_VEC_CASE(576, type_K, GGML_TYPE_TBQ3_4);            \
++    extern DECL_FATTN_VEC_CASE(576, type_K, GGML_TYPE_TBQ4_4);            \
++
++EXTERN_DECL_FATTN_VEC_TBQ4_576(GGML_TYPE_TBQ3_4)
++EXTERN_DECL_FATTN_VEC_TBQ4_576(GGML_TYPE_TBQ4_4)
++EXTERN_DECL_FATTN_VEC_TBQ4_576(GGML_TYPE_TBQP3_4)
++EXTERN_DECL_FATTN_VEC_TBQ4_576(GGML_TYPE_TBQP4_4)
++
++// Asymmetric: standard K + TBQ_4 V (D=576)
++extern DECL_FATTN_VEC_CASE(576, GGML_TYPE_F16,  GGML_TYPE_TBQ3_4);
++extern DECL_FATTN_VEC_CASE(576, GGML_TYPE_F16,  GGML_TYPE_TBQ4_4);
++extern DECL_FATTN_VEC_CASE(576, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_4);
++extern DECL_FATTN_VEC_CASE(576, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_4);

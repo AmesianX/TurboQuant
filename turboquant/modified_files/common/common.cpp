@@ -1237,7 +1237,9 @@ common_init_result::common_init_result(common_params & params) :
                 || t == GGML_TYPE_TBQ3_2  || t == GGML_TYPE_TBQ4_2
                 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
                 || t == GGML_TYPE_TBQ3_3  || t == GGML_TYPE_TBQ4_3
-                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3;
+                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3
+                || t == GGML_TYPE_TBQ3_4  || t == GGML_TYPE_TBQ4_4
+                || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4;
         };
 
       if (is_any_tbq(cparams.type_k) || is_any_tbq(cparams.type_v)) {
@@ -1318,9 +1320,15 @@ common_init_result::common_init_result(common_params & params) :
                         __func__, s_computed);
             }
 
-            // Final: power-of-2 validation (WHT hard requirement)
-            if (head_dim > 0 && (head_dim & (head_dim - 1)) != 0) {
-                LOG_WRN("%s: head_dim=%d is not power-of-2 — TurboQuant WHT cannot operate\n",
+            // Dimension validation: power-of-2 OR supported split dimensions (e.g. 576=256+256+64)
+            auto is_supported_dim = [](int dim) -> bool {
+                if (dim <= 0) return false;
+                if ((dim & (dim - 1)) == 0) return true; // power-of-2
+                if (dim == 576) return true; // GLM-4.7-Flash: 256+256+64 block split
+                return false;
+            };
+            if (head_dim > 0 && !is_supported_dim(head_dim)) {
+                LOG_WRN("%s: head_dim=%d is not supported — TurboQuant WHT cannot operate\n",
                         __func__, head_dim);
                 head_dim = 0; // force fallback path
             }
@@ -1335,13 +1343,16 @@ common_init_result::common_init_result(common_params & params) :
                 || t == GGML_TYPE_TBQ3_2  || t == GGML_TYPE_TBQ4_2
                 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
                 || t == GGML_TYPE_TBQ3_3  || t == GGML_TYPE_TBQ4_3
-                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3;
+                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3
+                || t == GGML_TYPE_TBQ3_4  || t == GGML_TYPE_TBQ4_4
+                || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4;
         };
         auto is_tbqp_type = [](ggml_type t) -> bool {
             return t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP4_0
                 || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
                 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
-                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3;
+                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3
+                || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4;
         };
 
         // Validation 1: V cache must not use TBQP (QJL) — no QJL dequantize for V
@@ -1356,6 +1367,8 @@ common_init_result::common_init_result(common_params & params) :
             else if (cparams.type_v == GGML_TYPE_TBQP4_2) cparams.type_v = GGML_TYPE_TBQ4_2;
             else if (cparams.type_v == GGML_TYPE_TBQP3_3) cparams.type_v = GGML_TYPE_TBQ3_3;
             else if (cparams.type_v == GGML_TYPE_TBQP4_3) cparams.type_v = GGML_TYPE_TBQ4_3;
+            else if (cparams.type_v == GGML_TYPE_TBQP3_4) cparams.type_v = GGML_TYPE_TBQ3_4;
+            else if (cparams.type_v == GGML_TYPE_TBQP4_4) cparams.type_v = GGML_TYPE_TBQ4_4;
             LOG_WRN("%s: TBQP (QJL) not supported for V cache, downgraded %s → %s\n",
                     __func__, orig, ggml_type_name(cparams.type_v));
         }
@@ -1379,20 +1392,22 @@ common_init_result::common_init_result(common_params & params) :
 
         // Auto-map _0 types to correct _N based on head_dim
         auto tbq_resolve = [&](ggml_type type, bool is_key) -> ggml_type {
-            struct tbq_map { ggml_type from; ggml_type to_256; ggml_type to_128; ggml_type to_64; };
+            struct tbq_map { ggml_type from; ggml_type to_256; ggml_type to_128; ggml_type to_64; ggml_type to_576; };
             static const tbq_map maps[] = {
-                { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2  },
-                { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2  },
-                { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2 },
-                { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2 },
+                { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2,  GGML_TYPE_TBQ3_4  },
+                { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2,  GGML_TYPE_TBQ4_4  },
+                { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQP3_4 },
+                { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQP4_4 },
             };
 
-            // Also catch _1/_2 types that don't match head_dim (user specified directly)
+            // Also catch _1/_2/_4 types that don't match head_dim (user specified directly)
             auto is_wrong_suffix = [&](ggml_type t) -> bool {
                 bool is_1 = (t == GGML_TYPE_TBQ3_1 || t == GGML_TYPE_TBQ4_1 || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1);
                 bool is_2 = (t == GGML_TYPE_TBQ3_2 || t == GGML_TYPE_TBQ4_2 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2);
+                bool is_4 = (t == GGML_TYPE_TBQ3_4 || t == GGML_TYPE_TBQ4_4 || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4);
                 if (is_1 && head_dim != 128) return true;
                 if (is_2 && head_dim != 64)  return true;
+                if (is_4 && head_dim != 576) return true;
                 return false;
             };
             if (is_wrong_suffix(type)) {
@@ -1427,12 +1442,17 @@ common_init_result::common_init_result(common_params & params) :
                         LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
                                 __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
                         return m.to_64;
+                    } else if (head_dim == 576) {
+                        // GLM-4.7-Flash: head_dim=576, split 256+256+64
+                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d, split 256+256+64)\n",
+                                __func__, ggml_type_name(type), ggml_type_name(m.to_576), head_dim);
+                        return m.to_576;
                     } else {
                         // Unsupported head_dim: disable TurboQuant, fallback to q8_0
                         LOG_WRN("\n");
                         LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
                         LOG_WRN("║  TurboQuant: head_dim=%d is not supported                   ║\n", head_dim);
-                        LOG_WRN("║  WHT requires power-of-2 dimensions (64, 128, or 256).      ║\n");
+                        LOG_WRN("║  WHT requires power-of-2 dimensions (64, 128, 256, or 576). ║\n");
                         LOG_WRN("║  Falling back to q8_0 for KV cache.                         ║\n");
                         LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
                         return GGML_TYPE_Q8_0;

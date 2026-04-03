@@ -1,17 +1,40 @@
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 3572fecc4..2bd51bcf5 100644
+index ddf1737a3..bc7128ede 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
-@@ -482,7 +482,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
-                 type_k == GGML_TYPE_TBQ3_2  || type_k == GGML_TYPE_TBQ4_2  ||
-                 type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2 ||
-                 type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2  ||
--                type_v == GGML_TYPE_TBQP3_2 || type_v == GGML_TYPE_TBQP4_2) {
+@@ -466,6 +466,35 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+         case GGML_OP_OUT_PROD:
+             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
+                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
++        case GGML_OP_FLASH_ATTN_EXT:
++        {
++            // TurboQuant types are CUDA-only (no CPU to_float/vec_dot)
++            const ggml_type type_k = op->src[1] ? op->src[1]->type : GGML_TYPE_F32;
++            const ggml_type type_v = op->src[2] ? op->src[2]->type : GGML_TYPE_F32;
++            if (type_k == GGML_TYPE_TBQ3_0  || type_k == GGML_TYPE_TBQ4_0  ||
++                type_k == GGML_TYPE_TBQP3_0 || type_k == GGML_TYPE_TBQP4_0 ||
++                type_k == GGML_TYPE_TBQ3_1  || type_k == GGML_TYPE_TBQ4_1  ||
++                type_k == GGML_TYPE_TBQP3_1 || type_k == GGML_TYPE_TBQP4_1 ||
++                type_v == GGML_TYPE_TBQ3_0  || type_v == GGML_TYPE_TBQ4_0  ||
++                type_v == GGML_TYPE_TBQP3_0 || type_v == GGML_TYPE_TBQP4_0 ||
++                type_v == GGML_TYPE_TBQ3_1  || type_v == GGML_TYPE_TBQ4_1  ||
++                type_v == GGML_TYPE_TBQP3_1 || type_v == GGML_TYPE_TBQP4_1 ||
++                type_k == GGML_TYPE_TBQ3_2  || type_k == GGML_TYPE_TBQ4_2  ||
++                type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2 ||
++                type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2  ||
 +                type_v == GGML_TYPE_TBQP3_2 || type_v == GGML_TYPE_TBQP4_2 ||
 +                type_k == GGML_TYPE_TBQ3_3  || type_k == GGML_TYPE_TBQ4_3  ||
 +                type_k == GGML_TYPE_TBQP3_3 || type_k == GGML_TYPE_TBQP4_3 ||
 +                type_v == GGML_TYPE_TBQ3_3  || type_v == GGML_TYPE_TBQ4_3  ||
-+                type_v == GGML_TYPE_TBQP3_3 || type_v == GGML_TYPE_TBQP4_3) {
-                 return false;
-             }
++                type_v == GGML_TYPE_TBQP3_3 || type_v == GGML_TYPE_TBQP4_3 ||
++                type_k == GGML_TYPE_TBQ3_4  || type_k == GGML_TYPE_TBQ4_4  ||
++                type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4 ||
++                type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4  ||
++                type_v == GGML_TYPE_TBQP3_4 || type_v == GGML_TYPE_TBQP4_4) {
++                return false;
++            }
++            return true;
++        }
+         default:
              return true;
+     }

@@ -742,6 +742,22 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         set_rows_cuda_quant<idx_t, block_tbqp4_2, TBQ_K64, quantize_f32_tbqp4_2_block>(
             src0_d, src1_d, (block_tbqp4_2*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+    } else if (dst->type == GGML_TYPE_TBQ3_4) {
+        set_rows_cuda_quant<idx_t, block_tbq3_4, TBQ_K576, quantize_f32_tbq3_4_block>(
+            src0_d, src1_d, (block_tbq3_4*)dst->data,
+            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+    } else if (dst->type == GGML_TYPE_TBQ4_4) {
+        set_rows_cuda_quant<idx_t, block_tbq4_4, TBQ_K576, quantize_f32_tbq4_4_block>(
+            src0_d, src1_d, (block_tbq4_4*)dst->data,
+            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+    } else if (dst->type == GGML_TYPE_TBQP3_4) {
+        set_rows_cuda_quant<idx_t, block_tbqp3_4, TBQ_K576, quantize_f32_tbqp3_4_block>(
+            src0_d, src1_d, (block_tbqp3_4*)dst->data,
+            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+    } else if (dst->type == GGML_TYPE_TBQP4_4) {
+        set_rows_cuda_quant<idx_t, block_tbqp4_4, TBQ_K576, quantize_f32_tbqp4_4_block>(
+            src0_d, src1_d, (block_tbqp4_4*)dst->data,
+            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
     } else if (dst->type == GGML_TYPE_TBQ3_3) {
         set_rows_cuda_xhead_v1<idx_t, block_tbq3_3, quantize_f32_tbq3_3_xhead>(
             src0_d, src1_d, (block_tbq3_3*)dst->data,
