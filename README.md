@@ -36,8 +36,9 @@ GLM-4.7-Flash는 head_dim=576을 사용합니다. WHT는 power-of-2만 지원하
 
 - **원인:** V 캐시 역WHT(IWHT)의 butterfly 연산이 FP16으로 수행 → 누적된 WHT 도메인 값에서 catastrophic cancellation 발생
 - **증상:** ~1500-2300토큰 이후 `////` 또는 `???` 반복 출력
-- **수정:** 모든 IWHT를 FP32 butterfly로 변경. KV 캐시 압축률 변화 없음
+- **수정:** 모든 WHT/IWHT를 FP32 butterfly로 변경 (Q 전처리 + V 후처리 모두). KV 캐시 압축률 변화 없음
 - 4096토큰 검증 완료 (Qwen3.5-27B tbqp3/tbq3 — corruption 없음)
+- ROCm(HIP) 빌드 호환성 개선 — FP16 `__shfl_xor_sync` 제거 (Issue #5)
 
 **새 타입:** TBQ3_4, TBQ4_4, TBQP3_4, TBQP4_4 (blck_size=576)
 
@@ -356,8 +357,9 @@ Fixed a critical bug causing output corruption after ~1500 tokens.
 
 - **Root cause:** V cache inverse WHT (IWHT) butterfly operations used FP16 (half) precision, causing catastrophic cancellation when accumulated WHT-domain values exceeded FP16's ~3.3 decimal digits of precision
 - **Symptoms:** `////` or `???` repeated output after ~1500-2300 tokens
-- **Fix:** All IWHT paths (D=256, D=128, D=64, D=576) now use FP32 butterfly. KV cache compression ratio unchanged (IWHT is computation-only, not storage)
+- **Fix:** All WHT/IWHT paths (Q preprocessing + V post-processing, D=256/128/64/576) now use FP32 butterfly throughout. KV cache compression ratio unchanged (computation-only, not storage)
 - Verified: 4096 tokens with Qwen3.5-27B tbqp3/tbq3 — zero corruption
+- ROCm/HIP build compatibility improved — removed FP16 `__shfl_xor_sync` (Issue #5)
 
 **New types:** TBQ3_4, TBQ4_4, TBQP3_4, TBQP4_4 (blck_size=576)
 
