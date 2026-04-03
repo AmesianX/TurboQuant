@@ -4571,6 +4571,1289 @@ index 631de7e8f..2d2684807 100644
      } else {
          GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
      }
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_0.cu
+new file mode 100644
+index 000000000..853abf7ea
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_0.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: F16 keys + TBQ3_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_TBQ3_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_1.cu
+new file mode 100644
+index 000000000..86c7e0887
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_1.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: F16 keys + TBQ3_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_TBQ3_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_2.cu
+new file mode 100644
+index 000000000..2c5b8082e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: F16 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_F16, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_4.cu
+new file mode 100644
+index 000000000..bd661d17f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: F16 keys + TBQ3_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_F16, GGML_TYPE_TBQ3_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_0.cu
+new file mode 100644
+index 000000000..4cc88f813
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_0.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: F16 keys + TBQ4_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_TBQ4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_1.cu
+new file mode 100644
+index 000000000..9065e5a06
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_1.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: F16 keys + TBQ4_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_TBQ4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_2.cu
+new file mode 100644
+index 000000000..8c5f8407a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: F16 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_F16, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_4.cu
+new file mode 100644
+index 000000000..6c72dbbd9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: F16 keys + TBQ4_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_F16, GGML_TYPE_TBQ4_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_0.cu
+new file mode 100644
+index 000000000..02896a7d6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_0.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q4_0 keys + TBQ3_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_1.cu
+new file mode 100644
+index 000000000..f6ebd0986
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_1.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q4_0 keys + TBQ3_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_2.cu
+new file mode 100644
+index 000000000..31035f3ed
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q4_0 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_0.cu
+new file mode 100644
+index 000000000..074fe2b02
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_0.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q4_0 keys + TBQ4_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_1.cu
+new file mode 100644
+index 000000000..0cfc1f2e0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_1.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q4_0 keys + TBQ4_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_2.cu
+new file mode 100644
+index 000000000..5f6fa6a0d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q4_0 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_0.cu
+new file mode 100644
+index 000000000..63fd21f18
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_0.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q8_0 keys + TBQ3_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_1.cu
+new file mode 100644
+index 000000000..7d896b294
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_1.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q8_0 keys + TBQ3_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_2.cu
+new file mode 100644
+index 000000000..b560550d7
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q8_0 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_4.cu
+new file mode 100644
+index 000000000..7abd1c7fb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: Q8_0 keys + TBQ3_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_0.cu
+new file mode 100644
+index 000000000..528622d87
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_0.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q8_0 keys + TBQ4_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_1.cu
+new file mode 100644
+index 000000000..d541d9079
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_1.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q8_0 keys + TBQ4_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_2.cu
+new file mode 100644
+index 000000000..eed2473a9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// Asymmetric: Q8_0 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_4.cu
+new file mode 100644
+index 000000000..0907f1a49
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: Q8_0 keys + TBQ4_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-f16.cu
+new file mode 100644
+index 000000000..b6cefbf10
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 3-bit KV cache: TBQ3_0 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-q8_0.cu
+new file mode 100644
+index 000000000..90304b05c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 3-bit K + Q8_0 V
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-tbq3_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-tbq3_0.cu
+new file mode 100644
+index 000000000..00dc282a3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-tbq3_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 3-bit K + 3-bit V (full TBQ compression)
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-tbq4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-tbq4_0.cu
+new file mode 100644
+index 000000000..4ef51e4be
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-tbq4_0.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-f16.cu
+new file mode 100644
+index 000000000..3f306cebc
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQ3_1 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-q8_0.cu
+new file mode 100644
+index 000000000..47af77ddc
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQ3_1 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-tbq3_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-tbq3_1.cu
+new file mode 100644
+index 000000000..228235d08
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-tbq3_1.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQ3_1 keys + TBQ3_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_TBQ3_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-tbq4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-tbq4_1.cu
+new file mode 100644
+index 000000000..92ab8bbce
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-tbq4_1.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQ3_1 keys + TBQ4_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_TBQ4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-f16.cu
+new file mode 100644
+index 000000000..c3ec9ad21
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQ3_2 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-q8_0.cu
+new file mode 100644
+index 000000000..e988279d6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQ3_2 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-tbq3_2.cu
+new file mode 100644
+index 000000000..baeea1a3e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQ3_2 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-tbq4_2.cu
+new file mode 100644
+index 000000000..ffc073863
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQ3_2 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-f16.cu
+new file mode 100644
+index 000000000..c0ed1b8d4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQ3_3 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-q8_0.cu
+new file mode 100644
+index 000000000..56559edb3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQ3_3 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq3_2.cu
+new file mode 100644
+index 000000000..7c1b01924
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQ3_3 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq3_3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq3_3.cu
+new file mode 100644
+index 000000000..3e2f1cb45
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq3_3.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: GGML_TYPE_TBQ3_3 keys + GGML_TYPE_TBQ3_3 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ3_3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq4_2.cu
+new file mode 100644
+index 000000000..7d4faa945
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQ3_3 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq4_3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq4_3.cu
+new file mode 100644
+index 000000000..82386ebbf
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq4_3.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: GGML_TYPE_TBQ3_3 keys + GGML_TYPE_TBQ4_3 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ4_3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-f16.cu
+new file mode 100644
+index 000000000..81f3ebb19
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQ3_4 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-q8_0.cu
+new file mode 100644
+index 000000000..a42028442
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQ3_4 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-tbq3_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-tbq3_4.cu
+new file mode 100644
+index 000000000..76a45b566
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-tbq3_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQ3_4 keys + TBQ3_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4, GGML_TYPE_TBQ3_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-tbq4_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-tbq4_4.cu
+new file mode 100644
+index 000000000..bad67272e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-tbq4_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQ3_4 keys + TBQ4_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4, GGML_TYPE_TBQ4_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-f16.cu
+new file mode 100644
+index 000000000..7fc44b5de
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-f16.cu
+@@ -0,0 +1,6 @@
++// TurboQuant KV cache: TBQ4_0 keys + F16 values
++// Only D=256 is valid (TBQ4_0 block size = QK_K = 256)
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-q8_0.cu
+new file mode 100644
+index 000000000..0d4e0c5dd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 4-bit K + Q8_0 V
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-tbq3_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-tbq3_0.cu
+new file mode 100644
+index 000000000..13438c3c3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-tbq3_0.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-tbq4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-tbq4_0.cu
+new file mode 100644
+index 000000000..aae51ded1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-tbq4_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 4-bit K + 4-bit V
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-f16.cu
+new file mode 100644
+index 000000000..3e4a683c2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQ4_1 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-q8_0.cu
+new file mode 100644
+index 000000000..1205fc4c4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQ4_1 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq3_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq3_1.cu
+new file mode 100644
+index 000000000..e392c10ac
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq3_1.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQ4_1 keys + TBQ3_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_TBQ3_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu
+new file mode 100644
+index 000000000..4ec838fdb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQ4_1 keys + TBQ4_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_TBQ4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-f16.cu
+new file mode 100644
+index 000000000..69bd03827
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQ4_2 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-q8_0.cu
+new file mode 100644
+index 000000000..e2cea11ad
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQ4_2 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-tbq3_2.cu
+new file mode 100644
+index 000000000..284a24c7f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQ4_2 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-tbq4_2.cu
+new file mode 100644
+index 000000000..f83ba6211
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQ4_2 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-f16.cu
+new file mode 100644
+index 000000000..5b0a4c21c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQ4_3 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-q8_0.cu
+new file mode 100644
+index 000000000..3ffb3860c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQ4_3 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq3_2.cu
+new file mode 100644
+index 000000000..d179eac5b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQ4_3 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq3_3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq3_3.cu
+new file mode 100644
+index 000000000..d92e63d0f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq3_3.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: GGML_TYPE_TBQ4_3 keys + GGML_TYPE_TBQ3_3 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ3_3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq4_2.cu
+new file mode 100644
+index 000000000..6484b5d1b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQ4_3 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq4_3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq4_3.cu
+new file mode 100644
+index 000000000..17f959711
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq4_3.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: GGML_TYPE_TBQ4_3 keys + GGML_TYPE_TBQ4_3 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ4_3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-f16.cu
+new file mode 100644
+index 000000000..ffb0a6bfb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQ4_4 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQ4_4, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-q8_0.cu
+new file mode 100644
+index 000000000..5dbc43f53
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQ4_4 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQ4_4, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-tbq3_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-tbq3_4.cu
+new file mode 100644
+index 000000000..cc72226da
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-tbq3_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQ4_4 keys + TBQ3_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQ4_4, GGML_TYPE_TBQ3_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-tbq4_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-tbq4_4.cu
+new file mode 100644
+index 000000000..5f91e3e59
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-tbq4_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQ4_4 keys + TBQ4_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQ4_4, GGML_TYPE_TBQ4_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-f16.cu
+new file mode 100644
+index 000000000..4a18271ee
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-f16.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-q8_0.cu
+new file mode 100644
+index 000000000..5820bc036
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-q8_0.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-tbq3_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-tbq3_0.cu
+new file mode 100644
+index 000000000..f1fbfcfa8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-tbq3_0.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-tbq4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-tbq4_0.cu
+new file mode 100644
+index 000000000..d9fe64ede
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-tbq4_0.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-f16.cu
+new file mode 100644
+index 000000000..036913f9e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQP3_1 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-q8_0.cu
+new file mode 100644
+index 000000000..aa3afd5fe
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQP3_1 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-tbq3_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-tbq3_1.cu
+new file mode 100644
+index 000000000..8f0672f30
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-tbq3_1.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQP3_1 keys + TBQ3_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ3_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-tbq4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-tbq4_1.cu
+new file mode 100644
+index 000000000..b1de5a567
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-tbq4_1.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQP3_1 keys + TBQ4_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-f16.cu
+new file mode 100644
+index 000000000..b3ee3e797
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQP3_2 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-q8_0.cu
+new file mode 100644
+index 000000000..0134d9032
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQP3_2 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-tbq3_2.cu
+new file mode 100644
+index 000000000..2359f240c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQP3_2 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-tbq4_2.cu
+new file mode 100644
+index 000000000..11b971cfd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQP3_2 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-f16.cu
+new file mode 100644
+index 000000000..dd8fb2b32
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQP3_3 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-q8_0.cu
+new file mode 100644
+index 000000000..59138fc6f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQP3_3 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq3_2.cu
+new file mode 100644
+index 000000000..af9021080
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQP3_3 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq3_3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq3_3.cu
+new file mode 100644
+index 000000000..23d2069a8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq3_3.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: GGML_TYPE_TBQP3_3 keys + GGML_TYPE_TBQ3_3 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq4_2.cu
+new file mode 100644
+index 000000000..0ad114d88
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQP3_3 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq4_3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq4_3.cu
+new file mode 100644
+index 000000000..6673eda67
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq4_3.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: GGML_TYPE_TBQP3_3 keys + GGML_TYPE_TBQ4_3 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-f16.cu
+new file mode 100644
+index 000000000..610077671
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQP3_4 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQP3_4, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-q8_0.cu
+new file mode 100644
+index 000000000..d68ad7e0d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQP3_4 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQP3_4, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-tbq3_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-tbq3_4.cu
+new file mode 100644
+index 000000000..122e47c76
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-tbq3_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQP3_4 keys + TBQ3_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ3_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-tbq4_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-tbq4_4.cu
+new file mode 100644
+index 000000000..3e67ee728
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-tbq4_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQP3_4 keys + TBQ4_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ4_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-f16.cu
+new file mode 100644
+index 000000000..e57bb4c69
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-f16.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-q8_0.cu
+new file mode 100644
+index 000000000..53139d8e0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-q8_0.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-tbq3_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-tbq3_0.cu
+new file mode 100644
+index 000000000..356ba9537
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-tbq3_0.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ3_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-tbq4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-tbq4_0.cu
+new file mode 100644
+index 000000000..7a9d10994
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-tbq4_0.cu
+@@ -0,0 +1,2 @@
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-f16.cu
+new file mode 100644
+index 000000000..b76ab269b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQP4_1 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-q8_0.cu
+new file mode 100644
+index 000000000..89b623dc7
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQP4_1 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-tbq3_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-tbq3_1.cu
+new file mode 100644
+index 000000000..40f5e256c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-tbq3_1.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQP4_1 keys + TBQ3_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ3_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu
+new file mode 100644
+index 000000000..a25bb3e82
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 128-block: TBQP4_1 keys + TBQ4_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-f16.cu
+new file mode 100644
+index 000000000..425586d5a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQP4_2 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-q8_0.cu
+new file mode 100644
+index 000000000..0408450a2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQP4_2 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-tbq3_2.cu
+new file mode 100644
+index 000000000..2cd6bd1fa
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQP4_2 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-tbq4_2.cu
+new file mode 100644
+index 000000000..75295d0f9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQP4_2 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-f16.cu
+new file mode 100644
+index 000000000..504763dca
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQP4_3 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-q8_0.cu
+new file mode 100644
+index 000000000..fb582abc6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQP4_3 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu
+new file mode 100644
+index 000000000..77eb3999c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQP4_3 keys + TBQ3_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq3_3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq3_3.cu
+new file mode 100644
+index 000000000..5c060476c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq3_3.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: GGML_TYPE_TBQP4_3 keys + GGML_TYPE_TBQ3_3 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq4_2.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq4_2.cu
+new file mode 100644
+index 000000000..224f31bfd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq4_2.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: TBQP4_3 keys + TBQ4_2 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_2);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq4_3.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq4_3.cu
+new file mode 100644
+index 000000000..e5155eaba
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq4_3.cu
+@@ -0,0 +1,5 @@
++// TurboQuant cross-head: GGML_TYPE_TBQP4_3 keys + GGML_TYPE_TBQ4_3 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_3);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-f16.cu
+new file mode 100644
+index 000000000..96c817909
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-f16.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQP4_4 keys + F16 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQP4_4, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-q8_0.cu
+new file mode 100644
+index 000000000..5729b0ece
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQP4_4 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQP4_4, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-tbq3_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-tbq3_4.cu
+new file mode 100644
+index 000000000..deb1ec7e3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-tbq3_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQP4_4 keys + TBQ3_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ3_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-tbq4_4.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-tbq4_4.cu
+new file mode 100644
+index 000000000..9ee18ab5a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-tbq4_4.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 576-block: TBQP4_4 keys + TBQ4_4 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_4);
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 48695a61e..4947055aa 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -2336,6 +2336,82 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
+     }
+ }
+ 
++// ====================== TurboQuant head_dim=64 dequantization ======================
++// Restores original float values: centroid lookup → IWHT → sign undo → scale
++
++static const float tbq_c3[8] = {
++    -2.1520f, -1.3440f, -0.7560f, -0.2451f,
++     0.2451f,  0.7560f,  1.3440f,  2.1520f,
++};
++static const float tbq_c4[16] = {
++    -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9424f, -0.6568f, -0.3881f, -0.1284f,
++     0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
++};
++static const uint8_t tbq_signs_64[8] = {
++    0xa7, 0x3b, 0x91, 0xf4, 0x6d, 0xc2, 0x58, 0x0e,
++};
++
++static void tbq_iwht_64(float * data) {
++    for (int len = 1; len < TBQ_K64; len *= 2)
++        for (int i = 0; i < TBQ_K64; i += 2*len)
++            for (int j = 0; j < len; j++) {
++                float u = data[i+j], v = data[i+j+len];
++                data[i+j] = u+v; data[i+j+len] = u-v;
++            }
++}
++
++void dequantize_row_tbq3_2(const block_tbq3_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % TBQ_K64 == 0);
++    const int64_t nb = k / TBQ_K64;
++
++    for (int64_t i = 0; i < nb; i++) {
++        const float norm = GGML_FP16_TO_FP32(x[i].d);
++        float tmp[TBQ_K64];
++
++        // 3-bit unpack → centroid values
++        for (int j = 0; j < TBQ_K64; j++) {
++            int bp = j * 3, by = bp / 8, bo = bp % 8;
++            uint32_t v = (uint32_t)x[i].qs[by] >> bo;
++            if (bo > 5 && by + 1 < TBQ_K64*3/8) v |= (uint32_t)x[i].qs[by+1] << (8 - bo);
++            tmp[j] = tbq_c3[v & 0x7] * norm;
++        }
++
++        // IWHT (WHT is self-inverse up to 1/D)
++        tbq_iwht_64(tmp);
++
++        // Sign undo + 1/D scaling
++        for (int j = 0; j < TBQ_K64; j++) {
++            float sign = ((tbq_signs_64[j >> 3] >> (j & 7)) & 1) ? -1.0f : 1.0f;
++            y[i * TBQ_K64 + j] = tmp[j] * sign / TBQ_K64;
++        }
++    }
++}
++
++void dequantize_row_tbq4_2(const block_tbq4_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % TBQ_K64 == 0);
++    const int64_t nb = k / TBQ_K64;
++
++    for (int64_t i = 0; i < nb; i++) {
++        const float norm = GGML_FP16_TO_FP32(x[i].d);
++        float tmp[TBQ_K64];
++
++        // 4-bit unpack → centroid values
++        for (int j = 0; j < TBQ_K64/2; j++) {
++            tmp[2*j]     = tbq_c4[x[i].qs[j] & 0xF] * norm;
++            tmp[2*j + 1] = tbq_c4[x[i].qs[j] >> 4]  * norm;
++        }
++
++        // IWHT
++        tbq_iwht_64(tmp);
++
++        // Sign undo + 1/D scaling
++        for (int j = 0; j < TBQ_K64; j++) {
++            float sign = ((tbq_signs_64[j >> 3] >> (j & 7)) & 1) ? -1.0f : 1.0f;
++            y[i * TBQ_K64 + j] = tmp[j] * sign / TBQ_K64;
++        }
++    }
++}
++
+ // ====================== "True" 2-bit (de)-quantization
+ 
+ void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
+index 00604f75c..b10d864ab 100644
+--- a/ggml/src/ggml-quants.h
++++ b/ggml/src/ggml-quants.h
+@@ -61,6 +61,10 @@ GGML_API void dequantize_row_q8_K(const block_q8_K * GGML_RESTRICT x, float * GG
+ GGML_API void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ 
++// TurboQuant head_dim=64 dequantization (centroid → IWHT → sign undo → original)
++GGML_API void dequantize_row_tbq3_2(const block_tbq3_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++GGML_API void dequantize_row_tbq4_2(const block_tbq4_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++
+ GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void dequantize_row_iq2_s  (const block_iq2_s   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index e9b6720c0..1e4131974 100644
 --- a/ggml/src/ggml.c
