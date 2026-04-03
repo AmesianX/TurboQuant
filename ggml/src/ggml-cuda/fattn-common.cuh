@@ -1951,9 +1951,16 @@ void launch_fattn(
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
     const char * K_data = (const char *) K->data;
+    const char * K_data_orig = K_data;  // Preserved for TBQP V spatial dequant (before K→WHT conversion)
     size_t nb11 = K->nb[1];
     size_t nb12 = K->nb[2];
     size_t nb13 = K->nb[3];
+
+    // TBQP WHT-domain MMA detection
+    const bool tbqp_wht_mode = need_f16_K &&
+        (K->type == GGML_TYPE_TBQP3_4 || K->type == GGML_TYPE_TBQP4_4);
+
+
 
     const char * V_data = (const char *) V->data;
     size_t nb21 = V->nb[1];
@@ -1963,11 +1970,15 @@ void launch_fattn(
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
+        const int64_t k_elems = ggml_nelements(K);
 
-        K_f16.alloc(ggml_nelements(K));
+        // TBQP: allocate 2x buffer for [K_mse | K_qjl] concatenated.
+        // Kernel accesses K_qjl at offset ne13*nb13 from K_data.
+        K_f16.alloc(tbqp_wht_mode ? 2 * k_elems : k_elems);
+
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
+            to_fp16(K_data, K_f16.ptr, k_elems, main_stream);
 
             nb11 = nb11*bs*sizeof(half)/ts;
             nb12 = nb12*bs*sizeof(half)/ts;
@@ -1984,15 +1995,51 @@ void launch_fattn(
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
         }
+
+        // TBQP: dequant K_qjl (QJL-only) into second half of K buffer
+        if (tbqp_wht_mode) {
+            fprintf(stderr, "[QJL ALLOC] k_elems=%lld K_f16_alloc=%lld nb13=%lld ne13=%lld K_qjl_offset_half2=%lld\n",
+                (long long)k_elems, (long long)(tbqp_wht_mode ? 2*k_elems : k_elems),
+                (long long)nb13, (long long)K->ne[3], (long long)(K->ne[3] * nb13 / sizeof(half2)));
+            extern void tbqp3_k_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
+            extern void tbqp4_k_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
+            half * K_qjl_ptr = K_f16.ptr + k_elems;  // second half of buffer
+            if (K->type == GGML_TYPE_TBQP3_4) {
+                tbqp3_k_qjl_f16_cuda(K_data_orig, K_qjl_ptr, k_elems, main_stream);
+            } else {
+                tbqp4_k_qjl_f16_cuda(K_data_orig, K_qjl_ptr, k_elems, main_stream);
+            }
+        }
+
         K_data = (char *) K_f16.ptr;
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
-        if (V_is_K_view) {
+        if (V_is_K_view && !tbqp_wht_mode) {
+            // TBQ: V shares K's spatial f16 buffer.
             V_data = K_data;
             nb21   = nb11;
             nb22   = nb12;
             nb23   = nb13;
+        } else if (V_is_K_view && tbqp_wht_mode) {
+            // TBQP: K has WHT+QJL (for Q·K dot product accuracy).
+            // V must NOT have QJL — QJL is dot-product-only, pollutes V accumulation.
+            // Dequant original K data → MSE-only WHT f16 (no QJL, no IWHT).
+            // MMA kernel uses V_is_K_view=false to read V separately from K.
+            // Output is WHT domain → IWHT applied after MMA.
+            extern void tbqp3_v_wht_noqjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
+            extern void tbqp4_v_wht_noqjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
+            const int64_t k_elems = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3];
+            V_f16.alloc(k_elems);
+            if (K->type == GGML_TYPE_TBQP3_4) {
+                tbqp3_v_wht_noqjl_f16_cuda(K_data_orig, V_f16.ptr, k_elems, main_stream);
+            } else {
+                tbqp4_v_wht_noqjl_f16_cuda(K_data_orig, V_f16.ptr, k_elems, main_stream);
+            }
+            V_data = (char *) V_f16.ptr;
+            nb21 = K->ne[0] * sizeof(half);
+            nb22 = K->ne[1] * nb21;
+            nb23 = K->ne[2] * nb22;
         } else {
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
@@ -2022,10 +2069,34 @@ void launch_fattn(
         }
     }
 
-    // TBQP WHT-domain MMA requires Q WHT preprocessing, but Q is a permuted view
-    // with non-trivial strides. Safe Q copy requires ggml graph-level integration
-    // (not launch_fattn level). TBQP routes to vec kernel for full QJL quality.
-    const bool tbqp_wht_mode = false;
+    // TBQP Q WHT: [Q_wht1 | Q_wht2] concatenated in persistent buffer.
+    // Q_wht1 = WHT(signs1 * Q) / 256 — for MSE dot product
+    // Q_wht2 = WHT(qjl_signs * Q_wht1 * 256) * qjl_factor / (256*256) — for QJL dot product
+    // Kernel accesses Q_wht2 at offset ne03*nb03 from Q_data.
+    // Q physical layout: contiguous with stride = Q->ne[0] = 576.
+    struct q_wht_cache_t { void * ptr = nullptr; size_t sz = 0; ~q_wht_cache_t() { if (ptr) cudaFree(ptr); } };
+    static thread_local q_wht_cache_t q_wht_cache;
+    if (tbqp_wht_mode) {
+        extern void tbq_q_wht_cuda(float *, int64_t, int64_t, int64_t, cudaStream_t);
+        extern void tbq_q_wht2_cuda(const float *, float *, int64_t, int64_t, int64_t, cudaStream_t);
+        const size_t n_q_bytes = ggml_nelements(Q) * sizeof(float);
+        const size_t n_q_total = 2 * n_q_bytes;  // [Q_wht1 | Q_wht2]
+        if (q_wht_cache.sz < n_q_total) {
+            if (q_wht_cache.ptr) CUDA_CHECK(cudaFree(q_wht_cache.ptr));
+            CUDA_CHECK(cudaMalloc(&q_wht_cache.ptr, n_q_total));
+            q_wht_cache.sz = n_q_total;
+        }
+        float * q_wht1 = (float *)q_wht_cache.ptr;
+        float * q_wht2 = (float *)((char *)q_wht_cache.ptr + n_q_bytes);
+        const int64_t n_q_rows = Q->ne[1]*Q->ne[2]*Q->ne[3];
+
+        // Q_wht1: copy Q → WHT with signs1 → /256
+        CUDA_CHECK(cudaMemcpyAsync(q_wht1, Q->data, n_q_bytes, cudaMemcpyDeviceToDevice, main_stream));
+        tbq_q_wht_cuda(q_wht1, Q->ne[0], n_q_rows, Q->ne[0], main_stream);
+
+        // Q_wht2: WHT(qjl_signs * Q_wht1 * 256) * qjl_factor / (256*256)
+        tbq_q_wht2_cuda(q_wht1, q_wht2, Q->ne[0], n_q_rows, Q->ne[0], main_stream);
+    }
 
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
@@ -2135,7 +2206,7 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
-    const char * Q_data_for_kernel = (const char *) Q->data;
+    const char * Q_data_for_kernel = tbqp_wht_mode ? (const char *) q_wht_cache.ptr : (const char *) Q->data;
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
         Q_data_for_kernel,
         K_data,
@@ -2173,9 +2244,9 @@ void launch_fattn(
     }
     CUDA_CHECK(cudaGetLastError());
 
-    // TBQP WHT-domain MMA: IWHT the output from WHT domain back to spatial domain.
+    // DEBUG: V is WHT+QJL copy → output is WHT domain → need IWHT
     if (tbqp_wht_mode) {
-        extern void tbq_output_iwht_cuda(float * dst, int64_t dv_dim, int64_t n_rows, cudaStream_t stream);
+        extern void tbq_output_iwht_cuda(float *, int64_t, int64_t, cudaStream_t);
         const int64_t n_out_rows = Q->ne[1] * Q->ne[2] * Q->ne[3];
         tbq_output_iwht_cuda((float *) KQV->data, V->ne[0], n_out_rows, main_stream);
         CUDA_CHECK(cudaGetLastError());

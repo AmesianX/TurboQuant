@@ -859,14 +859,92 @@ static __global__ void tbq_output_iwht_kernel(float * __restrict__ dst, int64_t 
     out[tid] = buf[tid] * s / 256.0f;
 }
 
+// TBQP K_qjl dequant: QJL-only component → f16.
+// Output: s_qjl * dq per element (latent sub-blocks), 0 for rope.
+// Used for separate QJL MMA pass: KQ_qjl = Q_wht2 @ K_qjl^T.
+template <typename block_type, int n_bits>
+static __global__ void dequantize_tbqp_4_k_qjl_f16_kernel(const void * __restrict__ vx, half * __restrict__ y, int64_t n_blocks) {
+    int64_t bi = blockIdx.x;
+    if (bi >= n_blocks) return;
+    const block_type * blk = (const block_type *)vx + bi;
+    half2 * out = (half2 *)(y + bi * TBQ_K576);
+    const int tid = threadIdx.x;
+    const int elem = tid * 2;
+
+    float v0, v1;
+    if (elem < 512) {
+        const int sub = elem < 256 ? 0 : 1;
+        const int e = elem - sub * 256;
+        const float dq = __half2float(sub == 0 ? blk->d1_qjl : blk->d2_qjl);
+        const uint8_t * qjl = sub == 0 ? blk->qjl1 : blk->qjl2;
+        const int s0 = ((qjl[e/8]>>(e%8))&1) ? 1 : -1;
+        const int s1 = ((qjl[(e+1)/8]>>((e+1)%8))&1) ? 1 : -1;
+        v0 = s0 * dq;
+        v1 = s1 * dq;
+    } else {
+        v0 = 0.0f;  // rope has no QJL
+        v1 = 0.0f;
+    }
+    out[tid] = make_half2(__float2half(v0), __float2half(v1));
+}
+
+// TBQP Q_wht2: second WHT with QJL sign pattern for QJL dot product correction.
+// Input: Q_wht1 (already WHT'd with signs1, stored as float, /256 applied).
+// Output: Q_wht2 = WHT(qjl_signs * Q_wht1 * 256) * qjl_factor / (256*256)
+// The *256 undoes Q_wht1's /256, then /256² for two WHTs, * qjl_factor for QJL scaling.
+// Net: Q_wht2 = WHT(qjl_signs * WHT(signs1*Q)) * qjl_factor / (256*256)
+static __global__ void tbq_q_wht2_kernel(const float * __restrict__ Q_wht1, float * __restrict__ Q_wht2,
+                                          int64_t n_rows, int64_t row_stride) {
+    int64_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const int sub = blockIdx.y;  // 0 or 1
+    const int tid = threadIdx.x;
+
+    // QJL sign pattern (same as qjl_signs_256 in fattn-vec.cuh)
+    static constexpr uint8_t qjl_signs[32] = {
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+    };
+
+    __shared__ float buf[256];
+    const float * src = Q_wht1 + row * row_stride + sub * 256;
+
+    // Load Q_wht1 * 256 (undo /256) and apply QJL sign
+    int s = ((qjl_signs[tid>>3]>>(tid&7))&1) ? -1 : 1;
+    buf[tid] = src[tid] * 256.0f * s;
+    __syncthreads();
+
+    // WHT butterfly
+    for (int len = 1; len < 256; len *= 2) {
+        int grp = tid/(2*len), pos = tid%(2*len);
+        if (pos < len) { float u=buf[grp*2*len+pos], v=buf[grp*2*len+pos+len]; buf[grp*2*len+pos]=u+v; buf[grp*2*len+pos+len]=u-v; }
+        __syncthreads();
+    }
+
+    // Scale: qjl_factor / (256*256)
+    constexpr float qjl_factor = 1.2533f;
+    float * dst = Q_wht2 + row * row_stride + sub * 256;
+    dst[tid] = buf[tid] * qjl_factor / (256.0f * 256.0f);
+}
+
 // Host wrappers
 void tbq_q_wht_cuda(float * Q, int64_t DKQ, int64_t n_rows, int64_t row_stride, cudaStream_t stream) {
-    // row_stride = physical stride between Q vectors (may differ from DKQ due to permute)
     tbq_q_wht_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(Q, n_rows, row_stride);
+}
+
+void tbq_q_wht2_cuda(const float * Q_wht1, float * Q_wht2, int64_t DKQ, int64_t n_rows, int64_t row_stride, cudaStream_t stream) {
+    tbq_q_wht2_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(Q_wht1, Q_wht2, n_rows, row_stride);
 }
 
 void tbq_output_iwht_cuda(float * dst, int64_t DV, int64_t n_rows, cudaStream_t stream) {
     tbq_output_iwht_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(dst, n_rows, DV);
+}
+
+void tbqp3_k_qjl_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_tbqp_4_k_qjl_f16_kernel<block_tbqp3_4, 3><<<k/TBQ_K576, 288, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+void tbqp4_k_qjl_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_tbqp_4_k_qjl_f16_kernel<block_tbqp4_4, 4><<<k/TBQ_K576, 288, 0, stream>>>(vx, y, k/TBQ_K576);
 }
 
 static void dequantize_row_tbq3_4_to_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
@@ -882,6 +960,101 @@ static void dequantize_row_tbqp3_4_to_f16_cuda(const void * vx, half * y, int64_
 static void dequantize_row_tbqp4_4_to_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
     dequantize_tbqp_4_wht_f16_kernel<block_tbqp4_4, 4><<<k/TBQ_K576, 288, 0, stream>>>(vx, y, k/TBQ_K576);
 }
+
+// TBQP V WHT dequant: MSE only (no QJL) in WHT domain → f16.
+// K gets QJL (for dot product accuracy), V must NOT have QJL (pollutes V accumulation).
+// Same structure as K WHT dequant but without + s*dq terms.
+template <typename block_type, int n_bits>
+static __global__ void dequantize_tbqp_4_v_wht_f16_kernel(const void * __restrict__ vx, half * __restrict__ y, int64_t n_blocks) {
+    int64_t bi = blockIdx.x;
+    if (bi >= n_blocks) return;
+    const block_type * blk = (const block_type *)vx + bi;
+    half2 * out = (half2 *)(y + bi * TBQ_K576);
+    const int tid = threadIdx.x;
+    const int elem = tid * 2;
+
+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+
+    float v0, v1;
+    if (elem < 512) {
+        const int sub = elem < 256 ? 0 : 1;
+        const int e = elem - sub * 256;
+        const float norm = __half2float(sub == 0 ? blk->d1 : blk->d2);
+        const uint8_t * qs = sub == 0 ? blk->qs1 : blk->qs2;
+        if constexpr (n_bits == 3) {
+            v0 = c2[(qs[e/4]>>((e%4)*2))&0x3]*norm;
+            v1 = c2[(qs[(e+1)/4]>>(((e+1)%4)*2))&0x3]*norm;
+        } else {
+            int bp0=e*3, by0=bp0/8, bo0=bp0%8;
+            int bp1=(e+1)*3, by1=bp1/8, bo1=bp1%8;
+            uint32_t r0=(uint32_t)qs[by0]>>bo0; if(bo0>5) r0|=(uint32_t)qs[by0+1]<<(8-bo0);
+            uint32_t r1=(uint32_t)qs[by1]>>bo1; if(bo1>5) r1|=(uint32_t)qs[by1+1]<<(8-bo1);
+            v0 = c3[r0&7]*norm;
+            v1 = c3[r1&7]*norm;
+        }
+    } else {
+        const int e = elem - 512;
+        v0 = __half2float(blk->rope[e]);
+        v1 = __half2float(blk->rope[e+1]);
+    }
+    out[tid] = make_half2(__float2half(v0), __float2half(v1));
+}
+
+void tbqp3_v_wht_noqjl_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_tbqp_4_v_wht_f16_kernel<block_tbqp3_4, 3><<<k/TBQ_K576, 288, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+void tbqp4_v_wht_noqjl_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_tbqp_4_v_wht_f16_kernel<block_tbqp4_4, 4><<<k/TBQ_K576, 288, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+
+// TBQP V spatial dequant: MSE only (no QJL) + cooperative IWHT → spatial f16.
+// For TBQP MMA: K uses WHT+QJL, V needs MSE-only spatial f16 (QJL breaks IWHT reconstruction).
+template <typename block_type, int n_bits>
+static __global__ void dequantize_tbqp_4_v_spatial_f16_kernel(const void * __restrict__ vx, half * __restrict__ y, int64_t n_blocks) {
+    int64_t bi = blockIdx.x;
+    if (bi >= n_blocks) return;
+    const block_type * blk = (const block_type *)vx + bi;
+    half * out = y + bi * TBQ_K576;
+    int tid = threadIdx.x;
+    __shared__ float buf[256];
+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    static constexpr uint8_t signs[32] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    };
+    for (int sub = 0; sub < 2; ++sub) {
+        const float norm = __half2float(sub == 0 ? blk->d1 : blk->d2);
+        const uint8_t * qs = sub == 0 ? blk->qs1 : blk->qs2;
+        if constexpr (n_bits == 3) {
+            buf[tid] = c2[(qs[tid/4]>>((tid%4)*2))&0x3] * norm;
+        } else {
+            int bp = tid*3, by = bp/8, bo = bp%8;
+            uint32_t r = (uint32_t)qs[by]>>bo; if (bo>5) r|=(uint32_t)qs[by+1]<<(8-bo);
+            buf[tid] = c3[r&7] * norm;
+        }
+        __syncthreads();
+        for (int len = 1; len < 256; len *= 2) {
+            int grp = tid/(2*len), pos = tid%(2*len);
+            if (pos < len) { float u=buf[grp*2*len+pos], v=buf[grp*2*len+pos+len]; buf[grp*2*len+pos]=u+v; buf[grp*2*len+pos+len]=u-v; }
+            __syncthreads();
+        }
+        int s = ((signs[tid>>3]>>(tid&7))&1) ? -1 : 1;
+        out[sub*256+tid] = __float2half(buf[tid]*s/256.0f);
+        __syncthreads();
+    }
+    if (tid < 64) out[512+tid] = blk->rope[tid];
+}
+
+void tbqp3_v_spatial_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_tbqp_4_v_spatial_f16_kernel<block_tbqp3_4, 3><<<k/TBQ_K576, 256, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+void tbqp4_v_spatial_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_tbqp_4_v_spatial_f16_kernel<block_tbqp4_4, 4><<<k/TBQ_K576, 256, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+
+// (Q WHT and output IWHT kernels defined above — no duplicates)
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
@@ -950,9 +1123,9 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_TBQ4_4:
             return dequantize_row_tbq4_4_to_f16_cuda;
         case GGML_TYPE_TBQP3_4:
-            return dequantize_row_tbqp3_4_to_f16_cuda;
+            return (to_fp16_cuda_t)tbqp3_v_wht_noqjl_f16_cuda;  // MSE-only WHT (QJL applied separately in MMA)
         case GGML_TYPE_TBQP4_4:
-            return dequantize_row_tbqp4_4_to_f16_cuda;
+            return (to_fp16_cuda_t)tbqp4_v_wht_noqjl_f16_cuda;
         default:
             return nullptr;
     }
