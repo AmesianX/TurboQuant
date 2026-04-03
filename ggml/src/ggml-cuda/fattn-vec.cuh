@@ -248,8 +248,8 @@ static __global__ void flash_attn_ext_vec(
                 // Stages 0-4: warp shuffle
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
                     else                { f0 = f0 + o0; f1 = f1 + o1; }
                 }
@@ -300,8 +300,8 @@ static __global__ void flash_attn_ext_vec(
                 { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
                     else                { f0 = f0 + o0; f1 = f1 + o1; }
                 }
@@ -358,7 +358,7 @@ static __global__ void flash_attn_ext_vec(
                 // Stages 0-4: warp shuffle
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; }
                     else                { f0 = f0 + o0; }
                 }
@@ -427,7 +427,7 @@ static __global__ void flash_attn_ext_vec(
                 // Stages 0-4: warp shuffle (tid >= 64 carries f0=0, no data corruption)
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; }
                     else                { f0 = f0 + o0; }
                 }
@@ -488,8 +488,8 @@ static __global__ void flash_attn_ext_vec(
                 { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
                     else                { f0 = f0 + o0; f1 = f1 + o1; }
                 }
@@ -527,8 +527,8 @@ static __global__ void flash_attn_ext_vec(
                 { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
                     else                { f0 = f0 + o0; f1 = f1 + o1; }
                 }
@@ -565,8 +565,8 @@ static __global__ void flash_attn_ext_vec(
                 { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
                     else                { f0 = f0 + o0; f1 = f1 + o1; }
                 }
@@ -604,8 +604,8 @@ static __global__ void flash_attn_ext_vec(
                 { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
                     else                { f0 = f0 + o0; f1 = f1 + o1; }
                 }
@@ -639,7 +639,7 @@ static __global__ void flash_attn_ext_vec(
                 }
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; }
                     else                { f0 = f0 + o0; }
                 }
@@ -1056,8 +1056,8 @@ static __global__ void flash_attn_ext_vec(
                     // Stages 0-4: warp shuffle
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
                         if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
                         else                { f0 = f0 + o0; f1 = f1 + o1; }
                     }
@@ -1112,7 +1112,7 @@ static __global__ void flash_attn_ext_vec(
                     // Stages 0-4: warp shuffle
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
                         if (tid & (1 << s)) { f0 = o0 - f0; }
                         else                { f0 = f0 + o0; }
                     }
@@ -1157,8 +1157,8 @@ static __global__ void flash_attn_ext_vec(
                     { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
                         if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
                         else                { f0 = f0 + o0; f1 = f1 + o1; }
                     }
@@ -1184,8 +1184,8 @@ static __global__ void flash_attn_ext_vec(
                     { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
                         if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
                         else                { f0 = f0 + o0; f1 = f1 + o1; }
                     }
@@ -1210,7 +1210,7 @@ static __global__ void flash_attn_ext_vec(
                     __syncthreads();
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
                         if (tid & (1 << s)) { f0 = o0 - f0; }
                         else                { f0 = f0 + o0; }
                     }
@@ -1251,7 +1251,7 @@ static __global__ void flash_attn_ext_vec(
                     __syncthreads();
                     #pragma unroll
                     for (int s = 0; s < 5; s++) {
-                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
                         if (tid & (1 << s)) { f0 = o0 - f0; }
                         else                { f0 = f0 + o0; }
                     }
