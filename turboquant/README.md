@@ -9,7 +9,43 @@
 
 Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
 
-### 🆕 v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
+### 🆕 v1.4.1 — GLM-4.7-Flash (MLA) 비대칭 K/V 지원
+
+**GLM-4.7-Flash, DeepSeek-V2/V3 등 MLA 아키텍처 모델에서 TurboQuant 완전 지원.**
+
+MLA(Multi-head Latent Attention)는 K=concat(latent[512], rope[64])=576차원, V=latent[512]차원의 비대칭 구조입니다. 세 가지 핵심 기술로 해결:
+
+1. **D_V 템플릿 파라미터**: vec 커널이 K/Q 차원(D=576)과 V 차원(D_V=512)을 분리 처리. VKQ 배열, combine stride, IWHT 패스 수, 출력 쓰기 모두 D_V 기준. 기존 대칭 모델은 D_V=D 기본값으로 영향 없음.
+2. **RoPE f16 passthrough**: _4 블록 구조체에서 마지막 64차원(rope)을 WHT+양자화 대신 f16으로 직접 저장. RoPE 값의 norm이 latent 대비 ~80배 커서(10.49 vs 0.13), 어떤 비트 수의 양자화든 오차가 attention score를 지배하는 문제 해결. Q 전처리와 dot product도 sub-block 3을 f16 직접 연산으로 처리.
+3. **MLA V-as-K-view 지원**: MLA absorption 최적화에서 V는 K 캐시의 view(같은 타입). TBQP V dequantize는 MSE centroid만 사용(QJL correction은 K·Q dot product 보정 전용이므로 V 재구성에 미적용). IWHT는 256+256 2패스(rope 64 패스 스킵).
+
+**벤치마크 (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
+
+| 캐시 | KV MiB | 압축 | PP t/s | TG t/s | PPL | 파울리 |
+|------|--------|------|--------|--------|-----|--------|
+| f16/f16 | 10,469 | 1.0x | 73.0 | 60.3 | 5.998 | PASS |
+| **tbq3/tbq3** | **2,944** | **3.6x** | 68.2 | 32.0 | **6.836** | **PASS** |
+| **tbqp3/tbq3** | **2,981** | **3.5x** | 66.8 | 31.5 | **6.586** | **PASS** |
+| tbq4/tbq4 | 3,526 | 3.0x | 67.2 | 33.4 | — | PASS |
+| tbqp4/tbq4 | 3,562 | 2.9x | 65.8 | 28.9 | — | PASS |
+
+> **참고:** MLA 모델의 압축률(3.5x)이 일반 모델(5.2x)보다 낮은 이유: MLA는 이미 KV를 256-dim 잠재 표현으로 압축하므로, 원래 캐시가 작습니다. 7.5GB 절약(10,469→2,981 MiB)은 실질적으로 큰 차이입니다.
+>
+> **참고:** TG 속도(31.5 t/s vs f16 60.3 t/s): TBQ는 vec 커널(스칼라 WHT dot product), f16은 MMA 커널(텐서코어 행렬곱)을 사용합니다. MMA 커널에 TBQ on-the-fly dequantize를 추가하면 텐서코어 활용 가능 — 향후 과제.
+
+**해결된 버그:**
+
+| 버그 | 원인 | 수정 |
+|------|------|------|
+| GLM tbqp3/tbq3 크래시 (v1.4.0) | `get_best_fattn_kernel`이 D=576 TBQ를 NONE 반환 | D=576+V=512 TBQ vec 커널 라우팅 추가 |
+| 대칭 dispatch가 비대칭을 먹음 | `FATTN_VEC_CASE`가 V->ne[0] 미확인 → DV=576으로 잘못 launch | ASYM 케이스를 대칭 앞에 배치 |
+| RoPE 양자화 → garbage 출력 | rope norm(~10.49) >> latent norm(~0.13), 양자화 오차가 attention 지배 | sub-block 3를 f16 passthrough로 변경 |
+| TBQP V dequant에 QJL 적용 → garbage | QJL은 K·Q dot product 보정 전용, V 재구성에 부적합 | V dequant에서 QJL 제거 (MSE only) |
+| Q WHT sub-block 간 race condition | sub-block 1 저장 후 `__syncthreads` 누락 → sub-block 2 WHT가 Q_wht 오염 가능 | `__syncthreads` barrier 추가 |
+
+---
+
+### v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
 
 **벤치마크 (Qwen3-30B-A3B Q4_K_M, DGX Spark GB10, head_dim=128):**
 
@@ -295,7 +331,43 @@ cmake --build build -j$(nproc)
 
 This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
 
-### 🆕 v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
+### 🆕 v1.4.1 — GLM-4.7-Flash (MLA) Asymmetric K/V Support
+
+**Full TurboQuant support for MLA architecture models: GLM-4.7-Flash, DeepSeek-V2/V3.**
+
+MLA (Multi-head Latent Attention) has asymmetric K=concat(latent[512], rope[64])=576 dims and V=latent[512] dims. Three key techniques:
+
+1. **D_V template parameter**: vec kernel separates K/Q dim (D=576) from V dim (D_V=512). VKQ arrays, combine stride, IWHT passes, output writes all use D_V. Symmetric models default D_V=D (zero impact).
+2. **RoPE f16 passthrough**: _4 block structs store sub-block 3 (rope 64) as raw f16 instead of WHT+quantized. RoPE norm (~10.49) is ~80x larger than latent (~0.13) — any quantization error dominates attention scores. Q preprocessing and dot product handle sub-block 3 as direct f16.
+3. **MLA V-as-K-view**: In MLA absorption, V is a view of K cache (same type). TBQP V dequantize uses MSE centroid only (QJL is for K·Q dot product correction, not V reconstruction). IWHT runs 256+256 two-pass (rope pass skipped).
+
+**Benchmark (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
+
+| Cache | KV MiB | Compress | PP t/s | TG t/s | PPL | Pauli |
+|-------|--------|----------|--------|--------|-----|-------|
+| f16/f16 | 10,469 | 1.0x | 73.0 | 60.3 | 5.998 | PASS |
+| **tbq3/tbq3** | **2,944** | **3.6x** | 68.2 | 32.0 | **6.836** | **PASS** |
+| **tbqp3/tbq3** | **2,981** | **3.5x** | 66.8 | 31.5 | **6.586** | **PASS** |
+| tbq4/tbq4 | 3,526 | 3.0x | 67.2 | 33.4 | — | PASS |
+| tbqp4/tbq4 | 3,562 | 2.9x | 65.8 | 28.9 | — | PASS |
+
+> **Note:** MLA compression ratio (3.5x) is lower than standard models (5.2x) because MLA already compresses KV to a 256-dim latent — the original cache is already small. The 7.5GB savings (10,469→2,981 MiB) is still significant.
+>
+> **Note:** TG speed (31.5 vs 60.3 t/s): TBQ uses the vec kernel (scalar WHT dot product), f16 uses the MMA kernel (tensor cores). Adding TBQ on-the-fly dequantize to MMA would enable tensor core acceleration — future work.
+
+**Bugs fixed:**
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| GLM tbqp3/tbq3 crash (v1.4.0) | `get_best_fattn_kernel` returned NONE for D=576 TBQ | Added D=576+V=512 TBQ vec kernel routing |
+| Symmetric dispatch shadows asymmetric | `FATTN_VEC_CASE` doesn't check V->ne[0] → launches DV=576 | ASYM cases placed before symmetric |
+| RoPE quantization → garbage | rope norm(~10.49) >> latent norm(~0.13), quant error dominates attention | Sub-block 3 changed to f16 passthrough |
+| TBQP V dequant with QJL → garbage | QJL corrects K·Q dot products only, not V reconstruction | Removed QJL from V dequant (MSE only) |
+| Q WHT sub-block race condition | Missing `__syncthreads` between sub-block storage and next WHT | Added `__syncthreads` barriers |
+
+---
+
+### v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
 
 **Benchmark (Qwen3-30B-A3B Q4_K_M, DGX Spark GB10, head_dim=128):**
 

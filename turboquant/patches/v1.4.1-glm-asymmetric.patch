@@ -1,0 +1,1398 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index e28486c0a..93f5969ca 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1246,6 +1246,13 @@ common_init_result::common_init_result(common_params & params) :
+         // Detect KV head dimension with multi-signal cross-validation
+         // TurboQuant WHT requires exact head_dim — wrong value = garbage output
+         int32_t head_dim = 0;
++        int32_t s_val_outer = 0; // V head_dim for asymmetric models (e.g. GLM K=576, V=512)
++        auto is_supported_dim = [](int dim) -> bool {
++            if (dim <= 0) return false;
++            if ((dim & (dim - 1)) == 0) return true; // power-of-2 (64, 128, 256, 512, ...)
++            if (dim == 576) return true; // GLM-4.7-Flash K: 256+256+64 block split
++            return false;
++        };
+         {
+             char arch[64] = {}, buf[64] = {};
+             llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+@@ -1320,13 +1327,9 @@ common_init_result::common_init_result(common_params & params) :
+                         __func__, s_computed);
+             }
+ 
+-            // Dimension validation: power-of-2 OR supported split dimensions (e.g. 576=256+256+64)
+-            auto is_supported_dim = [](int dim) -> bool {
+-                if (dim <= 0) return false;
+-                if ((dim & (dim - 1)) == 0) return true; // power-of-2
+-                if (dim == 576) return true; // GLM-4.7-Flash: 256+256+64 block split
+-                return false;
+-            };
++            // Save s_val for asymmetric K/V resolution
++            s_val_outer = s_val;
++
+             if (head_dim > 0 && !is_supported_dim(head_dim)) {
+                 LOG_WRN("%s: head_dim=%d is not supported — TurboQuant WHT cannot operate\n",
+                         __func__, head_dim);
+@@ -1442,6 +1445,11 @@ common_init_result::common_init_result(common_params & params) :
+                         LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
+                                 __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
+                         return m.to_64;
++                    } else if (head_dim == 512) {
++                        // V head_dim=512 (e.g. GLM-4.7-Flash V): 256-block × 2, use _0 type
++                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d, 256-block × 2)\n",
++                                __func__, ggml_type_name(type), ggml_type_name(m.to_256), head_dim);
++                        return m.to_256;
+                     } else if (head_dim == 576) {
+                         // GLM-4.7-Flash: head_dim=576, split 256+256+64
+                         LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d, split 256+256+64)\n",
+@@ -1468,8 +1476,19 @@ common_init_result::common_init_result(common_params & params) :
+                 if (is_tbq_type(cparams.type_k)) cparams.type_k = GGML_TYPE_Q8_0;
+                 if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_Q8_0;
+             } else {
++                // For asymmetric models (e.g. GLM-4.7-Flash: K=576, V=512),
++                // resolve K and V with their respective head dimensions
++                int32_t head_dim_v = head_dim; // default: same as K
++                if (s_val_outer > 0 && s_val_outer != head_dim && is_supported_dim(s_val_outer)) {
++                    head_dim_v = s_val_outer;
++                    LOG_INF("%s: asymmetric head_dim: K=%d, V=%d — resolving separately\n",
++                            __func__, head_dim, head_dim_v);
++                }
+                 cparams.type_k = tbq_resolve(cparams.type_k, true);
++                const int32_t saved_head_dim = head_dim;
++                head_dim = head_dim_v;
+                 cparams.type_v = tbq_resolve(cparams.type_v, false);
++                head_dim = saved_head_dim; // restore
+             }
+         }
+       } // end is_any_tbq
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index aa0e1c185..058d349f1 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -380,73 +380,66 @@ typedef block_tbqp4_2 block_tbqp4_3;
+ // TurboQuant head_dim=576 variants (split 256+256+64, each sub-block WHT'd independently)
+ #define TBQ_K576 576
+ 
+-// TurboQuant 3-bit, 576-block: 3-bit Lloyd-Max, split 256+256+64
++// TurboQuant 3-bit, 576-block: 3-bit Lloyd-Max on [0:511], f16 passthrough on [512:575] (rope)
++// MLA models (GLM-4.7-Flash): K=concat(latent[512], rope[64]), rope stored as f16 to avoid quantization error
+ typedef struct {
+-    // Sub-block 1: 256 elements
++    // Sub-block 1: 256 elements (WHT + 3-bit Lloyd-Max)
+     ggml_half d1;
+     uint8_t qs1[QK_K*3/8];       // 3-bit packed indices (96 bytes for 256 elements)
+-    // Sub-block 2: 256 elements
++    // Sub-block 2: 256 elements (WHT + 3-bit Lloyd-Max)
+     ggml_half d2;
+     uint8_t qs2[QK_K*3/8];       // 96 bytes
+-    // Sub-block 3: 64 elements
+-    ggml_half d3;
+-    uint8_t qs3[TBQ_K64*3/8];    // 24 bytes
++    // Sub-block 3: 64 elements (f16 passthrough — rope values stored directly, no WHT)
++    ggml_half rope[TBQ_K64];     // 128 bytes
+ } block_tbq3_4;
+-static_assert(sizeof(block_tbq3_4) == 3*sizeof(ggml_half) + 2*(QK_K*3/8) + TBQ_K64*3/8, "wrong tbq3_4 block size/padding");
++static_assert(sizeof(block_tbq3_4) == 2*sizeof(ggml_half) + 2*(QK_K*3/8) + TBQ_K64*sizeof(ggml_half), "wrong tbq3_4 block size/padding");
+ 
+-// TurboQuant 4-bit, 576-block: 4-bit Lloyd-Max, split 256+256+64
++// TurboQuant 4-bit, 576-block: 4-bit Lloyd-Max on [0:511], f16 passthrough on [512:575] (rope)
+ typedef struct {
+-    // Sub-block 1: 256 elements
++    // Sub-block 1: 256 elements (WHT + 4-bit Lloyd-Max)
+     ggml_half d1;
+     uint8_t qs1[QK_K/2];         // 4-bit packed indices (128 bytes for 256 elements)
+-    // Sub-block 2: 256 elements
++    // Sub-block 2: 256 elements (WHT + 4-bit Lloyd-Max)
+     ggml_half d2;
+     uint8_t qs2[QK_K/2];         // 128 bytes
+-    // Sub-block 3: 64 elements
+-    ggml_half d3;
+-    uint8_t qs3[TBQ_K64/2];      // 32 bytes
++    // Sub-block 3: 64 elements (f16 passthrough — rope values stored directly, no WHT)
++    ggml_half rope[TBQ_K64];     // 128 bytes
+ } block_tbq4_4;
+-static_assert(sizeof(block_tbq4_4) == 3*sizeof(ggml_half) + 2*(QK_K/2) + TBQ_K64/2, "wrong tbq4_4 block size/padding");
++static_assert(sizeof(block_tbq4_4) == 2*sizeof(ggml_half) + 2*(QK_K/2) + TBQ_K64*sizeof(ggml_half), "wrong tbq4_4 block size/padding");
+ 
+-// TurboQuant_prod 3-bit, 576-block: 2-bit Lloyd-Max + 1-bit QJL(256)/DirectSign(64)
++// TurboQuant_prod 3-bit, 576-block: 2-bit Lloyd-Max + 1-bit QJL on [0:511], f16 passthrough on [512:575] (rope)
+ typedef struct {
+-    // Sub-block 1: 256 elements (QJL SRHT correction)
++    // Sub-block 1: 256 elements (WHT + 2-bit Lloyd-Max + QJL SRHT correction)
+     ggml_half d1;
+     ggml_half d1_qjl;
+     uint8_t qs1[QK_K/4];         // 2-bit packed Lloyd-Max indices (64 bytes)
+     uint8_t qjl1[QK_K/8];        // 1-bit QJL signs (32 bytes)
+-    // Sub-block 2: 256 elements (QJL SRHT correction)
++    // Sub-block 2: 256 elements (WHT + 2-bit Lloyd-Max + QJL SRHT correction)
+     ggml_half d2;
+     ggml_half d2_qjl;
+     uint8_t qs2[QK_K/4];         // 64 bytes
+     uint8_t qjl2[QK_K/8];        // 32 bytes
+-    // Sub-block 3: 64 elements (Direct Sign correction — lower variance than QJL at d<=128)
+-    ggml_half d3;
+-    ggml_half d3_qjl;
+-    uint8_t qs3[TBQ_K64/4];      // 16 bytes
+-    uint8_t qjl3[TBQ_K64/8];     // 8 bytes
++    // Sub-block 3: 64 elements (f16 passthrough — rope values stored directly, no WHT)
++    ggml_half rope[TBQ_K64];     // 128 bytes
+ } block_tbqp3_4;
+-static_assert(sizeof(block_tbqp3_4) == 6*sizeof(ggml_half) + 2*(QK_K/4 + QK_K/8) + TBQ_K64/4 + TBQ_K64/8, "wrong tbqp3_4 block size/padding");
++static_assert(sizeof(block_tbqp3_4) == 4*sizeof(ggml_half) + 2*(QK_K/4 + QK_K/8) + TBQ_K64*sizeof(ggml_half), "wrong tbqp3_4 block size/padding");
+ 
+-// TurboQuant_prod 4-bit, 576-block: 3-bit Lloyd-Max + 1-bit QJL(256)/DirectSign(64)
++// TurboQuant_prod 4-bit, 576-block: 3-bit Lloyd-Max + 1-bit QJL on [0:511], f16 passthrough on [512:575] (rope)
+ typedef struct {
+-    // Sub-block 1: 256 elements (QJL SRHT correction)
++    // Sub-block 1: 256 elements (WHT + 3-bit Lloyd-Max + QJL SRHT correction)
+     ggml_half d1;
+     ggml_half d1_qjl;
+     uint8_t qs1[QK_K*3/8];       // 3-bit packed Lloyd-Max indices (96 bytes)
+     uint8_t qjl1[QK_K/8];        // 1-bit QJL signs (32 bytes)
+-    // Sub-block 2: 256 elements (QJL SRHT correction)
++    // Sub-block 2: 256 elements (WHT + 3-bit Lloyd-Max + QJL SRHT correction)
+     ggml_half d2;
+     ggml_half d2_qjl;
+     uint8_t qs2[QK_K*3/8];       // 96 bytes
+     uint8_t qjl2[QK_K/8];        // 32 bytes
+-    // Sub-block 3: 64 elements (Direct Sign correction)
+-    ggml_half d3;
+-    ggml_half d3_qjl;
+-    uint8_t qs3[TBQ_K64*3/8];    // 24 bytes
+-    uint8_t qjl3[TBQ_K64/8];     // 8 bytes
++    // Sub-block 3: 64 elements (f16 passthrough — rope values stored directly, no WHT)
++    ggml_half rope[TBQ_K64];     // 128 bytes
+ } block_tbqp4_4;
+-static_assert(sizeof(block_tbqp4_4) == 6*sizeof(ggml_half) + 2*(QK_K*3/8 + QK_K/8) + TBQ_K64*3/8 + TBQ_K64/8, "wrong tbqp4_4 block size/padding");
++static_assert(sizeof(block_tbqp4_4) == 4*sizeof(ggml_half) + 2*(QK_K*3/8 + QK_K/8) + TBQ_K64*sizeof(ggml_half), "wrong tbqp4_4 block size/padding");
+ 
+ //
+ // Super-block quantization structures
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index ddb20a1d6..6702fe3d8 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -230,7 +230,11 @@ if (CUDAToolkit_FOUND)
+             template-instances/fattn-vec-instance-f16-tbq3_4.cu
+             template-instances/fattn-vec-instance-f16-tbq4_4.cu
+             template-instances/fattn-vec-instance-q8_0-tbq3_4.cu
+-            template-instances/fattn-vec-instance-q8_0-tbq4_4.cu)
++            template-instances/fattn-vec-instance-q8_0-tbq4_4.cu
++            template-instances/fattn-vec-instance-tbq3_4-asym576x512.cu
++            template-instances/fattn-vec-instance-tbq4_4-asym576x512.cu
++            template-instances/fattn-vec-instance-tbqp3_4-asym576x512.cu
++            template-instances/fattn-vec-instance-tbqp4_4-asym576x512.cu)
+     endif()
+ 
+     ggml_add_backend_library(ggml-cuda
+diff --git a/ggml/src/ggml-cuda/cpy-utils.cuh b/ggml/src/ggml-cuda/cpy-utils.cuh
+index 811e2eb51..2c493100d 100644
+--- a/ggml/src/ggml-cuda/cpy-utils.cuh
++++ b/ggml/src/ggml-cuda/cpy-utils.cuh
+@@ -752,7 +752,6 @@ static __device__ void quantize_f32_tbq3_4_block(const float * __restrict__ x, b
+         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+         0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+     };
+-    static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+     static constexpr float tbq3_boundaries[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
+ 
+     // Helper: quantize a sub-block with 3-bit Lloyd-Max
+@@ -785,7 +784,7 @@ static __device__ void quantize_f32_tbq3_4_block(const float * __restrict__ x, b
+ 
+     quant_sub(x,       QK_K,    signs_256, &y->d1, y->qs1);
+     quant_sub(x + 256, QK_K,    signs_256, &y->d2, y->qs2);
+-    quant_sub(x + 512, TBQ_K64, signs_64,  &y->d3, y->qs3);
++    for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
+ }
+ 
+ static __device__ void quantize_f32_tbq4_4_block(const float * __restrict__ x, block_tbq4_4 * __restrict__ y) {
+@@ -793,7 +792,6 @@ static __device__ void quantize_f32_tbq4_4_block(const float * __restrict__ x, b
+         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+         0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+     };
+-    static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+     static constexpr float tbq4_boundaries[15] = {
+         -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,0.0f,
+         0.2583f,0.5225f,0.7996f,1.0993f,1.4371f,1.8435f,2.4008f,
+@@ -824,7 +822,8 @@ static __device__ void quantize_f32_tbq4_4_block(const float * __restrict__ x, b
+ 
+     quant_sub(x,       QK_K,    signs_256, &y->d1, y->qs1);
+     quant_sub(x + 256, QK_K,    signs_256, &y->d2, y->qs2);
+-    quant_sub(x + 512, TBQ_K64, signs_64,  &y->d3, y->qs3);
++    // Sub-block 3: f16 passthrough (rope)
++    for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
+ }
+ 
+ static __device__ void quantize_f32_tbqp3_4_block(const float * __restrict__ x, block_tbqp3_4 * __restrict__ y) {
+@@ -836,7 +835,6 @@ static __device__ void quantize_f32_tbqp3_4_block(const float * __restrict__ x,
+         0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+         0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+     };
+-    static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+     static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
+     static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
+ 
+@@ -883,47 +881,10 @@ static __device__ void quantize_f32_tbqp3_4_block(const float * __restrict__ x,
+         for (int j = 0; j < QK_K; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
+     };
+ 
+-    // Sub-block 3: 64-element, 2-bit Lloyd-Max + Direct Sign correction (lower variance at d<=128)
+-    auto quant_sub_direct = [&](const float * src,
+-                                 ggml_half * d_out, ggml_half * d_qjl_out, uint8_t * qs_out, uint8_t * qjl_out) {
+-        float tmp[TBQ_K64], recon[TBQ_K64];
+-        float sum_sq = 0.0f;
+-        for (int j = 0; j < TBQ_K64; j++) sum_sq += src[j] * src[j];
+-        float norm = sqrtf(sum_sq);
+-        *d_out = __float2half(norm);
+-        if (norm < 1e-10f) {
+-            for (int j = 0; j < TBQ_K64/4; j++) qs_out[j] = 0;
+-            for (int j = 0; j < TBQ_K64/8; j++) qjl_out[j] = 0;
+-            *d_qjl_out = __float2half(0.0f); return;
+-        }
+-        float inv_norm = 1.0f / norm;
+-        for (int j = 0; j < TBQ_K64; j++) {
+-            int sign = ((signs_64[j>>3]>>(j&7))&1) ? -1 : 1;
+-            tmp[j] = src[j] * inv_norm * sign;
+-        }
+-        for (int len = 1; len < TBQ_K64; len *= 2)
+-            for (int i = 0; i < TBQ_K64; i += 2*len)
+-                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+-        for (int j = 0; j < TBQ_K64/4; j++) {
+-            uint8_t packed = 0;
+-            for (int k = 0; k < 4; k++) {
+-                uint8_t idx = 3;
+-                for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } }
+-                packed |= (idx&0x3)<<(k*2);
+-                recon[j*4+k] = c2[idx];
+-            }
+-            qs_out[j] = packed;
+-        }
+-        float res[TBQ_K64], res_abs = 0.0f;
+-        for (int j = 0; j < TBQ_K64; j++) { res[j] = tmp[j]-recon[j]; res_abs += fabsf(res[j]); }
+-        *d_qjl_out = __float2half((res_abs/TBQ_K64)*norm);
+-        for (int j = 0; j < TBQ_K64/8; j++) qjl_out[j] = 0;
+-        for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
+-    };
+-
+     quant_sub_qjl(x,       signs_256, qjl_signs_256, &y->d1, &y->d1_qjl, y->qs1, y->qjl1);
+     quant_sub_qjl(x + 256, signs_256, qjl_signs_256, &y->d2, &y->d2_qjl, y->qs2, y->qjl2);
+-    quant_sub_direct(x + 512, &y->d3, &y->d3_qjl, y->qs3, y->qjl3);
++    // Sub-block 3: f16 passthrough (rope)
++    for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
+ }
+ 
+ static __device__ void quantize_f32_tbqp4_4_block(const float * __restrict__ x, block_tbqp4_4 * __restrict__ y) {
+@@ -935,7 +896,6 @@ static __device__ void quantize_f32_tbqp4_4_block(const float * __restrict__ x,
+         0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+         0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+     };
+-    static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+     static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+     static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
+ 
+@@ -982,47 +942,10 @@ static __device__ void quantize_f32_tbqp4_4_block(const float * __restrict__ x,
+         for (int j = 0; j < QK_K; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
+     };
+ 
+-    // Sub-block 3: 64-element, 3-bit Lloyd-Max + Direct Sign correction
+-    auto quant_sub_direct = [&](const float * src,
+-                                 ggml_half * d_out, ggml_half * d_qjl_out, uint8_t * qs_out, uint8_t * qjl_out) {
+-        float tmp[TBQ_K64], recon[TBQ_K64];
+-        float sum_sq = 0.0f;
+-        for (int j = 0; j < TBQ_K64; j++) sum_sq += src[j] * src[j];
+-        float norm = sqrtf(sum_sq);
+-        *d_out = __float2half(norm);
+-        if (norm < 1e-10f) {
+-            for (int j = 0; j < TBQ_K64*3/8; j++) qs_out[j] = 0;
+-            for (int j = 0; j < TBQ_K64/8; j++) qjl_out[j] = 0;
+-            *d_qjl_out = __float2half(0.0f); return;
+-        }
+-        float inv_norm = 1.0f / norm;
+-        for (int j = 0; j < TBQ_K64; j++) {
+-            int sign = ((signs_64[j>>3]>>(j&7))&1) ? -1 : 1;
+-            tmp[j] = src[j] * inv_norm * sign;
+-        }
+-        for (int len = 1; len < TBQ_K64; len *= 2)
+-            for (int i = 0; i < TBQ_K64; i += 2*len)
+-                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+-        int bit_pos = 0;
+-        for (int j = 0; j < TBQ_K64*3/8; j++) qs_out[j] = 0;
+-        for (int j = 0; j < TBQ_K64; j++) {
+-            uint8_t idx = 7;
+-            for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
+-            int byte_idx = bit_pos/8, bit_off = bit_pos%8;
+-            qs_out[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
+-            if (bit_off > 5) qs_out[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
+-            recon[j] = c3[idx]; bit_pos += 3;
+-        }
+-        float res[TBQ_K64], res_abs = 0.0f;
+-        for (int j = 0; j < TBQ_K64; j++) { res[j] = tmp[j]-recon[j]; res_abs += fabsf(res[j]); }
+-        *d_qjl_out = __float2half((res_abs/TBQ_K64)*norm);
+-        for (int j = 0; j < TBQ_K64/8; j++) qjl_out[j] = 0;
+-        for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
+-    };
+-
+     quant_sub_qjl(x,       signs_256, qjl_signs_256, &y->d1, &y->d1_qjl, y->qs1, y->qjl1);
+     quant_sub_qjl(x + 256, signs_256, qjl_signs_256, &y->d2, &y->d2_qjl, y->qs2, y->qjl2);
+-    quant_sub_direct(x + 512, &y->d3, &y->d3_qjl, y->qs3, y->qjl3);
++    // Sub-block 3: f16 passthrough (rope)
++    for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
+ }
+ 
+ // ============================================================
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 3b00ec8b7..c71389d89 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1257,14 +1257,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_4(
+             corr1 = (K->qjl2[(e+1)/8]>>((e+1)%8))&1;
+             use_qjl = true;
+         } else {
+-            // Sub-block 3: elements [512, 576)
++            // Sub-block 3: f16 passthrough (rope)
+             const int e = elem - 512;
+-            norm = __half2float(K->d3); d_corr = __half2float(K->d3_qjl);
+-            cent0 = c2[(K->qs3[e/4]>>((e%4)*2))&0x3];
+-            cent1 = c2[(K->qs3[(e+1)/4]>>(((e+1)%4)*2))&0x3];
+-            corr0 = (K->qjl3[e/8]>>(e%8))&1;
+-            corr1 = (K->qjl3[(e+1)/8]>>((e+1)%8))&1;
++            cent0 = __half2float(K->rope[e]);
++            cent1 = __half2float(K->rope[e + 1]);
+             use_qjl = false;
++            norm = 0.0f; d_corr = 0.0f; // unused, suppress warnings
++            corr0 = 0; corr1 = 0;
+         }
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+         const float2 q_mse = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+@@ -1276,9 +1275,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_4(
+             sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
+                  + d_corr*((corr0?q_qjl.x:-q_qjl.x) + (corr1?q_qjl.y:-q_qjl.y));
+         } else {
+-            // Direct Sign: use MSE query for correction too
+-            sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
+-                 + d_corr*((corr0?q_mse.x:-q_mse.x) + (corr1?q_mse.y:-q_mse.y));
++            // f16 passthrough: Q_reg already has Q_raw * scale, values are raw f16
++            sum += q_mse.x*cent0 + q_mse.y*cent1;
+         }
+     }
+     return sum;
+@@ -1316,13 +1314,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_4(
+             corr1 = (K->qjl2[(e+1)/8]>>((e+1)%8))&1;
+             use_qjl = true;
+         } else {
++            // Sub-block 3: f16 passthrough (rope)
+             const int e = elem - 512;
+-            norm = __half2float(K->d3); d_corr = __half2float(K->d3_qjl);
+-            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs3[by]>>bo; if(bo>5) v|=(uint32_t)K->qs3[by+1]<<(8-bo); cent0=c3[v&0x7]; }
+-            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs3[by]>>bo; if(bo>5) v|=(uint32_t)K->qs3[by+1]<<(8-bo); cent1=c3[v&0x7]; }
+-            corr0 = (K->qjl3[e/8]>>(e%8))&1;
+-            corr1 = (K->qjl3[(e+1)/8]>>((e+1)%8))&1;
++            cent0 = __half2float(K->rope[e]);
++            cent1 = __half2float(K->rope[e + 1]);
+             use_qjl = false;
++            norm = 0.0f; d_corr = 0.0f; // unused, suppress warnings
++            corr0 = 0; corr1 = 0;
+         }
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+         const float2 q_mse = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+@@ -1334,8 +1332,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_4(
+             sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
+                  + d_corr*((corr0?q_qjl.x:-q_qjl.x) + (corr1?q_qjl.y:-q_qjl.y));
+         } else {
+-            sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
+-                 + d_corr*((corr0?q_mse.x:-q_mse.x) + (corr1?q_mse.y:-q_mse.y));
++            // f16 passthrough: Q_reg already has Q_raw * scale, values are raw f16
++            sum += q_mse.x*cent0 + q_mse.y*cent1;
+         }
+     }
+     return sum;
+@@ -1355,18 +1353,32 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_4(
+         const int elem = k * 2;
+         float norm; const uint8_t * qs;
+         int e;
++        float cent0, cent1;
++        bool is_rope = false;
+         if (elem < 256) { norm = __half2float(K->d1); qs = K->qs1; e = elem; }
+         else if (elem < 512) { norm = __half2float(K->d2); qs = K->qs2; e = elem - 256; }
+-        else { norm = __half2float(K->d3); qs = K->qs3; e = elem - 512; }
+-        float cent0, cent1;
+-        { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent0=c3[v&0x7]; }
+-        { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent1=c3[v&0x7]; }
++        else {
++            // Sub-block 3: f16 passthrough (rope)
++            e = elem - 512;
++            cent0 = __half2float(K->rope[e]);
++            cent1 = __half2float(K->rope[e + 1]);
++            is_rope = true;
++            norm = 0.0f; qs = nullptr;
++        }
++        if (!is_rope) {
++            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent0=c3[v&0x7]; }
++            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent1=c3[v&0x7]; }
++        }
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+ #else
+         const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
+ #endif
+-        sum += norm*(q.x*cent0 + q.y*cent1);
++        if (is_rope) {
++            sum += q.x*cent0 + q.y*cent1;
++        } else {
++            sum += norm*(q.x*cent0 + q.y*cent1);
++        }
+     }
+     return sum;
+ }
+@@ -1385,19 +1397,34 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_4(
+         const int elem = k * 2;
+         float norm; const uint8_t * qs;
+         int e;
++        float cent0, cent1;
++        bool is_rope = false;
+         if (elem < 256) { norm = __half2float(K->d1); qs = K->qs1; e = elem; }
+         else if (elem < 512) { norm = __half2float(K->d2); qs = K->qs2; e = elem - 256; }
+-        else { norm = __half2float(K->d3); qs = K->qs3; e = elem - 512; }
+-        const uint8_t packed = qs[e/2];
+-        const float cent0 = (e % 2 == 0) ? c4[packed & 0xF] : c4[packed >> 4];
+-        const uint8_t packed1 = qs[(e+1)/2];
+-        const float cent1 = ((e+1) % 2 == 0) ? c4[packed1 & 0xF] : c4[packed1 >> 4];
++        else {
++            // Sub-block 3: f16 passthrough (rope)
++            e = elem - 512;
++            cent0 = __half2float(K->rope[e]);
++            cent1 = __half2float(K->rope[e + 1]);
++            is_rope = true;
++            norm = 0.0f; qs = nullptr;
++        }
++        if (!is_rope) {
++            const uint8_t packed = qs[e/2];
++            cent0 = (e % 2 == 0) ? c4[packed & 0xF] : c4[packed >> 4];
++            const uint8_t packed1 = qs[(e+1)/2];
++            cent1 = ((e+1) % 2 == 0) ? c4[packed1 & 0xF] : c4[packed1 >> 4];
++        }
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
+ #else
+         const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
+ #endif
+-        sum += norm*(q.x*cent0 + q.y*cent1);
++        if (is_rope) {
++            sum += q.x*cent0 + q.y*cent1;
++        } else {
++            sum += norm*(q.x*cent0 + q.y*cent1);
++        }
+     }
+     return sum;
+ }
+@@ -1409,13 +1436,30 @@ static __device__ __forceinline__ void dequantize_V_tbq3_4(const void * __restri
+     static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+     const int64_t ib = i0 / TBQ_K576;
+     const int elem = i0 % TBQ_K576;
++
++    // Sub-block 3: f16 passthrough (rope) — early return
++    if (elem >= 512) {
++#pragma unroll
++        for (int l = 0; l < ne; ++l) {
++            const float val = __half2float(x[ib].rope[elem - 512 + l]);
++            if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = val; }
++#ifdef FP16_AVAILABLE
++            else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(val); }
++#endif
++        }
++        return;
++    }
++
++    // Hoist sub-block selection + half2float out of unrolled loop (consecutive elements stay in same sub-block)
++    const bool is_blk1 = (elem < 256);
++    const float norm = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
++    const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
++    const int e_base = is_blk1 ? elem : (elem - 256);
++    constexpr int qs_len = QK_K*3/8;
++
+ #pragma unroll
+     for (int l = 0; l < ne; ++l) {
+-        const int global_e = elem + l;
+-        float norm; const uint8_t * qs; int e; int qs_len;
+-        if (global_e < 256)      { norm = __half2float(x[ib].d1); qs = x[ib].qs1; e = global_e;       qs_len = QK_K*3/8; }
+-        else if (global_e < 512) { norm = __half2float(x[ib].d2); qs = x[ib].qs2; e = global_e - 256; qs_len = QK_K*3/8; }
+-        else                     { norm = __half2float(x[ib].d3); qs = x[ib].qs3; e = global_e - 512; qs_len = TBQ_K64*3/8; }
++        const int e = e_base + l;
+         const int bp = e*3, by = bp/8, bo = bp%8;
+         uint32_t v = (uint32_t)qs[by]>>bo;
+         if (bo > 5 && by+1 < qs_len) v |= (uint32_t)qs[by+1]<<(8-bo);
+@@ -1434,13 +1478,29 @@ static __device__ __forceinline__ void dequantize_V_tbq4_4(const void * __restri
+     static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
+     const int64_t ib = i0 / TBQ_K576;
+     const int elem = i0 % TBQ_K576;
++
++    // Sub-block 3: f16 passthrough (rope) — early return
++    if (elem >= 512) {
++#pragma unroll
++        for (int l = 0; l < ne; ++l) {
++            const float val = __half2float(x[ib].rope[elem - 512 + l]);
++            if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = val; }
++#ifdef FP16_AVAILABLE
++            else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(val); }
++#endif
++        }
++        return;
++    }
++
++    // Hoist sub-block selection + half2float out of unrolled loop
++    const bool is_blk1 = (elem < 256);
++    const float norm = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
++    const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
++    const int e_base = is_blk1 ? elem : (elem - 256);
++
+ #pragma unroll
+     for (int l = 0; l < ne; ++l) {
+-        const int global_e = elem + l;
+-        float norm; const uint8_t * qs; int e;
+-        if (global_e < 256)      { norm = __half2float(x[ib].d1); qs = x[ib].qs1; e = global_e; }
+-        else if (global_e < 512) { norm = __half2float(x[ib].d2); qs = x[ib].qs2; e = global_e - 256; }
+-        else                     { norm = __half2float(x[ib].d3); qs = x[ib].qs3; e = global_e - 512; }
++        const int e = e_base + l;
+         const float cent = c4[(qs[e/2] >> ((e%2)*4)) & 0xF] * norm;
+         if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = cent; }
+ #ifdef FP16_AVAILABLE
+@@ -1449,6 +1509,95 @@ static __device__ __forceinline__ void dequantize_V_tbq4_4(const void * __restri
+     }
+ }
+ 
++// V dequantize for TBQP3_4 (576-block, 2-bit Lloyd-Max + 1-bit QJL)
++// For MLA V view: only sub-blocks 1,2 (elements 0..511) are accessed.
++// Sub-block selection is hoisted out of the inner loop for speed.
++template <typename T, int ne>
++static __device__ __forceinline__ void dequantize_V_tbqp3_4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
++    const block_tbqp3_4 * x = (const block_tbqp3_4 *) vx;
++    static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
++    const int64_t ib = i0 / TBQ_K576;
++    const int elem = i0 % TBQ_K576;
++
++    // For D_V=512 (MLA), elem is always < 512 so sub-block 3 is never reached.
++    if (elem >= 512) {
++        // Sub-block 3: f16 passthrough (rope)
++#pragma unroll
++        for (int l = 0; l < ne; ++l) {
++            const float val = __half2float(x[ib].rope[elem - 512 + l]);
++            if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
++#ifdef FP16_AVAILABLE
++            else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
++#endif
++        }
++        return;
++    }
++
++    // Hoist sub-block selection and half->float conversion out of the unrolled loop.
++    // NOTE: QJL correction is NOT applied here. QJL is for K·Q dot product correction only,
++    // not for V value reconstruction. V needs pure MSE centroid * norm for IWHT to work correctly.
++    const bool is_blk1 = (elem < 256);
++    const float norm  = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
++    const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
++    const int e_base = is_blk1 ? elem : (elem - 256);
++
++#pragma unroll
++    for (int l = 0; l < ne; ++l) {
++        const int e = e_base + l;
++        const float val = c2[(qs[e/4] >> ((e%4)*2)) & 0x3] * norm;
++        if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
++#ifdef FP16_AVAILABLE
++        else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
++#endif
++    }
++}
++
++// V dequantize for TBQP4_4 (576-block, 3-bit Lloyd-Max + 1-bit QJL)
++// For MLA V view: only sub-blocks 1,2 (elements 0..511) are accessed.
++// Sub-block selection and half->float hoisted out of inner loop.
++template <typename T, int ne>
++static __device__ __forceinline__ void dequantize_V_tbqp4_4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
++    const block_tbqp4_4 * x = (const block_tbqp4_4 *) vx;
++    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
++    const int64_t ib = i0 / TBQ_K576;
++    const int elem = i0 % TBQ_K576;
++
++    // For D_V=512 (MLA), elem is always < 512 so sub-block 3 is never reached.
++    if (elem >= 512) {
++        // Sub-block 3: f16 passthrough (rope)
++#pragma unroll
++        for (int l = 0; l < ne; ++l) {
++            const float val = __half2float(x[ib].rope[elem - 512 + l]);
++            if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
++#ifdef FP16_AVAILABLE
++            else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
++#endif
++        }
++        return;
++    }
++
++    // NOTE: QJL correction is NOT applied for V dequantization.
++    // QJL corrects K·Q dot products only, not per-element V reconstruction.
++    const bool is_blk1 = (elem < 256);
++    const float norm  = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
++    const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
++    const int e_base = is_blk1 ? elem : (elem - 256);
++    constexpr int qs_len = QK_K*3/8; // 96, always sub-block 1 or 2
++
++#pragma unroll
++    for (int l = 0; l < ne; ++l) {
++        const int e = e_base + l;
++        const int bp = e*3, by = bp/8, bo = bp%8;
++        uint32_t v = (uint32_t)qs[by] >> bo;
++        if (bo > 5 && by+1 < qs_len) v |= (uint32_t)qs[by+1] << (8-bo);
++        const float val = c3[v & 0x7] * norm;
++        if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
++#ifdef FP16_AVAILABLE
++        else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
++#endif
++    }
++}
++
+ template <ggml_type type_K, int D, int nthreads>
+ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
+     if constexpr (type_K == GGML_TYPE_F16) {
+@@ -1547,6 +1696,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
+         return dequantize_V_tbq3_4<T, ne>;
+     } else if constexpr (type_V == GGML_TYPE_TBQ4_4) {
+         return dequantize_V_tbq4_4<T, ne>;
++    } else if constexpr (type_V == GGML_TYPE_TBQP3_4) {
++        return dequantize_V_tbqp3_4<T, ne>;
++    } else if constexpr (type_V == GGML_TYPE_TBQP4_4) {
++        return dequantize_V_tbqp4_4<T, ne>;
+     } else {
+         static_assert(type_V == -1, "bad type");
+         return nullptr;
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index c920bbbcf..b49da6ec9 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wpass-failed"
+ #endif // __clang__
+-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
++template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int D_V = D> // D == K/Q head size, D_V == V head size
+ __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+ static __global__ void flash_attn_ext_vec(
+         const char * __restrict__ Q,
+@@ -118,18 +118,19 @@ static __global__ void flash_attn_ext_vec(
+ 
+     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+ 
+-    static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
++    static_assert(D   % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
++    static_assert(D_V % (2*WARP_SIZE) == 0, "D_V not divisible by 2*WARP_SIZE == 64.");
+     constexpr int nwarps = nthreads / WARP_SIZE;
+     const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+     __builtin_assume(tid < nthreads);
+ 
+     constexpr int ne_KQ      = ncols*D;
+-    constexpr int ne_combine = nwarps*V_cols_per_iter*D;
++    constexpr int ne_combine = nwarps*V_cols_per_iter*D_V;
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+-    half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
++    half2            VKQ[ncols][(D_V/2)/nthreads_V] = {{{0.0f, 0.0f}}};
+     __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+ #else
+-    float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
++    float2           VKQ[ncols][(D_V/2)/nthreads_V] = {{{0.0f, 0.0f}}};
+     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+ #endif // V_DOT2_F32_F16_AVAILABLE
+ 
+@@ -469,8 +470,6 @@ static __global__ void flash_attn_ext_vec(
+             0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+             0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+         };
+-        static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+-
+         for (int j = 0; j < ncols; ++j) {
+             float * Q_wht = (float *) &KQ[0]; // 576 floats workspace
+             const float * Q_f = (const float *) (Q + j*nb01);
+@@ -517,9 +516,10 @@ static __global__ void flash_attn_ext_vec(
+ #endif
+             }
+ 
++            __syncthreads(); // Barrier: all warps must finish reading Q_wht before sub-block 2 overwrites it
++
+             // QJL WHT for sub-block 1 (TBQP only)
+             if constexpr (type_K == GGML_TYPE_TBQP3_4 || type_K == GGML_TYPE_TBQP4_4) {
+-                __syncthreads();
+                 float f0, f1;
+                 { float sign0 = ((qjl_signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                   float sign1 = ((qjl_signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
+@@ -594,9 +594,10 @@ static __global__ void flash_attn_ext_vec(
+ #endif
+             }
+ 
++            __syncthreads(); // Barrier: all warps must finish reading Q_wht before sub-block 3 overwrites it
++
+             // QJL WHT for sub-block 2 (TBQP only)
+             if constexpr (type_K == GGML_TYPE_TBQP3_4 || type_K == GGML_TYPE_TBQP4_4) {
+-                __syncthreads();
+                 float f0, f1;
+                 { float sign0 = ((qjl_signs_256[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                   float sign1 = ((qjl_signs_256[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
+@@ -629,36 +630,12 @@ static __global__ void flash_attn_ext_vec(
+                 __syncthreads();
+             }
+ 
+-            // === Sub-block 3: WHT_64 on Q[512:576] ===
+-            {
+-                float f0 = 0.0f;
+-                if (tid < 64) {
+-                    float sign0 = ((signs_64[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+-                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[512 + tid];
+-                    f0 = q0 * sign0;
+-                }
+-                #pragma unroll
+-                for (int s = 0; s < 5; s++) {
+-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+-                    if (tid & (1 << s)) { f0 = o0 - f0; }
+-                    else                { f0 = f0 + o0; }
+-                }
+-                if (tid < 64) { Q_wht[tid] = f0; }
+-                __syncthreads();
+-                if (tid < 64) {
+-                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
+-                    f0 = (tid & 32) ? v0 - u0 : u0 + v0;
+-                }
+-                __syncthreads();
+-                if (tid < 64) { Q_wht[tid] = f0; }
+-                __syncthreads();
+-            }
+-            // Store sub-block 3 in Q_reg[8] (64/2/nthreads_KQ elements, scale/64)
++            // === Sub-block 3: f16 passthrough (rope, no WHT) ===
+             for (int i0 = 0; i0 < 32; i0 += nthreads_KQ) {
+                 const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                 if (i < 32) {
+-                    const float v0 = Q_wht[2*i] * scale / 64.0f;
+-                    const float v1 = Q_wht[2*i+1] * scale / 64.0f;
++                    const float v0 = ((ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[512 + 2*i]) * scale;
++                    const float v1 = ((ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[512 + 2*i + 1]) * scale;
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+                     Q_reg[j][256/nthreads_KQ + i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
+ #else
+@@ -666,7 +643,7 @@ static __global__ void flash_attn_ext_vec(
+ #endif
+                 }
+             }
+-            // Sub-block 3: Direct Sign, no QJL WHT needed (even for TBQP types)
++            // Sub-block 3: f16 passthrough, no QJL needed (even for TBQP types)
+ 
+             __syncthreads();
+         }
+@@ -760,7 +737,6 @@ static __global__ void flash_attn_ext_vec(
+                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                     sum = warp_reduce_sum<nthreads_KQ>(sum);
+                 }
+-
+                 if (use_logit_softcap) {
+                     sum = logit_softcap*tanhf(sum);
+                 }
+@@ -793,12 +769,12 @@ static __global__ void flash_attn_ext_vec(
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+ #pragma unroll
+-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
++            for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V) {
+                 VKQ[j][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
+             }
+ #else
+ #pragma unroll
+-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
++            for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V) {
+                 VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
+                 VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
+             }
+@@ -820,7 +796,7 @@ static __global__ void flash_attn_ext_vec(
+                 KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
+             }
+ #pragma unroll
+-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
++            for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                 half2 tmp[V_rows_per_thread/2];
+                 const int v_elem = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
+                 if constexpr (is_cross_head_V) {
+@@ -868,7 +844,7 @@ static __global__ void flash_attn_ext_vec(
+                 KQ_k[j] = KQ[j*nthreads + k];
+             }
+ #pragma unroll
+-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
++            for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                 float2 tmp[V_rows_per_thread/2];
+                 const int v_elem = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
+                 if constexpr (is_cross_head_V) {
+@@ -922,12 +898,12 @@ static __global__ void flash_attn_ext_vec(
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+ #pragma unroll
+-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
++            for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V) {
+                 VKQ[j][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
+             }
+ #else
+ #pragma unroll
+-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
++            for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V) {
+                 VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
+                 VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
+             }
+@@ -967,31 +943,31 @@ static __global__ void flash_attn_ext_vec(
+         KQ_max[j_VKQ] = kqmax_new;
+ 
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+-        half2 * VKQ_tmp = (half2 *) KQ + threadIdx.y*(V_cols_per_iter*D/2)
+-            + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V)*(D/2);
++        half2 * VKQ_tmp = (half2 *) KQ + threadIdx.y*(V_cols_per_iter*D_V/2)
++            + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V)*(D_V/2);
+ 
+         const half2 kqmax_scale_h2 = make_half2(kqmax_scale, kqmax_scale);
+ #pragma unroll
+-        for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
++        for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V) {
+             VKQ[j_VKQ][i_VKQ_0/nthreads_V] *= kqmax_scale_h2;
+         }
+ #pragma unroll
+-        for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
++        for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+             const int i_VKQ = i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*(V_rows_per_thread/2);
+ 
+             ggml_cuda_memcpy_1<V_rows_per_thread*sizeof(half)>(VKQ_tmp + i_VKQ, &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
+         }
+ #else
+-        float2 * VKQ_tmp = (float2 *) KQ + threadIdx.y*(V_cols_per_iter*D/2)
+-            + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V)*(D/2);
++        float2 * VKQ_tmp = (float2 *) KQ + threadIdx.y*(V_cols_per_iter*D_V/2)
++            + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V)*(D_V/2);
+ 
+ #pragma unroll
+-        for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
++        for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V) {
+             VKQ[j_VKQ][i_VKQ_0/nthreads_V].x *= kqmax_scale;
+             VKQ[j_VKQ][i_VKQ_0/nthreads_V].y *= kqmax_scale;
+         }
+ #pragma unroll
+-        for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
++        for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+             const int i_VKQ = i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*(V_rows_per_thread/2);
+ 
+             ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ,                       &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
+@@ -1007,18 +983,18 @@ static __global__ void flash_attn_ext_vec(
+ 
+         __syncthreads();
+ 
+-        if (nthreads <= D || tid < D) {
++        if (nthreads <= D_V || tid < D_V) {
+             KQ_sum[j_VKQ] = KQ_sum_shared[j_VKQ][threadIdx.x];
+             KQ_sum[j_VKQ] = warp_reduce_sum(KQ_sum[j_VKQ]);
+ 
+ #pragma unroll
+-            for (int i0 = 0; i0 < D; i0 += nthreads) {
++            for (int i0 = 0; i0 < D_V; i0 += nthreads) {
+                 float dst_val = 0;
+ #pragma unroll
+                 for (int w = 0; w < nwarps; ++w) {
+ #pragma unroll
+                     for (int v = 0; v < V_cols_per_iter; ++v) {
+-                        dst_val += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
++                        dst_val += float(KQ[w*V_cols_per_iter*D_V + v*D_V + i0 + tid]);
+                     }
+                 }
+                 if (gridDim.y == 1) {
+@@ -1029,10 +1005,11 @@ static __global__ void flash_attn_ext_vec(
+                            || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
+                            || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
+                            || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3
+-                           || type_V == GGML_TYPE_TBQ4_4 || type_V == GGML_TYPE_TBQ3_4) {
++                           || type_V == GGML_TYPE_TBQ4_4 || type_V == GGML_TYPE_TBQ3_4
++                           || type_V == GGML_TYPE_TBQP4_4 || type_V == GGML_TYPE_TBQP3_4) {
+                     KQ[i0 + tid] = dst_val; // reuse KQ shared memory
+                 } else {
+-                    dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
++                    dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D_V + i0 + tid] = dst_val;
+                 }
+             }
+ 
+@@ -1046,52 +1023,54 @@ static __global__ void flash_attn_ext_vec(
+                 };
+                 __syncthreads();
+ 
+-                // FP32 IWHT + sign undo + 1/D (FP16 causes precision loss with accumulated V values)
+-                {
+-                    float * buf = (float *) &KQ[0];
+-                    float f0 = buf[tid], f1 = buf[tid + 128];
+-                    __syncthreads();
+-                    // Stage 7 (stride 128): register-local
+-                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
+-                    // Stages 0-4: warp shuffle
+-                    #pragma unroll
+-                    for (int s = 0; s < 5; s++) {
+-                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+-                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
+-                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
+-                        else                { f0 = f0 + o0; f1 = f1 + o1; }
+-                    }
+-                    // Stages 5-6: shared memory
+-                    buf[tid] = f0; buf[tid + 128] = f1;
+-                    __syncthreads();
+-                    {
+-                        float u0 = buf[tid], v0 = buf[tid ^ 32];
+-                        float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 32];
+-                        f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
+-                        f1 = (tid & 32) ? (v1 - u1) : (u1 + v1);
+-                    }
+-                    buf[tid] = f0; buf[tid + 128] = f1;
+-                    __syncthreads();
++                float * buf_base = (float *) &KQ[0];
++                const int dst_base = (((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D_V;
++
++                // Process each 256-block independently (D_V/256 passes)
++                for (int blk = 0; blk < D_V; blk += 256) {
++                    float * buf = buf_base + blk;
++
++                    // FP32 IWHT + sign undo + 1/256 (FP16 causes precision loss with accumulated V values)
+                     {
+-                        float u0 = buf[tid], v0 = buf[tid ^ 64];
+-                        float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 64];
+-                        f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
+-                        f1 = (tid & 64) ? (v1 - u1) : (u1 + v1);
++                        float f0 = buf[tid], f1 = buf[tid + 128];
++                        __syncthreads();
++                        // Stage 7 (stride 128): register-local
++                        { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
++                        // Stages 0-4: warp shuffle
++                        #pragma unroll
++                        for (int s = 0; s < 5; s++) {
++                            float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                            float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
++                            if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
++                            else                { f0 = f0 + o0; f1 = f1 + o1; }
++                        }
++                        // Stages 5-6: shared memory
++                        buf[tid] = f0; buf[tid + 128] = f1;
++                        __syncthreads();
++                        {
++                            float u0 = buf[tid], v0 = buf[tid ^ 32];
++                            float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 32];
++                            f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
++                            f1 = (tid & 32) ? (v1 - u1) : (u1 + v1);
++                        }
++                        buf[tid] = f0; buf[tid + 128] = f1;
++                        __syncthreads();
++                        {
++                            float u0 = buf[tid], v0 = buf[tid ^ 64];
++                            float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 64];
++                            f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
++                            f1 = (tid & 64) ? (v1 - u1) : (u1 + v1);
++                        }
++                        __syncthreads();
++                        // Apply sign undo + 1/256
++                        float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                        float sign1 = ((tbq_signs_v[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
++                        dst[dst_base + blk + tid]       = f0 * sign0 / 256.0f;
++                        dst[dst_base + blk + tid + 128] = f1 * sign1 / 256.0f;
+                     }
+-                    __syncthreads();
+-                    // Apply sign undo + 1/D
+-                    float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+-                    float sign1 = ((tbq_signs_v[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
+-                    buf[tid] = f0 * sign0 / (float)D;
+-                    buf[tid + 128] = f1 * sign1 / (float)D;
+-                }
+-                __syncthreads();
+ 
+-                // Write IWHT'd result to dst
+-                for (int i0 = 0; i0 < D; i0 += nthreads) {
+-                    if (i0 + tid < D) {
+-                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
+-                            ((float *)&KQ[0])[i0 + tid];
++                    if (blk + 256 < D_V) {
++                        __syncthreads();
+                     }
+                 }
+             }
+@@ -1126,29 +1105,29 @@ static __global__ void flash_attn_ext_vec(
+                     { float u0 = buf[tid], v0 = buf[tid ^ 64]; f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); }
+                     __syncthreads();
+                     float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+-                    buf[tid] = f0 * sign0 / (float)D;
++                    buf[tid] = f0 * sign0 / (float)D_V;
+                 }
+                 __syncthreads();
+ 
+-                for (int i0 = 0; i0 < D; i0 += nthreads) {
+-                    if (i0 + tid < D) {
+-                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
++                for (int i0 = 0; i0 < D_V; i0 += nthreads) {
++                    if (i0 + tid < D_V) {
++                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D_V + i0 + tid] =
+                             ((float *)&KQ[0])[i0 + tid];
+                     }
+                 }
+             }
+ 
+             // TBQ V 576-block IWHT: split 256+256+64, three passes
+-            if constexpr (type_V == GGML_TYPE_TBQ4_4 || type_V == GGML_TYPE_TBQ3_4) {
++            if constexpr (type_V == GGML_TYPE_TBQ4_4 || type_V == GGML_TYPE_TBQ3_4
++                       || type_V == GGML_TYPE_TBQP4_4 || type_V == GGML_TYPE_TBQP3_4) {
+                 static constexpr uint8_t signs_256[32] = {
+                     0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+                     0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+                 };
+-                static constexpr uint8_t signs_64[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+                 __syncthreads();
+ 
+                 float * buf = (float *) &KQ[0];
+-                const int dst_base = (((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D;
++                const int dst_base = (((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D_V;
+ 
+                 // === FP32 IWHT pass 1: sub-block 1, buf[0:255] → dst[0:255] ===
+                 {
+@@ -1204,26 +1183,12 @@ static __global__ void flash_attn_ext_vec(
+                     dst[dst_base + 256 + tid + 128] = f1 * s1 / 256.0f;
+                 }
+ 
+-                // === FP32 IWHT pass 3: sub-block 3, buf[512:575] → dst[512:575] ===
+-                {
+-                    float f0 = (tid < 64) ? buf[512 + tid] : 0.0f;
+-                    __syncthreads();
+-                    #pragma unroll
+-                    for (int s = 0; s < 5; s++) {
+-                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+-                        if (tid & (1 << s)) { f0 = o0 - f0; }
+-                        else                { f0 = f0 + o0; }
+-                    }
+-                    if (tid < 64) { buf[tid] = f0; }
+-                    __syncthreads();
+-                    if (tid < 64) {
+-                        float u0 = buf[tid], v0 = buf[tid ^ 32];
+-                        f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
+-                    }
+-                    __syncthreads();
++                // === Pass 3: sub-block 3 (rope, f16 passthrough) → dst[512:575] ===
++                // No IWHT needed — values are already in spatial domain.
++                // Only needed when D_V > 512 (full 576-block); skipped for V view (D_V=512)
++                if constexpr (D_V > 512) {
+                     if (tid < 64) {
+-                        float s0 = ((signs_64[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+-                        dst[dst_base + 512 + tid] = f0 * s0 / 64.0f;
++                        dst[dst_base + 512 + tid] = buf[512 + tid];
+                     }
+                 }
+             }
+@@ -1247,7 +1212,7 @@ static __global__ void flash_attn_ext_vec(
+                 // FP32 IWHT (FP16 causes precision loss with accumulated V values)
+                 {
+                     float * buf = (float *) &KQ[0];
+-                    float f0 = (tid < D) ? buf[tid] : 0.0f;
++                    float f0 = (tid < D_V) ? buf[tid] : 0.0f;
+                     __syncthreads();
+                     #pragma unroll
+                     for (int s = 0; s < 5; s++) {
+@@ -1255,22 +1220,22 @@ static __global__ void flash_attn_ext_vec(
+                         if (tid & (1 << s)) { f0 = o0 - f0; }
+                         else                { f0 = f0 + o0; }
+                     }
+-                    if (tid < D) { buf[tid] = f0; }
++                    if (tid < D_V) { buf[tid] = f0; }
+                     __syncthreads();
+-                    if (tid < D) {
++                    if (tid < D_V) {
+                         float u0 = buf[tid], v0 = buf[tid ^ 32];
+                         f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
+                     }
+                     __syncthreads();
+-                    if (tid < D) {
++                    if (tid < D_V) {
+                         float sign0 = ((tbq_signs_v_full[v_signs_offset + (tid >> 3)] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+-                        buf[tid] = f0 * sign0 / (float)D;
++                        buf[tid] = f0 * sign0 / (float)D_V;
+                     }
+                 }
+                 __syncthreads();
+-                for (int i0 = 0; i0 < D; i0 += nthreads) {
+-                    if (i0 + tid < D) {
+-                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] =
++                for (int i0 = 0; i0 < D_V; i0 += nthreads) {
++                    if (i0 + tid < D_V) {
++                        dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D_V + i0 + tid] =
+                             ((float *)&KQ[0])[i0 + tid];
+                     }
+                 }
+@@ -1303,17 +1268,17 @@ static __global__ void flash_attn_ext_vec(
+ #pragma clang diagnostic pop
+ #endif // __clang__
+ 
+-template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
++template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int D_V = D>
+ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
+     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
+     const int nwarps   = nthreads / WARP_SIZE;
+-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
++    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, D_V>;
+     const bool need_f16_K = type_K == GGML_TYPE_F16;
+     const bool need_f16_V = type_V == GGML_TYPE_F16;
+     constexpr size_t nbytes_shared = 0;
+-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
++    launch_fattn<D_V, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+ }
+ 
+ template <int D, ggml_type type_K, ggml_type type_V>
+@@ -1346,10 +1311,41 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
+     }
+ }
+ 
++// Asymmetric K/V: D = K/Q head dim, D_V = V head dim (e.g. GLM-4.7-Flash: D=576, D_V=512)
++template <int D, int D_V, ggml_type type_K, ggml_type type_V>
++void ggml_cuda_flash_attn_ext_vec_case_asym(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * KQV = dst;
++    const ggml_tensor * Q   = dst->src[0];
++
++    float logit_softcap;
++    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
++
++    if (Q->ne[1] == 1) {
++        constexpr int cols_per_block = 1;
++        if (logit_softcap == 0.0f) {
++            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, false, D_V>(ctx, dst);
++        } else {
++            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, true, D_V>(ctx, dst);
++        }
++        return;
++    }
++
++    constexpr int cols_per_block = 2;
++    if (logit_softcap == 0.0f) {
++        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, false, D_V>(ctx, dst);
++    } else {
++        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, true, D_V>(ctx, dst);
++    }
++}
++
+ #define DECL_FATTN_VEC_CASE(D, type_K, type_V)                              \
+     template void ggml_cuda_flash_attn_ext_vec_case                         \
+     <D, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+ 
++#define DECL_FATTN_VEC_CASE_ASYM(D, D_V, type_K, type_V)                        \
++    template void ggml_cuda_flash_attn_ext_vec_case_asym                         \
++    <D, D_V, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
++
+ #define EXTERN_DECL_FATTN_VEC_CASES(D, type_K)             \
+     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_F16);  \
+     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_Q4_0); \
+@@ -1473,3 +1469,16 @@ extern DECL_FATTN_VEC_CASE(576, GGML_TYPE_F16,  GGML_TYPE_TBQ3_4);
+ extern DECL_FATTN_VEC_CASE(576, GGML_TYPE_F16,  GGML_TYPE_TBQ4_4);
+ extern DECL_FATTN_VEC_CASE(576, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_4);
+ extern DECL_FATTN_VEC_CASE(576, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_4);
++
++// GLM asymmetric: K=576 (_4 type), V=512 (_0 type or same-type view)
++#define EXTERN_DECL_FATTN_VEC_ASYM_576x512(type_K)                                 \
++    extern DECL_FATTN_VEC_CASE_ASYM(576, 512, type_K, GGML_TYPE_TBQ3_0);           \
++    extern DECL_FATTN_VEC_CASE_ASYM(576, 512, type_K, GGML_TYPE_TBQ4_0);           \
++    extern DECL_FATTN_VEC_CASE_ASYM(576, 512, type_K, GGML_TYPE_F16);              \
++    extern DECL_FATTN_VEC_CASE_ASYM(576, 512, type_K, GGML_TYPE_Q8_0);             \
++    extern DECL_FATTN_VEC_CASE_ASYM(576, 512, type_K, type_K);
++
++EXTERN_DECL_FATTN_VEC_ASYM_576x512(GGML_TYPE_TBQ3_4)
++EXTERN_DECL_FATTN_VEC_ASYM_576x512(GGML_TYPE_TBQ4_4)
++EXTERN_DECL_FATTN_VEC_ASYM_576x512(GGML_TYPE_TBQP3_4)
++EXTERN_DECL_FATTN_VEC_ASYM_576x512(GGML_TYPE_TBQP4_4)
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index e09adfde9..9fe1b7479 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -212,6 +212,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
+     FATTN_VEC_CASE(128, type_K, type_V)       \
+     FATTN_VEC_CASE(256, type_K, type_V)       \
+ 
++#define FATTN_VEC_CASE_ASYM(D, D_V, type_K, type_V)                                                             \
++    {                                                                                                            \
++        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
++        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
++        if (Q->ne[0] == (D) && V->ne[0] == (D_V) && type_K_okay && type_V_okay) {                               \
++            ggml_cuda_flash_attn_ext_vec_case_asym<D, D_V, type_K, type_V>(ctx, dst);                            \
++            return;                                                                                              \
++        }                                                                                                        \
++    }                                                                                                            \
++
++
+ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_tensor * Q = dst->src[0];
+     ggml_tensor * K = dst->src[1];
+@@ -371,7 +382,29 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_3)
+     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_3)
+ 
+-    // TurboQuant 576-block (_4): D=576 only (ALL_QUANTS path)
++    // GLM asymmetric MUST come before symmetric 576 cases (ASYM checks V->ne[0]==512, symmetric doesn't)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ4_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ3_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ3_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ4_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ3_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_F16)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_F16)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_F16)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_4)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_4)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_4)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_4)
++
++    // TurboQuant 576-block (_4): D=576 symmetric (ALL_QUANTS path)
+     FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
+     FATTN_VEC_CASE(576, GGML_TYPE_TBQ4_4,  GGML_TYPE_F16)
+     FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4,  GGML_TYPE_Q8_0)
+@@ -495,7 +528,28 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_2)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_2)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_2)
+-    // TurboQuant 576-block (_4): D=576 only
++    // GLM asymmetric MUST come before symmetric 576 cases (ASYM checks V->ne[0]==512, symmetric doesn't)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ4_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ3_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ3_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ4_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ3_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_F16)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_F16)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_F16)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_4)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_4)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_4)
++    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_4)
++    // TurboQuant 576-block (_4): D=576 symmetric
+     FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
+     FATTN_VEC_CASE(576, GGML_TYPE_TBQ4_4,  GGML_TYPE_F16)
+     FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4,  GGML_TYPE_Q8_0)
+@@ -600,11 +654,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+                         || K->type == GGML_TYPE_TBQ3_2 || K->type == GGML_TYPE_TBQ4_2
+                         || K->type == GGML_TYPE_TBQP3_2 || K->type == GGML_TYPE_TBQP4_2
+                         || K->type == GGML_TYPE_TBQ3_3 || K->type == GGML_TYPE_TBQ4_3
+-                        || K->type == GGML_TYPE_TBQP3_3 || K->type == GGML_TYPE_TBQP4_3;
++                        || K->type == GGML_TYPE_TBQP3_3 || K->type == GGML_TYPE_TBQP4_3
++                        || K->type == GGML_TYPE_TBQ3_4 || K->type == GGML_TYPE_TBQ4_4
++                        || K->type == GGML_TYPE_TBQP3_4 || K->type == GGML_TYPE_TBQP4_4;
+         const bool tbq_v = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0
+                         || V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQ4_1
+                         || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2
+-                        || V->type == GGML_TYPE_TBQ3_3 || V->type == GGML_TYPE_TBQ4_3;
++                        || V->type == GGML_TYPE_TBQ3_3 || V->type == GGML_TYPE_TBQ4_3
++                        || V->type == GGML_TYPE_TBQ3_4 || V->type == GGML_TYPE_TBQ4_4;
+         const bool std_k = K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0
+                         || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_BF16;
+         const bool std_v = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0;
+@@ -644,6 +701,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         case GGML_TYPE_TBQ4_3:
+         case GGML_TYPE_TBQP3_3:
+         case GGML_TYPE_TBQP4_3:
++        case GGML_TYPE_TBQ3_4:
++        case GGML_TYPE_TBQ4_4:
++        case GGML_TYPE_TBQP3_4:
++        case GGML_TYPE_TBQP4_4:
+             break;
+         default:
+             return BEST_FATTN_KERNEL_NONE;
+@@ -661,15 +722,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+      || K->type == GGML_TYPE_TBQ4_2 || K->type == GGML_TYPE_TBQ3_2
+      || K->type == GGML_TYPE_TBQP4_2 || K->type == GGML_TYPE_TBQP3_2
+      || K->type == GGML_TYPE_TBQ4_3 || K->type == GGML_TYPE_TBQ3_3
+-     || K->type == GGML_TYPE_TBQP4_3 || K->type == GGML_TYPE_TBQP3_3;
++     || K->type == GGML_TYPE_TBQP4_3 || K->type == GGML_TYPE_TBQP3_3
++     || K->type == GGML_TYPE_TBQ4_4 || K->type == GGML_TYPE_TBQ3_4
++     || K->type == GGML_TYPE_TBQP4_4 || K->type == GGML_TYPE_TBQP3_4;
+     const bool tbq_v_type = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_TBQ3_0
+      || V->type == GGML_TYPE_TBQ4_1 || V->type == GGML_TYPE_TBQ3_1
+      || V->type == GGML_TYPE_TBQ4_2 || V->type == GGML_TYPE_TBQ3_2
+-     || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3;
++     || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3
++     || V->type == GGML_TYPE_TBQ4_4 || V->type == GGML_TYPE_TBQ3_4;
+     if (tbq_k_type || tbq_v_type) {
+         if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+             return BEST_FATTN_KERNEL_VEC;
+         }
++        // GLM asymmetric: K=576, V=512 with TBQ types
++        if (Q->ne[0] == 576 && V->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
++            return BEST_FATTN_KERNEL_VEC;
++        }
+         return BEST_FATTN_KERNEL_NONE;
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-asym576x512.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-asym576x512.cu
+new file mode 100644
+index 000000000..94bb65ec4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-asym576x512.cu
+@@ -0,0 +1,9 @@
++// GLM asymmetric: K=576 (TBQ3_4), V=512 (_0/f16/q8_0/same-type)
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4, GGML_TYPE_TBQ3_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4, GGML_TYPE_TBQ4_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4, GGML_TYPE_F16);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4, GGML_TYPE_Q8_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4, GGML_TYPE_TBQ3_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-asym576x512.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-asym576x512.cu
+new file mode 100644
+index 000000000..b0d68ac20
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-asym576x512.cu
+@@ -0,0 +1,9 @@
++// GLM asymmetric: K=576 (TBQ4_4), V=512 (_0/f16/q8_0/same-type)
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4, GGML_TYPE_TBQ3_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4, GGML_TYPE_TBQ4_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4, GGML_TYPE_F16);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4, GGML_TYPE_Q8_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4, GGML_TYPE_TBQ4_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-asym576x512.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-asym576x512.cu
+new file mode 100644
+index 000000000..cd75aee24
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-asym576x512.cu
+@@ -0,0 +1,9 @@
++// GLM asymmetric: K=576 (TBQP3_4), V=512 (_0/f16/q8_0/same-type)
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ3_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ4_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_F16);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_Q8_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_4);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-asym576x512.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-asym576x512.cu
+new file mode 100644
+index 000000000..1d95a56e5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-asym576x512.cu
+@@ -0,0 +1,9 @@
++// GLM asymmetric: K=576 (TBQP4_4), V=512 (_0/f16/q8_0/same-type)
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ3_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_F16);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_Q8_0);
++DECL_FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_4);
