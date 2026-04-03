@@ -38,7 +38,7 @@ GLM-4.7-Flash는 head_dim=576을 사용합니다. WHT는 power-of-2만 지원하
 - **증상:** ~1500-2300토큰 이후 `////` 또는 `???` 반복 출력
 - **수정:** 모든 WHT/IWHT를 FP32 butterfly로 변경 (Q 전처리 + V 후처리 모두). KV 캐시 압축률 변화 없음
 - 4096토큰 검증 완료 (Qwen3.5-27B tbqp3/tbq3 — corruption 없음)
-- ROCm(HIP) 빌드 호환성 개선 — FP16 `__shfl_xor_sync` 제거 (Issue #5)
+- ROCm(HIP) 빌드 호환성 개선 — FP16 `__shfl_xor_sync` 제거 + 4번째 인자 `WARP_SIZE` 추가 (Issue #5)
 
 **새 타입:** TBQ3_4, TBQ4_4, TBQP3_4, TBQP4_4 (blck_size=576)
 
@@ -359,7 +359,7 @@ Fixed a critical bug causing output corruption after ~1500 tokens.
 - **Symptoms:** `////` or `???` repeated output after ~1500-2300 tokens
 - **Fix:** All WHT/IWHT paths (Q preprocessing + V post-processing, D=256/128/64/576) now use FP32 butterfly throughout. KV cache compression ratio unchanged (computation-only, not storage)
 - Verified: 4096 tokens with Qwen3.5-27B tbqp3/tbq3 — zero corruption
-- ROCm/HIP build compatibility improved — removed FP16 `__shfl_xor_sync` (Issue #5)
+- ROCm/HIP build compatibility improved — removed FP16 `__shfl_xor_sync` + added `WARP_SIZE` 4th argument (Issue #5)
 
 **New types:** TBQ3_4, TBQ4_4, TBQP3_4, TBQP4_4 (blck_size=576)
 

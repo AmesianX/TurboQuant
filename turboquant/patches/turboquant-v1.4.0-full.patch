@@ -2758,7 +2758,7 @@ index c59a4db39..3b00ec8b7 100644
          static_assert(type_V == -1, "bad type");
          return nullptr;
 diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
-index f0bd42a57..96b0c6ace 100644
+index f0bd42a57..c920bbbcf 100644
 --- a/ggml/src/ggml-cuda/fattn-vec.cuh
 +++ b/ggml/src/ggml-cuda/fattn-vec.cuh
 @@ -85,7 +85,20 @@ static __global__ void flash_attn_ext_vec(
@@ -2841,8 +2841,8 @@ index f0bd42a57..96b0c6ace 100644
 +                // Stages 0-4: warp shuffle
 +                #pragma unroll
 +                for (int s = 0; s < 5; s++) {
-+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
 +                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
 +                    else                { f0 = f0 + o0; f1 = f1 + o1; }
 +                }
@@ -2893,8 +2893,8 @@ index f0bd42a57..96b0c6ace 100644
 +                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
 +                #pragma unroll
 +                for (int s = 0; s < 5; s++) {
-+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
 +                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
 +                    else                { f0 = f0 + o0; f1 = f1 + o1; }
 +                }
@@ -2951,7 +2951,7 @@ index f0bd42a57..96b0c6ace 100644
 +                // Stages 0-4: warp shuffle
 +                #pragma unroll
 +                for (int s = 0; s < 5; s++) {
-+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
 +                    if (tid & (1 << s)) { f0 = o0 - f0; }
 +                    else                { f0 = f0 + o0; }
 +                }
@@ -3020,7 +3020,7 @@ index f0bd42a57..96b0c6ace 100644
 +                // Stages 0-4: warp shuffle (tid >= 64 carries f0=0, no data corruption)
 +                #pragma unroll
 +                for (int s = 0; s < 5; s++) {
-+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
 +                    if (tid & (1 << s)) { f0 = o0 - f0; }
 +                    else                { f0 = f0 + o0; }
 +                }
@@ -3081,8 +3081,8 @@ index f0bd42a57..96b0c6ace 100644
 +                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
 +                #pragma unroll
 +                for (int s = 0; s < 5; s++) {
-+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
 +                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
 +                    else                { f0 = f0 + o0; f1 = f1 + o1; }
 +                }
@@ -3120,8 +3120,8 @@ index f0bd42a57..96b0c6ace 100644
 +                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
 +                #pragma unroll
 +                for (int s = 0; s < 5; s++) {
-+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
 +                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
 +                    else                { f0 = f0 + o0; f1 = f1 + o1; }
 +                }
@@ -3158,8 +3158,8 @@ index f0bd42a57..96b0c6ace 100644
 +                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
 +                #pragma unroll
 +                for (int s = 0; s < 5; s++) {
-+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
 +                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
 +                    else                { f0 = f0 + o0; f1 = f1 + o1; }
 +                }
@@ -3197,8 +3197,8 @@ index f0bd42a57..96b0c6ace 100644
 +                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
 +                #pragma unroll
 +                for (int s = 0; s < 5; s++) {
-+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-+                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
 +                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
 +                    else                { f0 = f0 + o0; f1 = f1 + o1; }
 +                }
@@ -3232,7 +3232,7 @@ index f0bd42a57..96b0c6ace 100644
 +                }
 +                #pragma unroll
 +                for (int s = 0; s < 5; s++) {
-+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
 +                    if (tid & (1 << s)) { f0 = o0 - f0; }
 +                    else                { f0 = f0 + o0; }
 +                }
@@ -3410,8 +3410,8 @@ index f0bd42a57..96b0c6ace 100644
 +                    // Stages 0-4: warp shuffle
 +                    #pragma unroll
 +                    for (int s = 0; s < 5; s++) {
-+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
 +                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
 +                        else                { f0 = f0 + o0; f1 = f1 + o1; }
 +                    }
@@ -3466,7 +3466,7 @@ index f0bd42a57..96b0c6ace 100644
 +                    // Stages 0-4: warp shuffle
 +                    #pragma unroll
 +                    for (int s = 0; s < 5; s++) {
-+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
 +                        if (tid & (1 << s)) { f0 = o0 - f0; }
 +                        else                { f0 = f0 + o0; }
 +                    }
@@ -3511,8 +3511,8 @@ index f0bd42a57..96b0c6ace 100644
 +                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
 +                    #pragma unroll
 +                    for (int s = 0; s < 5; s++) {
-+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
 +                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
 +                        else                { f0 = f0 + o0; f1 = f1 + o1; }
 +                    }
@@ -3538,8 +3538,8 @@ index f0bd42a57..96b0c6ace 100644
 +                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
 +                    #pragma unroll
 +                    for (int s = 0; s < 5; s++) {
-+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
-+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s);
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
++                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
 +                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
 +                        else                { f0 = f0 + o0; f1 = f1 + o1; }
 +                    }
@@ -3564,7 +3564,7 @@ index f0bd42a57..96b0c6ace 100644
 +                    __syncthreads();
 +                    #pragma unroll
 +                    for (int s = 0; s < 5; s++) {
-+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
 +                        if (tid & (1 << s)) { f0 = o0 - f0; }
 +                        else                { f0 = f0 + o0; }
 +                    }
@@ -3605,7 +3605,7 @@ index f0bd42a57..96b0c6ace 100644
 +                    __syncthreads();
 +                    #pragma unroll
 +                    for (int s = 0; s < 5; s++) {
-+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s);
++                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
 +                        if (tid & (1 << s)) { f0 = o0 - f0; }
 +                        else                { f0 = f0 + o0; }
 +                    }
