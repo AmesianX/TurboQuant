@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
-index 631de7e8f..2d2684807 100644
+index 631de7e8f..73a715fed 100644
 --- a/ggml/src/ggml-cuda/set-rows.cu
 +++ b/ggml/src/ggml-cuda/set-rows.cu
 @@ -109,6 +109,349 @@ static void set_rows_cuda_quant(
@@ -226,7 +226,7 @@ index 631de7e8f..2d2684807 100644
 +    float sum_sq = sum_sq_local;
 +    #pragma unroll
 +    for (int offset = 4; offset >= 1; offset >>= 1) {
-+        sum_sq += __shfl_xor_sync(0xff << (local_group*8), sum_sq, offset);
++        sum_sq += __shfl_xor_sync(0xff << (local_group*8), sum_sq, offset, WARP_SIZE);
 +    }
 +    // Now all 8 threads have the same sum_sq (total across all heads)
 +    float norm = sqrtf(sum_sq);

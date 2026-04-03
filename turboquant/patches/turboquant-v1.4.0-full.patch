@@ -4089,7 +4089,7 @@ index cc80eb3ff..dce79bbe3 100644
                         (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
              } break;
 diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
-index 631de7e8f..2d2684807 100644
+index 631de7e8f..73a715fed 100644
 --- a/ggml/src/ggml-cuda/set-rows.cu
 +++ b/ggml/src/ggml-cuda/set-rows.cu
 @@ -109,6 +109,349 @@ static void set_rows_cuda_quant(
@@ -4316,7 +4316,7 @@ index 631de7e8f..2d2684807 100644
 +    float sum_sq = sum_sq_local;
 +    #pragma unroll
 +    for (int offset = 4; offset >= 1; offset >>= 1) {
-+        sum_sq += __shfl_xor_sync(0xff << (local_group*8), sum_sq, offset);
++        sum_sq += __shfl_xor_sync(0xff << (local_group*8), sum_sq, offset, WARP_SIZE);
 +    }
 +    // Now all 8 threads have the same sum_sq (total across all heads)
 +    float norm = sqrtf(sum_sq);
@@ -5752,6 +5752,129 @@ index 000000000..9ee18ab5a
 +#include "../fattn-vec.cuh"
 +
 +DECL_FATTN_VEC_CASE(576, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_4);
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index 291b48374..5d2224bfa 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -75,7 +75,117 @@ else()
+         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
+         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
+         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
+-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
++        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-tbq3_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_0-tbq4_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-tbq3_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-tbq4_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-tbq3_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-tbq4_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-tbq3_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_0-tbq4_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-tbq3_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_1-tbq4_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq3_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-tbq3_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_1-tbq4_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-tbq3_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_2-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_2-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_2-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq3_3.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_3-tbq4_3.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq3_3.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_3-tbq4_3.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq3_3.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_3-tbq4_3.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq3_3.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_3-tbq4_3.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq3_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-tbq4_2.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-tbq3_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq3_4-tbq4_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-tbq3_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbq4_4-tbq4_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-tbq3_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp3_4-tbq4_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-f16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-tbq3_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-tbqp4_4-tbq4_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-f16-tbq4_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq3_4.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-tbq4_4.cu)
+ endif()
+ 
+ ggml_add_backend_library(ggml-hip
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
 index 48695a61e..4947055aa 100644
 --- a/ggml/src/ggml-quants.c

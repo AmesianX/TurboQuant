@@ -329,7 +329,7 @@ static __global__ void k_set_rows_xhead_v2(
     float sum_sq = sum_sq_local;
     #pragma unroll
     for (int offset = 4; offset >= 1; offset >>= 1) {
-        sum_sq += __shfl_xor_sync(0xff << (local_group*8), sum_sq, offset);
+        sum_sq += __shfl_xor_sync(0xff << (local_group*8), sum_sq, offset, WARP_SIZE);
     }
     // Now all 8 threads have the same sum_sq (total across all heads)
     float norm = sqrtf(sum_sq);
