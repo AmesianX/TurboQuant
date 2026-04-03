@@ -1996,18 +1996,15 @@ void launch_fattn(
             nb13 = K->ne[2] * nb12;
         }
 
-        // TBQP: dequant K_qjl (QJL-only) into second half of K buffer
+        // TBQP: fused K_mse + K_qjl dequant — reads each block once, writes both outputs
         if (tbqp_wht_mode) {
-            fprintf(stderr, "[QJL ALLOC] k_elems=%lld K_f16_alloc=%lld nb13=%lld ne13=%lld K_qjl_offset_half2=%lld\n",
-                (long long)k_elems, (long long)(tbqp_wht_mode ? 2*k_elems : k_elems),
-                (long long)nb13, (long long)K->ne[3], (long long)(K->ne[3] * nb13 / sizeof(half2)));
-            extern void tbqp3_k_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
-            extern void tbqp4_k_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
-            half * K_qjl_ptr = K_f16.ptr + k_elems;  // second half of buffer
+            extern void tbqp3_fused_mse_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
+            extern void tbqp4_fused_mse_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
+            // Re-dequant K as fused (overwrites K_mse from to_fp16, adds K_qjl in second half)
             if (K->type == GGML_TYPE_TBQP3_4) {
-                tbqp3_k_qjl_f16_cuda(K_data_orig, K_qjl_ptr, k_elems, main_stream);
+                tbqp3_fused_mse_qjl_f16_cuda(K_data_orig, K_f16.ptr, k_elems, main_stream);
             } else {
-                tbqp4_k_qjl_f16_cuda(K_data_orig, K_qjl_ptr, k_elems, main_stream);
+                tbqp4_fused_mse_qjl_f16_cuda(K_data_orig, K_f16.ptr, k_elems, main_stream);
             }
         }
 
@@ -2022,20 +2019,12 @@ void launch_fattn(
             nb22   = nb12;
             nb23   = nb13;
         } else if (V_is_K_view && tbqp_wht_mode) {
-            // TBQP: K has WHT+QJL (for Q·K dot product accuracy).
-            // V must NOT have QJL — QJL is dot-product-only, pollutes V accumulation.
-            // Dequant original K data → MSE-only WHT f16 (no QJL, no IWHT).
-            // MMA kernel uses V_is_K_view=false to read V separately from K.
-            // Output is WHT domain → IWHT applied after MMA.
-            extern void tbqp3_v_wht_noqjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
-            extern void tbqp4_v_wht_noqjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
+            // TBQP: V = K_mse (first half of K_f16 buffer, no QJL).
+            // Copy K_mse to separate V buffer (V_is_K_view=false in MMA kernel).
+            // Eliminates separate V dequant kernel — K_mse already computed by fused dequant.
             const int64_t k_elems = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3];
             V_f16.alloc(k_elems);
-            if (K->type == GGML_TYPE_TBQP3_4) {
-                tbqp3_v_wht_noqjl_f16_cuda(K_data_orig, V_f16.ptr, k_elems, main_stream);
-            } else {
-                tbqp4_v_wht_noqjl_f16_cuda(K_data_orig, V_f16.ptr, k_elems, main_stream);
-            }
+            CUDA_CHECK(cudaMemcpyAsync(V_f16.ptr, K_f16.ptr, k_elems * sizeof(half), cudaMemcpyDeviceToDevice, main_stream));
             V_data = (char *) V_f16.ptr;
             nb21 = K->ne[0] * sizeof(half);
             nb22 = K->ne[1] * nb21;
@@ -2077,8 +2066,7 @@ void launch_fattn(
     struct q_wht_cache_t { void * ptr = nullptr; size_t sz = 0; ~q_wht_cache_t() { if (ptr) cudaFree(ptr); } };
     static thread_local q_wht_cache_t q_wht_cache;
     if (tbqp_wht_mode) {
-        extern void tbq_q_wht_cuda(float *, int64_t, int64_t, int64_t, cudaStream_t);
-        extern void tbq_q_wht2_cuda(const float *, float *, int64_t, int64_t, int64_t, cudaStream_t);
+        extern void tbq_q_wht12_cuda(float *, float *, int64_t, int64_t, int64_t, cudaStream_t);
         const size_t n_q_bytes = ggml_nelements(Q) * sizeof(float);
         const size_t n_q_total = 2 * n_q_bytes;  // [Q_wht1 | Q_wht2]
         if (q_wht_cache.sz < n_q_total) {
@@ -2090,12 +2078,9 @@ void launch_fattn(
         float * q_wht2 = (float *)((char *)q_wht_cache.ptr + n_q_bytes);
         const int64_t n_q_rows = Q->ne[1]*Q->ne[2]*Q->ne[3];
 
-        // Q_wht1: copy Q → WHT with signs1 → /256
+        // Fused: copy Q → WHT1(signs1) + WHT2(signs2) in single kernel
         CUDA_CHECK(cudaMemcpyAsync(q_wht1, Q->data, n_q_bytes, cudaMemcpyDeviceToDevice, main_stream));
-        tbq_q_wht_cuda(q_wht1, Q->ne[0], n_q_rows, Q->ne[0], main_stream);
-
-        // Q_wht2: WHT(qjl_signs * Q_wht1 * 256) * qjl_factor / (256*256)
-        tbq_q_wht2_cuda(q_wht1, q_wht2, Q->ne[0], n_q_rows, Q->ne[0], main_stream);
+        tbq_q_wht12_cuda(q_wht1, q_wht2, Q->ne[0], n_q_rows, Q->ne[0], main_stream);
     }
 
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);

@@ -831,6 +831,58 @@ static __global__ void tbq_q_wht_kernel(float * __restrict__ Q, int64_t n_rows, 
     q[tid] = buf[tid] / 256.0f;
 }
 
+// Fused Q_wht1 + Q_wht2: signs1 WHT → store Q_wht1, then signs2 WHT → store Q_wht2.
+// Single kernel, single block read, shared memory reused between the two WHTs.
+// Output: Q_wht1 at q1[sub*256+tid], Q_wht2 at q2[sub*256+tid]
+static __global__ void tbq_q_wht12_kernel(float * __restrict__ Q_wht1, float * __restrict__ Q_wht2,
+                                           int64_t n_rows, int64_t row_stride) {
+    int64_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const int sub = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    static constexpr uint8_t signs1[32] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    };
+    static constexpr uint8_t signs2[32] = {
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+    };
+
+    __shared__ float buf[256];
+    float * q1 = Q_wht1 + row * row_stride + sub * 256;
+    float * q2 = Q_wht2 + row * row_stride + sub * 256;
+
+    // === WHT 1: signs1 → butterfly → /256 ===
+    int s1 = ((signs1[tid>>3]>>(tid&7))&1) ? -1 : 1;
+    buf[tid] = q1[tid] * s1;  // q1 initially contains original Q (copied before this kernel)
+    __syncthreads();
+
+    for (int len = 1; len < 256; len *= 2) {
+        int grp = tid/(2*len), pos = tid%(2*len);
+        if (pos < len) { float u=buf[grp*2*len+pos], v=buf[grp*2*len+pos+len]; buf[grp*2*len+pos]=u+v; buf[grp*2*len+pos+len]=u-v; }
+        __syncthreads();
+    }
+
+    q1[tid] = buf[tid] / 256.0f;  // Store Q_wht1
+    // buf still has WHT(signs1*Q) (un-scaled) — use for Q_wht2
+
+    // === WHT 2: signs2 applied to WHT result, then butterfly, then qjl_factor/(256*256) ===
+    int s2 = ((signs2[tid>>3]>>(tid&7))&1) ? -1 : 1;
+    buf[tid] = buf[tid] * s2;  // signs2 * WHT(signs1*Q)
+    __syncthreads();
+
+    for (int len = 1; len < 256; len *= 2) {
+        int grp = tid/(2*len), pos = tid%(2*len);
+        if (pos < len) { float u=buf[grp*2*len+pos], v=buf[grp*2*len+pos+len]; buf[grp*2*len+pos]=u+v; buf[grp*2*len+pos+len]=u-v; }
+        __syncthreads();
+    }
+
+    constexpr float qjl_factor = 1.2533f;
+    q2[tid] = buf[tid] * qjl_factor / (256.0f * 256.0f);  // Store Q_wht2
+}
+
 // Output IWHT: transform attention output from WHT to spatial domain (for TBQP MMA post-processing).
 static __global__ void tbq_output_iwht_kernel(float * __restrict__ dst, int64_t n_rows, int64_t row_stride) {
     int64_t row = blockIdx.x;
@@ -888,6 +940,58 @@ static __global__ void dequantize_tbqp_4_k_qjl_f16_kernel(const void * __restric
     out[tid] = make_half2(__float2half(v0), __float2half(v1));
 }
 
+// TBQP fused K_mse + K_qjl dequant: reads each block ONCE, writes two outputs.
+// out_mse: centroid*norm (WHT domain, no QJL) — for K and V in MMA
+// out_qjl: s_qjl * dq (QJL-only) — for separate QJL MMA pass
+// n_blocks_total = total blocks. out_qjl = out_mse + n_blocks_total * TBQ_K576 (concatenated).
+template <typename block_type, int n_bits>
+static __global__ void dequantize_tbqp_4_fused_mse_qjl_f16_kernel(
+        const void * __restrict__ vx, half * __restrict__ out_mse, int64_t n_blocks) {
+    int64_t bi = blockIdx.x;
+    if (bi >= n_blocks) return;
+    const block_type * blk = (const block_type *)vx + bi;
+    half2 * mse = (half2 *)(out_mse + bi * TBQ_K576);
+    half2 * qjl = (half2 *)(out_mse + (n_blocks + bi) * TBQ_K576);  // second half of buffer
+    const int tid = threadIdx.x;
+    const int elem = tid * 2;
+
+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+
+    float mse0, mse1, qjl0, qjl1;
+    if (elem < 512) {
+        const int sub = elem < 256 ? 0 : 1;
+        const int e = elem - sub * 256;
+        const float norm = __half2float(sub == 0 ? blk->d1 : blk->d2);
+        const float dq   = __half2float(sub == 0 ? blk->d1_qjl : blk->d2_qjl);
+        const uint8_t * qs  = sub == 0 ? blk->qs1  : blk->qs2;
+        const uint8_t * qjl_bits = sub == 0 ? blk->qjl1 : blk->qjl2;
+        const int s0 = ((qjl_bits[e/8]>>(e%8))&1) ? 1 : -1;
+        const int s1 = ((qjl_bits[(e+1)/8]>>((e+1)%8))&1) ? 1 : -1;
+        if constexpr (n_bits == 3) {
+            mse0 = c2[(qs[e/4]>>((e%4)*2))&0x3]*norm;
+            mse1 = c2[(qs[(e+1)/4]>>(((e+1)%4)*2))&0x3]*norm;
+        } else {
+            int bp0=e*3, by0=bp0/8, bo0=bp0%8;
+            int bp1=(e+1)*3, by1=bp1/8, bo1=bp1%8;
+            uint32_t r0=(uint32_t)qs[by0]>>bo0; if(bo0>5) r0|=(uint32_t)qs[by0+1]<<(8-bo0);
+            uint32_t r1=(uint32_t)qs[by1]>>bo1; if(bo1>5) r1|=(uint32_t)qs[by1+1]<<(8-bo1);
+            mse0 = c3[r0&7]*norm;
+            mse1 = c3[r1&7]*norm;
+        }
+        qjl0 = s0 * dq;
+        qjl1 = s1 * dq;
+    } else {
+        const int e = elem - 512;
+        mse0 = __half2float(blk->rope[e]);
+        mse1 = __half2float(blk->rope[e+1]);
+        qjl0 = 0.0f;
+        qjl1 = 0.0f;
+    }
+    mse[tid] = make_half2(__float2half(mse0), __float2half(mse1));
+    qjl[tid] = make_half2(__float2half(qjl0), __float2half(qjl1));
+}
+
 // TBQP Q_wht2: second WHT with QJL sign pattern for QJL dot product correction.
 // Input: Q_wht1 (already WHT'd with signs1, stored as float, /256 applied).
 // Output: Q_wht2 = WHT(qjl_signs * Q_wht1 * 256) * qjl_factor / (256*256)
@@ -936,6 +1040,11 @@ void tbq_q_wht2_cuda(const float * Q_wht1, float * Q_wht2, int64_t DKQ, int64_t 
     tbq_q_wht2_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(Q_wht1, Q_wht2, n_rows, row_stride);
 }
 
+// Fused: Q_wht1 + Q_wht2 in one kernel. Q_wht1_buf initially contains original Q data.
+void tbq_q_wht12_cuda(float * Q_wht1, float * Q_wht2, int64_t DKQ, int64_t n_rows, int64_t row_stride, cudaStream_t stream) {
+    tbq_q_wht12_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(Q_wht1, Q_wht2, n_rows, row_stride);
+}
+
 void tbq_output_iwht_cuda(float * dst, int64_t DV, int64_t n_rows, cudaStream_t stream) {
     tbq_output_iwht_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(dst, n_rows, DV);
 }
@@ -945,6 +1054,15 @@ void tbqp3_k_qjl_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t str
 }
 void tbqp4_k_qjl_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
     dequantize_tbqp_4_k_qjl_f16_kernel<block_tbqp4_4, 4><<<k/TBQ_K576, 288, 0, stream>>>(vx, y, k/TBQ_K576);
+}
+
+// Fused: reads each TBQ block ONCE, writes K_mse and K_qjl to concatenated buffer.
+// out points to a 2*k buffer: [K_mse (k halves) | K_qjl (k halves)]
+void tbqp3_fused_mse_qjl_f16_cuda(const void * vx, half * out, int64_t k, cudaStream_t stream) {
+    dequantize_tbqp_4_fused_mse_qjl_f16_kernel<block_tbqp3_4, 3><<<k/TBQ_K576, 288, 0, stream>>>(vx, out, k/TBQ_K576);
+}
+void tbqp4_fused_mse_qjl_f16_cuda(const void * vx, half * out, int64_t k, cudaStream_t stream) {
+    dequantize_tbqp_4_fused_mse_qjl_f16_kernel<block_tbqp4_4, 4><<<k/TBQ_K576, 288, 0, stream>>>(vx, out, k/TBQ_K576);
 }
 
 static void dequantize_row_tbq3_4_to_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
