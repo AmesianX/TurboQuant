@@ -1246,6 +1246,13 @@ common_init_result::common_init_result(common_params & params) :
         // Detect KV head dimension with multi-signal cross-validation
         // TurboQuant WHT requires exact head_dim — wrong value = garbage output
         int32_t head_dim = 0;
+        int32_t s_val_outer = 0; // V head_dim for asymmetric models (e.g. GLM K=576, V=512)
+        auto is_supported_dim = [](int dim) -> bool {
+            if (dim <= 0) return false;
+            if ((dim & (dim - 1)) == 0) return true; // power-of-2 (64, 128, 256, 512, ...)
+            if (dim == 576) return true; // GLM-4.7-Flash K: 256+256+64 block split
+            return false;
+        };
         {
             char arch[64] = {}, buf[64] = {};
             llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
@@ -1320,13 +1327,9 @@ common_init_result::common_init_result(common_params & params) :
                         __func__, s_computed);
             }
 
-            // Dimension validation: power-of-2 OR supported split dimensions (e.g. 576=256+256+64)
-            auto is_supported_dim = [](int dim) -> bool {
-                if (dim <= 0) return false;
-                if ((dim & (dim - 1)) == 0) return true; // power-of-2
-                if (dim == 576) return true; // GLM-4.7-Flash: 256+256+64 block split
-                return false;
-            };
+            // Save s_val for asymmetric K/V resolution
+            s_val_outer = s_val;
+
             if (head_dim > 0 && !is_supported_dim(head_dim)) {
                 LOG_WRN("%s: head_dim=%d is not supported — TurboQuant WHT cannot operate\n",
                         __func__, head_dim);
@@ -1442,6 +1445,11 @@ common_init_result::common_init_result(common_params & params) :
                         LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
                                 __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
                         return m.to_64;
+                    } else if (head_dim == 512) {
+                        // V head_dim=512 (e.g. GLM-4.7-Flash V): 256-block × 2, use _0 type
+                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d, 256-block × 2)\n",
+                                __func__, ggml_type_name(type), ggml_type_name(m.to_256), head_dim);
+                        return m.to_256;
                     } else if (head_dim == 576) {
                         // GLM-4.7-Flash: head_dim=576, split 256+256+64
                         LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d, split 256+256+64)\n",
@@ -1468,8 +1476,19 @@ common_init_result::common_init_result(common_params & params) :
                 if (is_tbq_type(cparams.type_k)) cparams.type_k = GGML_TYPE_Q8_0;
                 if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_Q8_0;
             } else {
+                // For asymmetric models (e.g. GLM-4.7-Flash: K=576, V=512),
+                // resolve K and V with their respective head dimensions
+                int32_t head_dim_v = head_dim; // default: same as K
+                if (s_val_outer > 0 && s_val_outer != head_dim && is_supported_dim(s_val_outer)) {
+                    head_dim_v = s_val_outer;
+                    LOG_INF("%s: asymmetric head_dim: K=%d, V=%d — resolving separately\n",
+                            __func__, head_dim, head_dim_v);
+                }
                 cparams.type_k = tbq_resolve(cparams.type_k, true);
+                const int32_t saved_head_dim = head_dim;
+                head_dim = head_dim_v;
                 cparams.type_v = tbq_resolve(cparams.type_v, false);
+                head_dim = saved_head_dim; // restore
             }
         }
       } // end is_any_tbq
