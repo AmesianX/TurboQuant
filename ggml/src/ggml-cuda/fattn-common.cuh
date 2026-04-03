@@ -1972,11 +1972,24 @@ void launch_fattn(
         const size_t ts = ggml_type_size(K->type);
         const int64_t k_elems = ggml_nelements(K);
 
-        // TBQP: allocate 2x buffer for [K_mse | K_qjl] concatenated.
-        // Kernel accesses K_qjl at offset ne13*nb13 from K_data.
+        // TBQP: [K_mse | K_qjl] concatenated (2x), others: K_f16 (1x).
+        // K_qjl offset in kernel: DKQ * ne11 * ne13 / 2 (half2 units).
         K_f16.alloc(tbqp_wht_mode ? 2 * k_elems : k_elems);
 
-        if (ggml_is_contiguously_allocated(K)) {
+        if (tbqp_wht_mode) {
+            // TBQP: fused K_mse + K_qjl in single kernel (block read once, two outputs).
+            // Skips to_fp16 entirely — fused kernel handles both MSE and QJL from raw data.
+            extern void tbqp3_fused_mse_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
+            extern void tbqp4_fused_mse_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
+            if (K->type == GGML_TYPE_TBQP3_4) {
+                tbqp3_fused_mse_qjl_f16_cuda(K_data_orig, K_f16.ptr, k_elems, main_stream);
+            } else {
+                tbqp4_fused_mse_qjl_f16_cuda(K_data_orig, K_f16.ptr, k_elems, main_stream);
+            }
+            nb11 = K->ne[0] * sizeof(half);
+            nb12 = K->ne[1] * nb11;
+            nb13 = K->ne[2] * nb12;
+        } else if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16.ptr, k_elems, main_stream);
 
@@ -1994,18 +2007,6 @@ void launch_fattn(
             nb11 = K->ne[0] * sizeof(half);
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
-        }
-
-        // TBQP: fused K_mse + K_qjl dequant — reads each block once, writes both outputs
-        if (tbqp_wht_mode) {
-            extern void tbqp3_fused_mse_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
-            extern void tbqp4_fused_mse_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
-            // Re-dequant K as fused (overwrites K_mse from to_fp16, adds K_qjl in second half)
-            if (K->type == GGML_TYPE_TBQP3_4) {
-                tbqp3_fused_mse_qjl_f16_cuda(K_data_orig, K_f16.ptr, k_elems, main_stream);
-            } else {
-                tbqp4_fused_mse_qjl_f16_cuda(K_data_orig, K_f16.ptr, k_elems, main_stream);
-            }
         }
 
         K_data = (char *) K_f16.ptr;
@@ -2229,7 +2230,7 @@ void launch_fattn(
     }
     CUDA_CHECK(cudaGetLastError());
 
-    // DEBUG: V is WHT+QJL copy → output is WHT domain → need IWHT
+    // TBQP: V is WHT domain (K_mse view), output is WHT domain → need IWHT
     if (tbqp_wht_mode) {
         extern void tbq_output_iwht_cuda(float *, int64_t, int64_t, cudaStream_t);
         const int64_t n_out_rows = Q->ne[1] * Q->ne[2] * Q->ne[3];
