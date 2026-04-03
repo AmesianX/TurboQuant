@@ -2020,16 +2020,13 @@ void launch_fattn(
             nb22   = nb12;
             nb23   = nb13;
         } else if (V_is_K_view && tbqp_wht_mode) {
-            // TBQP: V = K_mse (first half of K_f16 buffer, no QJL).
-            // Copy K_mse to separate V buffer (V_is_K_view=false in MMA kernel).
-            // Eliminates separate V dequant kernel — K_mse already computed by fused dequant.
-            const int64_t k_elems = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3];
-            V_f16.alloc(k_elems);
-            CUDA_CHECK(cudaMemcpyAsync(V_f16.ptr, K_f16.ptr, k_elems * sizeof(half), cudaMemcpyDeviceToDevice, main_stream));
-            V_data = (char *) V_f16.ptr;
-            nb21 = K->ne[0] * sizeof(half);
-            nb22 = K->ne[1] * nb21;
-            nb23 = K->ne[2] * nb22;
+            // TBQP: V = K_mse (first half of K_f16 buffer, no QJL, no copy needed).
+            // K_f16 = [K_mse | K_qjl]. K_data points to K_mse. V reads same data.
+            // MMA kernel: V_is_K_view=false loads V from V_data = K_data = K_mse. Safe.
+            V_data = K_data;
+            nb21   = nb11;
+            nb22   = nb12;
+            nb23   = nb13;
         } else {
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
