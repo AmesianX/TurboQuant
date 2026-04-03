@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 env:
-  CUDA_ARCHITECTURES: "75;80;86;89;90;120"
+  CUDA_ARCHITECTURES: "86;89;90;120"
   ROCM_GPU_TARGETS: "gfx90a;gfx942;gfx1030;gfx1100;gfx1151;gfx1200"
 
 jobs:
@@ -185,7 +185,7 @@ jobs:
       - name: Build
         run: |
           cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120"
+            -DCMAKE_CUDA_ARCHITECTURES="86;89;90;120"
           cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
 
       - name: Package
@@ -229,7 +229,7 @@ jobs:
       - name: Build (no OpenSSL)
         run: |
           cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF `
-            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120"
+            -DCMAKE_CUDA_ARCHITECTURES="86;89;90;120"
           cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
 
       - name: Package
