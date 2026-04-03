@@ -1257,14 +1257,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_4(
             corr1 = (K->qjl2[(e+1)/8]>>((e+1)%8))&1;
             use_qjl = true;
         } else {
-            // Sub-block 3: elements [512, 576)
+            // Sub-block 3: f16 passthrough (rope)
             const int e = elem - 512;
-            norm = __half2float(K->d3); d_corr = __half2float(K->d3_qjl);
-            cent0 = c2[(K->qs3[e/4]>>((e%4)*2))&0x3];
-            cent1 = c2[(K->qs3[(e+1)/4]>>(((e+1)%4)*2))&0x3];
-            corr0 = (K->qjl3[e/8]>>(e%8))&1;
-            corr1 = (K->qjl3[(e+1)/8]>>((e+1)%8))&1;
+            cent0 = __half2float(K->rope[e]);
+            cent1 = __half2float(K->rope[e + 1]);
             use_qjl = false;
+            norm = 0.0f; d_corr = 0.0f; // unused, suppress warnings
+            corr0 = 0; corr1 = 0;
         }
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q_mse = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
@@ -1276,9 +1275,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_4(
             sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
                  + d_corr*((corr0?q_qjl.x:-q_qjl.x) + (corr1?q_qjl.y:-q_qjl.y));
         } else {
-            // Direct Sign: use MSE query for correction too
-            sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
-                 + d_corr*((corr0?q_mse.x:-q_mse.x) + (corr1?q_mse.y:-q_mse.y));
+            // f16 passthrough: Q_reg already has Q_raw * scale, values are raw f16
+            sum += q_mse.x*cent0 + q_mse.y*cent1;
         }
     }
     return sum;
@@ -1316,13 +1314,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_4(
             corr1 = (K->qjl2[(e+1)/8]>>((e+1)%8))&1;
             use_qjl = true;
         } else {
+            // Sub-block 3: f16 passthrough (rope)
             const int e = elem - 512;
-            norm = __half2float(K->d3); d_corr = __half2float(K->d3_qjl);
-            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs3[by]>>bo; if(bo>5) v|=(uint32_t)K->qs3[by+1]<<(8-bo); cent0=c3[v&0x7]; }
-            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs3[by]>>bo; if(bo>5) v|=(uint32_t)K->qs3[by+1]<<(8-bo); cent1=c3[v&0x7]; }
-            corr0 = (K->qjl3[e/8]>>(e%8))&1;
-            corr1 = (K->qjl3[(e+1)/8]>>((e+1)%8))&1;
+            cent0 = __half2float(K->rope[e]);
+            cent1 = __half2float(K->rope[e + 1]);
             use_qjl = false;
+            norm = 0.0f; d_corr = 0.0f; // unused, suppress warnings
+            corr0 = 0; corr1 = 0;
         }
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q_mse = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
@@ -1334,8 +1332,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_4(
             sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
                  + d_corr*((corr0?q_qjl.x:-q_qjl.x) + (corr1?q_qjl.y:-q_qjl.y));
         } else {
-            sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
-                 + d_corr*((corr0?q_mse.x:-q_mse.x) + (corr1?q_mse.y:-q_mse.y));
+            // f16 passthrough: Q_reg already has Q_raw * scale, values are raw f16
+            sum += q_mse.x*cent0 + q_mse.y*cent1;
         }
     }
     return sum;
@@ -1355,18 +1353,32 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_4(
         const int elem = k * 2;
         float norm; const uint8_t * qs;
         int e;
+        float cent0, cent1;
+        bool is_rope = false;
         if (elem < 256) { norm = __half2float(K->d1); qs = K->qs1; e = elem; }
         else if (elem < 512) { norm = __half2float(K->d2); qs = K->qs2; e = elem - 256; }
-        else { norm = __half2float(K->d3); qs = K->qs3; e = elem - 512; }
-        float cent0, cent1;
-        { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent0=c3[v&0x7]; }
-        { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent1=c3[v&0x7]; }
+        else {
+            // Sub-block 3: f16 passthrough (rope)
+            e = elem - 512;
+            cent0 = __half2float(K->rope[e]);
+            cent1 = __half2float(K->rope[e + 1]);
+            is_rope = true;
+            norm = 0.0f; qs = nullptr;
+        }
+        if (!is_rope) {
+            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent0=c3[v&0x7]; }
+            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent1=c3[v&0x7]; }
+        }
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
 #else
         const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
 #endif
-        sum += norm*(q.x*cent0 + q.y*cent1);
+        if (is_rope) {
+            sum += q.x*cent0 + q.y*cent1;
+        } else {
+            sum += norm*(q.x*cent0 + q.y*cent1);
+        }
     }
     return sum;
 }
@@ -1385,19 +1397,34 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_4(
         const int elem = k * 2;
         float norm; const uint8_t * qs;
         int e;
+        float cent0, cent1;
+        bool is_rope = false;
         if (elem < 256) { norm = __half2float(K->d1); qs = K->qs1; e = elem; }
         else if (elem < 512) { norm = __half2float(K->d2); qs = K->qs2; e = elem - 256; }
-        else { norm = __half2float(K->d3); qs = K->qs3; e = elem - 512; }
-        const uint8_t packed = qs[e/2];
-        const float cent0 = (e % 2 == 0) ? c4[packed & 0xF] : c4[packed >> 4];
-        const uint8_t packed1 = qs[(e+1)/2];
-        const float cent1 = ((e+1) % 2 == 0) ? c4[packed1 & 0xF] : c4[packed1 >> 4];
+        else {
+            // Sub-block 3: f16 passthrough (rope)
+            e = elem - 512;
+            cent0 = __half2float(K->rope[e]);
+            cent1 = __half2float(K->rope[e + 1]);
+            is_rope = true;
+            norm = 0.0f; qs = nullptr;
+        }
+        if (!is_rope) {
+            const uint8_t packed = qs[e/2];
+            cent0 = (e % 2 == 0) ? c4[packed & 0xF] : c4[packed >> 4];
+            const uint8_t packed1 = qs[(e+1)/2];
+            cent1 = ((e+1) % 2 == 0) ? c4[packed1 & 0xF] : c4[packed1 >> 4];
+        }
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
 #else
         const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
 #endif
-        sum += norm*(q.x*cent0 + q.y*cent1);
+        if (is_rope) {
+            sum += q.x*cent0 + q.y*cent1;
+        } else {
+            sum += norm*(q.x*cent0 + q.y*cent1);
+        }
     }
     return sum;
 }
@@ -1409,13 +1436,30 @@ static __device__ __forceinline__ void dequantize_V_tbq3_4(const void * __restri
     static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
     const int64_t ib = i0 / TBQ_K576;
     const int elem = i0 % TBQ_K576;
+
+    // Sub-block 3: f16 passthrough (rope) — early return
+    if (elem >= 512) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const float val = __half2float(x[ib].rope[elem - 512 + l]);
+            if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = val; }
+#ifdef FP16_AVAILABLE
+            else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(val); }
+#endif
+        }
+        return;
+    }
+
+    // Hoist sub-block selection + half2float out of unrolled loop (consecutive elements stay in same sub-block)
+    const bool is_blk1 = (elem < 256);
+    const float norm = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
+    const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
+    const int e_base = is_blk1 ? elem : (elem - 256);
+    constexpr int qs_len = QK_K*3/8;
+
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
-        const int global_e = elem + l;
-        float norm; const uint8_t * qs; int e; int qs_len;
-        if (global_e < 256)      { norm = __half2float(x[ib].d1); qs = x[ib].qs1; e = global_e;       qs_len = QK_K*3/8; }
-        else if (global_e < 512) { norm = __half2float(x[ib].d2); qs = x[ib].qs2; e = global_e - 256; qs_len = QK_K*3/8; }
-        else                     { norm = __half2float(x[ib].d3); qs = x[ib].qs3; e = global_e - 512; qs_len = TBQ_K64*3/8; }
+        const int e = e_base + l;
         const int bp = e*3, by = bp/8, bo = bp%8;
         uint32_t v = (uint32_t)qs[by]>>bo;
         if (bo > 5 && by+1 < qs_len) v |= (uint32_t)qs[by+1]<<(8-bo);
@@ -1434,17 +1478,122 @@ static __device__ __forceinline__ void dequantize_V_tbq4_4(const void * __restri
     static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
     const int64_t ib = i0 / TBQ_K576;
     const int elem = i0 % TBQ_K576;
+
+    // Sub-block 3: f16 passthrough (rope) — early return
+    if (elem >= 512) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const float val = __half2float(x[ib].rope[elem - 512 + l]);
+            if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = val; }
+#ifdef FP16_AVAILABLE
+            else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(val); }
+#endif
+        }
+        return;
+    }
+
+    // Hoist sub-block selection + half2float out of unrolled loop
+    const bool is_blk1 = (elem < 256);
+    const float norm = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
+    const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
+    const int e_base = is_blk1 ? elem : (elem - 256);
+
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
-        const int global_e = elem + l;
-        float norm; const uint8_t * qs; int e;
-        if (global_e < 256)      { norm = __half2float(x[ib].d1); qs = x[ib].qs1; e = global_e; }
-        else if (global_e < 512) { norm = __half2float(x[ib].d2); qs = x[ib].qs2; e = global_e - 256; }
-        else                     { norm = __half2float(x[ib].d3); qs = x[ib].qs3; e = global_e - 512; }
+        const int e = e_base + l;
         const float cent = c4[(qs[e/2] >> ((e%2)*4)) & 0xF] * norm;
         if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = cent; }
 #ifdef FP16_AVAILABLE
         else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(cent); }
+#endif
+    }
+}
+
+// V dequantize for TBQP3_4 (576-block, 2-bit Lloyd-Max + 1-bit QJL)
+// For MLA V view: only sub-blocks 1,2 (elements 0..511) are accessed.
+// Sub-block selection is hoisted out of the inner loop for speed.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbqp3_4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbqp3_4 * x = (const block_tbqp3_4 *) vx;
+    static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
+    const int64_t ib = i0 / TBQ_K576;
+    const int elem = i0 % TBQ_K576;
+
+    // For D_V=512 (MLA), elem is always < 512 so sub-block 3 is never reached.
+    if (elem >= 512) {
+        // Sub-block 3: f16 passthrough (rope)
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const float val = __half2float(x[ib].rope[elem - 512 + l]);
+            if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
+#ifdef FP16_AVAILABLE
+            else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
+#endif
+        }
+        return;
+    }
+
+    // Hoist sub-block selection and half->float conversion out of the unrolled loop.
+    // NOTE: QJL correction is NOT applied here. QJL is for K·Q dot product correction only,
+    // not for V value reconstruction. V needs pure MSE centroid * norm for IWHT to work correctly.
+    const bool is_blk1 = (elem < 256);
+    const float norm  = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
+    const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
+    const int e_base = is_blk1 ? elem : (elem - 256);
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int e = e_base + l;
+        const float val = c2[(qs[e/4] >> ((e%4)*2)) & 0x3] * norm;
+        if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
+#endif
+    }
+}
+
+// V dequantize for TBQP4_4 (576-block, 3-bit Lloyd-Max + 1-bit QJL)
+// For MLA V view: only sub-blocks 1,2 (elements 0..511) are accessed.
+// Sub-block selection and half->float hoisted out of inner loop.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbqp4_4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbqp4_4 * x = (const block_tbqp4_4 *) vx;
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    const int64_t ib = i0 / TBQ_K576;
+    const int elem = i0 % TBQ_K576;
+
+    // For D_V=512 (MLA), elem is always < 512 so sub-block 3 is never reached.
+    if (elem >= 512) {
+        // Sub-block 3: f16 passthrough (rope)
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const float val = __half2float(x[ib].rope[elem - 512 + l]);
+            if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
+#ifdef FP16_AVAILABLE
+            else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
+#endif
+        }
+        return;
+    }
+
+    // NOTE: QJL correction is NOT applied for V dequantization.
+    // QJL corrects K·Q dot products only, not per-element V reconstruction.
+    const bool is_blk1 = (elem < 256);
+    const float norm  = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
+    const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
+    const int e_base = is_blk1 ? elem : (elem - 256);
+    constexpr int qs_len = QK_K*3/8; // 96, always sub-block 1 or 2
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int e = e_base + l;
+        const int bp = e*3, by = bp/8, bo = bp%8;
+        uint32_t v = (uint32_t)qs[by] >> bo;
+        if (bo > 5 && by+1 < qs_len) v |= (uint32_t)qs[by+1] << (8-bo);
+        const float val = c3[v & 0x7] * norm;
+        if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
 #endif
     }
 }
@@ -1547,6 +1696,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_tbq3_4<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ4_4) {
         return dequantize_V_tbq4_4<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQP3_4) {
+        return dequantize_V_tbqp3_4<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQP4_4) {
+        return dequantize_V_tbqp4_4<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

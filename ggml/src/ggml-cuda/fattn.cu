@@ -212,6 +212,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE(128, type_K, type_V)       \
     FATTN_VEC_CASE(256, type_K, type_V)       \
 
+#define FATTN_VEC_CASE_ASYM(D, D_V, type_K, type_V)                                                             \
+    {                                                                                                            \
+        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
+        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
+        if (Q->ne[0] == (D) && V->ne[0] == (D_V) && type_K_okay && type_V_okay) {                               \
+            ggml_cuda_flash_attn_ext_vec_case_asym<D, D_V, type_K, type_V>(ctx, dst);                            \
+            return;                                                                                              \
+        }                                                                                                        \
+    }                                                                                                            \
+
+
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
@@ -371,7 +382,29 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_3)
     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_3)
 
-    // TurboQuant 576-block (_4): D=576 only (ALL_QUANTS path)
+    // GLM asymmetric MUST come before symmetric 576 cases (ASYM checks V->ne[0]==512, symmetric doesn't)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_4)
+
+    // TurboQuant 576-block (_4): D=576 symmetric (ALL_QUANTS path)
     FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
     FATTN_VEC_CASE(576, GGML_TYPE_TBQ4_4,  GGML_TYPE_F16)
     FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4,  GGML_TYPE_Q8_0)
@@ -495,7 +528,28 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_2)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_2)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_2)
-    // TurboQuant 576-block (_4): D=576 only
+    // GLM asymmetric MUST come before symmetric 576 cases (ASYM checks V->ne[0]==512, symmetric doesn't)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_4)
+    // TurboQuant 576-block (_4): D=576 symmetric
     FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
     FATTN_VEC_CASE(576, GGML_TYPE_TBQ4_4,  GGML_TYPE_F16)
     FATTN_VEC_CASE(576, GGML_TYPE_TBQ3_4,  GGML_TYPE_Q8_0)
@@ -600,11 +654,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         || K->type == GGML_TYPE_TBQ3_2 || K->type == GGML_TYPE_TBQ4_2
                         || K->type == GGML_TYPE_TBQP3_2 || K->type == GGML_TYPE_TBQP4_2
                         || K->type == GGML_TYPE_TBQ3_3 || K->type == GGML_TYPE_TBQ4_3
-                        || K->type == GGML_TYPE_TBQP3_3 || K->type == GGML_TYPE_TBQP4_3;
+                        || K->type == GGML_TYPE_TBQP3_3 || K->type == GGML_TYPE_TBQP4_3
+                        || K->type == GGML_TYPE_TBQ3_4 || K->type == GGML_TYPE_TBQ4_4
+                        || K->type == GGML_TYPE_TBQP3_4 || K->type == GGML_TYPE_TBQP4_4;
         const bool tbq_v = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0
                         || V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQ4_1
                         || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2
-                        || V->type == GGML_TYPE_TBQ3_3 || V->type == GGML_TYPE_TBQ4_3;
+                        || V->type == GGML_TYPE_TBQ3_3 || V->type == GGML_TYPE_TBQ4_3
+                        || V->type == GGML_TYPE_TBQ3_4 || V->type == GGML_TYPE_TBQ4_4;
         const bool std_k = K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0
                         || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_BF16;
         const bool std_v = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0;
@@ -644,6 +701,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_TBQ4_3:
         case GGML_TYPE_TBQP3_3:
         case GGML_TYPE_TBQP4_3:
+        case GGML_TYPE_TBQ3_4:
+        case GGML_TYPE_TBQ4_4:
+        case GGML_TYPE_TBQP3_4:
+        case GGML_TYPE_TBQP4_4:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -661,13 +722,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      || K->type == GGML_TYPE_TBQ4_2 || K->type == GGML_TYPE_TBQ3_2
      || K->type == GGML_TYPE_TBQP4_2 || K->type == GGML_TYPE_TBQP3_2
      || K->type == GGML_TYPE_TBQ4_3 || K->type == GGML_TYPE_TBQ3_3
-     || K->type == GGML_TYPE_TBQP4_3 || K->type == GGML_TYPE_TBQP3_3;
+     || K->type == GGML_TYPE_TBQP4_3 || K->type == GGML_TYPE_TBQP3_3
+     || K->type == GGML_TYPE_TBQ4_4 || K->type == GGML_TYPE_TBQ3_4
+     || K->type == GGML_TYPE_TBQP4_4 || K->type == GGML_TYPE_TBQP3_4;
     const bool tbq_v_type = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_TBQ3_0
      || V->type == GGML_TYPE_TBQ4_1 || V->type == GGML_TYPE_TBQ3_1
      || V->type == GGML_TYPE_TBQ4_2 || V->type == GGML_TYPE_TBQ3_2
-     || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3;
+     || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3
+     || V->type == GGML_TYPE_TBQ4_4 || V->type == GGML_TYPE_TBQ3_4;
     if (tbq_k_type || tbq_v_type) {
         if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        // GLM asymmetric: K=576, V=512 with TBQ types
+        if (Q->ne[0] == 576 && V->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
             return BEST_FATTN_KERNEL_VEC;
         }
         return BEST_FATTN_KERNEL_NONE;
