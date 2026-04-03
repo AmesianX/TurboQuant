@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 env:
-  CUDA_ARCHITECTURES: "75;80;86;89;90;120"
+  CUDA_ARCHITECTURES: "70;75;80;86;89;90;120"
   ROCM_GPU_TARGETS: "gfx90a;gfx942;gfx1030;gfx1100;gfx1151;gfx1200"
 
 jobs:
