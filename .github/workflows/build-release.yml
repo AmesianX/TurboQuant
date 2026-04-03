@@ -13,6 +13,7 @@ permissions:
 
 env:
   CUDA_ARCHITECTURES: "75;80;86;89;90;120"
+  ROCM_GPU_TARGETS: "gfx90a;gfx942;gfx1030;gfx1100;gfx1151;gfx1200"
 
 jobs:
   # ============================================================
@@ -247,4 +248,80 @@ jobs:
         run: |
           gh release upload ${{ github.event.inputs.tag }} `
             turboquant-bin-win-x64-cuda-cu12.8-standalone.zip `
+            --clobber
+
+  # ============================================================
+  # Linux x64 + ROCm 7.2 (Docker-based)
+  # ============================================================
+  build-linux-x64-rocm72:
+    runs-on: ubuntu-22.04
+    container:
+      image: rocm/dev-ubuntu-22.04:7.2.1-complete
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          apt-get update && apt-get install -y cmake zip
+
+      - name: Build
+        run: |
+          cmake -B build -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release \
+            -DGPU_TARGETS="${ROCM_GPU_TARGETS}"
+          cmake --build build -j$(nproc)
+
+      - name: Package
+        run: |
+          PKG="turboquant-bin-linux-x64-rocm-7.2"
+          mkdir -p $PKG
+          for bin in llama-cli llama-server llama-perplexity llama-bench \
+                     llama-quantize llama-gguf-split llama-imatrix llama-tokenize; do
+            cp build/bin/$bin $PKG/ 2>/dev/null || true
+          done
+          cp -P build/bin/lib*.so* $PKG/ 2>/dev/null || true
+          zip -r $PKG.zip $PKG/
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.inputs.tag }} \
+            turboquant-bin-linux-x64-rocm-7.2.zip \
+            --clobber
+
+  build-linux-x64-rocm72-standalone:
+    runs-on: ubuntu-22.04
+    container:
+      image: rocm/dev-ubuntu-22.04:7.2.1-complete
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          apt-get update && apt-get install -y cmake zip
+
+      - name: Build (no OpenSSL)
+        run: |
+          cmake -B build -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF \
+            -DGPU_TARGETS="${ROCM_GPU_TARGETS}"
+          cmake --build build -j$(nproc)
+
+      - name: Package
+        run: |
+          PKG="turboquant-bin-linux-x64-rocm-7.2-standalone"
+          mkdir -p $PKG
+          for bin in llama-cli llama-server llama-perplexity llama-bench \
+                     llama-quantize llama-gguf-split llama-imatrix llama-tokenize; do
+            cp build/bin/$bin $PKG/ 2>/dev/null || true
+          done
+          cp -P build/bin/lib*.so* $PKG/ 2>/dev/null || true
+          echo "Built without OpenSSL — llama-server HTTPS is disabled." > $PKG/STANDALONE-NOTE.txt
+          zip -r $PKG.zip $PKG/
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.inputs.tag }} \
+            turboquant-bin-linux-x64-rocm-7.2-standalone.zip \
             --clobber
