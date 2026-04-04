@@ -1972,20 +1972,14 @@ void launch_fattn(
         const size_t ts = ggml_type_size(K->type);
         const int64_t k_elems = ggml_nelements(K);
 
-        // TBQP: [K_mse | K_qjl] concatenated (2x), others: K_f16 (1x).
-        // K_qjl offset in kernel: DKQ * ne11 * ne13 / 2 (half2 units).
-        K_f16.alloc(tbqp_wht_mode ? 2 * k_elems : k_elems);
+        // TBQP: K_mse only (1x). QJL correction computed as scalar from raw block data.
+        K_f16.alloc(k_elems);
 
         if (tbqp_wht_mode) {
-            // TBQP: fused K_mse + K_qjl in single kernel (block read once, two outputs).
-            // Skips to_fp16 entirely — fused kernel handles both MSE and QJL from raw data.
-            extern void tbqp3_fused_mse_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
-            extern void tbqp4_fused_mse_qjl_f16_cuda(const void *, half *, int64_t, cudaStream_t);
-            if (K->type == GGML_TYPE_TBQP3_4) {
-                tbqp3_fused_mse_qjl_f16_cuda(K_data_orig, K_f16.ptr, k_elems, main_stream);
-            } else {
-                tbqp4_fused_mse_qjl_f16_cuda(K_data_orig, K_f16.ptr, k_elems, main_stream);
-            }
+            // TBQP: K_mse WHT f16 (no QJL). QJL applied as scalar correction in MMA kernel.
+            // to_fp16 already registered as MSE-only WHT dequant for TBQP types.
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+            to_fp16(K_data, K_f16.ptr, k_elems, main_stream);
             nb11 = K->ne[0] * sizeof(half);
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
@@ -2013,16 +2007,9 @@ void launch_fattn(
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
-        if (V_is_K_view && !tbqp_wht_mode) {
-            // TBQ: V shares K's spatial f16 buffer.
-            V_data = K_data;
-            nb21   = nb11;
-            nb22   = nb12;
-            nb23   = nb13;
-        } else if (V_is_K_view && tbqp_wht_mode) {
-            // TBQP: V = K_mse (first half of K_f16 buffer, no QJL, no copy needed).
-            // K_f16 = [K_mse | K_qjl]. K_data points to K_mse. V reads same data.
-            // MMA kernel: V_is_K_view=false loads V from V_data = K_data = K_mse. Safe.
+        if (V_is_K_view) {
+            // MLA: V shares K's f16 buffer. Both TBQ (spatial) and TBQP (MSE-only WHT).
+            // TBQP: K has no QJL (QJL applied as scalar correction). V is clean.
             V_data = K_data;
             nb21   = nb11;
             nb22   = nb12;
@@ -2074,11 +2061,9 @@ void launch_fattn(
         }
         float * q_wht1 = (float *)q_wht_cache.ptr;
         float * q_wht2 = (float *)((char *)q_wht_cache.ptr + n_q_bytes);
-        const int64_t n_q_rows = Q->ne[1]*Q->ne[2]*Q->ne[3];
-
-        // Fused: copy Q → WHT1(signs1) + WHT2(signs2) in single kernel
+        // Fused: Q_wht1 (signs1 WHT) + Q_wht2 (signs2 WHT) in single kernel
         CUDA_CHECK(cudaMemcpyAsync(q_wht1, Q->data, n_q_bytes, cudaMemcpyDeviceToDevice, main_stream));
-        tbq_q_wht12_cuda(q_wht1, q_wht2, Q->ne[0], n_q_rows, Q->ne[0], main_stream);
+        tbq_q_wht12_cuda(q_wht1, q_wht2, Q->ne[0], Q->ne[1]*Q->ne[2]*Q->ne[3], Q->ne[0], main_stream);
     }
 
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
@@ -2190,10 +2175,21 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
     const char * Q_data_for_kernel = tbqp_wht_mode ? (const char *) q_wht_cache.ptr : (const char *) Q->data;
+    // TBQP: pass raw K data via V pointer (V_is_K_view=true → V pointer/strides unused by MMA).
+    // Kernel accesses raw TBQP blocks via: V + nb23*sequence + nb22*z_KV + nb21*kv_token.
+    // nb21/22/23 carry the raw K strides (overwriting V strides, which are unused when V_is_K_view=true).
+    const char * V_data_for_kernel = V_data;
+    if (tbqp_wht_mode) {
+        V_data_for_kernel = K_data_orig;
+        nb21 = K->nb[1];  // raw K stride (bytes per KV token)
+        nb22 = K->nb[2];
+        nb23 = K->nb[3];
+    }
+
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
         Q_data_for_kernel,
         K_data,
-        V_data,
+        V_data_for_kernel,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
