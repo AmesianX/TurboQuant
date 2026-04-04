@@ -1,0 +1,1311 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 97a56dc61..ec5da90ae 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -391,9 +391,29 @@ const std::vector<ggml_type> kv_cache_types = {
+     GGML_TYPE_TBQ4_0,
+     GGML_TYPE_TBQP3_0,
+     GGML_TYPE_TBQP4_0,
++    GGML_TYPE_TBQ3_1,
++    GGML_TYPE_TBQ4_1,
++    GGML_TYPE_TBQP3_1,
++    GGML_TYPE_TBQP4_1,
++    GGML_TYPE_TBQ3_2,
++    GGML_TYPE_TBQ4_2,
++    GGML_TYPE_TBQP3_2,
++    GGML_TYPE_TBQP4_2,
+ };
+ 
+ static ggml_type kv_cache_type_from_str(const std::string & s) {
++    // TurboQuant shorthand: "tbq3" → tbq3_0 (resolved to correct _N by head_dim later)
++    // Users don't need to know about _0/_1/_2 suffixes
++    static const std::unordered_map<std::string, ggml_type> tbq_shortcuts = {
++        {"tbq3",  GGML_TYPE_TBQ3_0},
++        {"tbq4",  GGML_TYPE_TBQ4_0},
++        {"tbqp3", GGML_TYPE_TBQP3_0},
++        {"tbqp4", GGML_TYPE_TBQP4_0},
++    };
++    auto it = tbq_shortcuts.find(s);
++    if (it != tbq_shortcuts.end()) {
++        return it->second;
++    }
+     for (const auto & type : kv_cache_types) {
+         if (ggml_type_name(type) == s) {
+             return type;
+diff --git a/common/common.cpp b/common/common.cpp
+index a9bd49419..e525b0492 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1225,6 +1225,143 @@ common_init_result::common_init_result(common_params & params) :
+         cparams.n_samplers = pimpl->samplers_seq_config.size();
+     }
+ 
++    // TurboQuant auto-mapping: resolve _0 placeholder to correct _N based on head_dim
++    // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
++    {
++        // Get KV head dimension from GGUF metadata: {arch}.attention.key_length
++        int32_t head_dim = 0;
++        {
++            char arch[64] = {}, buf[64] = {};
++            llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
++            if (llama_model_meta_val_str(model, (std::string(arch) + ".attention.key_length").c_str(), buf, sizeof(buf)) > 0) {
++                head_dim = std::atoi(buf);
++            }
++        }
++
++        // Helper: check if a type is any TBQ/TBQP variant
++        auto is_tbq_type = [](ggml_type t) -> bool {
++            return t == GGML_TYPE_TBQ3_0  || t == GGML_TYPE_TBQ4_0
++                || t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP4_0
++                || t == GGML_TYPE_TBQ3_1  || t == GGML_TYPE_TBQ4_1
++                || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
++                || t == GGML_TYPE_TBQ3_2  || t == GGML_TYPE_TBQ4_2
++                || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
++                || t == GGML_TYPE_TBQ3_3  || t == GGML_TYPE_TBQ4_3
++                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3;
++        };
++        auto is_tbqp_type = [](ggml_type t) -> bool {
++            return t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP4_0
++                || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
++                || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
++                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3;
++        };
++
++        // Validation 1: V cache must not use TBQP (QJL) — no QJL dequantize for V
++        if (is_tbqp_type(cparams.type_v)) {
++            const char * orig = ggml_type_name(cparams.type_v);
++            // Downgrade tbqp → tbq (strip QJL, keep bit-width)
++                 if (cparams.type_v == GGML_TYPE_TBQP3_0) cparams.type_v = GGML_TYPE_TBQ3_0;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_0) cparams.type_v = GGML_TYPE_TBQ4_0;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_1) cparams.type_v = GGML_TYPE_TBQ3_1;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_1) cparams.type_v = GGML_TYPE_TBQ4_1;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_2) cparams.type_v = GGML_TYPE_TBQ3_2;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_2) cparams.type_v = GGML_TYPE_TBQ4_2;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_3) cparams.type_v = GGML_TYPE_TBQ3_3;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_3) cparams.type_v = GGML_TYPE_TBQ4_3;
++            LOG_WRN("%s: TBQP (QJL) not supported for V cache, downgraded %s → %s\n",
++                    __func__, orig, ggml_type_name(cparams.type_v));
++        }
++
++        // Validation 2: _3 (cross-head) types → strip to _0 (will be re-mapped below)
++        auto strip_cross_head = [](ggml_type t) -> ggml_type {
++            if (t == GGML_TYPE_TBQ3_3)  return GGML_TYPE_TBQ3_0;
++            if (t == GGML_TYPE_TBQ4_3)  return GGML_TYPE_TBQ4_0;
++            if (t == GGML_TYPE_TBQP3_3) return GGML_TYPE_TBQP3_0;
++            if (t == GGML_TYPE_TBQP4_3) return GGML_TYPE_TBQP4_0;
++            return t;
++        };
++        if (cparams.type_k != strip_cross_head(cparams.type_k)) {
++            LOG_WRN("%s: cross-head _3 types are deprecated, auto-mapping to standard type\n", __func__);
++            cparams.type_k = strip_cross_head(cparams.type_k);
++        }
++        if (cparams.type_v != strip_cross_head(cparams.type_v)) {
++            LOG_WRN("%s: cross-head _3 types are deprecated, auto-mapping to standard type\n", __func__);
++            cparams.type_v = strip_cross_head(cparams.type_v);
++        }
++
++        // Auto-map _0 types to correct _N based on head_dim
++        auto tbq_resolve = [&](ggml_type type, bool is_key) -> ggml_type {
++            struct tbq_map { ggml_type from; ggml_type to_256; ggml_type to_128; ggml_type to_64; };
++            static const tbq_map maps[] = {
++                { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2  },
++                { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2  },
++                { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2 },
++                { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2 },
++            };
++
++            // Also catch _1/_2 types that don't match head_dim (user specified directly)
++            auto is_wrong_suffix = [&](ggml_type t) -> bool {
++                bool is_1 = (t == GGML_TYPE_TBQ3_1 || t == GGML_TYPE_TBQ4_1 || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1);
++                bool is_2 = (t == GGML_TYPE_TBQ3_2 || t == GGML_TYPE_TBQ4_2 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2);
++                if (is_1 && head_dim != 128) return true;
++                if (is_2 && head_dim != 64)  return true;
++                return false;
++            };
++            if (is_wrong_suffix(type)) {
++                const ggml_type fallback = is_key ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
++                LOG_WRN("%s: %s does not match head_dim=%d, falling back to %s\n",
++                        __func__, ggml_type_name(type), head_dim, ggml_type_name(fallback));
++                return fallback;
++            }
++
++            for (const auto & m : maps) {
++                if (type == m.from) {
++                    if (head_dim == 256) {
++                        if (m.to_256 != type) {
++                            LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
++                                    __func__, ggml_type_name(type), ggml_type_name(m.to_256), head_dim);
++                        }
++                        return m.to_256;
++                    } else if (head_dim == 128) {
++                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
++                                __func__, ggml_type_name(type), ggml_type_name(m.to_128), head_dim);
++                        return m.to_128;
++                    } else if (head_dim == 64) {
++                        if (is_key) {
++                            LOG_WRN("\n");
++                            LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
++                            LOG_WRN("║  TurboQuant: head_dim=%d detected — K cache forced to q8_0  ║\n", head_dim);
++                            LOG_WRN("║  WHT quantization degrades attention accuracy at dim<128.   ║\n");
++                            LOG_WRN("║  V cache uses %s (WHT is OK for values)                 ║\n", ggml_type_name(m.to_64));
++                            LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
++                            LOG_WRN("\n");
++                            return GGML_TYPE_Q8_0;
++                        }
++                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
++                                __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
++                        return m.to_64;
++                    } else {
++                        LOG_WRN("%s: unsupported head_dim=%d for TurboQuant, falling back to %s\n",
++                                __func__, head_dim, is_key ? "q8_0" : "f16");
++                        return is_key ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
++                    }
++                }
++            }
++            return type; // not a _0 TBQ type, pass through
++        };
++
++        if (is_tbq_type(cparams.type_k) || is_tbq_type(cparams.type_v)) {
++            if (head_dim <= 0) {
++                LOG_WRN("%s: could not determine head_dim from model metadata, TurboQuant disabled\n", __func__);
++                if (is_tbq_type(cparams.type_k)) cparams.type_k = GGML_TYPE_Q8_0;
++                if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_F16;
++            } else {
++                cparams.type_k = tbq_resolve(cparams.type_k, true);
++                cparams.type_v = tbq_resolve(cparams.type_v, false);
++            }
++        }
++    }
++
+     llama_context * lctx = llama_init_from_model(model, cparams);
+     if (lctx == NULL) {
+         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 00f2ba66d..0ea67025f 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -440,7 +440,11 @@ extern "C" {
+         GGML_TYPE_TBQ4_2  = 50, // TurboQuant 4-bit, blck_size=64 (head_dim=64)
+         GGML_TYPE_TBQP3_2 = 51, // TurboQuant_prod 3-bit, blck_size=64 (head_dim=64)
+         GGML_TYPE_TBQP4_2 = 52, // TurboQuant_prod 4-bit, blck_size=64 (head_dim=64)
+-        GGML_TYPE_COUNT   = 53,
++        GGML_TYPE_TBQ3_3  = 53, // TurboQuant 3-bit, cross-head WHT (8×64=512)
++        GGML_TYPE_TBQ4_3  = 54, // TurboQuant 4-bit, cross-head WHT (8×64=512)
++        GGML_TYPE_TBQP3_3 = 55, // TurboQuant_prod 3-bit, cross-head WHT (8×64=512)
++        GGML_TYPE_TBQP4_3 = 56, // TurboQuant_prod 4-bit, cross-head WHT (8×64=512)
++        GGML_TYPE_COUNT   = 57,
+     };
+ 
+     // precision
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index eb290d80f..bcd7b2050 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -368,6 +368,15 @@ typedef struct {
+ } block_tbqp4_2;
+ static_assert(sizeof(block_tbqp4_2) == 2*sizeof(ggml_half) + TBQ_K64*3/8 + TBQ_K64/8, "wrong tbqp4_2 block size/padding");
+ 
++// TurboQuant cross-head WHT variants (8 heads × 64 dims = 512-element WHT)
++// Block format identical to _2 (blck_size=64), but quantization spans 8 heads
++// The 'd' field stores the L2 norm of the 512-element concatenated vector
++
++typedef block_tbq3_2  block_tbq3_3;
++typedef block_tbq4_2  block_tbq4_3;
++typedef block_tbqp3_2 block_tbqp3_3;
++typedef block_tbqp4_2 block_tbqp4_3;
++
+ //
+ // Super-block quantization structures
+ //
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 3572fecc4..2bd51bcf5 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -482,7 +482,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+                 type_k == GGML_TYPE_TBQ3_2  || type_k == GGML_TYPE_TBQ4_2  ||
+                 type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2 ||
+                 type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2  ||
+-                type_v == GGML_TYPE_TBQP3_2 || type_v == GGML_TYPE_TBQP4_2) {
++                type_v == GGML_TYPE_TBQP3_2 || type_v == GGML_TYPE_TBQP4_2 ||
++                type_k == GGML_TYPE_TBQ3_3  || type_k == GGML_TYPE_TBQ4_3  ||
++                type_k == GGML_TYPE_TBQP3_3 || type_k == GGML_TYPE_TBQP4_3 ||
++                type_v == GGML_TYPE_TBQ3_3  || type_v == GGML_TYPE_TBQ4_3  ||
++                type_v == GGML_TYPE_TBQP3_3 || type_v == GGML_TYPE_TBQP4_3) {
+                 return false;
+             }
+             return true;
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index df381866e..59591adac 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -169,6 +169,30 @@ if (CUDAToolkit_FOUND)
+             template-instances/fattn-vec-instance-tbqp4_2-q8_0.cu
+             template-instances/fattn-vec-instance-tbqp4_2-tbq3_2.cu
+             template-instances/fattn-vec-instance-tbqp4_2-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbq3_3-f16.cu
++            template-instances/fattn-vec-instance-tbq3_3-q8_0.cu
++            template-instances/fattn-vec-instance-tbq3_3-tbq3_2.cu
++            template-instances/fattn-vec-instance-tbq3_3-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbq4_3-f16.cu
++            template-instances/fattn-vec-instance-tbq4_3-q8_0.cu
++            template-instances/fattn-vec-instance-tbq4_3-tbq3_2.cu
++            template-instances/fattn-vec-instance-tbq4_3-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbqp3_3-f16.cu
++            template-instances/fattn-vec-instance-tbqp3_3-q8_0.cu
++            template-instances/fattn-vec-instance-tbqp3_3-tbq3_2.cu
++            template-instances/fattn-vec-instance-tbqp3_3-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbqp4_3-f16.cu
++            template-instances/fattn-vec-instance-tbqp4_3-q8_0.cu
++            template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu
++            template-instances/fattn-vec-instance-tbqp4_3-tbq4_2.cu
++            template-instances/fattn-vec-instance-tbq3_3-tbq3_3.cu
++            template-instances/fattn-vec-instance-tbq3_3-tbq4_3.cu
++            template-instances/fattn-vec-instance-tbq4_3-tbq3_3.cu
++            template-instances/fattn-vec-instance-tbq4_3-tbq4_3.cu
++            template-instances/fattn-vec-instance-tbqp3_3-tbq3_3.cu
++            template-instances/fattn-vec-instance-tbqp3_3-tbq4_3.cu
++            template-instances/fattn-vec-instance-tbqp4_3-tbq3_3.cu
++            template-instances/fattn-vec-instance-tbqp4_3-tbq4_3.cu
+             template-instances/fattn-vec-instance-f16-tbq3_0.cu
+             template-instances/fattn-vec-instance-f16-tbq4_0.cu
+             template-instances/fattn-vec-instance-f16-tbq3_1.cu
+diff --git a/ggml/src/ggml-cuda/cpy-utils.cuh b/ggml/src/ggml-cuda/cpy-utils.cuh
+index 3e6ca6cef..6d1101b0c 100644
+--- a/ggml/src/ggml-cuda/cpy-utils.cuh
++++ b/ggml/src/ggml-cuda/cpy-utils.cuh
+@@ -740,6 +740,240 @@ static __device__ void quantize_f32_tbqp4_2_block(const float * __restrict__ x,
+     for (int j = 0; j < TBQ_K64; j++) { if (res[j] >= 0.0f) y->qjl[j/8] |= (1<<(j%8)); }
+ }
+ 
++// ============================================================
++// TurboQuant cross-head WHT (8 heads × 64 = 512-element WHT)
++// H_512 = H_8 ⊗ H_64 — CLT convergence at d=512 for head_dim=64
++// ============================================================
++
++// 512-bit random sign pattern (first 8 bytes match tbq_signs for _2)
++static __device__ constexpr uint8_t tbq_signs_512[64] = {
++    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0
++    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
++    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
++    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
++    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
++    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
++    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
++    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
++};
++
++// Cross-head TBQ3: 8×64=512-element WHT, 3-bit Lloyd-Max
++static __device__ void quantize_f32_tbq3_3_xhead(
++    const float * __restrict__ x0, const float * __restrict__ x1,
++    const float * __restrict__ x2, const float * __restrict__ x3,
++    const float * __restrict__ x4, const float * __restrict__ x5,
++    const float * __restrict__ x6, const float * __restrict__ x7,
++    block_tbq3_3 * __restrict__ y0, block_tbq3_3 * __restrict__ y1,
++    block_tbq3_3 * __restrict__ y2, block_tbq3_3 * __restrict__ y3,
++    block_tbq3_3 * __restrict__ y4, block_tbq3_3 * __restrict__ y5,
++    block_tbq3_3 * __restrict__ y6, block_tbq3_3 * __restrict__ y7) {
++
++    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
++    const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
++    block_tbq3_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
++
++    float tmp[512];
++    float sum_sq = 0.0f;
++    for (int h = 0; h < 8; h++)
++        for (int j = 0; j < TBQ_K64; j++) {
++            float v = heads[h][j];
++            tmp[h*TBQ_K64 + j] = v;
++            sum_sq += v * v;
++        }
++    float norm = sqrtf(sum_sq);
++    ggml_half norm_h = __float2half(norm);
++    if (norm < 1e-10f) {
++        for (int h = 0; h < 8; h++) { outs[h]->d = norm_h; for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0; }
++        return;
++    }
++    float inv_norm = 1.0f / norm;
++    for (int j = 0; j < 512; j++) {
++        int sign = ((tbq_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
++        tmp[j] *= inv_norm * sign;
++    }
++    // 512-element serial WHT (9 stages)
++    for (int len = 1; len < 512; len *= 2)
++        for (int i = 0; i < 512; i += 2*len)
++            for (int j = 0; j < len; j++) {
++                float u = tmp[i+j], v = tmp[i+j+len];
++                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
++            }
++    // Quantize into 8 blocks of 64 elements each
++    for (int h = 0; h < 8; h++) {
++        outs[h]->d = norm_h;
++        int bit_pos = 0;
++        for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
++        for (int j = 0; j < TBQ_K64; j++) {
++            uint8_t idx = 7;
++            for (int b = 0; b < 7; b++) { if (tmp[h*TBQ_K64+j] < b3[b]) { idx = b; break; } }
++            int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
++            outs[h]->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
++            if (bit_off > 5) outs[h]->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
++            bit_pos += 3;
++        }
++    }
++}
++
++// Cross-head TBQ4: 8×64=512-element WHT, 4-bit Lloyd-Max
++static __device__ void quantize_f32_tbq4_3_xhead(
++    const float * __restrict__ x0, const float * __restrict__ x1,
++    const float * __restrict__ x2, const float * __restrict__ x3,
++    const float * __restrict__ x4, const float * __restrict__ x5,
++    const float * __restrict__ x6, const float * __restrict__ x7,
++    block_tbq4_3 * __restrict__ y0, block_tbq4_3 * __restrict__ y1,
++    block_tbq4_3 * __restrict__ y2, block_tbq4_3 * __restrict__ y3,
++    block_tbq4_3 * __restrict__ y4, block_tbq4_3 * __restrict__ y5,
++    block_tbq4_3 * __restrict__ y6, block_tbq4_3 * __restrict__ y7) {
++
++    static constexpr float b4[15] = { -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,0.0f,0.2583f,0.5225f,0.7996f,1.0993f,1.4371f,1.8435f,2.4008f };
++    const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
++    block_tbq4_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
++
++    float tmp[512];
++    float sum_sq = 0.0f;
++    for (int h = 0; h < 8; h++)
++        for (int j = 0; j < TBQ_K64; j++) { float v = heads[h][j]; tmp[h*TBQ_K64+j] = v; sum_sq += v*v; }
++    float norm = sqrtf(sum_sq);
++    ggml_half norm_h = __float2half(norm);
++    if (norm < 1e-10f) {
++        for (int h = 0; h < 8; h++) { outs[h]->d = norm_h; for (int j = 0; j < TBQ_K64/2; j++) outs[h]->qs[j] = 0; }
++        return;
++    }
++    float inv_norm = 1.0f / norm;
++    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= inv_norm * sign; }
++    for (int len = 1; len < 512; len *= 2)
++        for (int i = 0; i < 512; i += 2*len)
++            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
++    for (int h = 0; h < 8; h++) {
++        outs[h]->d = norm_h;
++        for (int j = 0; j < TBQ_K64/2; j++) {
++            uint8_t idx0 = 15, idx1 = 15;
++            for (int b = 0; b < 15; b++) { if (tmp[h*TBQ_K64+2*j]   < b4[b]) { idx0 = b; break; } }
++            for (int b = 0; b < 15; b++) { if (tmp[h*TBQ_K64+2*j+1] < b4[b]) { idx1 = b; break; } }
++            outs[h]->qs[j] = idx0 | (idx1 << 4);
++        }
++    }
++}
++
++// Cross-head TBQP3: 8×64=512-element WHT, 2-bit Lloyd-Max + 1-bit Direct Sign
++static __device__ void quantize_f32_tbqp3_3_xhead(
++    const float * __restrict__ x0, const float * __restrict__ x1,
++    const float * __restrict__ x2, const float * __restrict__ x3,
++    const float * __restrict__ x4, const float * __restrict__ x5,
++    const float * __restrict__ x6, const float * __restrict__ x7,
++    block_tbqp3_3 * __restrict__ y0, block_tbqp3_3 * __restrict__ y1,
++    block_tbqp3_3 * __restrict__ y2, block_tbqp3_3 * __restrict__ y3,
++    block_tbqp3_3 * __restrict__ y4, block_tbqp3_3 * __restrict__ y5,
++    block_tbqp3_3 * __restrict__ y6, block_tbqp3_3 * __restrict__ y7) {
++
++    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
++    static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
++    const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
++    block_tbqp3_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
++
++    float tmp[512];
++    float sum_sq = 0.0f;
++    for (int h = 0; h < 8; h++)
++        for (int j = 0; j < TBQ_K64; j++) { float v = heads[h][j]; tmp[h*TBQ_K64+j] = v; sum_sq += v*v; }
++    float norm = sqrtf(sum_sq);
++    ggml_half norm_h = __float2half(norm);
++    if (norm < 1e-10f) {
++        for (int h = 0; h < 8; h++) {
++            outs[h]->d = norm_h; outs[h]->d_qjl = __float2half(0.0f);
++            for (int j = 0; j < TBQ_K64/4; j++) outs[h]->qs[j] = 0;
++            for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++        }
++        return;
++    }
++    float inv_norm = 1.0f / norm;
++    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= inv_norm * sign; }
++    for (int len = 1; len < 512; len *= 2)
++        for (int i = 0; i < 512; i += 2*len)
++            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
++    // Quantize per 64-element block: 2-bit centroid + direct sign
++    for (int h = 0; h < 8; h++) {
++        outs[h]->d = norm_h;
++        float * seg = &tmp[h*TBQ_K64];
++        float recon[TBQ_K64];
++        // 2-bit Lloyd-Max
++        for (int j = 0; j < TBQ_K64/4; j++) {
++            uint8_t packed = 0;
++            for (int k = 0; k < 4; k++) {
++                uint8_t idx = 3;
++                for (int b = 0; b < 3; b++) { if (seg[j*4+k] < b2[b]) { idx = b; break; } }
++                packed |= (idx & 0x3) << (k*2);
++                recon[j*4+k] = c2[idx];
++            }
++            outs[h]->qs[j] = packed;
++        }
++        // Residual + Direct Sign
++        float res_abs = 0.0f;
++        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] - recon[j]);
++        outs[h]->d_qjl = __float2half((res_abs / TBQ_K64) * norm);
++        for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++        for (int j = 0; j < TBQ_K64; j++) {
++            if (seg[j] - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1 << (j%8));
++        }
++    }
++}
++
++// Cross-head TBQP4: 8×64=512-element WHT, 3-bit Lloyd-Max + 1-bit Direct Sign
++static __device__ void quantize_f32_tbqp4_3_xhead(
++    const float * __restrict__ x0, const float * __restrict__ x1,
++    const float * __restrict__ x2, const float * __restrict__ x3,
++    const float * __restrict__ x4, const float * __restrict__ x5,
++    const float * __restrict__ x6, const float * __restrict__ x7,
++    block_tbqp4_3 * __restrict__ y0, block_tbqp4_3 * __restrict__ y1,
++    block_tbqp4_3 * __restrict__ y2, block_tbqp4_3 * __restrict__ y3,
++    block_tbqp4_3 * __restrict__ y4, block_tbqp4_3 * __restrict__ y5,
++    block_tbqp4_3 * __restrict__ y6, block_tbqp4_3 * __restrict__ y7) {
++
++    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
++    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
++    const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
++    block_tbqp4_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
++
++    float tmp[512];
++    float sum_sq = 0.0f;
++    for (int h = 0; h < 8; h++)
++        for (int j = 0; j < TBQ_K64; j++) { float v = heads[h][j]; tmp[h*TBQ_K64+j] = v; sum_sq += v*v; }
++    float norm = sqrtf(sum_sq);
++    ggml_half norm_h = __float2half(norm);
++    if (norm < 1e-10f) {
++        for (int h = 0; h < 8; h++) {
++            outs[h]->d = norm_h; outs[h]->d_qjl = __float2half(0.0f);
++            for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
++            for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++        }
++        return;
++    }
++    float inv_norm = 1.0f / norm;
++    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= inv_norm * sign; }
++    for (int len = 1; len < 512; len *= 2)
++        for (int i = 0; i < 512; i += 2*len)
++            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
++    for (int h = 0; h < 8; h++) {
++        outs[h]->d = norm_h;
++        float * seg = &tmp[h*TBQ_K64];
++        float recon[TBQ_K64];
++        int bit_pos = 0;
++        for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
++        for (int j = 0; j < TBQ_K64; j++) {
++            uint8_t idx = 7;
++            for (int b = 0; b < 7; b++) { if (seg[j] < b3[b]) { idx = b; break; } }
++            int byte_idx = bit_pos/8, bit_off = bit_pos%8;
++            outs[h]->qs[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
++            if (bit_off > 5) outs[h]->qs[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
++            recon[j] = c3[idx]; bit_pos += 3;
++        }
++        float res_abs = 0.0f;
++        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] - recon[j]);
++        outs[h]->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
++        for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++        for (int j = 0; j < TBQ_K64; j++) { if (seg[j]-recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1<<(j%8)); }
++    }
++}
++
+ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
+     float amax = 0.0f;
+     float vmax = 0.0f;
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index f2f9f47b0..304aaa15f 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1245,6 +1245,14 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
+         return vec_dot_fattn_vec_KQ_tbqp3_2<D, nthreads>;
+     } else if constexpr (type_K == GGML_TYPE_TBQP4_2) {
+         return vec_dot_fattn_vec_KQ_tbqp4_2<D, nthreads>;
++    } else if constexpr (type_K == GGML_TYPE_TBQ3_3) {
++        return vec_dot_fattn_vec_KQ_tbq3_2<D, nthreads>;  // base function (used for per-group scoring)
++    } else if constexpr (type_K == GGML_TYPE_TBQ4_3) {
++        return vec_dot_fattn_vec_KQ_tbq4_2<D, nthreads>;
++    } else if constexpr (type_K == GGML_TYPE_TBQP3_3) {
++        return vec_dot_fattn_vec_KQ_tbqp3_2<D, nthreads>;
++    } else if constexpr (type_K == GGML_TYPE_TBQP4_3) {
++        return vec_dot_fattn_vec_KQ_tbqp4_2<D, nthreads>;
+     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
+         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
+     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
+@@ -1291,6 +1299,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
+         return dequantize_V_tbq4_2<T, ne>;
+     } else if constexpr (type_V == GGML_TYPE_TBQ3_2) {
+         return dequantize_V_tbq3_2<T, ne>;
++    } else if constexpr (type_V == GGML_TYPE_TBQ4_3) {
++        return dequantize_V_tbq4_2<T, ne>;
++    } else if constexpr (type_V == GGML_TYPE_TBQ3_3) {
++        return dequantize_V_tbq3_2<T, ne>;
+     } else {
+         static_assert(type_V == -1, "bad type");
+         return nullptr;
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 0291ab686..10002abb6 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -91,7 +91,12 @@ static __global__ void flash_attn_ext_vec(
+         && type_K != GGML_TYPE_TBQ4_1 && type_K != GGML_TYPE_TBQ3_1
+         && type_K != GGML_TYPE_TBQP3_1 && type_K != GGML_TYPE_TBQP4_1
+         && type_K != GGML_TYPE_TBQ4_2 && type_K != GGML_TYPE_TBQ3_2
+-        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2;
++        && type_K != GGML_TYPE_TBQP3_2 && type_K != GGML_TYPE_TBQP4_2
++        && type_K != GGML_TYPE_TBQ4_3 && type_K != GGML_TYPE_TBQ3_3
++        && type_K != GGML_TYPE_TBQP3_3 && type_K != GGML_TYPE_TBQP4_3;
++    constexpr bool is_cross_head_K = type_K == GGML_TYPE_TBQ3_3 || type_K == GGML_TYPE_TBQ4_3
++        || type_K == GGML_TYPE_TBQP3_3 || type_K == GGML_TYPE_TBQP4_3;
++    constexpr bool is_cross_head_V = type_V == GGML_TYPE_TBQ3_3 || type_V == GGML_TYPE_TBQ4_3;
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
+ #else
+@@ -400,12 +405,25 @@ static __global__ void flash_attn_ext_vec(
+             // vec_dot reuses Q_reg (MSE WHT'd query) directly for sign correction
+         }
+     } else if constexpr (type_K == GGML_TYPE_TBQ4_2 || type_K == GGML_TYPE_TBQ3_2
+-                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2) {
++                      || type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP3_2
++                      || type_K == GGML_TYPE_TBQ4_3 || type_K == GGML_TYPE_TBQ3_3
++                      || type_K == GGML_TYPE_TBQP4_3 || type_K == GGML_TYPE_TBQP3_3) {
+         // TurboQuant 64-block: D=64, nthreads=128, tid 0-63 participate in WHT
+         // WHT has 6 stages: stages 0-4 warp shuffle, stage 5 shared memory
+-        static constexpr uint8_t tbq_signs[8] = {
+-            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++        // For cross-head _3: use kv_head-specific 64-bit sign slice from 512-bit pattern
++        static constexpr uint8_t tbq_signs_full[64] = {
++            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0 (same as _2)
++            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
++            0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
++            0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
++            0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
++            0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
++            0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
++            0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
+         };
++        // For _2 types: always use head 0's signs. For _3: use kv_head-specific slice.
++        const int q_signs_offset = (is_cross_head_K) ? ((head / gqa_ratio) % 8) * 8 : 0;
++        const uint8_t * tbq_signs = tbq_signs_full + q_signs_offset;
+ 
+         for (int j = 0; j < ncols; ++j) {
+             float * Q_wht = (float *) &KQ[0];
+@@ -500,6 +518,9 @@ static __global__ void flash_attn_ext_vec(
+ #endif // V_DOT2_F32_F16_AVAILABLE
+     }
+ 
++    // Cross-head WHT: kv_head_idx within group of 8 for H_8 sign computation
++    [[maybe_unused]] const int kv_head_idx = (is_cross_head_K || is_cross_head_V) ? ((head / gqa_ratio) % 8) : 0;
++
+     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+     K     += blockIdx.y*nthreads * nb11;
+     V     += blockIdx.y*nthreads * nb21;
+@@ -523,8 +544,24 @@ static __global__ void flash_attn_ext_vec(
+ 
+ #pragma unroll
+             for (int j = 0; j < ncols; ++j) {
+-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+-                sum = warp_reduce_sum<nthreads_KQ>(sum);
++                float sum;
++                if constexpr (is_cross_head_K) {
++                    // Cross-head scoring: combine 8 groups with H_8 signs
++                    // H_512 = H_8 ⊗ H_64 → score = (1/8)Σ_g H_8[h][g] · vec_dot(K_g, Q_wht)
++                    sum = 0.0f;
++                    #pragma unroll
++                    for (int g = 0; g < 8; g++) {
++                        const char * K_g = K + (int64_t)(g - kv_head_idx) * nb12 + (int64_t)i_KQ * nb11;
++                        float partial = vec_dot_KQ(K_g, Q_reg[j], Q_i32[j], Q_ds[j]);
++                        const int h8_sign = (__popc(kv_head_idx & g) & 1) ? -1 : 1;
++                        sum += h8_sign * partial;
++                    }
++                    sum = warp_reduce_sum<nthreads_KQ>(sum);
++                    sum *= 0.125f; // 1/8
++                } else {
++                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
++                    sum = warp_reduce_sum<nthreads_KQ>(sum);
++                }
+ 
+                 if (use_logit_softcap) {
+                     sum = logit_softcap*tanhf(sum);
+@@ -587,17 +624,36 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                 half2 tmp[V_rows_per_thread/2];
+-                if constexpr (type_V == GGML_TYPE_BF16) {
++                const int v_elem = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
++                if constexpr (is_cross_head_V) {
++                    // Cross-head V: load 8 V blocks, combine with (1/8)H_8 inverse
++                    float2 v_sum[V_rows_per_thread/2];
++#pragma unroll
++                    for (int iv = 0; iv < V_rows_per_thread/2; iv++) v_sum[iv] = make_float2(0.0f, 0.0f);
++#pragma unroll
++                    for (int g = 0; g < 8; g++) {
++                        half2 v_g[V_rows_per_thread/2];
++                        dequantize_V(V + (int64_t)(g - kv_head_idx) * nb22 + k*nb21, v_g, v_elem);
++                        const float sign = (__popc(kv_head_idx & g) & 1) ? -0.125f : 0.125f;
++#pragma unroll
++                        for (int iv = 0; iv < V_rows_per_thread/2; iv++) {
++                            float2 vf = __half22float2(v_g[iv]);
++                            v_sum[iv].x += sign * vf.x;
++                            v_sum[iv].y += sign * vf.y;
++                        }
++                    }
++#pragma unroll
++                    for (int iv = 0; iv < V_rows_per_thread/2; iv++)
++                        tmp[iv] = __float22half2_rn(v_sum[iv]);
++                } else if constexpr (type_V == GGML_TYPE_BF16) {
+                     float2 tmp_f[V_rows_per_thread/2];
+-                    dequantize_V(V + k*nb21, tmp_f,
+-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
++                    dequantize_V(V + k*nb21, tmp_f, v_elem);
+ #pragma unroll
+                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
+                     }
+                 } else {
+-                    dequantize_V(V + k*nb21, tmp,
+-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
++                    dequantize_V(V + k*nb21, tmp, v_elem);
+                 }
+ #pragma unroll
+                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+@@ -616,8 +672,25 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                 float2 tmp[V_rows_per_thread/2];
+-                dequantize_V(V + k*nb21, tmp,
+-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
++                const int v_elem = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
++                if constexpr (is_cross_head_V) {
++                    // Cross-head V: load 8 V blocks, combine with (1/8)H_8 inverse
++#pragma unroll
++                    for (int iv = 0; iv < V_rows_per_thread/2; iv++) tmp[iv] = make_float2(0.0f, 0.0f);
++#pragma unroll
++                    for (int g = 0; g < 8; g++) {
++                        float2 v_g[V_rows_per_thread/2];
++                        dequantize_V(V + (int64_t)(g - kv_head_idx) * nb22 + k*nb21, v_g, v_elem);
++                        const float sign = (__popc(kv_head_idx & g) & 1) ? -0.125f : 0.125f;
++#pragma unroll
++                        for (int iv = 0; iv < V_rows_per_thread/2; iv++) {
++                            tmp[iv].x += sign * v_g[iv].x;
++                            tmp[iv].y += sign * v_g[iv].y;
++                        }
++                    }
++                } else {
++                    dequantize_V(V + k*nb21, tmp, v_elem);
++                }
+ #pragma unroll
+                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+ #pragma unroll
+@@ -756,7 +829,8 @@ static __global__ void flash_attn_ext_vec(
+                 // For TBQ V: store to shared memory for IWHT post-processing
+                 if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0
+                            || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
+-                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
++                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
++                           || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3) {
+                     KQ[i0 + tid] = dst_val; // reuse KQ shared memory
+                 } else {
+                     dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+@@ -874,10 +948,20 @@ static __global__ void flash_attn_ext_vec(
+             }
+ 
+             // TBQ V 64-block IWHT: D=64, tid 0-63 participate
+-            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2) {
+-                static constexpr uint8_t tbq_signs_v[8] = {
+-                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++            if constexpr (type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
++                      || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3) {
++                // Full 512-bit sign pattern: _2 uses head 0 (offset 0), _3 uses head-specific slice
++                static constexpr uint8_t tbq_signs_v_full[64] = {
++                    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0
++                    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
++                    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
++                    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
++                    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
++                    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
++                    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
++                    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
+                 };
++                const int v_signs_offset = is_cross_head_V ? ((head / gqa_ratio) % 8) * 8 : 0;
+                 __syncthreads();
+                 {
+                     float * buf = (float *) &KQ[0];
+@@ -899,7 +983,7 @@ static __global__ void flash_attn_ext_vec(
+                     }
+                     __syncthreads();
+                     if (tid < D) {
+-                        float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++                        float sign0 = ((tbq_signs_v_full[v_signs_offset + (tid >> 3)] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                         buf[tid] = __half2float(h0) * sign0 / (float)D;
+                     }
+                 }
+@@ -1055,6 +1139,20 @@ EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQ4_2)
+ EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP3_2)
+ EXTERN_DECL_FATTN_VEC_TBQ2(GGML_TYPE_TBQP4_2)
+ 
++// TurboQuant cross-head (_3) extern declarations: D=64, K=_3, V=_2/_3 or standard
++#define EXTERN_DECL_FATTN_VEC_TBQ3(type_K)                            \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_F16);            \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_Q8_0);           \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ3_2);         \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ4_2);         \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ3_3);         \
++    extern DECL_FATTN_VEC_CASE(64, type_K, GGML_TYPE_TBQ4_3);         \
++
++EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQ3_3)
++EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQ4_3)
++EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQP3_3)
++EXTERN_DECL_FATTN_VEC_TBQ3(GGML_TYPE_TBQP4_3)
++
+ // Asymmetric: standard K + TBQ V extern declarations
+ // D=256: only _0 V types
+ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ3_0);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 126e4d56f..743573c37 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -344,6 +344,32 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_2)
+     FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0, GGML_TYPE_TBQ3_2)
+     FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0, GGML_TYPE_TBQ4_2)
++
++    // Cross-head _3 (ALL_QUANTS path)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_3)
+ #else
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+@@ -400,6 +426,31 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_F16)
+     FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_Q8_0)
+     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_Q8_0)
++    // TurboQuant cross-head (_3): D=64
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_2)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_F16)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_3)
++    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_3)
+     // Asymmetric: standard K + TBQ V (e.g. q8_0 K + tbq3 V)
+     // D=256 (_0)
+     FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ3_0)
+@@ -504,10 +555,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+                         || K->type == GGML_TYPE_TBQ3_1 || K->type == GGML_TYPE_TBQ4_1
+                         || K->type == GGML_TYPE_TBQP3_1 || K->type == GGML_TYPE_TBQP4_1
+                         || K->type == GGML_TYPE_TBQ3_2 || K->type == GGML_TYPE_TBQ4_2
+-                        || K->type == GGML_TYPE_TBQP3_2 || K->type == GGML_TYPE_TBQP4_2;
++                        || K->type == GGML_TYPE_TBQP3_2 || K->type == GGML_TYPE_TBQP4_2
++                        || K->type == GGML_TYPE_TBQ3_3 || K->type == GGML_TYPE_TBQ4_3
++                        || K->type == GGML_TYPE_TBQP3_3 || K->type == GGML_TYPE_TBQP4_3;
+         const bool tbq_v = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0
+                         || V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQ4_1
+-                        || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2;
++                        || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2
++                        || V->type == GGML_TYPE_TBQ3_3 || V->type == GGML_TYPE_TBQ4_3;
+         const bool std_k = K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0
+                         || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_BF16;
+         const bool std_v = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0;
+@@ -543,6 +597,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         case GGML_TYPE_TBQ4_2:
+         case GGML_TYPE_TBQP3_2:
+         case GGML_TYPE_TBQP4_2:
++        case GGML_TYPE_TBQ3_3:
++        case GGML_TYPE_TBQ4_3:
++        case GGML_TYPE_TBQP3_3:
++        case GGML_TYPE_TBQP4_3:
+             break;
+         default:
+             return BEST_FATTN_KERNEL_NONE;
+@@ -552,13 +610,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         return BEST_FATTN_KERNEL_NONE;
+     }
+ 
+-    // TBQ4_0: only vec kernel is implemented (no MMA/tile/WMMA support)
+-    if (K->type == GGML_TYPE_TBQ4_0 || K->type == GGML_TYPE_TBQ3_0
++    // TBQ: only vec kernel is implemented (no MMA/tile/WMMA support)
++    const bool tbq_k_type = K->type == GGML_TYPE_TBQ4_0 || K->type == GGML_TYPE_TBQ3_0
+      || K->type == GGML_TYPE_TBQP4_0 || K->type == GGML_TYPE_TBQP3_0
+      || K->type == GGML_TYPE_TBQ4_1 || K->type == GGML_TYPE_TBQ3_1
+      || K->type == GGML_TYPE_TBQP4_1 || K->type == GGML_TYPE_TBQP3_1
+      || K->type == GGML_TYPE_TBQ4_2 || K->type == GGML_TYPE_TBQ3_2
+-     || K->type == GGML_TYPE_TBQP4_2 || K->type == GGML_TYPE_TBQP3_2) {
++     || K->type == GGML_TYPE_TBQP4_2 || K->type == GGML_TYPE_TBQP3_2
++     || K->type == GGML_TYPE_TBQ4_3 || K->type == GGML_TYPE_TBQ3_3
++     || K->type == GGML_TYPE_TBQP4_3 || K->type == GGML_TYPE_TBQP3_3;
++    const bool tbq_v_type = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_TBQ3_0
++     || V->type == GGML_TYPE_TBQ4_1 || V->type == GGML_TYPE_TBQ3_1
++     || V->type == GGML_TYPE_TBQ4_2 || V->type == GGML_TYPE_TBQ3_2
++     || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3;
++    if (tbq_k_type || tbq_v_type) {
+         if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+             return BEST_FATTN_KERNEL_VEC;
+         }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 415a9f90d..e9630229d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4843,7 +4843,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                        op->type == GGML_TYPE_TBQ3_1 || op->type == GGML_TYPE_TBQ4_1 ||
+                        op->type == GGML_TYPE_TBQP3_1 || op->type == GGML_TYPE_TBQP4_1 ||
+                        op->type == GGML_TYPE_TBQ3_2 || op->type == GGML_TYPE_TBQ4_2 ||
+-                       op->type == GGML_TYPE_TBQP3_2 || op->type == GGML_TYPE_TBQP4_2) &&
++                       op->type == GGML_TYPE_TBQP3_2 || op->type == GGML_TYPE_TBQP4_2 ||
++                       op->type == GGML_TYPE_TBQ3_3 || op->type == GGML_TYPE_TBQ4_3 ||
++                       op->type == GGML_TYPE_TBQP3_3 || op->type == GGML_TYPE_TBQP4_3) &&
+                        op->src[0]->type == GGML_TYPE_F32 &&
+                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
+             } break;
+diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
+index 4ae4ffe3b..1e643d49b 100644
+--- a/ggml/src/ggml-cuda/set-rows.cu
++++ b/ggml/src/ggml-cuda/set-rows.cu
+@@ -109,6 +109,349 @@ static void set_rows_cuda_quant(
+     }
+ }
+ 
++// ============================================================
++// Cross-head WHT kernel v1: simple 1-thread-per-group (proven correct, PPL=1340)
++// ============================================================
++template <typename idx_t, typename block_type,
++    void (*quantize_xhead)(const float*, const float*, const float*, const float*,
++                           const float*, const float*, const float*, const float*,
++                           block_type*, block_type*, block_type*, block_type*,
++                           block_type*, block_type*, block_type*, block_type*)>
++static __global__ void k_set_rows_xhead_v1(
++        const float * __restrict__ src0, const idx_t * __restrict__ src1, block_type * __restrict__ dst,
++        const int64_t ne_total_groups,
++        const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t s10, const int64_t s11, const int64_t s12,
++        const int64_t ne11, const int64_t ne12,
++        const int64_t s1, const int64_t s2, const int64_t s3,
++        const int64_t groups_per_ne00,
++        const uint3 ne01_fd, const uint3 ne02_fd, const uint3 ne11_fd, const uint3 ne12_fd) {
++    const int64_t ig = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
++    if (ig >= ne_total_groups) return;
++    const int64_t i_g00 = ig % groups_per_ne00;
++    const int64_t r1 = ig / groups_per_ne00;
++    uint2 div_mod = fast_div_modulo((uint32_t)r1, ne01_fd);
++    const int64_t i01 = div_mod.y; uint32_t tmp2 = div_mod.x;
++    div_mod = fast_div_modulo(tmp2, ne02_fd);
++    const int64_t i02 = div_mod.y, i03 = div_mod.x;
++    const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
++    const int64_t i11v = fastmodulo((uint32_t)i02, ne11_fd);
++    const idx_t dst_row = *(src1 + i01*s10 + i11v*s11 + i12*s12);
++    const int64_t blk_base = i_g00 * 8;
++    const float * sb = src0 + i01*s01 + i02*s02 + i03*s03;
++    block_type * db = (block_type *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
++    quantize_xhead(
++        sb+(blk_base+0)*TBQ_K64, sb+(blk_base+1)*TBQ_K64, sb+(blk_base+2)*TBQ_K64, sb+(blk_base+3)*TBQ_K64,
++        sb+(blk_base+4)*TBQ_K64, sb+(blk_base+5)*TBQ_K64, sb+(blk_base+6)*TBQ_K64, sb+(blk_base+7)*TBQ_K64,
++        db+blk_base+0, db+blk_base+1, db+blk_base+2, db+blk_base+3,
++        db+blk_base+4, db+blk_base+5, db+blk_base+6, db+blk_base+7);
++    GGML_UNUSED(ne11); GGML_UNUSED(ne12);
++}
++
++template<typename idx_t, typename block_type,
++    void (*quantize_xhead)(const float*, const float*, const float*, const float*,
++                           const float*, const float*, const float*, const float*,
++                           block_type*, block_type*, block_type*, block_type*,
++                           block_type*, block_type*, block_type*, block_type*)>
++static void set_rows_cuda_xhead_v1(
++        const float * src0_d, const idx_t * src1_d, block_type * dst_d,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
++        const size_t nb01, const size_t nb02, const size_t nb03,
++        const size_t nb10, const size_t nb11, const size_t nb12,
++        const size_t nb1, const size_t nb2, const size_t nb3,
++        cudaStream_t stream) {
++    GGML_ASSERT(ne00 % TBQ_K64 == 0);
++    const int64_t blks_per_ne00 = ne00 / TBQ_K64;
++    GGML_ASSERT(blks_per_ne00 % 8 == 0);
++    const int64_t groups_per_ne00 = blks_per_ne00 / 8;
++    const int64_t n_total = groups_per_ne00 * ne01 * ne02 * ne03;
++    if (n_total == 0) return;
++    constexpr int BS = 1; // 1 thread/block: heavy per-thread work (2KB+ stack)
++    const int nb = (n_total + BS - 1) / BS;
++    const uint3 ne01_fd = init_fastdiv_values((uint32_t)ne01);
++    const uint3 ne02_fd = init_fastdiv_values((uint32_t)ne02);
++    const uint3 ne11_fd = init_fastdiv_values((uint32_t)ne11);
++    const uint3 ne12_fd = init_fastdiv_values((uint32_t)ne12);
++    k_set_rows_xhead_v1<idx_t, block_type, quantize_xhead><<<nb, BS, 0, stream>>>(
++        src0_d, src1_d, dst_d, n_total,
++        nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
++        nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),
++        ne11, ne12, (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
++        groups_per_ne00, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
++    GGML_UNUSED(ne00); GGML_UNUSED(ne10); GGML_UNUSED(ne13);
++}
++
++// ============================================================
++// Cross-head WHT kernel v2: Kronecker decomposition + shared memory
++// H_512 = H_8 ⊗ H_64 → 8 parallel per-head WHTs + 3-stage cross-head WHT
++// 8 threads per group, each handles one head's 64-element WHT
++// Shared memory: 8×64 floats = 2KB per group for cross-head exchange
++// ============================================================
++
++// Per-head quantize helpers (called by each thread for its 64 elements)
++// These operate on tmp[64] in registers, writing to the output block
++template<typename block_type>
++static __device__ void xhead_quantize_tbq3(float * tmp, block_type * out, float norm) {
++    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
++    out->d = __float2half(norm);
++    int bit_pos = 0;
++    for (int j = 0; j < TBQ_K64*3/8; j++) out->qs[j] = 0;
++    for (int j = 0; j < TBQ_K64; j++) {
++        uint8_t idx = 7;
++        for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
++        int byte_idx = bit_pos/8, bit_off = bit_pos%8;
++        out->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
++        if (bit_off > 5) out->qs[byte_idx+1] |= (uint8_t)((idx & 0x7) >> (8-bit_off));
++        bit_pos += 3;
++    }
++}
++
++template<typename block_type>
++static __device__ void xhead_quantize_tbq4(float * tmp, block_type * out, float norm) {
++    static constexpr float b4[15] = { -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,0.0f,0.2583f,0.5225f,0.7996f,1.0993f,1.4371f,1.8435f,2.4008f };
++    out->d = __float2half(norm);
++    for (int j = 0; j < TBQ_K64/2; j++) {
++        uint8_t idx0 = 15, idx1 = 15;
++        for (int b = 0; b < 15; b++) { if (tmp[2*j]   < b4[b]) { idx0 = b; break; } }
++        for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < b4[b]) { idx1 = b; break; } }
++        out->qs[j] = idx0 | (idx1 << 4);
++    }
++}
++
++template<typename block_type>
++static __device__ void xhead_quantize_tbqp3(float * tmp, block_type * out, float norm) {
++    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
++    static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
++    out->d = __float2half(norm);
++    float recon[TBQ_K64];
++    for (int j = 0; j < TBQ_K64/4; j++) {
++        uint8_t packed = 0;
++        for (int k = 0; k < 4; k++) {
++            uint8_t idx = 3;
++            for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } }
++            packed |= (idx & 0x3) << (k*2);
++            recon[j*4+k] = c2[idx];
++        }
++        out->qs[j] = packed;
++    }
++    float res_abs = 0.0f;
++    for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(tmp[j] - recon[j]);
++    out->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
++    for (int j = 0; j < TBQ_K64/8; j++) out->qjl[j] = 0;
++    for (int j = 0; j < TBQ_K64; j++) { if (tmp[j]-recon[j] >= 0.0f) out->qjl[j/8] |= (1<<(j%8)); }
++}
++
++template<typename block_type>
++static __device__ void xhead_quantize_tbqp4(float * tmp, block_type * out, float norm) {
++    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
++    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
++    out->d = __float2half(norm);
++    float recon[TBQ_K64];
++    int bit_pos = 0;
++    for (int j = 0; j < TBQ_K64*3/8; j++) out->qs[j] = 0;
++    for (int j = 0; j < TBQ_K64; j++) {
++        uint8_t idx = 7;
++        for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
++        int byte_idx = bit_pos/8, bit_off = bit_pos%8;
++        out->qs[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
++        if (bit_off > 5) out->qs[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
++        recon[j] = c3[idx]; bit_pos += 3;
++    }
++    float res_abs = 0.0f;
++    for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(tmp[j] - recon[j]);
++    out->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
++    for (int j = 0; j < TBQ_K64/8; j++) out->qjl[j] = 0;
++    for (int j = 0; j < TBQ_K64; j++) { if (tmp[j]-recon[j] >= 0.0f) out->qjl[j/8] |= (1<<(j%8)); }
++}
++
++// Quantize type tag for template dispatch
++enum xhead_qtype { XHEAD_TBQ3, XHEAD_TBQ4, XHEAD_TBQP3, XHEAD_TBQP4 };
++
++template <typename idx_t, typename block_type, xhead_qtype QT>
++static __global__ void k_set_rows_xhead_v2(
++        const float * __restrict__ src0,
++        const idx_t * __restrict__ src1,
++        block_type  * __restrict__ dst,
++        const int64_t ne_total_groups,
++        const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t s10, const int64_t s11, const int64_t s12,
++        const int64_t ne11, const int64_t ne12,
++        const int64_t s1, const int64_t s2, const int64_t s3,
++        const int64_t groups_per_ne00,
++        const uint3 ne01_fd, const uint3 ne02_fd,
++        const uint3 ne11_fd, const uint3 ne12_fd) {
++
++    // 8 threads per group. threadIdx.x % 8 = head index within group.
++    const int h = threadIdx.x % 8;          // head index within 8-head group
++    const int local_group = threadIdx.x / 8; // which group within this block
++    const int64_t ig = int64_t(blockIdx.x) * (blockDim.x / 8) + local_group;
++    const bool active = (ig < ne_total_groups);
++
++    // Shared memory: 8×64 floats per group for cross-head WHT exchange
++    extern __shared__ float smem[];
++    float * xhead_smem = smem + local_group * 8 * TBQ_K64; // this group's 512-float region
++
++    // Decompose group index (only meaningful if active, but compute anyway to avoid branching)
++    int64_t i_g00 = 0, i01 = 0, i02 = 0, i03 = 0;
++    idx_t dst_row = 0;
++    int64_t blk_base = 0;
++    float tmp[TBQ_K64];
++    float sum_sq_local = 0.0f;
++
++    if (active) {
++        i_g00 = ig % groups_per_ne00;
++        const int64_t r1 = ig / groups_per_ne00;
++        uint2 div_mod = fast_div_modulo((uint32_t)r1, ne01_fd);
++        i01 = div_mod.y;
++        uint32_t tmp2 = div_mod.x;
++        div_mod = fast_div_modulo(tmp2, ne02_fd);
++        i02 = div_mod.y;
++        i03 = div_mod.x;
++
++        const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
++        const int64_t i11_val = fastmodulo((uint32_t)i02, ne11_fd);
++        dst_row = *(src1 + i01*s10 + i11_val*s11 + i12*s12);
++        blk_base = i_g00 * 8;
++
++        // Each thread loads its head's 64 floats
++        const float * src_head = src0 + i01*s01 + i02*s02 + i03*s03 + (blk_base + h)*TBQ_K64;
++        for (int j = 0; j < TBQ_K64; j++) {
++            float v = src_head[j];
++            tmp[j] = v;
++            sum_sq_local += v * v;
++        }
++    } else {
++        for (int j = 0; j < TBQ_K64; j++) tmp[j] = 0.0f;
++    }
++
++    // Warp-level reduction for shared norm (sum across 8 heads)
++    float sum_sq = sum_sq_local;
++    #pragma unroll
++    for (int offset = 4; offset >= 1; offset >>= 1) {
++        sum_sq += __shfl_xor_sync(0xff << (local_group*8), sum_sq, offset);
++    }
++    // Now all 8 threads have the same sum_sq (total across all heads)
++    float norm = sqrtf(sum_sq);
++
++    const bool zero_norm = (norm < 1e-10f);
++    if (active && zero_norm) {
++        block_type * out = (block_type *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3) + blk_base + h;
++        out->d = __float2half(0.0f);
++        for (int j = 0; j < (int)sizeof(out->qs); j++) out->qs[j] = 0;
++    }
++    // Don't return early — must participate in __syncthreads below
++    if (!active || zero_norm) {
++        // Still need to participate in all syncthreads
++        for (int j = 0; j < TBQ_K64; j++) tmp[j] = 0;
++    } else {
++
++    // Apply per-head signs + normalize
++    static __device__ constexpr uint8_t tbq_signs_512_k[64] = {
++        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
++        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
++        0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
++        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
++        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
++        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
++        0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
++    };
++    const float inv_norm = 1.0f / norm;
++    const int sign_offset = h * 8; // byte offset for this head's 64-bit signs
++    for (int j = 0; j < TBQ_K64; j++) {
++        const int global_j = h * TBQ_K64 + j;
++        int sign = ((tbq_signs_512_k[global_j >> 3] >> (global_j & 7)) & 1) ? -1 : 1;
++        tmp[j] *= inv_norm * sign;
++    }
++
++    // Phase 1: Per-head 64-element serial WHT (6 stages) — each thread independent
++    for (int len = 1; len < TBQ_K64; len *= 2)
++        for (int i = 0; i < TBQ_K64; i += 2*len)
++            for (int j = 0; j < len; j++) {
++                float u = tmp[i+j], v = tmp[i+j+len];
++                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
++            }
++    } // end else (active && !zero_norm)
++
++    // Phase 2: Cross-head 8-element WHT (3 stages) via shared memory
++    // All threads participate in syncthreads (including inactive ones)
++    // Store per-head WHT results to shared memory
++    for (int j = 0; j < TBQ_K64; j++) {
++        xhead_smem[h * TBQ_K64 + j] = tmp[j];
++    }
++    __syncthreads();
++
++    // 3-stage butterfly: each thread reads partner's values, computes in registers
++    #pragma unroll
++    for (int stage = 0; stage < 3; stage++) {
++        const int partner = h ^ (1 << stage);
++        for (int j = 0; j < TBQ_K64; j++) {
++            float my_val = xhead_smem[h * TBQ_K64 + j];
++            float partner_val = xhead_smem[partner * TBQ_K64 + j];
++            tmp[j] = (h & (1 << stage)) ? (partner_val - my_val) : (my_val + partner_val);
++        }
++        __syncthreads();
++        for (int j = 0; j < TBQ_K64; j++) {
++            xhead_smem[h * TBQ_K64 + j] = tmp[j];
++        }
++        __syncthreads();
++    }
++
++    // Quantize this thread's 64 elements to output block
++    if (active && !zero_norm) {
++        block_type * out = (block_type *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3) + blk_base + h;
++        if constexpr (QT == XHEAD_TBQ3)  { xhead_quantize_tbq3(tmp, out, norm); }
++        if constexpr (QT == XHEAD_TBQ4)  { xhead_quantize_tbq4(tmp, out, norm); }
++        if constexpr (QT == XHEAD_TBQP3) { xhead_quantize_tbqp3(tmp, out, norm); }
++        if constexpr (QT == XHEAD_TBQP4) { xhead_quantize_tbqp4(tmp, out, norm); }
++    }
++
++    GGML_UNUSED(ne11); GGML_UNUSED(ne12);
++}
++
++template<typename idx_t, typename block_type, xhead_qtype QT>
++static void set_rows_cuda_xhead(
++        const float * src0_d, const idx_t * src1_d, block_type * dst_d,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
++        const size_t nb01, const size_t nb02, const size_t nb03,
++        const size_t nb10, const size_t nb11, const size_t nb12,
++        const size_t nb1, const size_t nb2, const size_t nb3,
++        cudaStream_t stream) {
++
++    GGML_ASSERT(ne00 % TBQ_K64 == 0);
++    const int64_t blks_per_ne00 = ne00 / TBQ_K64;
++    GGML_ASSERT(blks_per_ne00 % 8 == 0 && "cross-head WHT requires n_kv_head divisible by 8");
++
++    const int64_t groups_per_ne00 = blks_per_ne00 / 8;
++    const int64_t ne_total_groups = groups_per_ne00 * ne01 * ne02 * ne03;
++    if (ne_total_groups == 0) return;
++
++    // 8 threads per group, multiple groups per block
++    constexpr int GROUPS_PER_BLOCK = 4;  // 4 groups × 8 threads = 32 threads/block
++    constexpr int THREADS_PER_BLOCK = GROUPS_PER_BLOCK * 8;
++    const int num_blocks = (ne_total_groups + GROUPS_PER_BLOCK - 1) / GROUPS_PER_BLOCK;
++    const size_t smem_size = GROUPS_PER_BLOCK * 8 * TBQ_K64 * sizeof(float); // 4 × 2KB = 8KB
++
++    const uint3 ne01_fd = init_fastdiv_values((uint32_t)ne01);
++    const uint3 ne02_fd = init_fastdiv_values((uint32_t)ne02);
++    const uint3 ne11_fd = init_fastdiv_values((uint32_t)ne11);
++    const uint3 ne12_fd = init_fastdiv_values((uint32_t)ne12);
++
++    k_set_rows_xhead_v2<idx_t, block_type, QT><<<num_blocks, THREADS_PER_BLOCK, smem_size, stream>>>(
++        src0_d, src1_d, dst_d,
++        ne_total_groups,
++        nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
++        nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),
++        ne11, ne12,
++        (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
++        groups_per_ne00,
++        ne01_fd, ne02_fd, ne11_fd, ne12_fd);
++
++    GGML_UNUSED(ne00); GGML_UNUSED(ne10); GGML_UNUSED(ne13);
++}
++
+ template <typename src_t, typename idx_t, typename dst_t>
+ static __global__ void k_set_rows(const src_t * __restrict__ src0,
+                                   const idx_t * __restrict__ src1,
+@@ -399,6 +742,22 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+         set_rows_cuda_quant<idx_t, block_tbqp4_2, TBQ_K64, quantize_f32_tbqp4_2_block>(
+             src0_d, src1_d, (block_tbqp4_2*)dst->data,
+             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++    } else if (dst->type == GGML_TYPE_TBQ3_3) {
++        set_rows_cuda_xhead_v1<idx_t, block_tbq3_3, quantize_f32_tbq3_3_xhead>(
++            src0_d, src1_d, (block_tbq3_3*)dst->data,
++            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++    } else if (dst->type == GGML_TYPE_TBQ4_3) {
++        set_rows_cuda_xhead_v1<idx_t, block_tbq4_3, quantize_f32_tbq4_3_xhead>(
++            src0_d, src1_d, (block_tbq4_3*)dst->data,
++            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++    } else if (dst->type == GGML_TYPE_TBQP3_3) {
++        set_rows_cuda_xhead_v1<idx_t, block_tbqp3_3, quantize_f32_tbqp3_3_xhead>(
++            src0_d, src1_d, (block_tbqp3_3*)dst->data,
++            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++    } else if (dst->type == GGML_TYPE_TBQP4_3) {
++        set_rows_cuda_xhead_v1<idx_t, block_tbqp4_3, quantize_f32_tbqp4_3_xhead>(
++            src0_d, src1_d, (block_tbqp4_3*)dst->data,
++            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+     } else {
+         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
+     }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index a1671b0db..fcfd63cb1 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -978,6 +978,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .type_size                = sizeof(block_tbqp4_2),
+         .is_quantized             = true,
+     },
++    [GGML_TYPE_TBQ3_3] = {
++        .type_name                = "tbq3_3",
++        .blck_size                = TBQ_K64,
++        .type_size                = sizeof(block_tbq3_3),
++        .is_quantized             = true,
++    },
++    [GGML_TYPE_TBQ4_3] = {
++        .type_name                = "tbq4_3",
++        .blck_size                = TBQ_K64,
++        .type_size                = sizeof(block_tbq4_3),
++        .is_quantized             = true,
++    },
++    [GGML_TYPE_TBQP3_3] = {
++        .type_name                = "tbqp3_3",
++        .blck_size                = TBQ_K64,
++        .type_size                = sizeof(block_tbqp3_3),
++        .is_quantized             = true,
++    },
++    [GGML_TYPE_TBQP4_3] = {
++        .type_name                = "tbqp4_3",
++        .blck_size                = TBQ_K64,
++        .type_size                = sizeof(block_tbqp4_3),
++        .is_quantized             = true,
++    },
+ };
+ 
+ const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

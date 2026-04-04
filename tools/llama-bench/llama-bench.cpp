@@ -489,6 +489,24 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
+    // TurboQuant types — full names
+    if (s == "tbq3_0")  { return GGML_TYPE_TBQ3_0;  }
+    if (s == "tbq4_0")  { return GGML_TYPE_TBQ4_0;  }
+    if (s == "tbqp3_0") { return GGML_TYPE_TBQP3_0; }
+    if (s == "tbqp4_0") { return GGML_TYPE_TBQP4_0; }
+    if (s == "tbq3_1")  { return GGML_TYPE_TBQ3_1;  }
+    if (s == "tbq4_1")  { return GGML_TYPE_TBQ4_1;  }
+    if (s == "tbqp3_1") { return GGML_TYPE_TBQP3_1; }
+    if (s == "tbqp4_1") { return GGML_TYPE_TBQP4_1; }
+    if (s == "tbq3_2")  { return GGML_TYPE_TBQ3_2;  }
+    if (s == "tbq4_2")  { return GGML_TYPE_TBQ4_2;  }
+    if (s == "tbqp3_2") { return GGML_TYPE_TBQP3_2; }
+    if (s == "tbqp4_2") { return GGML_TYPE_TBQP4_2; }
+    // TurboQuant shorthand — maps to _0 (user must specify correct suffix for non-256 head_dim)
+    if (s == "tbq3")  { return GGML_TYPE_TBQ3_0;  }
+    if (s == "tbq4")  { return GGML_TYPE_TBQ4_0;  }
+    if (s == "tbqp3") { return GGML_TYPE_TBQP3_0; }
+    if (s == "tbqp4") { return GGML_TYPE_TBQP4_0; }
 
     return GGML_TYPE_COUNT;
 }
