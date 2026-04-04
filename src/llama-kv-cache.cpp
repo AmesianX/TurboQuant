@@ -304,6 +304,9 @@ llama_kv_cache::llama_kv_cache(
                        || type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2
                        || type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4;
 
+    // TBQ types require WHT rotation regardless of variable GQA
+    // (WHT operates per-head, not per-GQA-group, so variable n_head_kv is fine)
+    // Note: attn_rot + TBQ WHT = double rotation, which is fine (both Q and K get same transforms)
     attn_rot_k =
         !attn_rot_disable &&
         n_embd_head_k_all > 0 &&
@@ -1245,7 +1248,12 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
+
+    // pass head_dim via op_params for TBQ 512-point WHT dispatch
+    result->op_params[0] = (int32_t) n_embd_head;
+
+    return result;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1280,6 +1288,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
+        // V cache: always use 256-block WHT (V IWHT is per-block, can't undo 512-WHT)
         return ggml_set_rows(ctx, v, v_cur, v_idxs);
     }
 

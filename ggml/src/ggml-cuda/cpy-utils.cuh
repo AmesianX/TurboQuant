@@ -204,6 +204,79 @@ static __device__ void quantize_f32_tbq3_0_block(const float * __restrict__ x, b
     }
 }
 
+// TurboQuant 3-bit: 512-point single-pass WHT, then split into 2 × 256-block for storage
+// Used when D=512 (Gemma 4 global attention). Better decorrelation than 2 × independent 256-WHT.
+static __device__ void quantize_f32_tbq3_0_block_512(const float * __restrict__ x, block_tbq3_0 * __restrict__ y) {
+    // 512-element sign pattern (64 bytes)
+    static constexpr uint8_t tbq_signs_512[64] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+        0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
+        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
+        0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+    };
+    static constexpr float tbq3_boundaries[7] = {
+        -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
+    };
+
+    float tmp[512];
+
+    // Apply signs on raw data
+    for (int j = 0; j < 512; j++) {
+        int sign = ((tbq_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * sign;
+    }
+
+    // 512-point serial WHT (9 stages)
+    for (int len = 1; len < 512; len *= 2)
+        for (int i = 0; i < 512; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // Global norm over all 512 WHT elements — shared by both blocks
+    // This preserves cross-block scale consistency (key insight for 512-WHT quality)
+    float global_sq = 0.0f;
+    for (int j = 0; j < 512; j++) global_sq += tmp[j] * tmp[j];
+    float global_norm = sqrtf(global_sq / 512.0f); // normalize so elements ~ N(0,1)
+
+    if (global_norm < 1e-10f) {
+        for (int blk = 0; blk < 2; blk++) {
+            y[blk].d = __float2half(0.0f);
+            for (int j = 0; j < QK_K*3/8; j++) y[blk].qs[j] = 0;
+        }
+        return;
+    }
+
+    float inv_norm = 1.0f / global_norm;
+
+    // Store SAME global_norm in both blocks — dequant reads block.d for each
+    y[0].d = __float2half(global_norm);
+    y[1].d = __float2half(global_norm);
+
+    // Quantize each 256-element half with shared norm
+    for (int blk = 0; blk < 2; blk++) {
+        float * blk_data = tmp + blk * 256;
+
+        int bit_pos = 0;
+        for (int j = 0; j < QK_K*3/8; j++) y[blk].qs[j] = 0;
+        for (int j = 0; j < 256; j++) {
+            float val = blk_data[j] * inv_norm;
+            uint8_t idx = 7;
+            for (int b = 0; b < 7; b++) { if (val < tbq3_boundaries[b]) { idx = b; break; } }
+            int byte_idx = bit_pos / 8;
+            int bit_off = bit_pos % 8;
+            y[blk].qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
+            if (bit_off > 5) y[blk].qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
+            bit_pos += 3;
+        }
+    }
+}
+
 // TurboQuant 4-bit: L2 norm + random signs + serial WHT + Lloyd-Max quantization
 // Single-thread implementation for set_rows (called once per token, performance uncritical)
 static __device__ void quantize_f32_tbq4_0_block(const float * __restrict__ x, block_tbq4_0 * __restrict__ y) {
