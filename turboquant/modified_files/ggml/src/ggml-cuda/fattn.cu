@@ -135,6 +135,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             GGML_ASSERT(V->ne[0] == 256);
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);
             break;
+        case 512:
+            GGML_ASSERT(V->ne[0] == 512);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
+            break;
         case 576: {
             // For Deepseek, go straight to the ncols1 switch to avoid compiling unnecessary kernels.
             GGML_ASSERT(V->ne[0] == 512);
@@ -287,7 +291,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 
-    // TurboQuant 256-block (_0): D=256 only
+    // TurboQuant 256-block (_0): D=256 and D=512 (256-block × 2)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
@@ -297,6 +301,21 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
+
+    // TurboQuant 256-block (_0) at D=512 (Gemma 4 global attention)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_Q8_0)
 
     // TurboQuant 128-block (_1): D=128 only
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_F16)
@@ -447,6 +466,20 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_Q8_0)
+    // TurboQuant 256-block (_0) at D=512 (Gemma 4 global attention)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_Q8_0)
     // TurboQuant 128-block (_1): D=128 only
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_F16)
@@ -632,6 +665,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
+        case 512:
+            if (V->ne[0] != K->ne[0]) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            // TBQ vec kernel doesn't require GQA opt, only MMA does
+            if (!gqa_opt_applies && !ggml_is_quantized(K->type) &&
+                K->type != GGML_TYPE_TBQ3_0 && K->type != GGML_TYPE_TBQ4_0 &&
+                K->type != GGML_TYPE_TBQP3_0 && K->type != GGML_TYPE_TBQP4_0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            break;
         case 576:
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
@@ -731,7 +775,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3
      || V->type == GGML_TYPE_TBQ4_4 || V->type == GGML_TYPE_TBQ3_4;
     if (tbq_k_type || tbq_v_type) {
-        if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+        if (Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
             return BEST_FATTN_KERNEL_VEC;
         }
         // GLM asymmetric: K=576, V=512 with TBQ types — MMA tensor core
@@ -790,7 +834,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
-    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 576) {
+    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -823,7 +867,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use MFMA flash attention for CDNA (MI100+):
-    if (amd_mfma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 256 && Q->ne[0] != 576) {
+    if (amd_mfma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 256 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         const int64_t eff_nq = Q->ne[1] * (gqa_opt_applies ? gqa_ratio : 1);
         // MMA vs tile crossover benchmarked on MI300X @ d32768:
         //   hsk=64  (gqa=4): MMA wins at eff >= 128 (+11%)
