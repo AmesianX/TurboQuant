@@ -9,20 +9,86 @@
 
 Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
 
-### 🆕 v1.5.0 — Upstream Rebase + Gemma 4 지원 준비
+### 🆕 v1.5.0 — Upstream Rebase + Gemma 4 지원
 
-**llama.cpp 최신 upstream(b7ad48ebd)에 완전 리베이스.**
+**llama.cpp 최신 upstream(b7ad48ebd)에 완전 리베이스 + Gemma 4 TBQ KV 캐시 지원.**
 
 기존에는 upstream llama.cpp와 별도 히스토리로 관리되어, 최신 기능을 반영하려면 수백 커밋을 수동 패치해야 했습니다. v1.5.0부터 upstream 커밋 히스토리를 공유하는 구조로 전환하여, `git merge upstream/master` 한 줄로 최신 동기화가 가능합니다.
 
 **변경 사항:**
 - upstream llama.cpp 최신 커밋(b7ad48ebd)에 3-way merge로 전체 TBQ/TBQP 코드 적용
+- **Gemma 4 지원**: head_dim=512(global) + 256(SWA) 혼합 아키텍처 완전 지원
 - Deepseek MLA 512x512 MMA config 반영 (upstream 추가분)
 - bf16 flash attention vec 커널 지원 (upstream 추가분)
 - V-less cache, stream-k FA 등 upstream 최적화 포함
 - `git merge upstream/master`로 향후 동기화 가능한 fork 구조 확립
 
-**호환성:** 기존 v1.4.2의 모든 기능(MMA 텐서코어, QJL scalar correction, MLA 비대칭) 유지. 벤치마크 동일.
+**Gemma 4 핵심 기술:**
+1. **SWA 캐시 타입 자동 재매핑**: global(head_dim=512)과 SWA(head_dim=256)가 다른 경우, SWA 캐시에 올바른 TBQ 서브타입을 자동 할당
+2. **가변 GQA 대응**: Gemma 4는 레이어마다 head_count_kv가 다름(16/4). WHT rotation이 head 단위로 동작하므로 가변 GQA에서도 안전 — `attn_rot_k` 활성화 조건 수정
+3. **D=512 vec 커널 2-pass WHT**: 512차원 Q를 256-block × 2로 나눠 각각 WHT 처리. IWHT도 동일 방식
+
+**벤치마크 (Gemma 4 31B-it UD-Q4_K_XL, DGX Spark GB10, 262K ctx):**
+
+| 캐시 | GPU 메모리 | 압축 | PP t/s | TG t/s | 수학 정확도 |
+|------|-----------|------|--------|--------|------------|
+| f16/f16 | 41,500 MiB | 1.0x | 152.9 | 10.1 | 42/65 (64.6%) |
+| **tbqp3/tbq3** | **23,215 MiB** | **1.8x** | 112.9 | 9.0 | **32/65 (49.2%)** |
+
+> **참고:** Gemma 4는 hybrid SWA 아키텍처로, non-SWA 10 layers (head_dim=512) + SWA 50 layers (head_dim=256)입니다. SWA 캐시는 sliding window 크기(1536 cells)로 제한되어, 전체 압축률은 MLA 모델(5.2x)보다 낮습니다.
+>
+> **참고:** 수학 정확도는 [turboquant_math_accuracy.py](https://github.com/eullm/eullm/blob/main/bench/turboquant_math_accuracy.py) 벤치마크(2x2/3x3 행렬곱, 스칼라 연산, filler 0-2000t)로 측정. TBQ 3-bit 양자화 특성상 f16 대비 정밀도 손실이 있으나, 일반 텍스트 생성은 정상 동작합니다.
+
+<details>
+<summary>빌드 및 실행 방법</summary>
+
+**빌드:**
+```bash
+cmake -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=ON \
+      -DGGML_CUDA=ON \
+      -DGGML_BLAS=ON \
+      -DGGML_CCACHE=OFF \
+      -DCMAKE_EXE_LINKER_FLAGS="-lpthread -lm" \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_SERVER=ON \
+      -DCMAKE_VERBOSE_MAKEFILE=ON \
+      ..
+
+make -j12
+```
+
+**서버 실행 (f16 baseline):**
+```bash
+./llama-server -m ~/Models/gemma4/gemma-4-31B-it-UD-Q4_K_XL.gguf \
+    -t 4 -c 262144 -n 32768 --parallel 2 \
+    --cont-batching --jinja --reasoning-format auto \
+    --chat-template-kwargs '{"enable_thinking": false, "reasoning_effort": "medium"}' \
+    --n-gpu-layers 999 --flash-attn on \
+    -b 1024 -ub 512 --no-mmap \
+    --cache-type-k f16 --cache-type-v f16 \
+    --top-k 20 --temp 0.6 --top-p 0.95 --min-p 0.0 \
+    --presence-penalty 0.0 --repeat-penalty 1.0 \
+    --host 127.0.0.1 --port 8888
+```
+
+**서버 실행 (TurboQuant):**
+```bash
+./llama-server -m ~/Models/gemma4/gemma-4-31B-it-UD-Q4_K_XL.gguf \
+    -t 4 -c 262144 -n 32768 --parallel 2 \
+    --cont-batching --jinja --reasoning-format auto \
+    --chat-template-kwargs '{"enable_thinking": false, "reasoning_effort": "medium"}' \
+    --n-gpu-layers 999 --flash-attn on \
+    -b 1024 -ub 512 --no-mmap \
+    --cache-type-k tbqp3 --cache-type-v tbq3 \
+    --top-k 20 --temp 0.6 --top-p 0.95 --min-p 0.0 \
+    --presence-penalty 0.0 --repeat-penalty 1.0 \
+    --host 127.0.0.1 --port 8889
+```
+</details>
+
+**호환성:** 기존 v1.4.2의 모든 기능(MMA 텐서코어, QJL scalar correction, MLA 비대칭) 유지. 기존 모델 벤치마크 동일.
 
 ---
 
@@ -376,20 +442,86 @@ cmake --build build -j$(nproc)
 
 This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
 
-### 🆕 v1.5.0 — Upstream Rebase + Gemma 4 Support (Planned)
+### 🆕 v1.5.0 — Upstream Rebase + Gemma 4 Support
 
-**Full rebase on latest upstream llama.cpp (b7ad48ebd).**
+**Full rebase on latest upstream llama.cpp (b7ad48ebd) + Gemma 4 TBQ KV cache support.**
 
 Previously maintained as a separate history from upstream llama.cpp, requiring manual patching of hundreds of commits for each sync. Starting with v1.5.0, the fork shares upstream commit history, enabling single-command sync via `git merge upstream/master`.
 
 **Changes:**
 - 3-way merged all TBQ/TBQP code onto latest upstream llama.cpp (b7ad48ebd)
+- **Gemma 4 support**: hybrid head_dim=512 (global) + 256 (SWA) architecture fully supported
 - Deepseek MLA 512x512 MMA config included (upstream addition)
 - bf16 flash attention vec kernel support (upstream addition)
 - V-less cache, stream-k FA, and other upstream optimizations included
 - Established proper fork structure for easy future upstream sync
 
-**Compatibility:** All v1.4.2 features (MMA tensor core, QJL scalar correction, MLA asymmetric) fully preserved. Benchmarks unchanged.
+**Gemma 4 key techniques:**
+1. **SWA cache type auto-remapping**: When global (head_dim=512) and SWA (head_dim=256) differ, the SWA cache is automatically assigned the correct TBQ sub-type
+2. **Variable GQA support**: Gemma 4 has per-layer head_count_kv (16/4). WHT rotation operates per-head, so variable GQA is safe — `attn_rot_k` activation condition updated
+3. **D=512 vec kernel 2-pass WHT**: 512-dim Q is split into 256-block × 2, each WHT'd separately. IWHT uses the same approach
+
+**Benchmark (Gemma 4 31B-it UD-Q4_K_XL, DGX Spark GB10, 262K ctx):**
+
+| Cache | GPU Memory | Compress | PP t/s | TG t/s | Math Accuracy |
+|-------|-----------|----------|--------|--------|---------------|
+| f16/f16 | 41,500 MiB | 1.0x | 152.9 | 10.1 | 42/65 (64.6%) |
+| **tbqp3/tbq3** | **23,215 MiB** | **1.8x** | 112.9 | 9.0 | **32/65 (49.2%)** |
+
+> **Note:** Gemma 4 is a hybrid SWA architecture with non-SWA 10 layers (head_dim=512) + SWA 50 layers (head_dim=256). SWA cache is limited to the sliding window size (1536 cells), so overall compression ratio is lower than MLA models (5.2x).
+>
+> **Note:** Math accuracy measured using [turboquant_math_accuracy.py](https://github.com/eullm/eullm/blob/main/bench/turboquant_math_accuracy.py) benchmark (2x2/3x3 matrix multiplication, scalar arithmetic, filler 0-2000t). TBQ 3-bit quantization shows some precision loss vs f16, but general text generation works correctly.
+
+<details>
+<summary>Build & Run</summary>
+
+**Build:**
+```bash
+cmake -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=ON \
+      -DGGML_CUDA=ON \
+      -DGGML_BLAS=ON \
+      -DGGML_CCACHE=OFF \
+      -DCMAKE_EXE_LINKER_FLAGS="-lpthread -lm" \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_SERVER=ON \
+      -DCMAKE_VERBOSE_MAKEFILE=ON \
+      ..
+
+make -j12
+```
+
+**Server (f16 baseline):**
+```bash
+./llama-server -m ~/Models/gemma4/gemma-4-31B-it-UD-Q4_K_XL.gguf \
+    -t 4 -c 262144 -n 32768 --parallel 2 \
+    --cont-batching --jinja --reasoning-format auto \
+    --chat-template-kwargs '{"enable_thinking": false, "reasoning_effort": "medium"}' \
+    --n-gpu-layers 999 --flash-attn on \
+    -b 1024 -ub 512 --no-mmap \
+    --cache-type-k f16 --cache-type-v f16 \
+    --top-k 20 --temp 0.6 --top-p 0.95 --min-p 0.0 \
+    --presence-penalty 0.0 --repeat-penalty 1.0 \
+    --host 127.0.0.1 --port 8888
+```
+
+**Server (TurboQuant):**
+```bash
+./llama-server -m ~/Models/gemma4/gemma-4-31B-it-UD-Q4_K_XL.gguf \
+    -t 4 -c 262144 -n 32768 --parallel 2 \
+    --cont-batching --jinja --reasoning-format auto \
+    --chat-template-kwargs '{"enable_thinking": false, "reasoning_effort": "medium"}' \
+    --n-gpu-layers 999 --flash-attn on \
+    -b 1024 -ub 512 --no-mmap \
+    --cache-type-k tbqp3 --cache-type-v tbq3 \
+    --top-k 20 --temp 0.6 --top-p 0.95 --min-p 0.0 \
+    --presence-penalty 0.0 --repeat-penalty 1.0 \
+    --host 127.0.0.1 --port 8889
+```
+</details>
+
+**Compatibility:** All v1.4.2 features (MMA tensor core, QJL scalar correction, MLA asymmetric) fully preserved. Existing model benchmarks unchanged.
 
 ---
 
