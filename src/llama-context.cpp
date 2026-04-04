@@ -2967,7 +2967,8 @@ llama_context * llama_init_from_model(
                 }
                 LLAMA_LOG_INFO("%s: TurboQuant auto-map: %s -> %s (head_dim=%u)\n",
                         __func__, ggml_type_name(orig), ggml_type_name(t), head_dim);
-            } else if (head_dim != 256) {
+            } else if (head_dim != 256 && head_dim != 512) {
+                // _0 types support 256 and 512 (2×256 sub-blocks, e.g. GLM-4.7-Flash V)
                 switch (t) {
                     case GGML_TYPE_TBQ3_0:
                     case GGML_TYPE_TBQ4_0:
