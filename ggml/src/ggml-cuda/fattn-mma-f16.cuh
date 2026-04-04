@@ -1832,11 +1832,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
     const int nwarps         = nthreads / warp_size_host;
 
-    // V_is_K_view: true for ALL MLA (DKQ=576). Both TBQ and TBQP use spatial K.
-    const ggml_tensor * K_tensor_for_view = dst->src[1];
-    const bool k_is_tbqp = K_tensor_for_view->type == GGML_TYPE_TBQP3_4 || K_tensor_for_view->type == GGML_TYPE_TBQP4_4;
-    // TBQP: K is spatial (IWHT in dequant). V = K view = spatial. No output IWHT.
-    // QJL applied as scalar correction, not baked into K.
+    // V_is_K_view: true for ALL MLA (DKQ=576). TBQ and TBQP both use spatial K.
+    // V = K view = spatial. QJL applied as scalar correction via raw_K_data.
     const bool V_is_K_view = (DKQ == 576);
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
@@ -1864,28 +1861,18 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
         if constexpr (DKQ == 576) {
-            // MLA: runtime V_is_K_view (false for TBQP to enable separate V dequant)
-            if (V_is_K_view) {
-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>;
-            } else {
-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
-            }
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>;
         } else {
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
         }
 
 #if !defined(GGML_USE_MUSA)
-        // Always set — TBQP alternates V_is_K_view true/false kernels with different shared memory needs.
         CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
 #endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
         if constexpr (DKQ == 576) {
-            if (V_is_K_view) {
-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>;
-            } else {
-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
-            }
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>;
         } else {
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
         }
