@@ -236,104 +236,141 @@ static __global__ void flash_attn_ext_vec(
             const float * Q_f = (const float *) (Q + j*nb01);
 
             // === WHT 1: MSE part (signs1) — FP32 butterfly ===
-            {
-                float f0, f1;
+            // For D=512: two passes over 256-element sub-blocks
+            constexpr int n_sub_blocks = D / 256;
+            for (int sb = 0; sb < n_sub_blocks; sb++) {
+                const int q_offset = sb * 256;
                 {
-                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-                    float sign1 = ((tbq_signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
-                    float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
-                    float q1 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid + 128];
-                    f0 = q0 * sign0;
-                    f1 = q1 * sign1;
+                    float f0, f1;
+                    {
+                        float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                        float sign1 = ((tbq_signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
+                        float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[q_offset + tid];
+                        float q1 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[q_offset + tid + 128];
+                        f0 = q0 * sign0;
+                        f1 = q1 * sign1;
+                    }
+                    // Stage 7 (stride 128): register-local
+                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
+                    // Stages 0-4: warp shuffle
+                    #pragma unroll
+                    for (int s = 0; s < 5; s++) {
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
+                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
+                        else                { f0 = f0 + o0; f1 = f1 + o1; }
+                    }
+                    // Stages 5-6: shared memory
+                    Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
+                    __syncthreads();
+                    {
+                        float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
+                        float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
+                        f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
+                        f1 = (tid & 32) ? (v1 - u1) : (u1 + v1);
+                    }
+                    Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
+                    __syncthreads();
+                    {
+                        float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64];
+                        float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
+                        f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
+                        f1 = (tid & 64) ? (v1 - u1) : (u1 + v1);
+                    }
+                    Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
+                    __syncthreads();
                 }
-                // Stage 7 (stride 128): register-local
-                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
-                // Stages 0-4: warp shuffle
-                #pragma unroll
-                for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
-                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
-                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
-                    else                { f0 = f0 + o0; f1 = f1 + o1; }
-                }
-                // Stages 5-6: shared memory
-                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
-                __syncthreads();
-                {
-                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
-                    float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
-                    f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
-                    f1 = (tid & 32) ? (v1 - u1) : (u1 + v1);
-                }
-                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
-                __syncthreads();
-                {
-                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64];
-                    float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
-                    f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
-                    f1 = (tid & 64) ? (v1 - u1) : (u1 + v1);
-                }
-                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
-                __syncthreads();
-            }
 
-            // Store MSE WHT'd query in Q_reg (scale/D applied)
-            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
-                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
-                const float v0 = Q_wht[2*i] * scale / (float)D;
-                const float v1 = Q_wht[2*i+1] * scale / (float)D;
+                // Store this sub-block's MSE WHT'd query in Q_reg (scale/256 applied)
+                for (int i0 = 0; i0 < 128; i0 += nthreads_KQ) {
+                    const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                    const float v0 = Q_wht[2*i] * scale / 256.0f;
+                    const float v1 = Q_wht[2*i+1] * scale / 256.0f;
+                    const int reg_idx = sb * (128/nthreads_KQ) + i0/nthreads_KQ;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
+                    Q_reg[j][reg_idx] = make_half2(__float2half(v0), __float2half(v1));
 #else
-                Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
+                    Q_reg[j][reg_idx] = make_float2(v0, v1);
 #endif
+                }
+                __syncthreads();
             }
-            // Q_wht still contains WHT'd query -- needed for TBQP QJL below
+            // Q_wht contains WHT of LAST sub-block -- for TBQP QJL, we redo per sub-block below
 
             // === WHT 2: QJL part (signs2) -- only for TBQP types ===
             if constexpr (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0) {
-                __syncthreads();
-                float f0, f1;
-                {
-                    float sign0 = ((qjl_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
-                    float sign1 = ((qjl_signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
-                    f0 = Q_wht[tid] * sign0;
-                    f1 = Q_wht[tid + 128] * sign1;
-                }
-                { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
-                #pragma unroll
-                for (int s = 0; s < 5; s++) {
-                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
-                    float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
-                    if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
-                    else                { f0 = f0 + o0; f1 = f1 + o1; }
-                }
-                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
-                __syncthreads();
-                {
-                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
-                    float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
-                    f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
-                    f1 = (tid & 32) ? (v1 - u1) : (u1 + v1);
-                }
-                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
-                __syncthreads();
-                {
-                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64];
-                    float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
-                    f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
-                    f1 = (tid & 64) ? (v1 - u1) : (u1 + v1);
-                }
-                constexpr float qjl_factor = 1.2533f; // sqrt(pi/2), scale applied below
-                const float sf = scale * qjl_factor / ((float)D * (float)D);
-                Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
-                __syncthreads();
+                constexpr float qjl_factor = 1.2533f; // sqrt(pi/2)
+                const float sf = scale * qjl_factor / (256.0f * 256.0f);
 
-                for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
-                    const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
-                    Q_ds[j][i0/nthreads_KQ] = make_float2(Q_wht[2*i] * sf, Q_wht[2*i+1] * sf);
+                for (int sb = 0; sb < n_sub_blocks; sb++) {
+                    const int q_offset = sb * 256;
+
+                    // First: redo MSE WHT to get Q_wht for this sub-block
+                    {
+                        float f0, f1;
+                        {
+                            float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                            float sign1 = ((tbq_signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
+                            float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[q_offset + tid];
+                            float q1 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[q_offset + tid + 128];
+                            f0 = q0 * sign0; f1 = q1 * sign1;
+                        }
+                        { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
+                        #pragma unroll
+                        for (int s = 0; s < 5; s++) {
+                            float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                            float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
+                            if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
+                            else                { f0 = f0 + o0; f1 = f1 + o1; }
+                        }
+                        Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
+                        __syncthreads();
+                        { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
+                          f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); f1 = (tid & 32) ? (v1 - u1) : (u1 + v1); }
+                        Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
+                        __syncthreads();
+                        { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
+                          f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); f1 = (tid & 64) ? (v1 - u1) : (u1 + v1); }
+                        Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
+                        __syncthreads();
+                    }
+
+                    // Now apply QJL signs2 WHT on Q_wht
+                    {
+                        float f0, f1;
+                        {
+                            float sign0 = ((qjl_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                            float sign1 = ((qjl_signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
+                            f0 = Q_wht[tid] * sign0;
+                            f1 = Q_wht[tid + 128] * sign1;
+                        }
+                        { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
+                        #pragma unroll
+                        for (int s = 0; s < 5; s++) {
+                            float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                            float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
+                            if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
+                            else                { f0 = f0 + o0; f1 = f1 + o1; }
+                        }
+                        Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
+                        __syncthreads();
+                        { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 32];
+                          f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); f1 = (tid & 32) ? (v1 - u1) : (u1 + v1); }
+                        Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
+                        __syncthreads();
+                        { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64]; float u1 = Q_wht[tid+128], v1 = Q_wht[(tid+128) ^ 64];
+                          f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); f1 = (tid & 64) ? (v1 - u1) : (u1 + v1); }
+                        Q_wht[tid] = f0; Q_wht[tid + 128] = f1;
+                        __syncthreads();
+                    }
+
+                    for (int i0 = 0; i0 < 128; i0 += nthreads_KQ) {
+                        const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                        const int reg_idx = sb * (128/nthreads_KQ) + i0/nthreads_KQ;
+                        Q_ds[j][reg_idx] = make_float2(Q_wht[2*i] * sf, Q_wht[2*i+1] * sf);
+                    }
+                    __syncthreads();
                 }
-                __syncthreads();
             }
         }
     } else if constexpr (type_K == GGML_TYPE_TBQ4_1 || type_K == GGML_TYPE_TBQ3_1
@@ -800,36 +837,17 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D_V/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 half2 tmp[V_rows_per_thread/2];
-                const int v_elem = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
-                if constexpr (is_cross_head_V) {
-                    // Cross-head V: load 8 V blocks, combine with (1/8)H_8 inverse
-                    float2 v_sum[V_rows_per_thread/2];
-#pragma unroll
-                    for (int iv = 0; iv < V_rows_per_thread/2; iv++) v_sum[iv] = make_float2(0.0f, 0.0f);
-#pragma unroll
-                    for (int g = 0; g < 8; g++) {
-                        half2 v_g[V_rows_per_thread/2];
-                        dequantize_V(V + (int64_t)(g - kv_head_idx) * nb22 + k*nb21, v_g, v_elem);
-                        const float sign = (__popc(kv_head_idx & g) & 1) ? -0.125f : 0.125f;
-#pragma unroll
-                        for (int iv = 0; iv < V_rows_per_thread/2; iv++) {
-                            float2 vf = __half22float2(v_g[iv]);
-                            v_sum[iv].x += sign * vf.x;
-                            v_sum[iv].y += sign * vf.y;
-                        }
-                    }
-#pragma unroll
-                    for (int iv = 0; iv < V_rows_per_thread/2; iv++)
-                        tmp[iv] = __float22half2_rn(v_sum[iv]);
-                } else if constexpr (type_V == GGML_TYPE_BF16) {
+                if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f, v_elem);
+                    dequantize_V(V + k*nb21, tmp_f,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp, v_elem);
+                    dequantize_V(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
