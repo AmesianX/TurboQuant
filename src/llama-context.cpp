@@ -427,6 +427,7 @@ void llama_context::sched_reserve() {
     if (cparams.auto_fa) {
         auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
         if (!gf) {
+            LLAMA_LOG_ERROR("%s: graph_reserve returned NULL - a graph op has no supporting backend\n", __func__);
             throw std::runtime_error("failed to reserve graph for Flash Attention check");
         }
 

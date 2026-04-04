@@ -2339,6 +2339,267 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
 // ====================== TurboQuant head_dim=64 dequantization ======================
 // Restores original float values: centroid lookup → IWHT → sign undo → scale
 
+
+// ====================== TurboQuant _0 dequantize (head_dim=256) ======================
+
+// Lloyd-Max centroids (shared with _2 types below)
+static const float tbq_c3_0[8] = {
+    -2.1520f, -1.3440f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3440f,  2.1520f,
+};
+static const float tbq_c4_0[16] = {
+    -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9424f, -0.6568f, -0.3881f, -0.1284f,
+     0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
+};
+
+static const uint8_t tbq_signs_256[32] = {
+    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+};
+
+static void tbq_iwht_256(float * data) {
+    for (int len = 1; len < QK_K; len *= 2)
+        for (int i = 0; i < QK_K; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = data[i+j], v = data[i+j+len];
+                data[i+j] = u+v; data[i+j+len] = u-v;
+            }
+}
+
+void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        float tmp[QK_K];
+        for (int j = 0; j < QK_K; j++) {
+            int bp = j * 3, by = bp / 8, bo = bp % 8;
+            uint32_t v = (uint32_t)x[i].qs[by] >> bo;
+            if (bo > 5) v |= (uint32_t)x[i].qs[by+1] << (8 - bo);
+            tmp[j] = tbq_c3_0[v & 0x7] * norm;
+        }
+        tbq_iwht_256(tmp);
+        for (int j = 0; j < QK_K; j++) {
+            float sign = ((tbq_signs_256[j >> 3] >> (j & 7)) & 1) ? -1.0f : 1.0f;
+            y[i * QK_K + j] = tmp[j] * sign / QK_K;
+        }
+    }
+}
+
+void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        float tmp[QK_K];
+        for (int j = 0; j < QK_K/2; j++) {
+            tmp[2*j]     = tbq_c4_0[x[i].qs[j] & 0xF] * norm;
+            tmp[2*j + 1] = tbq_c4_0[x[i].qs[j] >> 4]  * norm;
+        }
+        tbq_iwht_256(tmp);
+        for (int j = 0; j < QK_K; j++) {
+            float sign = ((tbq_signs_256[j >> 3] >> (j & 7)) & 1) ? -1.0f : 1.0f;
+            y[i * QK_K + j] = tmp[j] * sign / QK_K;
+        }
+    }
+}
+
+void dequantize_row_tbqp3_0(const block_tbqp3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        const float d_qjl = GGML_FP16_TO_FP32(x[i].d_qjl);
+        float tmp[QK_K];
+        // MSE part: 2-bit centroids
+        for (int j = 0; j < QK_K; j++) {
+            int by = j / 4, bo = (j % 4) * 2;
+            tmp[j] = c2[(x[i].qs[by] >> bo) & 0x3] * norm;
+        }
+        // QJL part: 1-bit signs
+        for (int j = 0; j < QK_K; j++) {
+            float qjl_sign = ((x[i].qjl[j/8] >> (j%8)) & 1) ? 1.0f : -1.0f;
+            tmp[j] += qjl_sign * d_qjl;
+        }
+        tbq_iwht_256(tmp);
+        for (int j = 0; j < QK_K; j++) {
+            float sign = ((tbq_signs_256[j >> 3] >> (j & 7)) & 1) ? -1.0f : 1.0f;
+            y[i * QK_K + j] = tmp[j] * sign / QK_K;
+        }
+    }
+}
+
+void dequantize_row_tbqp4_0(const block_tbqp4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        const float d_qjl = GGML_FP16_TO_FP32(x[i].d_qjl);
+        float tmp[QK_K];
+        // MSE part: 3-bit centroids
+        for (int j = 0; j < QK_K; j++) {
+            int bp = j * 3, by = bp / 8, bo = bp % 8;
+            uint32_t v = (uint32_t)x[i].qs[by] >> bo;
+            if (bo > 5) v |= (uint32_t)x[i].qs[by+1] << (8 - bo);
+            tmp[j] = tbq_c3_0[v & 0x7] * norm;
+        }
+        // QJL part: 1-bit signs
+        for (int j = 0; j < QK_K; j++) {
+            float qjl_sign = ((x[i].qjl[j/8] >> (j%8)) & 1) ? 1.0f : -1.0f;
+            tmp[j] += qjl_sign * d_qjl;
+        }
+        tbq_iwht_256(tmp);
+        for (int j = 0; j < QK_K; j++) {
+            float sign = ((tbq_signs_256[j >> 3] >> (j & 7)) & 1) ? -1.0f : 1.0f;
+            y[i * QK_K + j] = tmp[j] * sign / QK_K;
+        }
+    }
+}
+
+
+
+static void tbq_wht_256(float * data) {
+    for (int len = 1; len < QK_K; len *= 2)
+        for (int i = 0; i < QK_K; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = data[i+j], v = data[i+j+len];
+                data[i+j] = u+v; data[i+j+len] = u-v;
+            }
+}
+
+void quantize_row_tbq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    static const float boundaries[7] = {-1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f};
+    assert(k % QK_K == 0);
+    block_tbq3_0 * y = (block_tbq3_0 *) vy;
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
+        float norm = sqrtf(sum_sq);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+        if (norm < 1e-10f) { memset(y[i].qs, 0, QK_K*3/8); x += QK_K; continue; }
+        float tmp[QK_K];
+        float inv = 1.0f / norm;
+        for (int j = 0; j < QK_K; j++) {
+            float sign = ((tbq_signs_256[j>>3] >> (j&7)) & 1) ? -1.0f : 1.0f;
+            tmp[j] = x[j] * inv * sign;
+        }
+        tbq_wht_256(tmp);
+        int bp = 0;
+        memset(y[i].qs, 0, QK_K*3/8);
+        for (int j = 0; j < QK_K; j++) {
+            uint8_t idx = 7;
+            for (int b = 0; b < 7; b++) { if (tmp[j] < boundaries[b]) { idx = b; break; } }
+            int by = bp/8, bo = bp%8;
+            y[i].qs[by] |= (uint8_t)((idx & 0x7) << bo);
+            if (bo > 5) y[i].qs[by+1] |= (uint8_t)((idx & 0x7) >> (8-bo));
+            bp += 3;
+        }
+        x += QK_K;
+    }
+}
+
+void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    static const float boundaries[15] = {-2.4008f,-1.8438f,-1.4373f,-1.0993f,-0.7994f,-0.5195f,-0.2533f,0.0f,0.2533f,0.5195f,0.7994f,1.0993f,1.4373f,1.8438f,2.4008f};
+    assert(k % QK_K == 0);
+    block_tbq4_0 * y = (block_tbq4_0 *) vy;
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
+        float norm = sqrtf(sum_sq);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+        if (norm < 1e-10f) { memset(y[i].qs, 0, QK_K/2); x += QK_K; continue; }
+        float tmp[QK_K];
+        float inv = 1.0f / norm;
+        for (int j = 0; j < QK_K; j++) {
+            float sign = ((tbq_signs_256[j>>3] >> (j&7)) & 1) ? -1.0f : 1.0f;
+            tmp[j] = x[j] * inv * sign;
+        }
+        tbq_wht_256(tmp);
+        for (int j = 0; j < QK_K/2; j++) {
+            uint8_t lo = 15, hi = 15;
+            for (int b = 0; b < 15; b++) { if (tmp[2*j] < boundaries[b]) { lo = b; break; } }
+            for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < boundaries[b]) { hi = b; break; } }
+            y[i].qs[j] = lo | (hi << 4);
+        }
+        x += QK_K;
+    }
+}
+
+// Simplified TBQP quantize (without QJL for now — stores MSE part only)
+void quantize_row_tbqp3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    static const float c2[4] = {-1.5104f,-0.4528f,0.4528f,1.5104f};
+    static const float b2[3] = {-0.9816f,0.0f,0.9816f};
+    assert(k % QK_K == 0);
+    block_tbqp3_0 * y = (block_tbqp3_0 *) vy;
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
+        float norm = sqrtf(sum_sq);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+        y[i].d_qjl = GGML_FP32_TO_FP16(0.0f);
+        memset(y[i].qjl, 0, QK_K/8);
+        if (norm < 1e-10f) { memset(y[i].qs, 0, QK_K/4); x += QK_K; continue; }
+        float tmp[QK_K];
+        float inv = 1.0f / norm;
+        for (int j = 0; j < QK_K; j++) {
+            float sign = ((tbq_signs_256[j>>3] >> (j&7)) & 1) ? -1.0f : 1.0f;
+            tmp[j] = x[j] * inv * sign;
+        }
+        tbq_wht_256(tmp);
+        for (int j = 0; j < QK_K/4; j++) {
+            uint8_t packed = 0;
+            for (int k2 = 0; k2 < 4; k2++) {
+                uint8_t idx = 3;
+                for (int b = 0; b < 3; b++) { if (tmp[4*j+k2] < b2[b]) { idx = b; break; } }
+                packed |= (idx << (k2*2));
+            }
+            y[i].qs[j] = packed;
+        }
+        x += QK_K;
+    }
+}
+
+void quantize_row_tbqp4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    static const float boundaries[7] = {-1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f};
+    assert(k % QK_K == 0);
+    block_tbqp4_0 * y = (block_tbqp4_0 *) vy;
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
+        float norm = sqrtf(sum_sq);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+        y[i].d_qjl = GGML_FP32_TO_FP16(0.0f);
+        memset(y[i].qjl, 0, QK_K/8);
+        if (norm < 1e-10f) { memset(y[i].qs, 0, QK_K*3/8); x += QK_K; continue; }
+        float tmp[QK_K];
+        float inv = 1.0f / norm;
+        for (int j = 0; j < QK_K; j++) {
+            float sign = ((tbq_signs_256[j>>3] >> (j&7)) & 1) ? -1.0f : 1.0f;
+            tmp[j] = x[j] * inv * sign;
+        }
+        tbq_wht_256(tmp);
+        int bp = 0;
+        memset(y[i].qs, 0, QK_K*3/8);
+        for (int j = 0; j < QK_K; j++) {
+            uint8_t idx = 7;
+            for (int b = 0; b < 7; b++) { if (tmp[j] < boundaries[b]) { idx = b; break; } }
+            int by = bp/8, bo = bp%8;
+            y[i].qs[by] |= (uint8_t)((idx & 0x7) << bo);
+            if (bo > 5) y[i].qs[by+1] |= (uint8_t)((idx & 0x7) >> (8-bo));
+            bp += 3;
+        }
+        x += QK_K;
+    }
+}
+
+
 static const float tbq_c3[8] = {
     -2.1520f, -1.3440f, -0.7560f, -0.2451f,
      0.2451f,  0.7560f,  1.3440f,  2.1520f,
@@ -5489,4 +5750,74 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     }
 
     return true;
+}
+
+// CPU vec_dot for TBQ3_0: dequantize K block then float dot product with Q
+void ggml_vec_dot_tbq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    
+    const block_tbq3_0 * x = (const block_tbq3_0 *) vx;
+    const float * y = (const float *) vy;
+    
+    float sumf = 0.0f;
+    const int nb = n / QK_K;
+    
+    for (int i = 0; i < nb; i++) {
+        float tmp[QK_K];
+        dequantize_row_tbq3_0(x + i, tmp, QK_K);
+        for (int j = 0; j < QK_K; j++) {
+            sumf += tmp[j] * y[i * QK_K + j];
+        }
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_tbq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    const block_tbq4_0 * x = (const block_tbq4_0 *) vx;
+    const float * y = (const float *) vy;
+    float sumf = 0.0f;
+    const int nb = n / QK_K;
+    for (int i = 0; i < nb; i++) {
+        float tmp[QK_K];
+        dequantize_row_tbq4_0(x + i, tmp, QK_K);
+        for (int j = 0; j < QK_K; j++) sumf += tmp[j] * y[i * QK_K + j];
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_tbqp3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    const block_tbqp3_0 * x = (const block_tbqp3_0 *) vx;
+    const float * y = (const float *) vy;
+    float sumf = 0.0f;
+    const int nb = n / QK_K;
+    for (int i = 0; i < nb; i++) {
+        float tmp[QK_K];
+        dequantize_row_tbqp3_0(x + i, tmp, QK_K);
+        for (int j = 0; j < QK_K; j++) sumf += tmp[j] * y[i * QK_K + j];
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_tbqp4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    const block_tbqp4_0 * x = (const block_tbqp4_0 *) vx;
+    const float * y = (const float *) vy;
+    float sumf = 0.0f;
+    const int nb = n / QK_K;
+    for (int i = 0; i < nb; i++) {
+        float tmp[QK_K];
+        dequantize_row_tbqp4_0(x + i, tmp, QK_K);
+        for (int j = 0; j < QK_K; j++) sumf += tmp[j] * y[i * QK_K + j];
+    }
+    *s = sumf;
 }

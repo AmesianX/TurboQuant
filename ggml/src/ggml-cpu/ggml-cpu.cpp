@@ -471,12 +471,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             // TurboQuant types are CUDA-only (no CPU to_float/vec_dot)
             const ggml_type type_k = op->src[1] ? op->src[1]->type : GGML_TYPE_F32;
             const ggml_type type_v = op->src[2] ? op->src[2]->type : GGML_TYPE_F32;
-            if (type_k == GGML_TYPE_TBQ3_0  || type_k == GGML_TYPE_TBQ4_0  ||
-                type_k == GGML_TYPE_TBQP3_0 || type_k == GGML_TYPE_TBQP4_0 ||
+            if (// _0 types now have CPU dequant
+                
                 type_k == GGML_TYPE_TBQ3_1  || type_k == GGML_TYPE_TBQ4_1  ||
                 type_k == GGML_TYPE_TBQP3_1 || type_k == GGML_TYPE_TBQP4_1 ||
-                type_v == GGML_TYPE_TBQ3_0  || type_v == GGML_TYPE_TBQ4_0  ||
-                type_v == GGML_TYPE_TBQP3_0 || type_v == GGML_TYPE_TBQP4_0 ||
+                
+                
                 type_v == GGML_TYPE_TBQ3_1  || type_v == GGML_TYPE_TBQ4_1  ||
                 type_v == GGML_TYPE_TBQP3_1 || type_v == GGML_TYPE_TBQP4_1 ||
                 type_k == GGML_TYPE_TBQ3_2  || type_k == GGML_TYPE_TBQ4_2  ||
