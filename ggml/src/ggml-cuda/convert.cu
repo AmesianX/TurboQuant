@@ -834,7 +834,8 @@ static __global__ void tbq_q_wht_kernel(float * __restrict__ Q, int64_t n_rows, 
 // Fused Q_wht1 + Q_wht2: signs1 WHT → store Q_wht1, then signs2 WHT → store Q_wht2.
 // Single kernel, single block read, shared memory reused between the two WHTs.
 // Output: Q_wht1 at q1[sub*256+tid], Q_wht2 at q2[sub*256+tid]
-static __global__ void tbq_q_wht12_kernel(float * __restrict__ Q_wht1, float * __restrict__ Q_wht2,
+static __global__ void tbq_q_wht12_kernel(const float * __restrict__ Q_src,
+                                           float * __restrict__ Q_wht1, float * __restrict__ Q_wht2,
                                            int64_t n_rows, int64_t row_stride) {
     int64_t row = blockIdx.x;
     if (row >= n_rows) return;
@@ -851,12 +852,13 @@ static __global__ void tbq_q_wht12_kernel(float * __restrict__ Q_wht1, float * _
     };
 
     __shared__ float buf[256];
+    const float * q_src = Q_src + row * row_stride + sub * 256;
     float * q1 = Q_wht1 + row * row_stride + sub * 256;
     float * q2 = Q_wht2 + row * row_stride + sub * 256;
 
     // === WHT 1: signs1 → butterfly → /256 ===
     int s1 = ((signs1[tid>>3]>>(tid&7))&1) ? -1 : 1;
-    buf[tid] = q1[tid] * s1;  // q1 initially contains original Q (copied before this kernel)
+    buf[tid] = q_src[tid] * s1;  // Read from Q_src directly
     __syncthreads();
 
     for (int len = 1; len < 256; len *= 2) {
@@ -1041,8 +1043,8 @@ void tbq_q_wht2_cuda(const float * Q_wht1, float * Q_wht2, int64_t DKQ, int64_t 
 }
 
 // Fused: Q_wht1 + Q_wht2 in one kernel. Q_wht1_buf initially contains original Q data.
-void tbq_q_wht12_cuda(float * Q_wht1, float * Q_wht2, int64_t DKQ, int64_t n_rows, int64_t row_stride, cudaStream_t stream) {
-    tbq_q_wht12_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(Q_wht1, Q_wht2, n_rows, row_stride);
+void tbq_q_wht12_cuda(const float * Q_src, float * Q_wht1, float * Q_wht2, int64_t DKQ, int64_t n_rows, int64_t row_stride, cudaStream_t stream) {
+    tbq_q_wht12_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(Q_src, Q_wht1, Q_wht2, n_rows, row_stride);
 }
 
 void tbq_output_iwht_cuda(float * dst, int64_t DV, int64_t n_rows, cudaStream_t stream) {
@@ -1241,9 +1243,9 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_TBQ4_4:
             return dequantize_row_tbq4_4_to_f16_cuda;
         case GGML_TYPE_TBQP3_4:
-            return (to_fp16_cuda_t)tbqp3_v_wht_noqjl_f16_cuda;  // MSE-only WHT (QJL applied separately in MMA)
+            return (to_fp16_cuda_t)tbqp3_v_spatial_f16_cuda;  // Spatial (MSE + IWHT). V=K view=spatial, no output IWHT.
         case GGML_TYPE_TBQP4_4:
-            return (to_fp16_cuda_t)tbqp4_v_wht_noqjl_f16_cuda;
+            return (to_fp16_cuda_t)tbqp4_v_spatial_f16_cuda;
         default:
             return nullptr;
     }

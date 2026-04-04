@@ -39,7 +39,11 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const char * __restrict__ raw_K_data,
+        const int32_t raw_K_stride,
+        const char * __restrict__ Q_wht2_data,
+        const int32_t Q_wht2_stride);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -2008,8 +2012,8 @@ void launch_fattn(
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
         if (V_is_K_view) {
-            // MLA: V shares K's f16 buffer. Both TBQ (spatial) and TBQP (MSE-only WHT).
-            // TBQP: K has no QJL (QJL applied as scalar correction). V is clean.
+            // MLA: V shares K's spatial f16 buffer. Both TBQ and TBQP.
+            // TBQP: K is spatial (IWHT in dequant). V = K view = spatial. No output IWHT.
             V_data = K_data;
             nb21   = nb11;
             nb22   = nb12;
@@ -2043,17 +2047,16 @@ void launch_fattn(
         }
     }
 
-    // TBQP Q WHT: [Q_wht1 | Q_wht2] concatenated in persistent buffer.
-    // Q_wht1 = WHT(signs1 * Q) / 256 — for MSE dot product
-    // Q_wht2 = WHT(qjl_signs * Q_wht1 * 256) * qjl_factor / (256*256) — for QJL dot product
-    // Kernel accesses Q_wht2 at offset ne03*nb03 from Q_data.
-    // Q physical layout: contiguous with stride = Q->ne[0] = 576.
+    // TBQP: K is spatial. Q stays spatial (no WHT needed for dot product).
+    // Only Q_wht2 needed for QJL scalar correction. Q_wht1 is intermediate.
     struct q_wht_cache_t { void * ptr = nullptr; size_t sz = 0; ~q_wht_cache_t() { if (ptr) cudaFree(ptr); } };
     static thread_local q_wht_cache_t q_wht_cache;
+    const char * q_wht2_ptr = nullptr;
+    int32_t q_wht2_stride = 0;
     if (tbqp_wht_mode) {
-        extern void tbq_q_wht12_cuda(float *, float *, int64_t, int64_t, int64_t, cudaStream_t);
+        extern void tbq_q_wht12_cuda(const float *, float *, float *, int64_t, int64_t, int64_t, cudaStream_t);
         const size_t n_q_bytes = ggml_nelements(Q) * sizeof(float);
-        const size_t n_q_total = 2 * n_q_bytes;  // [Q_wht1 | Q_wht2]
+        const size_t n_q_total = 2 * n_q_bytes;  // [Q_wht1 (temp) | Q_wht2 (for QJL)]
         if (q_wht_cache.sz < n_q_total) {
             if (q_wht_cache.ptr) CUDA_CHECK(cudaFree(q_wht_cache.ptr));
             CUDA_CHECK(cudaMalloc(&q_wht_cache.ptr, n_q_total));
@@ -2061,9 +2064,11 @@ void launch_fattn(
         }
         float * q_wht1 = (float *)q_wht_cache.ptr;
         float * q_wht2 = (float *)((char *)q_wht_cache.ptr + n_q_bytes);
-        // Fused: Q_wht1 (signs1 WHT) + Q_wht2 (signs2 WHT) in single kernel
-        CUDA_CHECK(cudaMemcpyAsync(q_wht1, Q->data, n_q_bytes, cudaMemcpyDeviceToDevice, main_stream));
-        tbq_q_wht12_cuda(q_wht1, q_wht2, Q->ne[0], Q->ne[1]*Q->ne[2]*Q->ne[3], Q->ne[0], main_stream);
+        // Reads Q->data directly, computes Q_wht1 (temp) + Q_wht2 (for QJL). No cudaMemcpy.
+        tbq_q_wht12_cuda((const float *)Q->data, q_wht1, q_wht2,
+                         Q->ne[0], Q->ne[1]*Q->ne[2]*Q->ne[3], Q->ne[0], main_stream);
+        q_wht2_ptr = (const char *)q_wht2;
+        q_wht2_stride = Q->ne[0] * sizeof(float);
     }
 
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
@@ -2174,22 +2179,11 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
-    const char * Q_data_for_kernel = tbqp_wht_mode ? (const char *) q_wht_cache.ptr : (const char *) Q->data;
-    // TBQP: pass raw K data via V pointer (V_is_K_view=true → V pointer/strides unused by MMA).
-    // Kernel accesses raw TBQP blocks via: V + nb23*sequence + nb22*z_KV + nb21*kv_token.
-    // nb21/22/23 carry the raw K strides (overwriting V strides, which are unused when V_is_K_view=true).
-    const char * V_data_for_kernel = V_data;
-    if (tbqp_wht_mode) {
-        V_data_for_kernel = K_data_orig;
-        nb21 = K->nb[1];  // raw K stride (bytes per KV token)
-        nb22 = K->nb[2];
-        nb23 = K->nb[3];
-    }
-
+    // TBQP: Q stays spatial (K is spatial too). V = K view (spatial). No hacks.
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
-        Q_data_for_kernel,
+        (const char *) Q->data,
         K_data,
-        V_data_for_kernel,
+        V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
@@ -2199,7 +2193,11 @@ void launch_fattn(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        tbqp_wht_mode ? K_data_orig : nullptr,
+        tbqp_wht_mode ? (int32_t)K->nb[1] : 0,
+        q_wht2_ptr,
+        q_wht2_stride
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -2223,12 +2221,6 @@ void launch_fattn(
     }
     CUDA_CHECK(cudaGetLastError());
 
-    // TBQP: V is WHT domain (K_mse view), output is WHT domain → need IWHT
-    if (tbqp_wht_mode) {
-        extern void tbq_output_iwht_cuda(float *, int64_t, int64_t, cudaStream_t);
-        const int64_t n_out_rows = Q->ne[1] * Q->ne[2] * Q->ne[3];
-        tbq_output_iwht_cuda((float *) KQV->data, V->ne[0], n_out_rows, main_stream);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    // TBQP: K and V are spatial (IWHT in K dequant). Output is spatial. No output IWHT.
     // Q WHT buffer is persistent (thread_local), no free needed per call.
 }
