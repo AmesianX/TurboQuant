@@ -807,40 +807,48 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
          0.2451f,  0.7560f,  1.3440f,  2.1520f,
     };
 
-    const float norm = __half2float(K_tbq[0].d);
-    float sum = 0.0f;
+    // D=512: two 256-blocks, each with own norm. Sum both contributions.
+    constexpr int n_blocks = D / 256;
+    float total = 0.0f;
 
-    #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int elem = k * 2;
+    for (int blk = 0; blk < n_blocks; blk++) {
+        const float norm = __half2float(K_tbq[blk].d);
+        float sum = 0.0f;
 
-        float cent0, cent1;
-        {
-            const int bp0 = elem * 3;
-            const int by0 = bp0 / 8, bo0 = bp0 % 8;
-            uint32_t v0 = (uint32_t)K_tbq[0].qs[by0] >> bo0;
-            if (bo0 > 5) v0 |= (uint32_t)K_tbq[0].qs[by0+1] << (8-bo0);
-            cent0 = c3[v0 & 0x7];
-        }
-        {
-            const int bp1 = (elem + 1) * 3;
-            const int by1 = bp1 / 8, bo1 = bp1 % 8;
-            uint32_t v1 = (uint32_t)K_tbq[0].qs[by1] >> bo1;
-            if (bo1 > 5) v1 |= (uint32_t)K_tbq[0].qs[by1+1] << (8-bo1);
-            cent1 = c3[v1 & 0x7];
-        }
+        #pragma unroll
+        for (int k_KQ_0 = 0; k_KQ_0 < 128; k_KQ_0 += nthreads) {
+            const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+            const int elem = k * 2;
 
+            float cent0, cent1;
+            {
+                const int bp0 = elem * 3;
+                const int by0 = bp0 / 8, bo0 = bp0 % 8;
+                uint32_t v0 = (uint32_t)K_tbq[blk].qs[by0] >> bo0;
+                if (bo0 > 5) v0 |= (uint32_t)K_tbq[blk].qs[by0+1] << (8-bo0);
+                cent0 = c3[v0 & 0x7];
+            }
+            {
+                const int bp1 = (elem + 1) * 3;
+                const int by1 = bp1 / 8, bo1 = bp1 % 8;
+                uint32_t v1 = (uint32_t)K_tbq[blk].qs[by1] >> bo1;
+                if (bo1 > 5) v1 |= (uint32_t)K_tbq[blk].qs[by1+1] << (8-bo1);
+                cent1 = c3[v1 & 0x7];
+            }
+
+            const int q_idx = blk * (128/nthreads) + k_KQ_0/nthreads;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
+            const float2 q = __half22float2(((const half2 *) Q_v)[q_idx]);
 #else
-        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
+            const float2 q = ((const float2 *) Q_v)[q_idx];
 #endif
 
-        sum += q.x * cent0 + q.y * cent1;
+            sum += q.x * cent0 + q.y * cent1;
+        }
+        total += norm * sum;
     }
 
-    return norm * sum;
+    return total;
 }
 
 // ============================================================
