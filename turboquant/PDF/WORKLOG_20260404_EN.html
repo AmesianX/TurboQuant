@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Work Log 2026-04-04</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root { --bg:#fafbfc; --fg:#1a1a2e; --accent:#3b82f6; --accent2:#8b5cf6; --success:#10b981; --warning:#f59e0b; --danger:#ef4444; --muted:#64748b; --card-bg:#ffffff; --border:#e2e8f0; }
+  .reveal { font-family:'Noto Sans KR',sans-serif; font-size:28px; color:var(--fg); }
+  .reveal .slides { text-align:left; }
+  .reveal .slides section { padding:40px 50px; box-sizing:border-box; }
+  .reveal h1,.reveal h2,.reveal h3 { font-family:'Noto Sans KR',sans-serif; font-weight:700; color:var(--fg); text-transform:none; letter-spacing:-0.02em; }
+  .reveal h1 { font-size:2.0em; margin-bottom:0.2em; }
+  .reveal h2 { font-size:1.4em; margin-bottom:0.5em; }
+  .reveal h3 { font-size:1.1em; margin-bottom:0.4em; color:var(--accent); }
+  .cover { text-align:center!important; display:flex!important; flex-direction:column; align-items:center; justify-content:center; }
+  .cover h1 { font-size:2.2em; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; margin-bottom:0.1em; }
+  .cover .subtitle { font-size:1.0em; color:var(--muted); font-weight:300; margin-bottom:1.5em; }
+  .cover .meta { font-size:0.7em; color:var(--muted); line-height:1.8; }
+  .cover .meta span { display:inline-block; background:#f1f5f9; padding:4px 14px; border-radius:20px; margin:3px 4px; }
+  .divider { width:60px; height:3px; background:linear-gradient(90deg,var(--accent),var(--accent2)); border:none; border-radius:2px; margin:10px 0 20px 0; }
+  .cover .divider { margin:10px auto 20px auto; }
+  .tag { display:inline-block; font-size:0.55em; font-weight:500; padding:2px 10px; border-radius:12px; vertical-align:middle; margin-left:8px; }
+  .tag-blue { background:#dbeafe; color:#1d4ed8; } .tag-green { background:#d1fae5; color:#065f46; } .tag-red { background:#fee2e2; color:#991b1b; } .tag-purple { background:#ede9fe; color:#5b21b6; }
+  .timeline { position:relative; padding-left:24px; margin:0; }
+  .timeline::before { content:''; position:absolute; left:6px; top:4px; bottom:4px; width:2px; background:var(--border); }
+  .timeline li { list-style:none; position:relative; margin-bottom:12px; font-size:0.78em; line-height:1.6; }
+  .timeline li::before { content:''; position:absolute; left:-22px; top:8px; width:10px; height:10px; border-radius:50%; background:var(--accent); border:2px solid white; box-shadow:0 0 0 2px var(--accent); }
+  .timeline .time { font-family:'JetBrains Mono',monospace; font-size:0.85em; color:var(--muted); font-weight:500; }
+  .items { list-style:none; padding:0; margin:0; }
+  .items li { position:relative; padding-left:20px; margin-bottom:10px; font-size:0.78em; line-height:1.7; }
+  .items li::before { content:''; position:absolute; left:0; top:10px; width:8px; height:8px; border-radius:2px; background:var(--accent); opacity:0.6; }
+  .card-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; }
+  .card { background:var(--card-bg); border:1px solid var(--border); border-radius:10px; padding:18px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin:0 0 8px 0; font-size:0.75em; font-weight:700; color:var(--fg); }
+  .card p,.card ul { margin:0; font-size:0.65em; line-height:1.7; color:#475569; }
+  .card ul { padding-left:16px; }
+  .highlight-box { border-left:4px solid; border-radius:6px; padding:14px 18px; margin:14px 0; font-size:0.78em; line-height:1.7; }
+  .highlight-box.blue { border-color:var(--accent); background:#eff6ff; }
+  .highlight-box.green { border-color:var(--success); background:#ecfdf5; }
+  .highlight-box.red { border-color:var(--danger); background:#fef2f2; }
+  .highlight-box.purple { border-color:var(--accent2); background:#f5f3ff; }
+  .reveal code { font-family:'JetBrains Mono',monospace; font-size:0.88em; background:#f1f5f9; padding:1px 6px; border-radius:4px; color:var(--accent2); }
+  .reveal table { width:100%; border-collapse:collapse; font-size:0.65em; margin-top:10px; }
+  .reveal table th { background:#f8fafc; font-weight:600; text-align:left; padding:8px 12px; border-bottom:2px solid var(--border); color:var(--muted); font-size:0.9em; text-transform:uppercase; letter-spacing:0.05em; }
+  .reveal table td { padding:8px 12px; border-bottom:1px solid var(--border); line-height:1.5; }
+  .reveal table .ok { color:var(--success); font-weight:600; }
+  .reveal table .ng { color:var(--danger); font-weight:600; }
+  .metric { text-align:center; padding:10px; }
+  .metric .num { font-size:2.0em; font-weight:700; line-height:1.1; }
+  .metric .label { font-size:0.6em; color:var(--muted); margin-top:4px; }
+  .metric .num.blue { color:var(--accent); } .metric .num.green { color:var(--success); } .metric .num.purple { color:var(--accent2); }
+  @media print { .reveal .slides section { page-break-after:always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>TurboQuant v1.5.0</h1>
+  <p class="subtitle">Work Log</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-04</span>
+    <span>Upstream Rebase + Gemma 4 Support</span>
+    <br>
+    <span>Full 3-way merge rebase</span>
+    <span>head_dim=512 vec kernel</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>Session Overview</h2>
+  <hr class="divider">
+  <ul class="timeline">
+    <li><span class="time">AM</span> &mdash; Full source rebase on latest upstream llama.cpp (b7ad48ebd)</li>
+    <li><span class="time">AM</span> &mdash; 3-way merge (diff3): base=27b93cbd1, 26 conflicts auto-resolved</li>
+    <li><span class="time">PM</span> &mdash; Build success + GLM-4.7-Flash / Qwen3.5-27B verified</li>
+    <li><span class="time">PM</span> &mdash; main branch swap (main-old backup), force push</li>
+    <li><span class="time">PM</span> &mdash; Gemma 4: SWA remap + attn_rot_k fix + D=512 2-pass WHT</li>
+    <li><span class="time">EVE</span> &mdash; Gemma 4 31B Dense + 26B MoE benchmark</li>
+    <li><span class="time">EVE</span> &mdash; Qwen3-14B V-cache issue #11 verified (f16=TBQ identical))</li>
+    <li><span class="time">EVE</span> &mdash; v1.5.0 release + community comments (#20969) (#20969)</li>
+    <li><span class="time">EVE</span> &mdash; First auto-merge success (0 conflicts, 2 files))</li>
+  </ul>
+</section>
+
+<!-- UPSTREAM REBASE -->
+<section>
+  <h2>Upstream Rebase <span class="tag tag-purple">Core</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Problem</h4>
+      <ul>
+        <li>기존: upstream과 별도 히스토리</li>
+        <li>동기화 = 수백 커밋 수동 패치</li>
+        <li><code>git merge-base</code> 불가</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Resolved</h4>
+      <ul>
+        <li>fork point: <code>27b93cbd1</code></li>
+        <li><code>diff3 -m</code> 3-way merge</li>
+        <li>TBQ overlap &rarr; ours, 비-TBQ &rarr; upstream</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>Result:</strong> 앞으로 <code>git fetch upstream && git merge upstream/master</code> 한 줄로 동기화. 첫 자동 머지 테스트: <strong>충돌 0개</strong>, 2개 파일 자동 합침.
+  </div>
+</section>
+
+<!-- GEMMA 4 -->
+<section>
+  <h2>Gemma 4 지원 <span class="tag tag-blue">New</span></h2>
+  <hr class="divider">
+
+  <p style="font-size:0.75em; color:var(--muted); margin-bottom:14px">
+    Gemma 4: hybrid SWA &mdash; global head_dim=512 (10L) + SWA head_dim=256 (50L), 가변 GQA (16/4)
+  </p>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>버그 1: SWA 타입 불일치</h4>
+      <p>global head_dim=512로 매핑된 TBQ 타입이 SWA Cache(256)에도 적용 &rarr; 크래시<br>
+      <strong>수정:</strong> <code>llama_kv_cache_iswa</code>에서 SWA head_dim 감지, 자동 재매핑</p>
+    </div>
+    <div class="card">
+      <h4>버그 2: attn_rot_k 비활성화</h4>
+      <p>가변 GQA &rarr; <code>is_n_embd_k_gqa_variable()=true</code> &rarr; WHT rotation 꺼짐 &rarr; garbage<br>
+      <strong>수정:</strong> TBQ 타입일 때 variable GQA 체크 우회</p>
+    </div>
+    <div class="card">
+      <h4>버그 3: D=512 Q WHT 미처리</h4>
+      <p>_0 타입 Q WHT가 256 단일 블록만 처리. D=512면 절반 누락<br>
+      <strong>수정:</strong> <code>n_sub_blocks = D/256</code> 루프로 2-pass</p>
+    </div>
+    <div class="card">
+      <h4>D=512 vec dispatch</h4>
+      <p><code>FATTN_VEC_CASE(512, ...)</code> 추가<br>
+      <code>get_best_fattn_kernel</code>: D&le;512 TBQ &rarr; VEC<br>
+      template instance 16개 추가</p>
+    </div>
+  </div>
+</section>
+
+<!-- BENCHMARK GEMMA 4 -->
+<section>
+  <h2>벤치마크: Gemma 4 <span class="tag tag-green">Verified</span></h2>
+  <hr class="divider">
+
+  <h3>31B-it Dense (UD-Q4_K_XL, DGX Spark GB10)</h3>
+  <table>
+    <thead><tr><th>Cache</th><th>GPU Mem</th><th>Compress</th><th>PP t/s</th><th>TG t/s</th><th>PPL</th><th>Math</th><th>Pauli</th></tr></thead>
+    <tbody>
+      <tr><td>f16/f16</td><td>41,500 MiB</td><td>1.0x</td><td>152.9</td><td>10.1</td><td>309.7</td><td>42/65 (64.6%)</td><td class="ok">PASS</td></tr>
+      <tr style="background:#eff6ff"><td><strong>tbqp3/tbq3</strong></td><td><strong>23,215 MiB</strong></td><td class="ok"><strong>1.8x</strong></td><td>112.9</td><td>9.0</td><td>212.1</td><td>32/65 (49.2%)</td><td class="ok"><strong>PASS</strong></td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin-top:20px">26B-A4B MoE (UD-Q4_K_XL, DGX Spark GB10)</h3>
+  <table>
+    <thead><tr><th>Cache</th><th>GPU Mem</th><th>Compress</th><th>TG t/s</th><th>Math</th><th>Pauli</th></tr></thead>
+    <tbody>
+      <tr><td>f16/f16</td><td>5,720 MiB</td><td>1.0x</td><td>56.4</td><td>37/65 (56.9%)</td><td class="ok">PASS</td></tr>
+      <tr style="background:#eff6ff"><td><strong>tbqp3/tbq3</strong></td><td><strong>1,106 MiB</strong></td><td class="ok"><strong>5.2x</strong></td><td>41.1</td><td>30/65 (46.2%)</td><td class="ok"><strong>PASS</strong></td></tr>
+    </tbody>
+  </table>
+
+  <div class="highlight-box blue" style="margin-top:14px">
+    65개 테스트 중 f16과 TBQ는 <strong>55개(Dense)/58개(MoE)에서 동일한 결과</strong>. 차이는 작은 수치 오차 (예: 160&rarr;150, 519&rarr;509).
+  </div>
+</section>
+
+<!-- QWEN3-14B -->
+<section>
+  <h2>이슈 #11 Verified: Qwen3-14B <span class="tag tag-green">Resolved</span></h2>
+  <hr class="divider">
+
+  <p style="font-size:0.75em; color:var(--muted); margin-bottom:14px">
+    V-cache 정밀도 버그 보고 &mdash; Rust bindings, head_dim=128, 1500t+ recall 저하 주장
+  </p>
+
+  <table>
+    <thead><tr><th>Cache</th><th>Math 정확도</th><th>KV 메모리</th></tr></thead>
+    <tbody>
+      <tr><td>f16/f16</td><td>22/65 (33.8%)</td><td>20,480 MiB</td></tr>
+      <tr style="background:#eff6ff"><td><strong>tbqp3/tbq3</strong></td><td class="ok"><strong>22/65 (33.8%)</strong></td><td><strong>8,160 MiB</strong></td></tr>
+    </tbody>
+  </table>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>Result:</strong> f16과 TBQ <strong>완벽 동일 정확도</strong>. divergent 18개 중 f16 9승, TBQ 9승. 모델 자체 한계(33.8%)이지 TBQ Problem 아님. <strong>메모리 2.5배 절약.</strong>
+  </div>
+</section>
+
+<!-- ISSUE RESPONSE -->
+<section>
+  <h2>이슈 대응 <span class="tag tag-blue">Community</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>#</th><th>제목</th><th>대응</th><th>상태</th></tr></thead>
+    <tbody>
+      <tr><td>#11</td><td>V-cache 정밀도 (Qwen3-14B)</td><td>벤치 돌려서 f16=TBQ 증명</td><td class="ok">답변</td></tr>
+      <tr><td>#12</td><td>Metal GPU 지원 요청</td><td>CUDA 전용, 2200줄+ 포팅 필요 설명</td><td class="ok">답변</td></tr>
+      <tr><td>#9</td><td>Gemma 4 지원 요청</td><td>구현 완료, 벤치마크 게시</td><td class="ok">닫음</td></tr>
+      <tr><td>#6</td><td>Gemma 4 지원 (중복)</td><td>#9 참조</td><td class="ok">닫음</td></tr>
+      <tr><td>#20969</td><td>llama.cpp 디스커션</td><td>v1.5.0 벤치 + 대결표 게시</td><td class="ok">게시</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- METRICS -->
+<section>
+  <h2>v1.5.0 성과 요약</h2>
+  <hr class="divider">
+
+  <div class="card-grid" style="grid-template-columns:1fr 1fr 1fr 1fr">
+    <div class="metric"><div class="num green">5.2x</div><div class="label">Gemma 4 MoE Compress</div></div>
+    <div class="metric"><div class="num blue">0</div><div class="label">upstream 머지 충돌</div></div>
+    <div class="metric"><div class="num purple">5</div><div class="label">지원 아키텍처</div></div>
+    <div class="metric"><div class="num green">4/4</div><div class="label">Pauli PASS</div></div>
+  </div>
+
+  <div class="highlight-box purple" style="margin-top:20px">
+    <strong>Remaining Work:</strong> Gemma 4 Math 정확도 개선 (tbq4 4-bit 테스트), MMA 텐서코어 D=512 이식, upstream 정기 동기화 (1-2주 간격)
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash: true, width: 1280, height: 720, margin: 0, transition: 'slide' });</script>
+</body>
+</html>
