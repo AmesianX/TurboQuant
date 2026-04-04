@@ -9,7 +9,24 @@
 
 Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
 
-### 🆕 v1.4.2 — MMA Tensor Core 가속 + QJL Scalar Correction
+### 🆕 v1.5.0 — Upstream Rebase + Gemma 4 지원 준비
+
+**llama.cpp 최신 upstream(b7ad48ebd)에 완전 리베이스.**
+
+기존에는 upstream llama.cpp와 별도 히스토리로 관리되어, 최신 기능을 반영하려면 수백 커밋을 수동 패치해야 했습니다. v1.5.0부터 upstream 커밋 히스토리를 공유하는 구조로 전환하여, `git merge upstream/master` 한 줄로 최신 동기화가 가능합니다.
+
+**변경 사항:**
+- upstream llama.cpp 최신 커밋(b7ad48ebd)에 3-way merge로 전체 TBQ/TBQP 코드 적용
+- Deepseek MLA 512x512 MMA config 반영 (upstream 추가분)
+- bf16 flash attention vec 커널 지원 (upstream 추가분)
+- V-less cache, stream-k FA 등 upstream 최적화 포함
+- `git merge upstream/master`로 향후 동기화 가능한 fork 구조 확립
+
+**호환성:** 기존 v1.4.2의 모든 기능(MMA 텐서코어, QJL scalar correction, MLA 비대칭) 유지. 벤치마크 동일.
+
+---
+
+### v1.4.2 — MMA Tensor Core 가속 + QJL Scalar Correction
 
 **TBQ/TBQP MMA 텐서코어 가속으로 토큰 생성 속도 30→49 t/s (+63%).**
 
@@ -359,7 +376,24 @@ cmake --build build -j$(nproc)
 
 This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
 
-### 🆕 v1.4.2 — MMA Tensor Core Acceleration + QJL Scalar Correction
+### 🆕 v1.5.0 — Upstream Rebase + Gemma 4 Support (Planned)
+
+**Full rebase on latest upstream llama.cpp (b7ad48ebd).**
+
+Previously maintained as a separate history from upstream llama.cpp, requiring manual patching of hundreds of commits for each sync. Starting with v1.5.0, the fork shares upstream commit history, enabling single-command sync via `git merge upstream/master`.
+
+**Changes:**
+- 3-way merged all TBQ/TBQP code onto latest upstream llama.cpp (b7ad48ebd)
+- Deepseek MLA 512x512 MMA config included (upstream addition)
+- bf16 flash attention vec kernel support (upstream addition)
+- V-less cache, stream-k FA, and other upstream optimizations included
+- Established proper fork structure for easy future upstream sync
+
+**Compatibility:** All v1.4.2 features (MMA tensor core, QJL scalar correction, MLA asymmetric) fully preserved. Benchmarks unchanged.
+
+---
+
+### v1.4.2 — MMA Tensor Core Acceleration + QJL Scalar Correction
 
 **TBQ/TBQP MMA tensor core acceleration: TG speed 30→49 t/s (+63%).**
 
