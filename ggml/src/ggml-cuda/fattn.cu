@@ -291,7 +291,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 
-    // TurboQuant 256-block (_0): D=256 only
+    // TurboQuant 256-block (_0): D=256 and D=512 (256-block × 2)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
@@ -301,6 +301,21 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
+
+    // TurboQuant 256-block (_0) at D=512 (Gemma 4 global attention)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_Q8_0)
 
     // TurboQuant 128-block (_1): D=128 only
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_F16)
@@ -451,6 +466,20 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_Q8_0)
+    // TurboQuant 256-block (_0) at D=512 (Gemma 4 global attention)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_Q8_0)
     // TurboQuant 128-block (_1): D=128 only
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_F16)
@@ -640,7 +669,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
+            // TBQ vec kernel doesn't require GQA opt, only MMA does
+            if (!gqa_opt_applies && !ggml_is_quantized(K->type) &&
+                K->type != GGML_TYPE_TBQ3_0 && K->type != GGML_TYPE_TBQ4_0 &&
+                K->type != GGML_TYPE_TBQP3_0 && K->type != GGML_TYPE_TBQP4_0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
@@ -743,7 +775,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3
      || V->type == GGML_TYPE_TBQ4_4 || V->type == GGML_TYPE_TBQ3_4;
     if (tbq_k_type || tbq_v_type) {
-        if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+        if (Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
             return BEST_FATTN_KERNEL_VEC;
         }
         // GLM asymmetric: K=576, V=512 with TBQ types — MMA tensor core

@@ -66,8 +66,61 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
+    // TurboQuant: SWA layers may have different head_dim than global layers (e.g. Gemma 4: 256 vs 512).
+    // Re-map TBQ types for SWA head_dim if they differ.
+    ggml_type type_k_swa = type_k;
+    ggml_type type_v_swa = type_v;
+    {
+        const uint32_t hd_full = hparams.n_embd_head_k_full;
+        const uint32_t hd_swa  = hparams.n_embd_head_k_swa;
+        if (hd_swa > 0 && hd_swa != hd_full) {
+            // SWA has different head_dim — need to re-map TBQ sub-types
+            auto tbq_remap_for_swa = [&](ggml_type t) -> ggml_type {
+                // Extract base type (3-bit or 4-bit, TBQ or TBQP)
+                struct tbq_entry { ggml_type base; ggml_type d256; ggml_type d128; ggml_type d64; ggml_type d512; };
+                static const tbq_entry entries[] = {
+                    { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2,  GGML_TYPE_TBQ3_0  },
+                    { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2,  GGML_TYPE_TBQ4_0  },
+                    { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQP3_0 },
+                    { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQP4_0 },
+                };
+                // Normalize to base _0 type first
+                ggml_type base = t;
+                for (const auto & e : entries) {
+                    if (t == e.d256 || t == e.d128 || t == e.d64 || t == e.d512) {
+                        base = e.base;
+                        break;
+                    }
+                }
+                // Now map to SWA head_dim
+                for (const auto & e : entries) {
+                    if (base == e.base) {
+                        switch (hd_swa) {
+                            case 256: return e.d256;
+                            case 512: return e.d512;
+                            case 128: return e.d128;
+                            case 64:  return e.d64;
+                            default:
+                                LLAMA_LOG_WARN("%s: SWA head_dim=%u unsupported for TBQ, falling back to q8_0\n", __func__, hd_swa);
+                                return GGML_TYPE_Q8_0;
+                        }
+                    }
+                }
+                return t; // not a TBQ type
+            };
+            type_k_swa = tbq_remap_for_swa(type_k);
+            type_v_swa = tbq_remap_for_swa(type_v);
+            if (type_k_swa != type_k || type_v_swa != type_v) {
+                LLAMA_LOG_INFO("%s: SWA head_dim=%u (vs global %u) — remapped K: %s→%s, V: %s→%s\n",
+                    __func__, hd_swa, hd_full,
+                    ggml_type_name(type_k), ggml_type_name(type_k_swa),
+                    ggml_type_name(type_v), ggml_type_name(type_v_swa));
+            }
+        }
+    }
+
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, type_k, type_v,
+            model, type_k_swa, type_v_swa,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, filter_swa, reuse);
 }
