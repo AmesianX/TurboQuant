@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Work Log 2026-04-01 PM</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {
+    --bg: #fafbfc;
+    --fg: #1a1a2e;
+    --accent: #3b82f6;
+    --accent2: #8b5cf6;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --muted: #64748b;
+    --card-bg: #ffffff;
+    --border: #e2e8f0;
+  }
+
+  .reveal {
+    font-family: 'Noto Sans KR', sans-serif;
+    font-size: 28px;
+    color: var(--fg);
+  }
+
+  .reveal .slides { text-align: left; }
+  .reveal .slides section { padding: 40px 50px; box-sizing: border-box; }
+
+  .reveal h1, .reveal h2, .reveal h3 {
+    font-family: 'Noto Sans KR', sans-serif;
+    font-weight: 700;
+    color: var(--fg);
+    text-transform: none;
+    letter-spacing: -0.02em;
+  }
+  .reveal h1 { font-size: 2.0em; margin-bottom: 0.2em; }
+  .reveal h2 { font-size: 1.4em; margin-bottom: 0.5em; }
+  .reveal h3 { font-size: 1.1em; margin-bottom: 0.4em; color: var(--accent); }
+
+  .cover {
+    text-align: center !important;
+    display: flex !important;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  .cover h1 {
+    font-size: 2.2em;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 0.1em;
+  }
+  .cover .subtitle { font-size: 1.0em; color: var(--muted); font-weight: 300; margin-bottom: 1.5em; }
+  .cover .meta { font-size: 0.7em; color: var(--muted); line-height: 1.8; }
+  .cover .meta span { display: inline-block; background: #f1f5f9; padding: 4px 14px; border-radius: 20px; margin: 3px 4px; }
+
+  .divider { width: 60px; height: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); border: none; border-radius: 2px; margin: 10px 0 20px 0; }
+  .cover .divider { margin: 10px auto 20px auto; }
+
+  .tag { display: inline-block; font-size: 0.55em; font-weight: 500; padding: 2px 10px; border-radius: 12px; vertical-align: middle; margin-left: 8px; }
+  .tag-blue { background: #dbeafe; color: #1d4ed8; }
+  .tag-green { background: #d1fae5; color: #065f46; }
+  .tag-red { background: #fee2e2; color: #991b1b; }
+  .tag-yellow { background: #fef3c7; color: #92400e; }
+  .tag-purple { background: #ede9fe; color: #5b21b6; }
+
+  .timeline { position: relative; padding-left: 24px; margin: 0; }
+  .timeline::before { content: ''; position: absolute; left: 6px; top: 4px; bottom: 4px; width: 2px; background: var(--border); }
+  .timeline li { list-style: none; position: relative; margin-bottom: 12px; font-size: 0.78em; line-height: 1.6; }
+  .timeline li::before { content: ''; position: absolute; left: -22px; top: 8px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); border: 2px solid white; box-shadow: 0 0 0 2px var(--accent); }
+
+  .timeline .time { font-family: 'JetBrains Mono', monospace; font-size: 0.85em; color: var(--muted); font-weight: 500; }
+
+  .items { list-style: none; padding: 0; margin: 0; }
+  .items li { position: relative; padding-left: 20px; margin-bottom: 10px; font-size: 0.78em; line-height: 1.7; }
+  .items li::before { content: ''; position: absolute; left: 0; top: 10px; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); opacity: 0.6; }
+  .items li.check::before { background: var(--success); opacity: 1; border-radius: 50%; }
+
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+  .card-grid.three { grid-template-columns: 1fr 1fr 1fr; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin: 0 0 8px 0; font-size: 0.75em; font-weight: 700; color: var(--fg); }
+  .card p, .card ul { margin: 0; font-size: 0.65em; line-height: 1.7; color: #475569; }
+  .card ul { padding-left: 16px; }
+
+  .highlight-box { border-left: 4px solid; border-radius: 6px; padding: 14px 18px; margin: 14px 0; font-size: 0.78em; line-height: 1.7; }
+  .highlight-box.blue { border-color: var(--accent); background: #eff6ff; }
+  .highlight-box.green { border-color: var(--success); background: #ecfdf5; }
+  .highlight-box.red { border-color: var(--danger); background: #fef2f2; }
+  .highlight-box.purple { border-color: var(--accent2); background: #f5f3ff; }
+
+  .reveal code { font-family: 'JetBrains Mono', monospace; font-size: 0.88em; background: #f1f5f9; padding: 1px 6px; border-radius: 4px; color: var(--accent2); }
+
+  .reveal table { width: 100%; border-collapse: collapse; font-size: 0.65em; margin-top: 10px; }
+  .reveal table th { background: #f8fafc; font-weight: 600; text-align: left; padding: 8px 12px; border-bottom: 2px solid var(--border); color: var(--muted); font-size: 0.9em; text-transform: uppercase; letter-spacing: 0.05em; }
+  .reveal table td { padding: 8px 12px; border-bottom: 1px solid var(--border); line-height: 1.5; }
+  .reveal table tr:last-child td { border-bottom: none; }
+  .reveal table .ok { color: var(--success); font-weight: 600; }
+  .reveal table .ng { color: var(--danger); font-weight: 600; }
+
+  .metric { text-align: center; padding: 10px; }
+  .metric .num { font-size: 2.0em; font-weight: 700; line-height: 1.1; }
+  .metric .label { font-size: 0.6em; color: var(--muted); margin-top: 4px; }
+  .metric .num.blue { color: var(--accent); }
+  .metric .num.green { color: var(--success); }
+  .metric .num.purple { color: var(--accent2); }
+  .metric .num.red { color: var(--danger); }
+
+  @media print { .reveal .slides section { page-break-after: always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>TurboQuant v1.3.0</h1>
+  <p class="subtitle">Work Log</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-01 14:00 ~ 23:00</span>
+    <span>Total 9 hours</span>
+    <br>
+    <span>head_dim P1-P5 + All Community Issues Resolved + TheTom Fork Analysis</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>Session Overview</h2>
+  <hr class="divider">
+  <ul class="timeline">
+    <li><span class="time">14:00 ~ 14:30</span> &mdash; Work log PDF + GitHub Actions cleanup</li>
+    <li><span class="time">14:30 ~ 15:00</span> &mdash; Community feedback analysis (6 issues)</li>
+    <li><span class="time">15:00 ~ 15:30</span> &mdash; v1.2.0 build issues + standalone build</li>
+    <li><span class="time">15:30 ~ 18:00</span> &mdash; head_dim P1-P5 Priority Cascade implementation</li>
+    <li><span class="time">18:00 ~ 19:00</span> &mdash; turbo4 PPL + "////" reproduction test</li>
+    <li><span class="time">19:00 ~ 20:00</span> &mdash; v1.3.0 release + community sharing</li>
+    <li><span class="time">20:00 ~ 21:00</span> &mdash; Distill benchmark + scientist name test</li>
+    <li><span class="time">21:00 ~ 22:00</span> &mdash; Code review + community response</li>
+    <li><span class="time">22:00 ~ 23:00</span> &mdash; TheTom fork turbo4 analysis + comment correction</li>
+  </ul>
+</section>
+
+<!-- HEAD_DIM P1-P5 -->
+<section>
+  <h2>head_dim P1-P5 Priority Cascade <span class="tag tag-purple">Core</span></h2>
+  <hr class="divider">
+
+  <p style="font-size:0.75em; color:var(--muted); margin-bottom: 14px">
+    Before: Only read GGUF <code>attention.key_length</code> &rarr; TurboQuant silently disabled on most models
+  </p>
+
+  <table>
+    <thead><tr><th>Priority</th><th>Signal</th><th>Confidence</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><strong>P1</strong></td><td><code>attention.key_length</code></td><td class="ok">100%</td><td>GGUF official value</td></tr>
+      <tr><td><strong>P2</strong></td><td><code>key_length_mla</code></td><td class="ok">100%</td><td>DeepSeek V2 etc.</td></tr>
+      <tr><td><strong>P3</strong></td><td><code>key_length_swa</code></td><td class="ok">100%</td><td>Gemma 2/3 etc.</td></tr>
+      <tr><td><strong>P4</strong></td><td><code>value_length</code></td><td style="color:var(--warning)">95%</td><td>Cross-validation</td></tr>
+      <tr><td><strong>P5</strong></td><td><code>n_embd / n_head</code></td><td class="ng">70%</td><td>Wrong for MoE!</td></tr>
+    </tbody>
+  </table>
+
+  <div class="highlight-box red" style="margin-top:14px">
+    <strong>P5 Trap:</strong> Qwen3-MoE has n_embd/n_head=64 but actual head_dim=<strong>128</strong>. Qwen3.5-27B has 213 but actual <strong>256</strong>.
+  </div>
+</section>
+
+<!-- ISSUES RESOLVED -->
+<section>
+  <h2>All Community Issues Resolved <span class="tag tag-green">Done</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>Issue</th><th>Reporter</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Phi-4, DeepSeek head_dim detection failure</td><td>@fritolays</td><td class="ok">Fixed</td></tr>
+      <tr><td>turbo4-K PPL explosion (18,202)</td><td>@TheTom</td><td class="ok">Fixed</td></tr>
+      <tr><td>GLM head_dim=576, Qwen3-4B head_dim=80</td><td>@fritolays, @sztlink</td><td class="ok">Fixed</td></tr>
+      <tr><td>"////" output (Qwen3.5-27B-UD)</td><td>@modderBUG</td><td style="color:var(--muted)">Not reproducible</td></tr>
+      <tr><td>llama-bench TBQ unsupported</td><td>@sztlink</td><td class="ok">Fixed</td></tr>
+      <tr><td>Windows OpenSSL DLL dependency</td><td>@sztlink</td><td class="ok">Fixed</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- TURBO4 + //// -->
+<section>
+  <h2>turbo4-K PPL + "////" Output Verification <span class="tag tag-blue">Resolved</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>turbo4-K PPL (Qwen3-30B-A3B)</h4>
+      <table>
+        <tr><td>f16/f16</td><td><strong>6.26</strong></td><td>baseline</td></tr>
+        <tr><td>tbq4/tbq4</td><td><strong>6.73</strong></td><td>+7.5%</td></tr>
+        <tr><td>tbq3/tbq3</td><td>8.49</td><td>+35.6%</td></tr>
+      </table>
+      <p style="margin-top:8px;color:var(--success)"><strong>Normal &mdash; no explosion!</strong></p>
+    </div>
+    <div class="card">
+      <h4>"////" Output Reproduction (Qwen3.5-27B-UD)</h4>
+      <ul>
+        <li>Tested with tbqp3/tbq3</li>
+        <li>Normal output confirmed</li>
+        <li>P1 correctly detected head_dim=256</li>
+        <li>n_embd/n_head=213 &rarr; P5 was wrong</li>
+      </ul>
+      <p style="margin-top:8px;color:var(--muted)"><strong>Not reproducible &mdash; environment-specific</strong></p>
+    </div>
+  </div>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>Conclusion:</strong> Both issues had head_dim misdetection as root cause. Resolved by P1&rarr;P5 cascade.
+  </div>
+</section>
+
+<!-- DISTILL BENCHMARK -->
+<section>
+  <h2>Distill Model Benchmark <span class="tag tag-purple">New</span></h2>
+  <hr class="divider">
+
+  <p style="font-size:0.7em;color:var(--muted)">Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled Q4_K_M, head_dim=256</p>
+
+  <table>
+    <thead><tr><th>Config</th><th>PPL</th><th>vs F16</th><th>KV Memory</th><th>Compression</th></tr></thead>
+    <tbody>
+      <tr><td>f16/f16</td><td><strong>6.16</strong></td><td>baseline</td><td>8,192 MiB</td><td>1.0x</td></tr>
+      <tr><td><strong>tbqp4/tbq4</strong></td><td><strong>6.20</strong></td><td class="ok"><strong>+0.6%</strong></td><td>2,096 MiB</td><td><strong>3.9x</strong></td></tr>
+      <tr><td><strong>tbqp3/tbq3</strong></td><td><strong>6.23</strong></td><td class="ok"><strong>+1.1%</strong></td><td>1,584 MiB</td><td><strong>5.2x</strong></td></tr>
+      <tr><td>tbq4/tbq4</td><td>7.01</td><td>+13.8%</td><td>&mdash;</td><td>&mdash;</td></tr>
+      <tr><td>tbq3/tbq3</td><td>7.11</td><td>+15.4%</td><td>&mdash;</td><td>&mdash;</td></tr>
+    </tbody>
+  </table>
+
+  <div class="highlight-box purple" style="margin-top:14px">
+    <strong>head_dim=256 + QJL:</strong> 5.2x compression with only PPL +1.1% &mdash; nearly lossless
+  </div>
+</section>
+
+<!-- PAULI TEST -->
+<section>
+  <h2>Scientist Name Test (6 names) <span class="tag tag-green">Passed</span></h2>
+  <hr class="divider">
+
+  <p style="font-size:0.7em;color:var(--muted);margin-bottom:14px">tbqp3/tbq3 (5.2x compression), Qwen3.5-27B-Claude-4.6-Opus-Distilled</p>
+
+  <table>
+    <thead><tr><th>Scientist</th><th>Output (Korean)</th><th>Standard (Korean)</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td>Wolfgang Pauli</td><td>Bolpeugang Paulli</td><td>Bolpeugang Paulli</td><td class="ok">PASS</td></tr>
+      <tr><td>Niels Bohr</td><td>Nielseu Boeo</td><td>Nilseu Boeo</td><td style="color:var(--warning)">OK*</td></tr>
+      <tr><td>Erwin Schr&ouml;dinger</td><td>Ereubin Syuroedingeo</td><td>Ereubin Syuroedingeo</td><td class="ok">PASS</td></tr>
+      <tr><td>Werner Heisenberg</td><td>Bereneo Haijenberekeu</td><td>Bereneo Haijenberekeu</td><td class="ok">PASS</td></tr>
+      <tr><td>Max Planck</td><td>Makseu Peullangkeu</td><td>Makseu Peullangkeu</td><td class="ok">PASS</td></tr>
+      <tr><td>Enrico Fermi</td><td>Eriko Pereumi</td><td>Enriko Pereumi</td><td style="color:var(--warning)">OK*</td></tr>
+    </tbody>
+  </table>
+
+  <p style="font-size:0.65em;color:var(--muted);margin-top:10px">* Commonly used transliteration with minor difference from standard &mdash; Chinese LLM characteristic (unrelated to TurboQuant, F16 produces same output)</p>
+</section>
+
+<!-- CODE REVIEW -->
+<section>
+  <h2>Code Review Fixes <span class="tag tag-yellow">Quality</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Critical (2 items)</h4>
+      <ul>
+        <li>Missing <code>head_dim=0</code> reset after pow2 validation</li>
+        <li>V fallback type mismatch (f16 vs q8_0) unified</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Medium (1 item)</h4>
+      <ul>
+        <li>Skip entire detection logic when TBQ unused</li>
+        <li>Remove unnecessary metadata reads + logs</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    After fixes: rebuild + Pauli test passed + patches/modified_files regenerated
+  </div>
+</section>
+
+<!-- COMMUNITY -->
+<section>
+  <h2>Community Response <span class="tag tag-blue">Communication</span></h2>
+  <hr class="divider">
+
+  <ul class="items">
+    <li class="check"><strong>@dagbdagb</strong> &mdash; Pointed out "6 signals" error &rarr; corrected to "5-level cascade"</li>
+    <li class="check"><strong>@sztlink</strong> &mdash; Thanks for RTX 4090 bench + requested v1.3.0 retest</li>
+    <li class="check"><strong>@zekrom-vale</strong> &mdash; turbo4 explosion was head_dim misdetection, our fork is fine</li>
+    <li class="check"><strong>@Defilan</strong> &mdash; SM 120 testing welcome + shared upstream integration plan</li>
+    <li class="check"><strong>@fritolays</strong> &mdash; Thanks for 7-architecture bench + requested Phi-4/DeepSeek retest</li>
+    <li class="check"><strong>@yajo</strong> &mdash; Explained orthogonal relationship between BitNet and TurboQuant</li>
+  </ul>
+
+  <div class="highlight-box blue" style="margin-top:14px">
+    <strong>Upstream plan:</strong> PR to llama.cpp main after stabilization. Currently managing patches+diffs in turboquant/ directory.
+  </div>
+</section>
+
+<!-- THETOM FORK -->
+<section>
+  <h2>TheTom Fork Analysis <span class="tag tag-red">Analysis</span></h2>
+  <hr class="divider">
+
+  <ul class="items">
+    <li class="check"><strong>Analyzed TheTom's turboquant_plus fork code</strong></li>
+    <li class="check"><strong>Actual root cause of turbo4-K PPL explosion:</strong> 7 kernel bugs (SET_ROWS packing mismatch, QJL stage missing, etc.)</li>
+    <li class="check"><strong>Our fork is an independent implementation</strong> &mdash; unaffected by those bugs</li>
+    <li class="check"><strong>Comment corrected:</strong> "head_dim misdetection" &rarr; "TheTom fork's own kernel bugs"</li>
+    <li class="check"><strong>Shared analysis results with TheTom</strong> + acknowledged turbo4-resurrection paper</li>
+  </ul>
+
+  <div class="highlight-box red" style="margin-top:14px">
+    <strong>Key finding:</strong> turbo4 PPL explosion was caused by 7 kernel bugs in TheTom's fork. Unrelated to our independent implementation.
+  </div>
+</section>
+
+<!-- SUMMARY -->
+<section>
+  <h2>Key Achievements Summary</h2>
+  <hr class="divider">
+
+  <div class="card-grid three">
+    <div class="card metric">
+      <div class="num purple">7</div>
+      <div class="label">Issues Resolved</div>
+    </div>
+    <div class="card metric">
+      <div class="num blue">9h</div>
+      <div class="label">Work Duration</div>
+    </div>
+    <div class="card metric">
+      <div class="num green">v1.3.0</div>
+      <div class="label">Release Deployed</div>
+    </div>
+  </div>
+
+  <div style="margin-top: 24px;">
+    <ul class="items">
+      <li class="check"><strong>P1&rarr;P5 Priority Cascade</strong> &mdash; 6-signal cross-validation</li>
+      <li class="check"><strong>Community issues 6/6 resolved</strong> &mdash; Phi-4, turbo4, GLM, ////, llama-bench, OpenSSL</li>
+      <li class="check"><strong>Distill benchmark</strong> &mdash; PPL 6.23 (+1.1%), 5.2x compression nearly lossless</li>
+      <li class="check"><strong>Scientist names 6/6</strong> &mdash; head_dim=256 QJL precision perfectly maintained</li>
+      <li class="check"><strong>Code review applied</strong> &mdash; 2 Critical + 1 Medium fixes</li>
+      <li class="check"><strong>Responded to 8 community members</strong> &mdash; shared upstream integration plan</li>
+      <li class="check"><strong>TheTom fork analysis</strong> &mdash; turbo4 PPL explosion caused by 7 kernel bugs, confirmed unrelated to our independent implementation</li>
+    </ul>
+  </div>
+</section>
+
+<!-- END -->
+<section class="cover">
+  <h1 style="font-size:1.6em">Thank You</h1>
+  <hr class="divider">
+  <p class="meta">
+    <span>TurboQuant v1.3.0</span>
+    <span>2026-04-01</span>
+  </p>
+</section>
+
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>
+Reveal.initialize({
+  hash: true,
+  slideNumber: 'c/t',
+  width: 1280,
+  height: 720,
+  margin: 0.04,
+  transition: 'fade',
+  transitionSpeed: 'fast',
+  pdfSeparateFragments: false,
+  pdfMaxPagesPerSlide: 1
+});
+</script>
+</body>
+</html>

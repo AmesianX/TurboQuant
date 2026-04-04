@@ -1,0 +1,86 @@
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index b1ec32906..bcd7b2050 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -302,6 +302,81 @@ typedef struct {
+ } block_tbqp4_0;
+ static_assert(sizeof(block_tbqp4_0) == 2*sizeof(ggml_half) + QK_K*3/8 + QK_K/8, "wrong tbqp4_0 block size/padding");
+ 
++// TurboQuant head_dim=128 variants (blck_size=128)
++#define TBQ_K128 128
++
++// TurboQuant 3-bit, 128-block: ~3.125 bpw
++typedef struct {
++    ggml_half d;               // L2 norm of original vector
++    uint8_t qs[TBQ_K128*3/8]; // 3-bit packed indices (48 bytes for 128 elements)
++} block_tbq3_1;
++static_assert(sizeof(block_tbq3_1) == sizeof(ggml_half) + TBQ_K128*3/8, "wrong tbq3_1 block size/padding");
++
++// TurboQuant 4-bit, 128-block: ~4.125 bpw
++typedef struct {
++    ggml_half d;               // L2 norm of original vector
++    uint8_t qs[TBQ_K128/2];   // 4-bit packed indices (64 bytes for 128 elements)
++} block_tbq4_1;
++static_assert(sizeof(block_tbq4_1) == sizeof(ggml_half) + TBQ_K128/2, "wrong tbq4_1 block size/padding");
++
++// TurboQuant_prod 3-bit, 128-block: 2-bit Lloyd-Max + 1-bit QJL
++typedef struct {
++    ggml_half d;                 // L2 norm (MSE part)
++    ggml_half d_qjl;             // residual L2 norm (QJL part)
++    uint8_t qs[TBQ_K128/4];     // 2-bit packed Lloyd-Max indices (32 bytes)
++    uint8_t qjl[TBQ_K128/8];    // 1-bit QJL signs (16 bytes)
++} block_tbqp3_1;
++static_assert(sizeof(block_tbqp3_1) == 2*sizeof(ggml_half) + TBQ_K128/4 + TBQ_K128/8, "wrong tbqp3_1 block size/padding");
++
++// TurboQuant_prod 4-bit, 128-block: 3-bit Lloyd-Max + 1-bit QJL
++typedef struct {
++    ggml_half d;                 // L2 norm (MSE part)
++    ggml_half d_qjl;             // residual L2 norm (QJL part)
++    uint8_t qs[TBQ_K128*3/8];   // 3-bit packed Lloyd-Max indices (48 bytes)
++    uint8_t qjl[TBQ_K128/8];    // 1-bit QJL signs (16 bytes)
++} block_tbqp4_1;
++static_assert(sizeof(block_tbqp4_1) == 2*sizeof(ggml_half) + TBQ_K128*3/8 + TBQ_K128/8, "wrong tbqp4_1 block size/padding");
++
++// TurboQuant head_dim=64 variants (blck_size=64)
++#define TBQ_K64 64
++
++typedef struct {
++    ggml_half d;
++    uint8_t qs[TBQ_K64*3/8];
++} block_tbq3_2;
++static_assert(sizeof(block_tbq3_2) == sizeof(ggml_half) + TBQ_K64*3/8, "wrong tbq3_2 block size/padding");
++
++typedef struct {
++    ggml_half d;
++    uint8_t qs[TBQ_K64/2];
++} block_tbq4_2;
++static_assert(sizeof(block_tbq4_2) == sizeof(ggml_half) + TBQ_K64/2, "wrong tbq4_2 block size/padding");
++
++typedef struct {
++    ggml_half d;
++    ggml_half d_qjl;
++    uint8_t qs[TBQ_K64/4];
++    uint8_t qjl[TBQ_K64/8];
++} block_tbqp3_2;
++static_assert(sizeof(block_tbqp3_2) == 2*sizeof(ggml_half) + TBQ_K64/4 + TBQ_K64/8, "wrong tbqp3_2 block size/padding");
++
++typedef struct {
++    ggml_half d;
++    ggml_half d_qjl;
++    uint8_t qs[TBQ_K64*3/8];
++    uint8_t qjl[TBQ_K64/8];
++} block_tbqp4_2;
++static_assert(sizeof(block_tbqp4_2) == 2*sizeof(ggml_half) + TBQ_K64*3/8 + TBQ_K64/8, "wrong tbqp4_2 block size/padding");
++
++// TurboQuant cross-head WHT variants (8 heads × 64 dims = 512-element WHT)
++// Block format identical to _2 (blck_size=64), but quantization spans 8 heads
++// The 'd' field stores the L2 norm of the 512-element concatenated vector
++
++typedef block_tbq3_2  block_tbq3_3;
++typedef block_tbq4_2  block_tbq4_3;
++typedef block_tbqp3_2 block_tbqp3_3;
++typedef block_tbqp4_2 block_tbqp4_3;
++
+ //
+ // Super-block quantization structures
+ //
