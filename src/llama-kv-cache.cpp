@@ -277,16 +277,31 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
     }
 
+    // TBQ types require WHT rotation regardless of variable GQA
+    // (WHT operates per-head, not per-GQA-group, so variable n_head_kv is fine)
+    const bool is_tbq_k = type_k == GGML_TYPE_TBQ3_0  || type_k == GGML_TYPE_TBQ4_0
+                       || type_k == GGML_TYPE_TBQP3_0 || type_k == GGML_TYPE_TBQP4_0
+                       || type_k == GGML_TYPE_TBQ3_1  || type_k == GGML_TYPE_TBQ4_1
+                       || type_k == GGML_TYPE_TBQP3_1 || type_k == GGML_TYPE_TBQP4_1
+                       || type_k == GGML_TYPE_TBQ3_2  || type_k == GGML_TYPE_TBQ4_2
+                       || type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2
+                       || type_k == GGML_TYPE_TBQ3_4  || type_k == GGML_TYPE_TBQ4_4
+                       || type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4;
+    const bool is_tbq_v = type_v == GGML_TYPE_TBQ3_0  || type_v == GGML_TYPE_TBQ4_0
+                       || type_v == GGML_TYPE_TBQ3_1  || type_v == GGML_TYPE_TBQ4_1
+                       || type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2
+                       || type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4;
+
     attn_rot_k =
         !attn_rot_disable &&
         ggml_is_quantized(type_k) &&
-        !hparams.is_n_embd_k_gqa_variable() &&
+        (is_tbq_k || !hparams.is_n_embd_k_gqa_variable()) &&
         hparams.n_embd_head_k() % 64 == 0;
 
     attn_rot_v =
         !attn_rot_disable &&
         ggml_is_quantized(type_v) &&
-        !hparams.is_n_embd_v_gqa_variable() &&
+        (is_tbq_v || !hparams.is_n_embd_v_gqa_variable()) &&
         hparams.n_embd_head_v() % 64 == 0;
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d\n", __func__, attn_rot_k);
