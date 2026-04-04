@@ -95,6 +95,9 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
+    // Note: TurboQuant head_dim auto-mapping (_0 → _1/_2) is done in llama_init_from_model()
+    // before this constructor is called. No duplicate mapping needed here.
+
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:

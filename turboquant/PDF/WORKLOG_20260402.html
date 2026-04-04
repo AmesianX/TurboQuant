@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>업무일지 2026-04-02 ~ 04-03</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {
+    --bg: #fafbfc;
+    --fg: #1a1a2e;
+    --accent: #3b82f6;
+    --accent2: #8b5cf6;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --muted: #64748b;
+    --card-bg: #ffffff;
+    --border: #e2e8f0;
+  }
+
+  .reveal {
+    font-family: 'Noto Sans KR', sans-serif;
+    font-size: 28px;
+    color: var(--fg);
+  }
+
+  .reveal .slides { text-align: left; }
+  .reveal .slides section { padding: 40px 50px; box-sizing: border-box; }
+
+  .reveal h1, .reveal h2, .reveal h3 {
+    font-family: 'Noto Sans KR', sans-serif;
+    font-weight: 700;
+    color: var(--fg);
+    text-transform: none;
+    letter-spacing: -0.02em;
+  }
+  .reveal h1 { font-size: 2.0em; margin-bottom: 0.2em; }
+  .reveal h2 { font-size: 1.4em; margin-bottom: 0.5em; }
+  .reveal h3 { font-size: 1.1em; margin-bottom: 0.4em; color: var(--accent); }
+
+  .cover {
+    text-align: center !important;
+    display: flex !important;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  .cover h1 {
+    font-size: 2.2em;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 0.1em;
+  }
+  .cover .subtitle { font-size: 1.0em; color: var(--muted); font-weight: 300; margin-bottom: 1.5em; }
+  .cover .meta { font-size: 0.7em; color: var(--muted); line-height: 1.8; }
+  .cover .meta span { display: inline-block; background: #f1f5f9; padding: 4px 14px; border-radius: 20px; margin: 3px 4px; }
+
+  .divider { width: 60px; height: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); border: none; border-radius: 2px; margin: 10px 0 20px 0; }
+  .cover .divider { margin: 10px auto 20px auto; }
+
+  .tag { display: inline-block; font-size: 0.55em; font-weight: 500; padding: 2px 10px; border-radius: 12px; vertical-align: middle; margin-left: 8px; }
+  .tag-blue { background: #dbeafe; color: #1d4ed8; }
+  .tag-green { background: #d1fae5; color: #065f46; }
+  .tag-red { background: #fee2e2; color: #991b1b; }
+  .tag-yellow { background: #fef3c7; color: #92400e; }
+  .tag-purple { background: #ede9fe; color: #5b21b6; }
+
+  .timeline { position: relative; padding-left: 24px; margin: 0; }
+  .timeline::before { content: ''; position: absolute; left: 6px; top: 4px; bottom: 4px; width: 2px; background: var(--border); }
+  .timeline li { list-style: none; position: relative; margin-bottom: 12px; font-size: 0.78em; line-height: 1.6; }
+  .timeline li::before { content: ''; position: absolute; left: -22px; top: 8px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); border: 2px solid white; box-shadow: 0 0 0 2px var(--accent); }
+  .timeline .time { font-family: 'JetBrains Mono', monospace; font-size: 0.85em; color: var(--muted); font-weight: 500; }
+
+  .items { list-style: none; padding: 0; margin: 0; }
+  .items li { position: relative; padding-left: 20px; margin-bottom: 10px; font-size: 0.78em; line-height: 1.7; }
+  .items li::before { content: ''; position: absolute; left: 0; top: 10px; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); opacity: 0.6; }
+  .items li.check::before { background: var(--success); opacity: 1; border-radius: 50%; }
+
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+  .card-grid.three { grid-template-columns: 1fr 1fr 1fr; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin: 0 0 8px 0; font-size: 0.75em; font-weight: 700; color: var(--fg); }
+  .card p, .card ul { margin: 0; font-size: 0.65em; line-height: 1.7; color: #475569; }
+  .card ul { padding-left: 16px; }
+
+  .highlight-box { border-left: 4px solid; border-radius: 6px; padding: 14px 18px; margin: 14px 0; font-size: 0.78em; line-height: 1.7; }
+  .highlight-box.blue { border-color: var(--accent); background: #eff6ff; }
+  .highlight-box.green { border-color: var(--success); background: #ecfdf5; }
+  .highlight-box.red { border-color: var(--danger); background: #fef2f2; }
+  .highlight-box.purple { border-color: var(--accent2); background: #f5f3ff; }
+
+  .reveal code { font-family: 'JetBrains Mono', monospace; font-size: 0.88em; background: #f1f5f9; padding: 1px 6px; border-radius: 4px; color: var(--accent2); }
+
+  .reveal table { width: 100%; border-collapse: collapse; font-size: 0.65em; margin-top: 10px; }
+  .reveal table th { background: #f8fafc; font-weight: 600; text-align: left; padding: 8px 12px; border-bottom: 2px solid var(--border); color: var(--muted); font-size: 0.9em; text-transform: uppercase; letter-spacing: 0.05em; }
+  .reveal table td { padding: 8px 12px; border-bottom: 1px solid var(--border); line-height: 1.5; }
+  .reveal table tr:last-child td { border-bottom: none; }
+  .reveal table .ok { color: var(--success); font-weight: 600; }
+  .reveal table .ng { color: var(--danger); font-weight: 600; }
+
+  .metric { text-align: center; padding: 10px; }
+  .metric .num { font-size: 2.0em; font-weight: 700; line-height: 1.1; }
+  .metric .label { font-size: 0.6em; color: var(--muted); margin-top: 4px; }
+  .metric .num.blue { color: var(--accent); }
+  .metric .num.green { color: var(--success); }
+  .metric .num.purple { color: var(--accent2); }
+  .metric .num.red { color: var(--danger); }
+
+  @media print { .reveal .slides section { page-break-after: always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>TurboQuant v1.4.0</h1>
+  <p class="subtitle">업무일지 / Work Log</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-02 ~ 04-03</span>
+    <span>GLM-4.7-Flash + V Cache Bug Fix</span>
+    <br>
+    <span>head_dim=576 블록 분할 구현</span>
+    <span>IWHT FP16&rarr;FP32 정밀도 수정</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>세션 개요</h2>
+  <hr class="divider">
+  <ul class="timeline">
+    <li><span class="time">04-02 PM</span> &mdash; GLM-4.7-Flash head_dim=576 설계 문서 검토 + 구현 계획</li>
+    <li><span class="time">04-02 PM</span> &mdash; 타입 시스템 + 블록 구조체 + auto-mapping + 양자화 커널 구현</li>
+    <li><span class="time">04-02 PM</span> &mdash; K dot product + V dequant + Q 전처리 + IWHT 구현</li>
+    <li><span class="time">04-02 PM</span> &mdash; Template dispatch + 20개 instance 파일 + 빌드 시스템</li>
+    <li><span class="time">04-02 EVE</span> &mdash; 빌드 성공 + GLM-4.7-Flash 생성 테스트 (49.4/65.6 t/s)</li>
+    <li><span class="time">04-02 EVE</span> &mdash; GitHub Issue #2 버그 재현 (Windows + Linux)</li>
+    <li><span class="time">04-02 EVE</span> &mdash; V 캐시 IWHT FP16 정밀도 버그 발견 + FP32 수정</li>
+    <li><span class="time">04-03 AM</span> &mdash; Q 전처리 WHT도 FP32로 통일 (ROCm 호환)</li>
+    <li><span class="time">04-03 AM</span> &mdash; v1.4.0 릴리즈 + 워크플로 + 커뮤니티 댓글</li>
+  </ul>
+</section>
+
+<!-- GLM-4.7-Flash 256+256+64 -->
+<section>
+  <h2>GLM-4.7-Flash head_dim=576 <span class="tag tag-purple">핵심</span></h2>
+  <hr class="divider">
+
+  <p style="font-size:0.75em; color:var(--muted); margin-bottom: 14px">
+    WHT는 power-of-2만 지원 &rarr; 576 = <strong>256 + 256 + 64</strong> 블록 분할로 해결
+  </p>
+
+  <table>
+    <thead><tr><th>블록</th><th>범위</th><th>WHT</th><th>보정</th><th>커널</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Sub-block 1</strong></td><td>[0, 256)</td><td>WHT_256</td><td>QJL SRHT</td><td>기존 _0 재활용</td></tr>
+      <tr><td><strong>Sub-block 2</strong></td><td>[256, 512)</td><td>WHT_256</td><td>QJL SRHT</td><td>기존 _0 재활용</td></tr>
+      <tr><td><strong>Sub-block 3</strong></td><td>[512, 576)</td><td>WHT_64</td><td>Direct Sign</td><td>기존 _2 재활용</td></tr>
+    </tbody>
+  </table>
+
+  <div class="highlight-box purple" style="margin-top:14px">
+    <strong>시뮬레이션 결과:</strong> MSE -3.4% vs Full QR 직교 회전, 메모리 오버헤드 0%. 256이 sweet spot &mdash; 512 한 덩어리보다 256 두 개가 MSE 낮음.
+  </div>
+</section>
+
+<!-- SIMULATION DATA -->
+<section>
+  <h2>시뮬레이션 비교 (500회 반복, 3-bit) <span class="tag tag-blue">검증</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>방법</th><th>MSE</th><th>vs Full QR</th><th>저장</th><th>오버헤드</th></tr></thead>
+    <tbody>
+      <tr><td>FullPad 1024</td><td>0.063</td><td>-40.6%</td><td>1024</td><td class="ng">78%</td></tr>
+      <tr style="background:#eff6ff"><td><strong>256+256+64</strong></td><td><strong>0.102</strong></td><td class="ok"><strong>-3.4%</strong></td><td><strong>576</strong></td><td class="ok"><strong>0%</strong></td></tr>
+      <tr><td>Full QR ortho</td><td>0.106</td><td>기준</td><td>576</td><td>0%</td></tr>
+      <tr><td>512+64</td><td>0.108</td><td>+2.5%</td><td>576</td><td>0%</td></tr>
+      <tr><td>Kronecker H64&otimes;O9</td><td>0.112</td><td>+5.2%</td><td>576</td><td>0%</td></tr>
+      <tr><td>No rotation</td><td>0.569</td><td class="ng">+435%</td><td>576</td><td>0%</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- IMPLEMENTATION -->
+<section>
+  <h2>구현 상세 <span class="tag tag-blue">32 files</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>타입 시스템</h4>
+      <ul>
+        <li>4 enum: TBQ3_4 ~ TBQP4_4 (ID 57-60)</li>
+        <li>4 composite block struct (228-300B)</li>
+        <li>blck_size = 576, type_traits 등록</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>양자화 (Encoding)</h4>
+      <ul>
+        <li>4 quantize 함수 (sub-block별 독립 WHT)</li>
+        <li>Sub-block 1,2: QJL SRHT 보정</li>
+        <li>Sub-block 3: Direct Sign 보정</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>역양자화 (Decoding)</h4>
+      <ul>
+        <li>K dot product 4개 + V dequant 2개</li>
+        <li>Q 전처리: 3-pass split WHT</li>
+        <li>V IWHT: 3-pass 역변환 &rarr; dst</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>인프라</h4>
+      <ul>
+        <li>20 template instance (.cu) 파일</li>
+        <li>CMakeLists + fattn.cu dispatch</li>
+        <li>auto-mapping head_dim=576 &rarr; _4</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- V CACHE BUG -->
+<section>
+  <h2>V 캐시 IWHT FP16 정밀도 버그 <span class="tag tag-red">치명적</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>증상</h4>
+      <ul>
+        <li>~1500-2300토큰 이후 <code>////</code> 또는 <code>???</code> 반복</li>
+        <li>tbqp3: ~1826tok에서 발생</li>
+        <li>tbqp4: ~2284tok에서 발생</li>
+        <li>f16 V: 문제 없음</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>원인 분석</h4>
+      <ul>
+        <li>V IWHT butterfly가 FP16(half)으로 수행</li>
+        <li>누적된 WHT 도메인 값 &rarr; FP16 정밀도 초과</li>
+        <li>Catastrophic cancellation in subtraction</li>
+        <li>K만 양자화 &rarr; 정상, V만 양자화 &rarr; 손상</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box red" style="margin-top:14px">
+    <strong>K/V 분리 테스트가 핵심:</strong> tbqp3 K + f16 V = 정상 / f16 K + tbq3 V = 손상 &rarr; V 경로 특정
+  </div>
+</section>
+
+<!-- BUG FIX -->
+<section>
+  <h2>수정: WHT/IWHT 전체 FP32 전환 <span class="tag tag-green">해결</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>경로</th><th>수정 전</th><th>수정 후</th><th>영향</th></tr></thead>
+    <tbody>
+      <tr><td>V IWHT (D=256/128/64/576)</td><td class="ng">FP16 butterfly</td><td class="ok">FP32 butterfly</td><td>corruption 해결</td></tr>
+      <tr><td>Q WHT MSE (D=256/128/64/576)</td><td class="ng">FP16 butterfly</td><td class="ok">FP32 butterfly</td><td>정밀도 + ROCm</td></tr>
+      <tr><td>Q WHT QJL (D=256/576)</td><td class="ng">FP16 butterfly</td><td class="ok">FP32 butterfly</td><td>정밀도 + ROCm</td></tr>
+    </tbody>
+  </table>
+
+  <div class="card-grid" style="margin-top:14px">
+    <div class="card">
+      <h4>검증 결과</h4>
+      <table>
+        <tr><td>Qwen3.5-27B tbqp3/tbq3</td><td>4096 tok</td><td class="ok">NO CORRUPTION</td></tr>
+        <tr><td>파울리 테스트</td><td>볼프강 파울리</td><td class="ok">정확</td></tr>
+        <tr><td>하이젠베르크 테스트</td><td>베르너 하이젠베르크</td><td class="ok">정확</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h4>부수 효과</h4>
+      <ul>
+        <li>KV 캐시 압축률: 변화 없음</li>
+        <li>속도 오버헤드: 측정 불가 수준</li>
+        <li>ROCm/HIP 빌드 호환성 개선</li>
+        <li><code>__shfl_xor_sync</code> half &rarr; float</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- COMMUNITY -->
+<section>
+  <h2>커뮤니티 이슈 대응 <span class="tag tag-green">완료</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>이슈</th><th>보고자</th><th>내용</th><th>상태</th></tr></thead>
+    <tbody>
+      <tr><td>#2</td><td>@alrunan</td><td>//// 출력 (RTX 5090, Qwen3.5-27B)</td><td class="ok">v1.4.0 수정</td></tr>
+      <tr><td>#2</td><td>@superherointj</td><td>Linux NixOS에서도 동일 재현</td><td class="ok">v1.4.0 수정</td></tr>
+      <tr><td>#3</td><td>@jarkevithwlad</td><td>standalone 크래시 (RTX 3090)</td><td style="color:var(--warning)">v1.4.0 시도 요청</td></tr>
+      <tr><td>#4</td><td>@dpblnt</td><td>Vulkan SET_ROWS 미지원</td><td style="color:var(--muted)">CUDA 전용 안내</td></tr>
+      <tr><td>#5</td><td>@dpblnt</td><td>ROCm(HIP) 빌드 실패</td><td class="ok">FP32 전환으로 해결</td></tr>
+      <tr><td>#6</td><td>@jarkevithwlad</td><td>Gemma 4 아키텍처 미인식</td><td style="color:var(--muted)">upstream 필요</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- RELEASE -->
+<section>
+  <h2>v1.4.0 릴리즈 <span class="tag tag-green">배포</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid three">
+    <div class="card">
+      <div class="metric">
+        <div class="num purple">32</div>
+        <div class="label">수정/추가 파일</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="metric">
+        <div class="num blue">4</div>
+        <div class="label">새 타입 (TBQ_4)</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="metric">
+        <div class="num green">0</div>
+        <div class="label">Corruption (4096tok)</div>
+      </div>
+    </div>
+  </div>
+
+  <ul class="items" style="margin-top:20px">
+    <li class="check">GitHub 릴리즈: v1.4.0 생성 + 릴리즈 노트</li>
+    <li class="check">빌드 워크플로 트리거 (Linux x64/arm64, Windows x64, CUDA 12.8)</li>
+    <li class="check">README.md 업데이트 (한국어 + 영어)</li>
+    <li class="check">Issue #2, #3, #4, #5, #6 댓글 대응</li>
+    <li class="check">llama.cpp Discussion #20969 공지</li>
+    <li class="check">turboquant/ 디렉토리 백업 (modified_files + patches)</li>
+  </ul>
+</section>
+
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash: true, slideNumber: true, width: 1280, height: 720 });</script>
+</body>
+</html>

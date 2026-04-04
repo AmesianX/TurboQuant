@@ -2961,6 +2961,50 @@ llama_context * llama_init_from_model(
         }
     }
 
+    // TurboQuant head_dim auto-detection: map _0 types (blck_size=256) to _1 types (blck_size=128)
+    {
+        auto tbq_map = [&](ggml_type & t, uint32_t head_dim) {
+            if (head_dim == 128) {
+                ggml_type orig = t;
+                switch (t) {
+                    case GGML_TYPE_TBQ3_0:  t = GGML_TYPE_TBQ3_1;  break;
+                    case GGML_TYPE_TBQ4_0:  t = GGML_TYPE_TBQ4_1;  break;
+                    case GGML_TYPE_TBQP3_0: t = GGML_TYPE_TBQP3_1; break;
+                    case GGML_TYPE_TBQP4_0: t = GGML_TYPE_TBQP4_1; break;
+                    default: return;
+                }
+                LLAMA_LOG_INFO("%s: TurboQuant auto-map: %s -> %s (head_dim=%u)\n",
+                        __func__, ggml_type_name(orig), ggml_type_name(t), head_dim);
+            } else if (head_dim == 64) {
+                ggml_type orig = t;
+                switch (t) {
+                    case GGML_TYPE_TBQ3_0:  t = GGML_TYPE_TBQ3_2;  break;
+                    case GGML_TYPE_TBQ4_0:  t = GGML_TYPE_TBQ4_2;  break;
+                    case GGML_TYPE_TBQP3_0: t = GGML_TYPE_TBQP3_2; break;
+                    case GGML_TYPE_TBQP4_0: t = GGML_TYPE_TBQP4_2; break;
+                    default: return;
+                }
+                LLAMA_LOG_INFO("%s: TurboQuant auto-map: %s -> %s (head_dim=%u)\n",
+                        __func__, ggml_type_name(orig), ggml_type_name(t), head_dim);
+            } else if (head_dim != 256 && head_dim != 512) {
+                // _0 types support 256 and 512 (2×256 sub-blocks, e.g. GLM-4.7-Flash V)
+                switch (t) {
+                    case GGML_TYPE_TBQ3_0:
+                    case GGML_TYPE_TBQ4_0:
+                    case GGML_TYPE_TBQP3_0:
+                    case GGML_TYPE_TBQP4_0:
+                        LLAMA_LOG_WARN("%s: TurboQuant unsupported head_dim=%u, falling back to F16\n",
+                                __func__, head_dim);
+                        t = GGML_TYPE_F16;
+                        break;
+                    default: break;
+                }
+            }
+        };
+        tbq_map(params.type_k, model->hparams.n_embd_head_k());
+        tbq_map(params.type_v, model->hparams.n_embd_head_v());
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
