@@ -9,49 +9,67 @@
 
 Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
 
-### 🆕 v1.4.0 — GLM-4.7-Flash (head_dim=576) 지원 + V 캐시 IWHT 버그 수정
+### 🆕 v1.4.2 — MMA Tensor Core 가속 + QJL Scalar Correction
 
-**GLM-4.7-Flash 지원 — Non-power-of-2 head_dim 해결:**
+**TBQ/TBQP MMA 텐서코어 가속으로 토큰 생성 속도 30→49 t/s (+63%).**
 
-GLM-4.7-Flash는 head_dim=576을 사용합니다. WHT는 power-of-2만 지원하므로, **256+256+64 블록 분할** 기법으로 해결했습니다:
+GLM-4.7-Flash (MLA, K=576/V=512) 비대칭 모델에서 MMA 텐서코어를 활용한 KV 캐시 attention 가속. vec 커널 대비 최대 1.6배 TG 속도 향상.
 
-| 블록 | 범위 | WHT | 보정 | 커널 |
-|------|------|-----|------|------|
-| Sub-block 1 | [0, 256) | WHT_256 | QJL SRHT | 기존 _0 재활용 |
-| Sub-block 2 | [256, 512) | WHT_256 | QJL SRHT | 기존 _0 재활용 |
-| Sub-block 3 | [512, 576) | WHT_64 | Direct Sign | 기존 _2 재활용 |
+**핵심 기술:**
 
-- **시뮬레이션 검증:** MSE -3.4% vs Full QR 직교 회전, 메모리 오버헤드 0%
-- **256이 sweet spot인 이유:** CLT 수렴과 블록 단위 양자화 정밀도의 균형점
-- **범용 적용:** head_dim=80(64+16), 192(128+64) 등 임의 차원에 확장 가능
+1. **MMA K spatial dequant**: TBQ/TBQP raw blocks → IWHT → spatial f16 → tensor core. Warp shuffle 최적화로 cooperative IWHT의 `__syncthreads` 8→4회 감소.
+2. **QJL scalar correction**: TBQP의 QJL 1-bit 보정을 full MMA pass 대신 경량 scalar 연산으로 수행. K의 raw block에서 sign bits + dq를 직접 읽어 `dq × Σ(Q_wht2[i] × sign[i])` 계산. QJL의 두 번째 sign basis(signs2)를 올바르게 처리.
+3. **V = K view spatial**: K를 spatial domain으로 dequant하므로 V(= K view)도 자동으로 spatial. Output IWHT 완전 제거.
+4. **정식 커널 시그니처**: `fattn_kernel_t`에 `raw_K_data`, `raw_K_stride`, `Q_wht2_data`, `Q_wht2_stride` 파라미터 추가. hack 없는 정석 구현.
+5. **Fused Q WHT12**: Q->data에서 직접 읽어 Q_wht1(중간값) + Q_wht2(QJL용) 계산. cudaMemcpy 제거.
 
-```bash
-# GLM-4.7-Flash에서 자동 적용
---cache-type-k tbqp3 --cache-type-v tbq3  # head_dim=576 자동 감지 → _4 타입 선택
-```
+**벤치마크 (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
 
-**V 캐시 IWHT FP16 정밀도 버그 수정 (Issue #2):**
+| 캐시 | KV MiB | 압축 | TG t/s | vs v1.4.1 | 파울리 |
+|------|--------|------|--------|-----------|--------|
+| f16/f16 | 10,469 | 1.0x | 67.5 | — | PASS |
+| **tbq3/tbq3** | **2,944** | **3.6x** | **49.7** | **+55%** (32→49.7) | **PASS** |
+| **tbqp3/tbq3** | **2,981** | **3.5x** | **42.8** | **+36%** (31.5→42.8) | **PASS** |
+| tbq4/tbq4 | 3,526 | 3.0x | ~49 | +47% | PASS |
+| tbqp4/tbq4 | 3,562 | 2.9x | ~42 | +45% | PASS |
 
-~1500토큰 이후 출력이 깨지는 치명적 버그를 수정했습니다.
+> **참고:** TBQP(QJL 보정)가 TBQ보다 느린 이유: QJL은 별도 sign basis(signs2)로 WHT 변환 후 scalar correction을 수행하므로 Q_wht2 precompute + per-token scalar correction 오버헤드. 대신 dot product 정확도가 향상되어 PPL 개선.
 
-- **원인:** V 캐시 역WHT(IWHT)의 butterfly 연산이 FP16으로 수행 → 누적된 WHT 도메인 값에서 catastrophic cancellation 발생
-- **증상:** ~1500-2300토큰 이후 `////` 또는 `???` 반복 출력
-- **수정:** 모든 WHT/IWHT를 FP32 butterfly로 변경 (Q 전처리 + V 후처리 모두). KV 캐시 압축률 변화 없음
-- Windows RTX 5090에서 직접 빌드 + 검증 완료:
+---
 
-| 모델 | 캐시 타입 | 4096 토큰 | 결과 |
-|------|-----------|-----------|------|
-| Qwen3.5-27B-UD-Q4_K_XL | tbqp3/tbq3 | 18,282 chars | ✅ CLEAN |
-| Qwen3.5-27B-UD-Q4_K_XL | tbqp4/tbq4 | 17,850 chars | ✅ CLEAN |
-| Qwen3.5-27B-Q4_K_M | tbqp3/tbq3 | 20,076 chars | ✅ CLEAN |
-| Qwen3.5-27B-Q4_K_M | tbqp4/tbq4 | 20,302 chars | ✅ CLEAN |
-| Qwen3.5-35B-A3B-MoE-Q4_K_M | tbqp3/tbq3 | 17,463 chars | ✅ CLEAN |
-| Qwen3.5-35B-A3B-MoE-Q4_K_M | tbqp4/tbq4 | 17,168 chars | ✅ CLEAN |
+### v1.4.1 — GLM-4.7-Flash (MLA) 비대칭 K/V 지원
 
-> v1.3.0에서는 tbqp3/tbq3이 ~1826토큰, tbqp4/tbq4가 ~2284토큰에서 `???` corruption 발생. v1.4.0에서 6/6 전부 4096토큰까지 깨끗.
-- ROCm(HIP) 빌드 호환성 개선 — FP16 `__shfl_xor_sync` 제거 + 4번째 인자 `WARP_SIZE` 추가 (Issue #5)
+**GLM-4.7-Flash, DeepSeek-V2/V3 등 MLA 아키텍처 모델에서 TurboQuant 완전 지원.**
 
-**새 타입:** TBQ3_4, TBQ4_4, TBQP3_4, TBQP4_4 (blck_size=576)
+MLA(Multi-head Latent Attention)는 K=concat(latent[512], rope[64])=576차원, V=latent[512]차원의 비대칭 구조입니다. 세 가지 핵심 기술로 해결:
+
+1. **D_V 템플릿 파라미터**: vec 커널이 K/Q 차원(D=576)과 V 차원(D_V=512)을 분리 처리. VKQ 배열, combine stride, IWHT 패스 수, 출력 쓰기 모두 D_V 기준. 기존 대칭 모델은 D_V=D 기본값으로 영향 없음.
+2. **RoPE f16 passthrough**: _4 블록 구조체에서 마지막 64차원(rope)을 WHT+양자화 대신 f16으로 직접 저장. RoPE 값의 norm이 latent 대비 ~80배 커서(10.49 vs 0.13), 어떤 비트 수의 양자화든 오차가 attention score를 지배하는 문제 해결. Q 전처리와 dot product도 sub-block 3을 f16 직접 연산으로 처리.
+3. **MLA V-as-K-view 지원**: MLA absorption 최적화에서 V는 K 캐시의 view(같은 타입). TBQP V dequantize는 MSE centroid만 사용(QJL correction은 K·Q dot product 보정 전용이므로 V 재구성에 미적용). IWHT는 256+256 2패스(rope 64 패스 스킵).
+
+**벤치마크 (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
+
+| 캐시 | KV MiB | 압축 | PP t/s | TG t/s | PPL | 파울리 |
+|------|--------|------|--------|--------|-----|--------|
+| f16/f16 | 10,469 | 1.0x | 73.0 | 60.3 | 5.998 | PASS |
+| **tbq3/tbq3** | **2,944** | **3.6x** | 68.2 | 32.0 | **6.836** | **PASS** |
+| **tbqp3/tbq3** | **2,981** | **3.5x** | 66.8 | 31.5 | **6.586** | **PASS** |
+| tbq4/tbq4 | 3,526 | 3.0x | 67.2 | 33.4 | — | PASS |
+| tbqp4/tbq4 | 3,562 | 2.9x | 65.8 | 28.9 | — | PASS |
+
+> **참고:** MLA 모델의 압축률(3.5x)이 일반 모델(5.2x)보다 낮은 이유: MLA는 이미 KV를 256-dim 잠재 표현으로 압축하므로, 원래 캐시가 작습니다. 7.5GB 절약(10,469→2,981 MiB)은 실질적으로 큰 차이입니다.
+>
+> **참고:** TG 속도(31.5 t/s vs f16 60.3 t/s): TBQ는 vec 커널(스칼라 WHT dot product), f16은 MMA 커널(텐서코어 행렬곱)을 사용합니다. MMA 커널에 TBQ on-the-fly dequantize를 추가하면 텐서코어 활용 가능 — 향후 과제.
+
+**해결된 버그:**
+
+| 버그 | 원인 | 수정 |
+|------|------|------|
+| GLM tbqp3/tbq3 크래시 (v1.4.0) | `get_best_fattn_kernel`이 D=576 TBQ를 NONE 반환 | D=576+V=512 TBQ vec 커널 라우팅 추가 |
+| 대칭 dispatch가 비대칭을 먹음 | `FATTN_VEC_CASE`가 V->ne[0] 미확인 → DV=576으로 잘못 launch | ASYM 케이스를 대칭 앞에 배치 |
+| RoPE 양자화 → garbage 출력 | rope norm(~10.49) >> latent norm(~0.13), 양자화 오차가 attention 지배 | sub-block 3를 f16 passthrough로 변경 |
+| TBQP V dequant에 QJL 적용 → garbage | QJL은 K·Q dot product 보정 전용, V 재구성에 부적합 | V dequant에서 QJL 제거 (MSE only) |
+| Q WHT sub-block 간 race condition | sub-block 1 저장 후 `__syncthreads` 누락 → sub-block 2 WHT가 Q_wht 오염 가능 | `__syncthreads` barrier 추가 |
 
 ---
 
@@ -341,49 +359,67 @@ cmake --build build -j$(nproc)
 
 This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
 
-### 🆕 v1.4.0 — GLM-4.7-Flash (head_dim=576) Support + V Cache IWHT Bug Fix
+### 🆕 v1.4.2 — MMA Tensor Core Acceleration + QJL Scalar Correction
 
-**GLM-4.7-Flash Support — Non-power-of-2 head_dim solved:**
+**TBQ/TBQP MMA tensor core acceleration: TG speed 30→49 t/s (+63%).**
 
-GLM-4.7-Flash uses head_dim=576. Since WHT only supports power-of-2 dimensions, we solve this with **256+256+64 block splitting**:
+MMA tensor core attention acceleration for GLM-4.7-Flash (MLA, K=576/V=512) asymmetric models. Up to 1.6x TG speed improvement over vec kernel.
 
-| Block | Range | WHT | Correction | Kernel |
-|-------|-------|-----|------------|--------|
-| Sub-block 1 | [0, 256) | WHT_256 | QJL SRHT | Reuses existing _0 |
-| Sub-block 2 | [256, 512) | WHT_256 | QJL SRHT | Reuses existing _0 |
-| Sub-block 3 | [512, 576) | WHT_64 | Direct Sign | Reuses existing _2 |
+**Key features:**
 
-- **Simulation validated:** MSE -3.4% vs Full QR orthogonal rotation, 0% memory overhead
-- **Why 256 is the sweet spot:** Optimal balance between CLT convergence and block-level quantization precision. Two 256-blocks beat one 512-block in MSE.
-- **Generalizes:** Applies to any head_dim — e.g., 80(64+16), 192(128+64)
+1. **MMA K spatial dequant**: raw TBQ/TBQP blocks → IWHT → spatial f16 → tensor core. Warp shuffle optimization reduces cooperative IWHT `__syncthreads` from 8 to 4.
+2. **QJL scalar correction**: TBQP 1-bit QJL correction via lightweight scalar ops instead of full MMA pass. Reads sign bits + dq directly from raw K blocks. Correctly handles QJL's second sign basis (signs2).
+3. **V = K view spatial**: K dequanted to spatial domain, V (= K view) automatically spatial. Output IWHT completely eliminated.
+4. **Proper kernel signature**: `fattn_kernel_t` extended with `raw_K_data`, `raw_K_stride`, `Q_wht2_data`, `Q_wht2_stride`. No pointer hacks.
+5. **Fused Q WHT12**: Reads Q->data directly, computes Q_wht1 (intermediate) + Q_wht2 (for QJL). No cudaMemcpy.
 
-```bash
-# Automatically applied for GLM-4.7-Flash
---cache-type-k tbqp3 --cache-type-v tbq3  # head_dim=576 auto-detected → _4 types selected
-```
+**Benchmarks (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
 
-**V Cache IWHT FP16 Precision Bug Fix (Issue #2):**
+| Cache | KV MiB | Ratio | TG t/s | vs v1.4.1 | Pauli |
+|-------|--------|-------|--------|-----------|-------|
+| f16/f16 | 10,469 | 1.0x | 67.5 | — | PASS |
+| **tbq3/tbq3** | **2,944** | **3.6x** | **49.7** | **+55%** | **PASS** |
+| **tbqp3/tbq3** | **2,981** | **3.5x** | **42.8** | **+36%** | **PASS** |
+| tbq4/tbq4 | 3,526 | 3.0x | ~49 | +47% | PASS |
+| tbqp4/tbq4 | 3,562 | 2.9x | ~42 | +45% | PASS |
 
-Fixed a critical bug causing output corruption after ~1500 tokens.
+> **Note:** TBQP (with QJL) is slower than TBQ because QJL requires a second WHT transform (signs2) for Q_wht2 precomputation + per-token scalar correction overhead. The tradeoff is improved dot product accuracy (better PPL).
 
-- **Root cause:** V cache inverse WHT (IWHT) butterfly operations used FP16 (half) precision, causing catastrophic cancellation when accumulated WHT-domain values exceeded FP16's ~3.3 decimal digits of precision
-- **Symptoms:** `////` or `???` repeated output after ~1500-2300 tokens
-- **Fix:** All WHT/IWHT paths (Q preprocessing + V post-processing, D=256/128/64/576) now use FP32 butterfly throughout. KV cache compression ratio unchanged (computation-only, not storage)
-- Verified on Windows RTX 5090 (local build + test):
+---
 
-| Model | Cache Type | 4096 Tokens | Result |
-|-------|-----------|-------------|--------|
-| Qwen3.5-27B-UD-Q4_K_XL | tbqp3/tbq3 | 18,282 chars | ✅ CLEAN |
-| Qwen3.5-27B-UD-Q4_K_XL | tbqp4/tbq4 | 17,850 chars | ✅ CLEAN |
-| Qwen3.5-27B-Q4_K_M | tbqp3/tbq3 | 20,076 chars | ✅ CLEAN |
-| Qwen3.5-27B-Q4_K_M | tbqp4/tbq4 | 20,302 chars | ✅ CLEAN |
-| Qwen3.5-35B-A3B-MoE-Q4_K_M | tbqp3/tbq3 | 17,463 chars | ✅ CLEAN |
-| Qwen3.5-35B-A3B-MoE-Q4_K_M | tbqp4/tbq4 | 17,168 chars | ✅ CLEAN |
+### v1.4.1 — GLM-4.7-Flash (MLA) Asymmetric K/V Support
 
-> v1.3.0: tbqp3/tbq3 corrupted at ~1826 tokens, tbqp4/tbq4 at ~2284 tokens. v1.4.0: all 6/6 clean through 4096 tokens.
-- ROCm/HIP build compatibility improved — removed FP16 `__shfl_xor_sync` + added `WARP_SIZE` 4th argument (Issue #5)
+**Full TurboQuant support for MLA architecture models: GLM-4.7-Flash, DeepSeek-V2/V3.**
 
-**New types:** TBQ3_4, TBQ4_4, TBQP3_4, TBQP4_4 (blck_size=576)
+MLA (Multi-head Latent Attention) has asymmetric K=concat(latent[512], rope[64])=576 dims and V=latent[512] dims. Three key techniques:
+
+1. **D_V template parameter**: vec kernel separates K/Q dim (D=576) from V dim (D_V=512). VKQ arrays, combine stride, IWHT passes, output writes all use D_V. Symmetric models default D_V=D (zero impact).
+2. **RoPE f16 passthrough**: _4 block structs store sub-block 3 (rope 64) as raw f16 instead of WHT+quantized. RoPE norm (~10.49) is ~80x larger than latent (~0.13) — any quantization error dominates attention scores. Q preprocessing and dot product handle sub-block 3 as direct f16.
+3. **MLA V-as-K-view**: In MLA absorption, V is a view of K cache (same type). TBQP V dequantize uses MSE centroid only (QJL is for K·Q dot product correction, not V reconstruction). IWHT runs 256+256 two-pass (rope pass skipped).
+
+**Benchmark (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
+
+| Cache | KV MiB | Compress | PP t/s | TG t/s | PPL | Pauli |
+|-------|--------|----------|--------|--------|-----|-------|
+| f16/f16 | 10,469 | 1.0x | 73.0 | 60.3 | 5.998 | PASS |
+| **tbq3/tbq3** | **2,944** | **3.6x** | 68.2 | 32.0 | **6.836** | **PASS** |
+| **tbqp3/tbq3** | **2,981** | **3.5x** | 66.8 | 31.5 | **6.586** | **PASS** |
+| tbq4/tbq4 | 3,526 | 3.0x | 67.2 | 33.4 | — | PASS |
+| tbqp4/tbq4 | 3,562 | 2.9x | 65.8 | 28.9 | — | PASS |
+
+> **Note:** MLA compression ratio (3.5x) is lower than standard models (5.2x) because MLA already compresses KV to a 256-dim latent — the original cache is already small. The 7.5GB savings (10,469→2,981 MiB) is still significant.
+>
+> **Note:** TG speed (31.5 vs 60.3 t/s): TBQ uses the vec kernel (scalar WHT dot product), f16 uses the MMA kernel (tensor cores). Adding TBQ on-the-fly dequantize to MMA would enable tensor core acceleration — future work.
+
+**Bugs fixed:**
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| GLM tbqp3/tbq3 crash (v1.4.0) | `get_best_fattn_kernel` returned NONE for D=576 TBQ | Added D=576+V=512 TBQ vec kernel routing |
+| Symmetric dispatch shadows asymmetric | `FATTN_VEC_CASE` doesn't check V->ne[0] → launches DV=576 | ASYM cases placed before symmetric |
+| RoPE quantization → garbage | rope norm(~10.49) >> latent norm(~0.13), quant error dominates attention | Sub-block 3 changed to f16 passthrough |
+| TBQP V dequant with QJL → garbage | QJL corrects K·Q dot products only, not V reconstruction | Removed QJL from V dequant (MSE only) |
+| Q WHT sub-block race condition | Missing `__syncthreads` between sub-block storage and next WHT | Added `__syncthreads` barriers |
 
 ---
 

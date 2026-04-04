@@ -9,7 +9,35 @@
 
 Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
 
-### 🆕 v1.4.1 — GLM-4.7-Flash (MLA) 비대칭 K/V 지원
+### 🆕 v1.4.2 — MMA Tensor Core 가속 + QJL Scalar Correction
+
+**TBQ/TBQP MMA 텐서코어 가속으로 토큰 생성 속도 30→49 t/s (+63%).**
+
+GLM-4.7-Flash (MLA, K=576/V=512) 비대칭 모델에서 MMA 텐서코어를 활용한 KV 캐시 attention 가속. vec 커널 대비 최대 1.6배 TG 속도 향상.
+
+**핵심 기술:**
+
+1. **MMA K spatial dequant**: TBQ/TBQP raw blocks → IWHT → spatial f16 → tensor core. Warp shuffle 최적화로 cooperative IWHT의 `__syncthreads` 8→4회 감소.
+2. **QJL scalar correction**: TBQP의 QJL 1-bit 보정을 full MMA pass 대신 경량 scalar 연산으로 수행. K의 raw block에서 sign bits + dq를 직접 읽어 `dq × Σ(Q_wht2[i] × sign[i])` 계산. QJL의 두 번째 sign basis(signs2)를 올바르게 처리.
+3. **V = K view spatial**: K를 spatial domain으로 dequant하므로 V(= K view)도 자동으로 spatial. Output IWHT 완전 제거.
+4. **정식 커널 시그니처**: `fattn_kernel_t`에 `raw_K_data`, `raw_K_stride`, `Q_wht2_data`, `Q_wht2_stride` 파라미터 추가. hack 없는 정석 구현.
+5. **Fused Q WHT12**: Q->data에서 직접 읽어 Q_wht1(중간값) + Q_wht2(QJL용) 계산. cudaMemcpy 제거.
+
+**벤치마크 (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
+
+| 캐시 | KV MiB | 압축 | TG t/s | vs v1.4.1 | 파울리 |
+|------|--------|------|--------|-----------|--------|
+| f16/f16 | 10,469 | 1.0x | 67.5 | — | PASS |
+| **tbq3/tbq3** | **2,944** | **3.6x** | **49.7** | **+55%** (32→49.7) | **PASS** |
+| **tbqp3/tbq3** | **2,981** | **3.5x** | **42.8** | **+36%** (31.5→42.8) | **PASS** |
+| tbq4/tbq4 | 3,526 | 3.0x | ~49 | +47% | PASS |
+| tbqp4/tbq4 | 3,562 | 2.9x | ~42 | +45% | PASS |
+
+> **참고:** TBQP(QJL 보정)가 TBQ보다 느린 이유: QJL은 별도 sign basis(signs2)로 WHT 변환 후 scalar correction을 수행하므로 Q_wht2 precompute + per-token scalar correction 오버헤드. 대신 dot product 정확도가 향상되어 PPL 개선.
+
+---
+
+### v1.4.1 — GLM-4.7-Flash (MLA) 비대칭 K/V 지원
 
 **GLM-4.7-Flash, DeepSeek-V2/V3 등 MLA 아키텍처 모델에서 TurboQuant 완전 지원.**
 
@@ -331,7 +359,35 @@ cmake --build build -j$(nproc)
 
 This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
 
-### 🆕 v1.4.1 — GLM-4.7-Flash (MLA) Asymmetric K/V Support
+### 🆕 v1.4.2 — MMA Tensor Core Acceleration + QJL Scalar Correction
+
+**TBQ/TBQP MMA tensor core acceleration: TG speed 30→49 t/s (+63%).**
+
+MMA tensor core attention acceleration for GLM-4.7-Flash (MLA, K=576/V=512) asymmetric models. Up to 1.6x TG speed improvement over vec kernel.
+
+**Key features:**
+
+1. **MMA K spatial dequant**: raw TBQ/TBQP blocks → IWHT → spatial f16 → tensor core. Warp shuffle optimization reduces cooperative IWHT `__syncthreads` from 8 to 4.
+2. **QJL scalar correction**: TBQP 1-bit QJL correction via lightweight scalar ops instead of full MMA pass. Reads sign bits + dq directly from raw K blocks. Correctly handles QJL's second sign basis (signs2).
+3. **V = K view spatial**: K dequanted to spatial domain, V (= K view) automatically spatial. Output IWHT completely eliminated.
+4. **Proper kernel signature**: `fattn_kernel_t` extended with `raw_K_data`, `raw_K_stride`, `Q_wht2_data`, `Q_wht2_stride`. No pointer hacks.
+5. **Fused Q WHT12**: Reads Q->data directly, computes Q_wht1 (intermediate) + Q_wht2 (for QJL). No cudaMemcpy.
+
+**Benchmarks (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
+
+| Cache | KV MiB | Ratio | TG t/s | vs v1.4.1 | Pauli |
+|-------|--------|-------|--------|-----------|-------|
+| f16/f16 | 10,469 | 1.0x | 67.5 | — | PASS |
+| **tbq3/tbq3** | **2,944** | **3.6x** | **49.7** | **+55%** | **PASS** |
+| **tbqp3/tbq3** | **2,981** | **3.5x** | **42.8** | **+36%** | **PASS** |
+| tbq4/tbq4 | 3,526 | 3.0x | ~49 | +47% | PASS |
+| tbqp4/tbq4 | 3,562 | 2.9x | ~42 | +45% | PASS |
+
+> **Note:** TBQP (with QJL) is slower than TBQ because QJL requires a second WHT transform (signs2) for Q_wht2 precomputation + per-token scalar correction overhead. The tradeoff is improved dot product accuracy (better PPL).
+
+---
+
+### v1.4.1 — GLM-4.7-Flash (MLA) Asymmetric K/V Support
 
 **Full TurboQuant support for MLA architecture models: GLM-4.7-Flash, DeepSeek-V2/V3.**
 
