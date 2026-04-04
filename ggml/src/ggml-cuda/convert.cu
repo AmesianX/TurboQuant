@@ -718,19 +718,60 @@ static __device__ __forceinline__ void tbq_dequant_sub(const block_type * blk, f
     }
 }
 
+// Optimized IWHT: warp shuffle for stages 0-4, shared memory for stages 5-7.
+// 256 threads, each handles 2 elements (tid and tid+128). 8→3 __syncthreads.
 static __device__ __forceinline__ void tbq_iwht_256(float * buf, int tid) {
     static constexpr uint8_t signs[32] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
         0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
     };
     __syncthreads();
-    for (int len = 1; len < 256; len *= 2) {
-        int grp = tid/(2*len), pos = tid%(2*len);
-        if (pos < len) { float u=buf[grp*2*len+pos], v=buf[grp*2*len+pos+len]; buf[grp*2*len+pos]=u+v; buf[grp*2*len+pos+len]=u-v; }
-        __syncthreads();
+
+    // 256 threads, 256 elements. First 128 threads handle 2 elements each.
+    // Threads 128-255 idle during butterfly but help with shared memory sync.
+    if (tid < 128) {
+        float f0 = buf[tid], f1 = buf[tid + 128];
+
+        // Stage 7 (len=128): butterfly between f0 and f1 (same thread)
+        { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
+
+        // Stages 0-4 (len=1,2,4,8,16): warp shuffle, no __syncthreads
+        #pragma unroll
+        for (int s = 0; s < 5; s++) {
+            float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, 32);
+            float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, 32);
+            if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; }
+            else                { f0 = f0 + o0; f1 = f1 + o1; }
+        }
+
+        // Stage 5 (len=32): cross-warp via shared memory
+        buf[tid] = f0; buf[tid + 128] = f1;
     }
-    int s = ((signs[tid>>3]>>(tid&7))&1) ? -1 : 1;
-    buf[tid] = buf[tid]*s/256.0f;
+    __syncthreads();
+    if (tid < 128) {
+        float f0, f1;
+        { float u0 = buf[tid], v0 = buf[tid ^ 32];
+          float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 32];
+          f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
+          f1 = (tid & 32) ? (v1 - u1) : (u1 + v1); }
+
+        // Stage 6 (len=64): cross-warp via shared memory
+        buf[tid] = f0; buf[tid + 128] = f1;
+    }
+    __syncthreads();
+    if (tid < 128) {
+        float f0, f1;
+        { float u0 = buf[tid], v0 = buf[tid ^ 64];
+          float u1 = buf[tid+128], v1 = buf[(tid+128) ^ 64];
+          f0 = (tid & 64) ? (v0 - u0) : (u0 + v0);
+          f1 = (tid & 64) ? (v1 - u1) : (u1 + v1); }
+
+        // Sign unscramble + /256
+        float s0 = ((signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+        float s1 = ((signs[(tid+128) >> 3] >> ((tid+128) & 7)) & 1) ? -1.0f : 1.0f;
+        buf[tid]       = f0 * s0 / 256.0f;
+        buf[tid + 128] = f1 * s1 / 256.0f;
+    }
     __syncthreads();
 }
 
@@ -1154,15 +1195,8 @@ static __global__ void dequantize_tbqp_4_v_spatial_f16_kernel(const void * __res
             uint32_t r = (uint32_t)qs[by]>>bo; if (bo>5) r|=(uint32_t)qs[by+1]<<(8-bo);
             buf[tid] = c3[r&7] * norm;
         }
-        __syncthreads();
-        for (int len = 1; len < 256; len *= 2) {
-            int grp = tid/(2*len), pos = tid%(2*len);
-            if (pos < len) { float u=buf[grp*2*len+pos], v=buf[grp*2*len+pos+len]; buf[grp*2*len+pos]=u+v; buf[grp*2*len+pos+len]=u-v; }
-            __syncthreads();
-        }
-        int s = ((signs[tid>>3]>>(tid&7))&1) ? -1 : 1;
-        out[sub*256+tid] = __float2half(buf[tid]*s/256.0f);
-        __syncthreads();
+        tbq_iwht_256(buf, tid);
+        out[sub*256+tid] = __float2half(buf[tid]);
     }
     if (tid < 64) out[512+tid] = blk->rope[tid];
 }
