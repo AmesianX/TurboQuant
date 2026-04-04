@@ -144,6 +144,9 @@ struct llama_hparams {
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
 
+    // Gemma4 per-layer embedding dimension
+    uint32_t n_embd_per_layer = 0;
+
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
 
