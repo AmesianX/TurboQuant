@@ -286,7 +286,7 @@ static __device__ void quantize_f32_tbq3_0_block_nowht(const float * __restrict_
 
     float sum_sq = 0.0f;
     for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
-    float norm = sqrtf(sum_sq / (float)QK_K); // RMS norm → elements ~ N(0,1)
+    float norm = sqrtf(sum_sq / (float)QK_K);
     y->d = __float2half(norm);
 
     if (norm < 1e-10f) {
