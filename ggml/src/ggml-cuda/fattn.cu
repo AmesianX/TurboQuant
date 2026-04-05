@@ -232,7 +232,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
 
-#ifdef GGML_CUDA_FA_ALL_QUANTS
+#ifdef GGML_CUDA_FA_TBQ_TUNING
+    // Minimal dispatch for TBQ centroid/dither tuning (tbq3_0/tbq3_0 only)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
+#elif defined(GGML_CUDA_FA_ALL_QUANTS)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
