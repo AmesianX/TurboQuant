@@ -1499,6 +1499,26 @@ common_init_result::common_init_result(common_params & params) :
       } // end is_any_tbq
     }
 
+    // D=512 V cache type validation: only f16 and TBQ types have flash attention dispatch
+    if (head_dim == 512) {
+        const ggml_type vt = cparams.type_v;
+        const bool v_ok = vt == GGML_TYPE_F16 || vt == GGML_TYPE_F32
+            || vt == GGML_TYPE_TBQ3_0  || vt == GGML_TYPE_TBQ4_0
+            || vt == GGML_TYPE_TBQ3_1  || vt == GGML_TYPE_TBQ4_1
+            || vt == GGML_TYPE_TBQ3_2  || vt == GGML_TYPE_TBQ4_2
+            || vt == GGML_TYPE_TBQ3_4  || vt == GGML_TYPE_TBQ4_4;
+        if (!v_ok) {
+            LOG_WRN("\n");
+            LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
+            LOG_WRN("║  head_dim=512: V cache type '%s' not supported          ║\n", ggml_type_name(vt));
+            LOG_WRN("║  Only f16 and TBQ types have flash attention at D=512.      ║\n");
+            LOG_WRN("║  Falling back to f16 for V cache.                           ║\n");
+            LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
+            LOG_WRN("\n");
+            cparams.type_v = GGML_TYPE_F16;
+        }
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
