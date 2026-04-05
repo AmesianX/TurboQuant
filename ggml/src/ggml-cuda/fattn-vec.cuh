@@ -360,69 +360,10 @@ static __global__ void flash_attn_ext_vec(
                 __syncthreads();
             }
 
-            // === WHT 2: QJL part (signs2) -- for TBQP types ===
-            if constexpr (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0) {
-                // QJL sign pattern for 512 elements (fully independent from MSE signs)
-                static constexpr uint8_t qjl_signs_512[64] = {
-                    0x21,0x4e,0x75,0x8d,0x12,0xa1,0x04,0x88,
-                    0x6c,0x5d,0x2c,0xb3,0x8c,0xe2,0x00,0xd4,
-                    0x30,0xc2,0x15,0x38,0x2b,0xb0,0xa5,0x32,
-                    0xf8,0xbe,0x8a,0x1d,0x43,0x86,0xf3,0x6f,
-                    0xbc,0x9b,0xdd,0xcb,0x05,0x8a,0x09,0xf3,
-                    0x2f,0x39,0x17,0x3c,0x6f,0xb8,0x75,0x78,
-                    0x74,0x44,0x6f,0x2a,0x6a,0x23,0x25,0x0d,
-                    0x61,0x4f,0x35,0xbb,0x04,0x7b,0xbc,0x3d,
-                };
-
-                if constexpr (D == 512) {
-                    // D=512: 512-point QJL WHT2 on existing Q_wht
-                    constexpr float qjl_factor = 1.2533f;
-                    const float sf = scale * qjl_factor / (512.0f * 512.0f);
-
-                    float f0, f1, f2, f3;
-                    {
-                        const uint8_t * qs = qjl_signs_512;
-                        float s0 = ((qs[(tid)     >>3]>>((tid)     &7))&1) ? -1.0f : 1.0f;
-                        float s1 = ((qs[(tid+128) >>3]>>((tid+128) &7))&1) ? -1.0f : 1.0f;
-                        float s2 = ((qs[(tid+256) >>3]>>((tid+256) &7))&1) ? -1.0f : 1.0f;
-                        float s3 = ((qs[(tid+384) >>3]>>((tid+384) &7))&1) ? -1.0f : 1.0f;
-                        f0 = Q_wht[tid]     * s0;
-                        f1 = Q_wht[tid+128] * s1;
-                        f2 = Q_wht[tid+256] * s2;
-                        f3 = Q_wht[tid+384] * s3;
-                    }
-                    { float u = f0, v = f2; f0 = u+v; f2 = u-v; }
-                    { float u = f1, v = f3; f1 = u+v; f3 = u-v; }
-                    { float u = f0, v = f1; f0 = u+v; f1 = u-v; }
-                    { float u = f2, v = f3; f2 = u+v; f3 = u-v; }
-                    #pragma unroll
-                    for (int s = 0; s < 5; s++) {
-                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1<<s, WARP_SIZE);
-                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1<<s, WARP_SIZE);
-                        float o2 = __shfl_xor_sync(0xffffffff, f2, 1<<s, WARP_SIZE);
-                        float o3 = __shfl_xor_sync(0xffffffff, f3, 1<<s, WARP_SIZE);
-                        if (tid&(1<<s)) { f0=o0-f0; f1=o1-f1; f2=o2-f2; f3=o3-f3; }
-                        else            { f0=f0+o0; f1=f1+o1; f2=f2+o2; f3=f3+o3; }
-                    }
-                    Q_wht[tid]=f0; Q_wht[tid+128]=f1; Q_wht[tid+256]=f2; Q_wht[tid+384]=f3;
-                    __syncthreads();
-                    { float u0=Q_wht[tid],v0=Q_wht[tid^32]; float u1=Q_wht[tid+128],v1=Q_wht[(tid+128)^32];
-                      float u2=Q_wht[tid+256],v2=Q_wht[(tid+256)^32]; float u3=Q_wht[tid+384],v3=Q_wht[(tid+384)^32];
-                      f0=(tid&32)?v0-u0:u0+v0; f1=(tid&32)?v1-u1:u1+v1; f2=(tid&32)?v2-u2:u2+v2; f3=(tid&32)?v3-u3:u3+v3; }
-                    Q_wht[tid]=f0; Q_wht[tid+128]=f1; Q_wht[tid+256]=f2; Q_wht[tid+384]=f3;
-                    __syncthreads();
-                    { float u0=Q_wht[tid],v0=Q_wht[tid^64]; float u1=Q_wht[tid+128],v1=Q_wht[(tid+128)^64];
-                      float u2=Q_wht[tid+256],v2=Q_wht[(tid+256)^64]; float u3=Q_wht[tid+384],v3=Q_wht[(tid+384)^64];
-                      f0=(tid&64)?v0-u0:u0+v0; f1=(tid&64)?v1-u1:u1+v1; f2=(tid&64)?v2-u2:u2+v2; f3=(tid&64)?v3-u3:u3+v3; }
-                    Q_wht[tid]=f0; Q_wht[tid+128]=f1; Q_wht[tid+256]=f2; Q_wht[tid+384]=f3;
-                    __syncthreads();
-
-                    for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
-                        const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
-                        Q_ds[j][i0/nthreads_KQ] = make_float2(Q_wht[2*i] * sf, Q_wht[2*i+1] * sf);
-                    }
-                    __syncthreads();
-                } else {
+            // === WHT 2: QJL part (signs2) -- for TBQP types, D=256 only ===
+            // Note: D=512 TBQP auto-downgraded to TBQ in common.cpp (QJL ineffective at D=512)
+            if constexpr ((type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQP4_0) && D <= 256) {
+                {
                     // D=256: original single-block QJL WHT
                     constexpr float qjl_factor = 1.2533f;
                     const float sf = scale * qjl_factor / (256.0f * 256.0f);
@@ -493,7 +434,6 @@ static __global__ void flash_attn_ext_vec(
                     __syncthreads();
                 }
             }
-        }
     } else if constexpr (type_K == GGML_TYPE_TBQ4_1 || type_K == GGML_TYPE_TBQ3_1
                       || type_K == GGML_TYPE_TBQP4_1 || type_K == GGML_TYPE_TBQP3_1) {
         // TurboQuant 128-block: D=128, nthreads=128, 1:1 thread-element mapping
