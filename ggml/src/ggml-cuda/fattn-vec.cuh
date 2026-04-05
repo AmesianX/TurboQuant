@@ -434,6 +434,7 @@ static __global__ void flash_attn_ext_vec(
                     __syncthreads();
                 }
             }
+        }
     } else if constexpr (type_K == GGML_TYPE_TBQ4_1 || type_K == GGML_TYPE_TBQ3_1
                       || type_K == GGML_TYPE_TBQP4_1 || type_K == GGML_TYPE_TBQP3_1) {
         // TurboQuant 128-block: D=128, nthreads=128, 1:1 thread-element mapping
@@ -1094,10 +1095,21 @@ static __global__ void flash_attn_ext_vec(
                 }
             }
 
-            // TBQ V post-processing: IWHT on the WHT-domain weighted sum
-            // Always use 256-block independent IWHT (even for D_V=512)
-            // because V blocks have per-block norms — mixing them in 512-IWHT corrupts scales
+            // TBQ V post-processing
             if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0) {
+                if constexpr (D_V == 512) {
+                    // D_V=512: V stored without WHT (direct Lloyd-Max) → no IWHT needed
+                    // Just write accumulated values directly (already in attn_rot domain)
+                    // The model's output projection handles de-rotation
+                    __syncthreads();
+                    float * buf_base = (float *) &KQ[0];
+                    const int dst_base = (((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D_V;
+                    for (int i0 = 0; i0 < D_V; i0 += nthreads) {
+                        if (i0 + tid < D_V) {
+                            dst[dst_base + i0 + tid] = buf_base[i0 + tid];
+                        }
+                    }
+                } else {
                 static constexpr uint8_t tbq_signs_v[32] = {
                     0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
                     0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
@@ -1147,6 +1159,7 @@ static __global__ void flash_attn_ext_vec(
                         __syncthreads();
                     }
                 }
+                } // end else (D_V <= 256)
             }
 
             // TBQ V 128-block IWHT: D=128, 1:1 thread mapping, no stage 7

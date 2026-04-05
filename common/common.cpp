@@ -1232,6 +1232,7 @@ common_init_result::common_init_result(common_params & params) :
 
     // TurboQuant auto-mapping: resolve _0 placeholder to correct _N based on head_dim
     // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
+    int32_t head_dim = 0; // outside block scope — used by D=512 validation at lines 1504/1522
     {
         // Quick check: skip entirely if neither K nor V uses TBQ types
         auto is_any_tbq = [](ggml_type t) -> bool {
@@ -1250,7 +1251,6 @@ common_init_result::common_init_result(common_params & params) :
       if (is_any_tbq(cparams.type_k) || is_any_tbq(cparams.type_v)) {
         // Detect KV head dimension with multi-signal cross-validation
         // TurboQuant WHT requires exact head_dim — wrong value = garbage output
-        int32_t head_dim = 0;
         int32_t s_val_outer = 0; // V head_dim for asymmetric models (e.g. GLM K=576, V=512)
         auto is_supported_dim = [](int dim) -> bool {
             if (dim <= 0) return false;
