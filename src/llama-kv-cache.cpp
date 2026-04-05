@@ -1288,8 +1288,13 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        // V cache: always use 256-block WHT (V IWHT is per-block, can't undo 512-WHT)
-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
+        // V cache: pass head_dim, and skip WHT for D=512 only (experiment 2)
+        ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
+        result->op_params[0] = (int32_t) n_embd_head;
+        if (n_embd_head >= 512) {
+            result->op_params[1] = 1; // D=512: skip WHT, direct Lloyd-Max (attn_rot decorrelation)
+        }
+        return result;
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
