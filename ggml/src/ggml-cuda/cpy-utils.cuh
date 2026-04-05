@@ -277,6 +277,39 @@ static __device__ void quantize_f32_tbq3_0_block_512(const float * __restrict__ 
     }
 }
 
+// TurboQuant 3-bit: NO WHT — direct norm + Lloyd-Max on attn_rot'd values
+// For V cache experiment: attn_rot provides decorrelation, no IWHT needed
+static __device__ void quantize_f32_tbq3_0_block_nowht(const float * __restrict__ x, block_tbq3_0 * __restrict__ y) {
+    static constexpr float tbq3_boundaries[7] = {
+        -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
+    };
+
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_K; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq / (float)QK_K); // RMS norm → elements ~ N(0,1)
+    y->d = __float2half(norm);
+
+    if (norm < 1e-10f) {
+        for (int j = 0; j < QK_K*3/8; j++) y->qs[j] = 0;
+        return;
+    }
+
+    float inv_norm = 1.0f / norm;
+
+    int bit_pos = 0;
+    for (int j = 0; j < QK_K*3/8; j++) y->qs[j] = 0;
+    for (int j = 0; j < QK_K; j++) {
+        float val = x[j] * inv_norm;
+        uint8_t idx = 7;
+        for (int b = 0; b < 7; b++) { if (val < tbq3_boundaries[b]) { idx = b; break; } }
+        int byte_idx = bit_pos / 8;
+        int bit_off = bit_pos % 8;
+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
+        bit_pos += 3;
+    }
+}
+
 // TurboQuant 4-bit: L2 norm + random signs + serial WHT + Lloyd-Max quantization
 // Single-thread implementation for set_rows (called once per token, performance uncritical)
 static __device__ void quantize_f32_tbq4_0_block(const float * __restrict__ x, block_tbq4_0 * __restrict__ y) {
