@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Work Log 2026-04-07</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root { --bg:#fafbfc; --fg:#1a1a2e; --accent:#3b82f6; --accent2:#8b5cf6; --success:#10b981; --warning:#f59e0b; --danger:#ef4444; --muted:#64748b; --card-bg:#ffffff; --border:#e2e8f0; }
+  .reveal { font-family:'Noto Sans KR',sans-serif; font-size:28px; color:var(--fg); }
+  .reveal .slides { text-align:left; }
+  .reveal .slides section { padding:40px 50px; box-sizing:border-box; }
+  .reveal h1,.reveal h2,.reveal h3 { font-family:'Noto Sans KR',sans-serif; font-weight:700; color:var(--fg); text-transform:none; letter-spacing:-0.02em; }
+  .reveal h1 { font-size:2.0em; margin-bottom:0.2em; }
+  .reveal h2 { font-size:1.4em; margin-bottom:0.5em; }
+  .reveal h3 { font-size:1.1em; margin-bottom:0.4em; color:var(--accent); }
+  .cover { text-align:center!important; display:flex!important; flex-direction:column; align-items:center; justify-content:center; }
+  .cover h1 { font-size:2.2em; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; margin-bottom:0.1em; }
+  .cover .subtitle { font-size:1.0em; color:var(--muted); font-weight:300; margin-bottom:1.5em; }
+  .cover .meta { font-size:0.7em; color:var(--muted); line-height:1.8; }
+  .cover .meta span { display:inline-block; background:#f1f5f9; padding:4px 14px; border-radius:20px; margin:3px 4px; }
+  .divider { width:60px; height:3px; background:linear-gradient(90deg,var(--accent),var(--accent2)); border:none; border-radius:2px; margin:10px 0 20px 0; }
+  .cover .divider { margin:10px auto 20px auto; }
+  .tag { display:inline-block; font-size:0.55em; font-weight:500; padding:2px 10px; border-radius:12px; vertical-align:middle; margin-left:8px; }
+  .tag-blue { background:#dbeafe; color:#1d4ed8; } .tag-green { background:#d1fae5; color:#065f46; } .tag-red { background:#fee2e2; color:#991b1b; } .tag-purple { background:#ede9fe; color:#5b21b6; }
+  .timeline { position:relative; padding-left:24px; margin:0; }
+  .timeline::before { content:''; position:absolute; left:6px; top:4px; bottom:4px; width:2px; background:var(--border); }
+  .timeline li { list-style:none; position:relative; margin-bottom:12px; font-size:0.78em; line-height:1.6; }
+  .timeline li::before { content:''; position:absolute; left:-22px; top:8px; width:10px; height:10px; border-radius:50%; background:var(--accent); border:2px solid white; box-shadow:0 0 0 2px var(--accent); }
+  .timeline .time { font-family:'JetBrains Mono',monospace; font-size:0.85em; color:var(--muted); font-weight:500; }
+  .items { list-style:none; padding:0; margin:0; }
+  .items li { position:relative; padding-left:20px; margin-bottom:10px; font-size:0.78em; line-height:1.7; }
+  .items li::before { content:''; position:absolute; left:0; top:10px; width:8px; height:8px; border-radius:2px; background:var(--accent); opacity:0.6; }
+  .card-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; }
+  .card { background:var(--card-bg); border:1px solid var(--border); border-radius:10px; padding:18px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin:0 0 8px 0; font-size:0.75em; font-weight:700; color:var(--fg); }
+  .card p,.card ul { margin:0; font-size:0.65em; line-height:1.7; color:#475569; }
+  .card ul { padding-left:16px; }
+  .highlight-box { border-left:4px solid; border-radius:6px; padding:14px 18px; margin:14px 0; font-size:0.78em; line-height:1.7; }
+  .highlight-box.blue { border-color:var(--accent); background:#eff6ff; }
+  .highlight-box.green { border-color:var(--success); background:#ecfdf5; }
+  .highlight-box.red { border-color:var(--danger); background:#fef2f2; }
+  .highlight-box.purple { border-color:var(--accent2); background:#f5f3ff; }
+  .reveal code { font-family:'JetBrains Mono',monospace; font-size:0.88em; background:#f1f5f9; padding:1px 6px; border-radius:4px; color:var(--accent2); }
+  .reveal table { width:100%; border-collapse:collapse; font-size:0.65em; margin-top:10px; }
+  .reveal table th { background:#f8fafc; font-weight:600; text-align:left; padding:8px 12px; border-bottom:2px solid var(--border); color:var(--muted); font-size:0.9em; text-transform:uppercase; letter-spacing:0.05em; }
+  .reveal table td { padding:8px 12px; border-bottom:1px solid var(--border); line-height:1.5; }
+  .reveal table .ok { color:var(--success); font-weight:600; }
+  .reveal table .ng { color:var(--danger); font-weight:600; }
+  .metric { text-align:center; padding:10px; }
+  .metric .num { font-size:2.0em; font-weight:700; line-height:1.1; }
+  .metric .label { font-size:0.6em; color:var(--muted); margin-top:4px; }
+  .metric .num.blue { color:var(--accent); } .metric .num.green { color:var(--success); } .metric .num.purple { color:var(--accent2); }
+  @media print { .reveal .slides section { page-break-after:always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>TurboQuant v1.5.2</h1>
+  <p class="subtitle">Work Log</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-07</span>
+    <span>PPL 21%&rarr;8%, Attention Sharpening + V Rotation Bugfix</span>
+    <br>
+    <span>MMSE-derived &alpha;</span>
+    <span>attn_rot_v bug found</span>
+    <span>Split &alpha; for TBQ3/TBQP3</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>Session Overview</h2>
+  <hr class="divider">
+  <ul class="timeline">
+    <li><span class="time">Morning</span> &mdash; PPL benchmark investigation &mdash; discovered 21% gap vs f16 at ctx=2048</li>
+    <li><span class="time">Morning</span> &mdash; Code audit &mdash; found 1.15x V heavy-tail compensation was empirical hack</li>
+    <li><span class="time">Afternoon</span> &mdash; Per-block norm implementation (global norm &rarr; per-block for TBQ3 D=512)</li>
+    <li><span class="time">Afternoon</span> &mdash; Removed 1.15x V compensation</li>
+    <li><span class="time">Afternoon</span> &mdash; Sub-block scale experiment (32-element groups) &mdash; proved WHT already handles variance uniformization</li>
+    <li><span class="time">Evening</span> &mdash; Breakthrough &mdash; Attention Sharpening &alpha; = 1 + 1/(2&times;SQNR) derived from MMSE theory</li>
+    <li><span class="time">Evening</span> &mdash; V rotation bug discovered (attn_rot_v=1 but IWHT has no inverse rotation)</li>
+    <li><span class="time">Night</span> &mdash; Split &alpha; for TBQ3 (1.016) vs TBQP3 (1.036) &mdash; different noise profiles</li>
+    <li><span class="time">Night</span> &mdash; Final PPL 454.7 (1.08x vs f16), math bench 19.1/35 vs f16 20.1/35</li>
+  </ul>
+</section>
+
+<!-- PPL GAP INVESTIGATION -->
+<section>
+  <h2>PPL Gap Investigation <span class="tag tag-red">Problem</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Symptoms</h4>
+      <ul>
+        <li>v1.5.1: PPL 509.9 (vs f16 419.8 = <strong>1.21x</strong>)</li>
+        <li>q4_0 only 1.03x gap &rarr; TBQ3's 1.21x is disproportionate</li>
+        <li>Why is 3-bit so much worse than 4-bit?</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Root Cause</h4>
+      <ul>
+        <li>Not bit count, but <strong>scale factor count</strong></li>
+        <li>q4_0: 16 scales per 512 dims</li>
+        <li>TBQ3: only <strong>2 scales</strong> per 512 dims</li>
+        <li>Fewer scales &rarr; accumulated quantization noise</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box red" style="margin-top:14px">
+    <strong>Key insight:</strong> TBQ3's problem is not 3-bit precision itself, but too few scale factors per block causing softmax distribution flattening. Instead of adding more scales, a different approach is needed.
+  </div>
+</section>
+
+<!-- SUB-BLOCK SCALE EXPERIMENT -->
+<section>
+  <h2>Sub-block Scale Experiment <span class="tag tag-red">Failed</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Experiment Design</h4>
+      <ul>
+        <li>Added 8 sub-scales to <code>block_tbq3_0</code> struct</li>
+        <li>32-element groups with independent scales</li>
+        <li>Goal: finer-grained scaling to improve PPL</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Results</h4>
+      <ul>
+        <li>PPL <strong>worsened</strong>: 514.6 vs baseline 509.9</li>
+        <li>Sub-scales themselves add quantization noise</li>
+        <li>WHT already performs variance uniformization</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box purple" style="margin-top:14px">
+    <strong>Lesson:</strong> WHT (Walsh-Hadamard Transform) already uniformizes coefficient variance. Sub-scales are redundant and only add noise. &rarr; Pivoted to <strong>attention correction</strong> approach.
+  </div>
+</section>
+
+<!-- ATTENTION SHARPENING -->
+<section>
+  <h2>Attention Sharpening <span class="tag tag-green">Breakthrough</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Theoretical Basis</h4>
+      <ul>
+        <li>3-bit quantization noise flattens softmax distribution</li>
+        <li>Derived from MMSE theory: <code>&alpha; = 1 + 1/(2&times;SQNR)</code></li>
+        <li>SQNR<sub>3bit</sub> &asymp; 13.8 &rarr; &alpha; &asymp; 1.036</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Advantages</h4>
+      <ul>
+        <li><strong>Zero memory cost</strong> &mdash; one scalar multiply</li>
+        <li><strong>Zero compute cost</strong> &mdash; single multiply before softmax</li>
+        <li>Theoretically grounded correction (not empirical hack)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>Result:</strong> PPL 509.9 &rarr; <strong>455.0</strong> (1.21x &rarr; <strong>1.08x</strong>). 62% reduction in PPL gap with zero additional memory or compute cost.
+  </div>
+</section>
+
+<!-- V ROTATION BUG -->
+<section>
+  <h2>V Rotation Bug <span class="tag tag-red">Bugfix</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Problem</h4>
+      <ul>
+        <li><code>attn_rot</code> applied to both K and V</li>
+        <li>K: safe &mdash; Q gets same rotation, cancels in dot product<br><code>(R&middot;Q)&middot;(R&middot;K) = Q&middot;K</code></li>
+        <li>V: <strong>BUG</strong> &mdash; IWHT decode has no inverse rotation</li>
+        <li>V output remains rotated &rarr; corrupted results</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Fix</h4>
+      <ul>
+        <li>Set <code>attn_rot_v = false</code></li>
+        <li>Only K gets rotation, V keeps original values</li>
+        <li>IWHT correctly recovers original V</li>
+        <li>PPL: 455.0 &rarr; <strong>448.1</strong> (1.08x &rarr; 1.07x)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box blue" style="margin-top:14px">
+    <strong>Principle:</strong> K rotation cancels via <code>R<sup>T</sup>R = I</code> in the Q&middot;K dot product, but V is directly output after weighted sum &mdash; any remaining rotation distorts the result.
+  </div>
+</section>
+
+<!-- SPLIT ALPHA -->
+<section>
+  <h2>Split &alpha; for TBQ3 / TBQP3 <span class="tag tag-purple">Optimization</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>TBQP3 (2-bit + QJL)</h4>
+      <ul>
+        <li>QJL projection adds extra noise to attention scores</li>
+        <li>Needs stronger sharpening</li>
+        <li><strong>&alpha; = 1.036</strong></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>TBQ3 (3-bit)</h4>
+      <ul>
+        <li>Cleaner noise profile</li>
+        <li>Lighter sharpening sufficient</li>
+        <li><strong>&alpha; = 1.016</strong></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>Result:</strong> Split &alpha; vs single &alpha; improved tbqp3/tbq3 PPL: 473.7 &rarr; <strong>454.7</strong>. Each quantization method gets correction matched to its noise characteristics.
+  </div>
+</section>
+
+<!-- PER-BLOCK NORM -->
+<section>
+  <h2>Per-block Norm <span class="tag tag-blue">Improvement</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>TBQ3 (3-bit)</h4>
+      <ul>
+        <li>Per-block norm applied</li>
+        <li>Each 256-half normalized independently</li>
+        <li>Captures per-block variance differences accurately</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>TBQP3 (2-bit + QJL)</h4>
+      <ul>
+        <li>Global norm retained</li>
+        <li>QJL residual uses cross-block 512-WHT</li>
+        <li>Requires information sharing across blocks</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box blue" style="margin-top:14px">
+    <strong>Design principle:</strong> TBQ3 uses independent 256-blocks &rarr; per-block norm is natural. TBQP3 uses full 512-WHT &rarr; global norm is the correct choice.
+  </div>
+</section>
+
+<!-- TBQ4_0 OOB BUG -->
+<section>
+  <h2>tbq4_0 OOB Bug Fix <span class="tag tag-red">Bugfix</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Problem</h4>
+      <ul>
+        <li><code>vec_dot_fattn_vec_KQ_tbq4_0</code></li>
+        <li>At D=512, only read <code>K_tbq[0]</code></li>
+        <li>Remaining 256 dims unprocessed &rarr; incorrect results</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Fix</h4>
+      <ul>
+        <li>Applied <code>n_blocks = D/256</code> loop</li>
+        <li>Iterates over all blocks for complete dot product</li>
+        <li>Works correctly for both D=256 and D=512</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- RESULTS -->
+<section>
+  <h2>Final Results <span class="tag tag-green">v1.5.2</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>Metric</th><th>f16</th><th>tbqp3/tbq3</th><th>Ratio</th></tr></thead>
+    <tbody>
+      <tr><td>PPL (ctx=2048)</td><td>419.8</td><td class="ok"><strong>454.7</strong></td><td class="ok">1.08x</td></tr>
+      <tr><td>Math Bench</td><td>20.1/35</td><td>19.1/35</td><td>95%</td></tr>
+      <tr><td>Math Peak</td><td>21</td><td class="ok"><strong>23</strong></td><td class="ok">&gt;f16</td></tr>
+      <tr><td>KV Memory</td><td>5,420 MiB</td><td class="ok"><strong>1,290 MiB</strong></td><td class="ok">4.2x compression</td></tr>
+    </tbody>
+  </table>
+
+  <div class="card-grid" style="grid-template-columns:1fr 1fr 1fr 1fr; margin-top:20px">
+    <div class="metric"><div class="num green">1.08x</div><div class="label">PPL (v1.5.1: 1.21x)</div></div>
+    <div class="metric"><div class="num blue">4.2x</div><div class="label">KV Cache Compression</div></div>
+    <div class="metric"><div class="num purple">0</div><div class="label">Extra Memory Cost</div></div>
+    <div class="metric"><div class="num green">62%</div><div class="label">PPL Gap Reduction</div></div>
+  </div>
+</section>
+
+<!-- SUMMARY -->
+<section>
+  <h2>v1.5.2 Summary</h2>
+  <hr class="divider">
+
+  <ul class="items">
+    <li>Attention Sharpening: MMSE theory-derived &alpha;, zero memory/compute cost</li>
+    <li>V Rotation bug found and fixed: IWHT inverse lacked rotation reversal</li>
+    <li>Split &alpha; for TBQ3/TBQP3: optimal correction per noise profile</li>
+    <li>Per-block norm: TBQ3 block-independent, TBQP3 global retained</li>
+    <li>Sub-block scale experiment: proved WHT variance uniformization (negative result has value)</li>
+    <li>tbq4_0 OOB bug fix: D=512 multi-block loop</li>
+  </ul>
+
+  <div class="highlight-box purple" style="margin-top:20px">
+    <strong>v1.5.1 &rarr; v1.5.2:</strong> PPL 509.9 &rarr; 454.7 (1.21x &rarr; 1.08x). A theoretically grounded single-scalar correction dramatically improved quantization quality. Achieved within 8% of f16 PPL at 4.2x compression.
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash: true, width: 1280, height: 720, margin: 0, transition: 'slide' });</script>
+</body>
+</html>
