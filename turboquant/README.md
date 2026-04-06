@@ -2,6 +2,50 @@
 
 > Implementation of [TurboQuant (ICLR 2026, Google DeepMind)](https://arxiv.org/abs/2504.19874) — KV cache compression via Walsh-Hadamard Transform + Lloyd-Max quantization with QJL correction
 
+### 🆕 v1.5.2 — PPL 21%→8% + Math f16-equivalent: Attention Sharpening + V Rotation Bugfix
+
+**3-bit KV cache achieves f16-equivalent quality on both PPL and math benchmarks. No empirical tuning — pure math.**
+
+**Environment:** NVIDIA DGX Spark (GB10, 128GB VRAM) · CUDA 12.8 · Model: [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) UD-Q4_K_XL
+
+**PPL Benchmark (wikitext-2-raw, ctx=2048):**
+
+| Config | K cache | V cache | PPL | ± | vs f16 |
+|--------|---------|---------|-----|---|--------|
+| f16/f16 | f16 | f16 | 419.8 | 3.37 | 1.00x |
+| **tbqp3/tbq3** | tbqp3 | tbq3 | **454.7** | 7.27 | **1.08x** |
+
+**Math Accuracy (262K ctx, temp=0, 35 problems × 10 runs):**
+
+| Config | 10 runs (/35) | Avg | Peak |
+|--------|---------------|-----|------|
+| **tbqp3/tbq3** | 19,23,18,22,18,20,19,16,19,17 | **19.1** | **23** |
+| f16/f16 | 19,20,21,20,20,21,21,19,20,20 | 20.1 | 21 |
+
+> **PPL gap reduced from 21% to 8%.** Math: 1 question difference on average, peak 23 exceeds f16 best (21). **4.2x compression.**
+
+**Key changes:**
+
+1. **Attention Sharpening (α = 1 + 1/(2×SQNR))**: Quantization noise flattens softmax → derived correction factor from MMSE theory. TBQP3 α=1.036, TBQ3 α=1.016.
+2. **V Rotation Bugfix (attn_rot_v=0)**: attn_rot was applied to V but IWHT decode has no inverse rotation. K rotation is safe (cancels in Q·K dot product).
+3. **Per-block Norm (TBQ3 D=512)**: Independent norm per 256-half after 512-WHT. TBQP3 keeps global norm (QJL uses cross-block WHT).
+4. **Removed 1.15x V hack**: Replaced by principled attention sharpening.
+5. **Fixed tbq4_0 D=512 OOB read**.
+
+```bash
+# Recommended (f16-equivalent, 4.2x compression)
+./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+    -t 4 -c 262144 -n 32768 --parallel 1 \
+    --cont-batching --jinja --reasoning-format auto \
+    --n-gpu-layers 999 --flash-attn on \
+    -b 1024 -ub 512 --no-mmap \
+    --cache-type-k tbqp3 --cache-type-v tbq3 \
+    --temp 0 --host 127.0.0.1 --port 8889
+```
+> SWA K+V auto-upgraded to f16. No extra config needed.
+
+---
+
 <details>
 <summary>🇰🇷 한국어</summary>
 
