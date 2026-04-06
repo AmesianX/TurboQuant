@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>업무일지 2026-04-07</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root { --bg:#fafbfc; --fg:#1a1a2e; --accent:#3b82f6; --accent2:#8b5cf6; --success:#10b981; --warning:#f59e0b; --danger:#ef4444; --muted:#64748b; --card-bg:#ffffff; --border:#e2e8f0; }
+  .reveal { font-family:'Noto Sans KR',sans-serif; font-size:28px; color:var(--fg); }
+  .reveal .slides { text-align:left; }
+  .reveal .slides section { padding:40px 50px; box-sizing:border-box; }
+  .reveal h1,.reveal h2,.reveal h3 { font-family:'Noto Sans KR',sans-serif; font-weight:700; color:var(--fg); text-transform:none; letter-spacing:-0.02em; }
+  .reveal h1 { font-size:2.0em; margin-bottom:0.2em; }
+  .reveal h2 { font-size:1.4em; margin-bottom:0.5em; }
+  .reveal h3 { font-size:1.1em; margin-bottom:0.4em; color:var(--accent); }
+  .cover { text-align:center!important; display:flex!important; flex-direction:column; align-items:center; justify-content:center; }
+  .cover h1 { font-size:2.2em; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; margin-bottom:0.1em; }
+  .cover .subtitle { font-size:1.0em; color:var(--muted); font-weight:300; margin-bottom:1.5em; }
+  .cover .meta { font-size:0.7em; color:var(--muted); line-height:1.8; }
+  .cover .meta span { display:inline-block; background:#f1f5f9; padding:4px 14px; border-radius:20px; margin:3px 4px; }
+  .divider { width:60px; height:3px; background:linear-gradient(90deg,var(--accent),var(--accent2)); border:none; border-radius:2px; margin:10px 0 20px 0; }
+  .cover .divider { margin:10px auto 20px auto; }
+  .tag { display:inline-block; font-size:0.55em; font-weight:500; padding:2px 10px; border-radius:12px; vertical-align:middle; margin-left:8px; }
+  .tag-blue { background:#dbeafe; color:#1d4ed8; } .tag-green { background:#d1fae5; color:#065f46; } .tag-red { background:#fee2e2; color:#991b1b; } .tag-purple { background:#ede9fe; color:#5b21b6; }
+  .timeline { position:relative; padding-left:24px; margin:0; }
+  .timeline::before { content:''; position:absolute; left:6px; top:4px; bottom:4px; width:2px; background:var(--border); }
+  .timeline li { list-style:none; position:relative; margin-bottom:12px; font-size:0.78em; line-height:1.6; }
+  .timeline li::before { content:''; position:absolute; left:-22px; top:8px; width:10px; height:10px; border-radius:50%; background:var(--accent); border:2px solid white; box-shadow:0 0 0 2px var(--accent); }
+  .timeline .time { font-family:'JetBrains Mono',monospace; font-size:0.85em; color:var(--muted); font-weight:500; }
+  .items { list-style:none; padding:0; margin:0; }
+  .items li { position:relative; padding-left:20px; margin-bottom:10px; font-size:0.78em; line-height:1.7; }
+  .items li::before { content:''; position:absolute; left:0; top:10px; width:8px; height:8px; border-radius:2px; background:var(--accent); opacity:0.6; }
+  .card-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; }
+  .card { background:var(--card-bg); border:1px solid var(--border); border-radius:10px; padding:18px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin:0 0 8px 0; font-size:0.75em; font-weight:700; color:var(--fg); }
+  .card p,.card ul { margin:0; font-size:0.65em; line-height:1.7; color:#475569; }
+  .card ul { padding-left:16px; }
+  .highlight-box { border-left:4px solid; border-radius:6px; padding:14px 18px; margin:14px 0; font-size:0.78em; line-height:1.7; }
+  .highlight-box.blue { border-color:var(--accent); background:#eff6ff; }
+  .highlight-box.green { border-color:var(--success); background:#ecfdf5; }
+  .highlight-box.red { border-color:var(--danger); background:#fef2f2; }
+  .highlight-box.purple { border-color:var(--accent2); background:#f5f3ff; }
+  .reveal code { font-family:'JetBrains Mono',monospace; font-size:0.88em; background:#f1f5f9; padding:1px 6px; border-radius:4px; color:var(--accent2); }
+  .reveal table { width:100%; border-collapse:collapse; font-size:0.65em; margin-top:10px; }
+  .reveal table th { background:#f8fafc; font-weight:600; text-align:left; padding:8px 12px; border-bottom:2px solid var(--border); color:var(--muted); font-size:0.9em; text-transform:uppercase; letter-spacing:0.05em; }
+  .reveal table td { padding:8px 12px; border-bottom:1px solid var(--border); line-height:1.5; }
+  .reveal table .ok { color:var(--success); font-weight:600; }
+  .reveal table .ng { color:var(--danger); font-weight:600; }
+  .metric { text-align:center; padding:10px; }
+  .metric .num { font-size:2.0em; font-weight:700; line-height:1.1; }
+  .metric .label { font-size:0.6em; color:var(--muted); margin-top:4px; }
+  .metric .num.blue { color:var(--accent); } .metric .num.green { color:var(--success); } .metric .num.purple { color:var(--accent2); }
+  @media print { .reveal .slides section { page-break-after:always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>TurboQuant v1.5.2</h1>
+  <p class="subtitle">업무일지 / Work Log</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-07</span>
+    <span>PPL 21%&rarr;8%, Attention Sharpening + V Rotation 버그 수정</span>
+    <br>
+    <span>MMSE 기반 &alpha; 유도</span>
+    <span>attn_rot_v 버그 발견</span>
+    <span>TBQ3/TBQP3 분리 &alpha;</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>세션 개요</h2>
+  <hr class="divider">
+  <ul class="timeline">
+    <li><span class="time">오전</span> &mdash; PPL 벤치마크 조사 &mdash; ctx=2048에서 f16 대비 21% 격차 발견</li>
+    <li><span class="time">오전</span> &mdash; 코드 감사 &mdash; 1.15x V heavy-tail 보상이 경험적 해킹임을 확인</li>
+    <li><span class="time">오후</span> &mdash; Per-block norm 구현 (global norm &rarr; TBQ3 D=512 블록별)</li>
+    <li><span class="time">오후</span> &mdash; 1.15x V 보상 제거</li>
+    <li><span class="time">오후</span> &mdash; Sub-block scale 실험 (32-element 그룹) &mdash; WHT가 이미 분산 균등화함을 증명</li>
+    <li><span class="time">저녁</span> &mdash; 돌파구 &mdash; MMSE 이론에서 Attention Sharpening &alpha; = 1 + 1/(2&times;SQNR) 유도</li>
+    <li><span class="time">저녁</span> &mdash; V rotation 버그 발견 (attn_rot_v=1이나 IWHT에 역회전 없음)</li>
+    <li><span class="time">야간</span> &mdash; TBQ3 (1.016) vs TBQP3 (1.036) 분리 &alpha; &mdash; 다른 노이즈 프로파일</li>
+    <li><span class="time">야간</span> &mdash; 최종 PPL 454.7 (f16 대비 1.08x), math bench 19.1/35 vs f16 20.1/35</li>
+  </ul>
+</section>
+
+<!-- PPL GAP INVESTIGATION -->
+<section>
+  <h2>PPL 격차 조사 <span class="tag tag-red">문제</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>현상</h4>
+      <ul>
+        <li>v1.5.1: PPL 509.9 (f16 419.8 대비 <strong>1.21x</strong>)</li>
+        <li>q4_0은 1.03x 격차 &rarr; TBQ3의 1.21x는 비트 수 대비 과도</li>
+        <li>3-bit이 4-bit보다 왜 이렇게 나쁜가?</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>근본 원인</h4>
+      <ul>
+        <li>비트 수가 아닌 <strong>스케일 팩터 수</strong>가 핵심</li>
+        <li>q4_0: 512차원당 스케일 16개</li>
+        <li>TBQ3: 512차원당 스케일 <strong>2개</strong></li>
+        <li>스케일 부족 &rarr; 양자화 노이즈 누적</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box red" style="margin-top:14px">
+    <strong>핵심:</strong> TBQ3의 문제는 3-bit 자체가 아니라, 블록당 스케일 팩터가 적어서 softmax 분포가 평탄화되는 것. 스케일을 늘리는 대신 다른 접근이 필요.
+  </div>
+</section>
+
+<!-- SUB-BLOCK SCALE EXPERIMENT -->
+<section>
+  <h2>Sub-block Scale 실험 <span class="tag tag-red">실패</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>실험 설계</h4>
+      <ul>
+        <li><code>block_tbq3_0</code> 구조체에 8개 서브스케일 추가</li>
+        <li>32-element 그룹별 독립 스케일</li>
+        <li>목표: 세밀한 스케일로 PPL 개선</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>결과</h4>
+      <ul>
+        <li>PPL <strong>악화</strong>: 514.6 vs 기존 509.9</li>
+        <li>서브스케일 자체가 양자화 노이즈 추가</li>
+        <li>WHT가 이미 분산 균등화 수행 중</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box purple" style="margin-top:14px">
+    <strong>교훈:</strong> WHT(Walsh-Hadamard Transform)는 이미 계수 분산을 균등화한다. 서브스케일은 중복이며 오히려 노이즈만 추가. &rarr; 스케일이 아닌 <strong>attention 보정</strong>으로 방향 전환.
+  </div>
+</section>
+
+<!-- ATTENTION SHARPENING -->
+<section>
+  <h2>Attention Sharpening <span class="tag tag-green">돌파구</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>이론적 배경</h4>
+      <ul>
+        <li>3-bit 양자화 노이즈가 softmax 분포를 평탄화</li>
+        <li>MMSE 이론에서 유도: <code>&alpha; = 1 + 1/(2&times;SQNR)</code></li>
+        <li>SQNR<sub>3bit</sub> &asymp; 13.8 &rarr; &alpha; &asymp; 1.036</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>장점</h4>
+      <ul>
+        <li><strong>메모리 비용 0</strong> &mdash; 스칼라 곱셈 하나</li>
+        <li><strong>연산 비용 0</strong> &mdash; softmax 전 단일 multiply</li>
+        <li>이론적 근거 있는 보정 (경험적 해킹 아님)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>결과:</strong> PPL 509.9 &rarr; <strong>455.0</strong> (1.21x &rarr; <strong>1.08x</strong>). 메모리/연산 추가 비용 없이 PPL 격차 62% 감소.
+  </div>
+</section>
+
+<!-- V ROTATION BUG -->
+<section>
+  <h2>V Rotation 버그 <span class="tag tag-red">버그 수정</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>문제</h4>
+      <ul>
+        <li><code>attn_rot</code>이 K와 V 모두에 적용</li>
+        <li>K: 안전 &mdash; Q도 같은 회전, 내적에서 상쇄<br><code>(R&middot;Q)&middot;(R&middot;K) = Q&middot;K</code></li>
+        <li>V: <strong>버그</strong> &mdash; IWHT 디코드에 역회전 없음</li>
+        <li>V 출력이 회전된 상태로 나감</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>수정</h4>
+      <ul>
+        <li><code>attn_rot_v = false</code> 설정</li>
+        <li>K만 회전 적용, V는 원래 값 유지</li>
+        <li>IWHT가 올바른 원본 V를 복원</li>
+        <li>PPL: 455.0 &rarr; <strong>448.1</strong> (1.08x &rarr; 1.07x)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box blue" style="margin-top:14px">
+    <strong>원리:</strong> K 회전은 Q&middot;K 내적에서 <code>R<sup>T</sup>R = I</code>로 상쇄되지만, V는 가중합 후 직접 출력되므로 회전이 남아있으면 결과가 왜곡된다.
+  </div>
+</section>
+
+<!-- SPLIT ALPHA -->
+<section>
+  <h2>TBQ3 / TBQP3 분리 &alpha; <span class="tag tag-purple">최적화</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>TBQP3 (2-bit + QJL)</h4>
+      <ul>
+        <li>QJL 프로젝션이 attention 스코어에 추가 노이즈</li>
+        <li>더 강한 sharpening 필요</li>
+        <li><strong>&alpha; = 1.036</strong></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>TBQ3 (3-bit)</h4>
+      <ul>
+        <li>깨끗한 노이즈 프로파일</li>
+        <li>가벼운 sharpening 충분</li>
+        <li><strong>&alpha; = 1.016</strong></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>결과:</strong> 단일 &alpha; 대비 분리 &alpha; 적용으로 tbqp3/tbq3 PPL: 473.7 &rarr; <strong>454.7</strong>. 각 양자화 방식의 노이즈 특성에 맞는 보정.
+  </div>
+</section>
+
+<!-- PER-BLOCK NORM -->
+<section>
+  <h2>Per-block Norm <span class="tag tag-blue">개선</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>TBQ3 (3-bit)</h4>
+      <ul>
+        <li>Per-block norm 적용</li>
+        <li>각 256-half 독립 정규화</li>
+        <li>블록별 분산 차이를 정확히 포착</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>TBQP3 (2-bit + QJL)</h4>
+      <ul>
+        <li>Global norm 유지</li>
+        <li>QJL residual이 cross-block 512-WHT 사용</li>
+        <li>블록 간 정보 공유 필요</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box blue" style="margin-top:14px">
+    <strong>설계 원칙:</strong> TBQ3는 256 블록 독립 &rarr; per-block norm이 자연스럽고, TBQP3는 512 전체 WHT &rarr; global norm이 올바른 선택.
+  </div>
+</section>
+
+<!-- TBQ4_0 OOB BUG -->
+<section>
+  <h2>tbq4_0 OOB 버그 수정 <span class="tag tag-red">버그 수정</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>문제</h4>
+      <ul>
+        <li><code>vec_dot_fattn_vec_KQ_tbq4_0</code></li>
+        <li>D=512에서 <code>K_tbq[0]</code>만 읽음</li>
+        <li>나머지 256 차원 미처리 &rarr; 잘못된 결과</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>수정</h4>
+      <ul>
+        <li><code>n_blocks = D/256</code> 루프 적용</li>
+        <li>모든 블록 순회하여 완전한 내적 계산</li>
+        <li>D=256, 512 모두 정상 동작</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- RESULTS -->
+<section>
+  <h2>최종 결과 <span class="tag tag-green">v1.5.2</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>항목</th><th>f16</th><th>tbqp3/tbq3</th><th>비율</th></tr></thead>
+    <tbody>
+      <tr><td>PPL (ctx=2048)</td><td>419.8</td><td class="ok"><strong>454.7</strong></td><td class="ok">1.08x</td></tr>
+      <tr><td>Math Bench</td><td>20.1/35</td><td>19.1/35</td><td>95%</td></tr>
+      <tr><td>Math Peak</td><td>21</td><td class="ok"><strong>23</strong></td><td class="ok">&gt;f16</td></tr>
+      <tr><td>KV 메모리</td><td>5,420 MiB</td><td class="ok"><strong>1,290 MiB</strong></td><td class="ok">4.2x 압축</td></tr>
+    </tbody>
+  </table>
+
+  <div class="card-grid" style="grid-template-columns:1fr 1fr 1fr 1fr; margin-top:20px">
+    <div class="metric"><div class="num green">1.08x</div><div class="label">PPL (v1.5.1: 1.21x)</div></div>
+    <div class="metric"><div class="num blue">4.2x</div><div class="label">KV 캐시 압축</div></div>
+    <div class="metric"><div class="num purple">0</div><div class="label">추가 메모리 비용</div></div>
+    <div class="metric"><div class="num green">62%</div><div class="label">PPL 격차 감소</div></div>
+  </div>
+</section>
+
+<!-- SUMMARY -->
+<section>
+  <h2>v1.5.2 성과 요약</h2>
+  <hr class="divider">
+
+  <ul class="items">
+    <li>Attention Sharpening: MMSE 이론 기반 &alpha; 유도, 메모리/연산 비용 0</li>
+    <li>V Rotation 버그 발견 및 수정: IWHT 역변환에 역회전 부재</li>
+    <li>TBQ3/TBQP3 분리 &alpha;: 노이즈 프로파일별 최적 보정</li>
+    <li>Per-block norm: TBQ3 블록 독립, TBQP3 글로벌 유지</li>
+    <li>Sub-block scale 실험: WHT 분산 균등화 효과 증명 (음성 결과도 가치)</li>
+    <li>tbq4_0 OOB 버그 수정: D=512 멀티블록 루프</li>
+  </ul>
+
+  <div class="highlight-box purple" style="margin-top:20px">
+    <strong>v1.5.1 &rarr; v1.5.2:</strong> PPL 509.9 &rarr; 454.7 (1.21x &rarr; 1.08x). 이론적 근거 있는 단일 스칼라 보정으로 양자화 품질을 대폭 개선. 4.2x 압축에서 f16 대비 8% 이내 PPL 달성.
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash: true, width: 1280, height: 720, margin: 0, transition: 'slide' });</script>
+</body>
+</html>
