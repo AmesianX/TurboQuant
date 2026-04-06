@@ -292,11 +292,17 @@ llama_kv_cache::llama_kv_cache(
                        || type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2
                        || type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4;
 
-    // TBQ types require WHT rotation regardless of variable GQA
-    // (WHT operates per-head, not per-GQA-group, so variable n_head_kv is fine)
-    // Note: attn_rot + TBQ WHT = double rotation, which is fine (both Q and K get same transforms)
+    // TBQP (QJL) types: disable attn_rot for K — QJL already provides its own random projection,
+    // triple rotation (attn_rot + WHT + QJL) is redundant. Benchmarked: OFF avg 37.0 > ON avg 35.4.
+    // TBQ (non-QJL) types: keep attn_rot — double rotation (attn_rot + WHT) helps decorrelation.
+    const bool is_tbqp_k = type_k == GGML_TYPE_TBQP3_0 || type_k == GGML_TYPE_TBQP4_0
+                        || type_k == GGML_TYPE_TBQP3_1 || type_k == GGML_TYPE_TBQP4_1
+                        || type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2
+                        || type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4;
+
     attn_rot_k =
         !attn_rot_disable &&
+        !is_tbqp_k &&
         ggml_is_quantized(type_k) &&
         (is_tbq_k || !hparams.is_n_embd_k_gqa_variable()) &&
         hparams.n_embd_head_k() % 64 == 0;
