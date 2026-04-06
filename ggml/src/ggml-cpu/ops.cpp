@@ -5584,6 +5584,26 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
         case GGML_TYPE_F64:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQP3_0:
+        case GGML_TYPE_TBQP4_0:
+        case GGML_TYPE_TBQ3_1:
+        case GGML_TYPE_TBQ4_1:
+        case GGML_TYPE_TBQP3_1:
+        case GGML_TYPE_TBQP4_1:
+        case GGML_TYPE_TBQ3_2:
+        case GGML_TYPE_TBQ4_2:
+        case GGML_TYPE_TBQP3_2:
+        case GGML_TYPE_TBQP4_2:
+        case GGML_TYPE_TBQ3_3:
+        case GGML_TYPE_TBQ4_3:
+        case GGML_TYPE_TBQP3_3:
+        case GGML_TYPE_TBQP4_3:
+        case GGML_TYPE_TBQ3_4:
+        case GGML_TYPE_TBQ4_4:
+        case GGML_TYPE_TBQP3_4:
+        case GGML_TYPE_TBQP4_4:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");
