@@ -1113,17 +1113,61 @@ static __global__ void flash_attn_ext_vec(
             // TBQ V post-processing
             if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0) {
                 if constexpr (D_V == 512) {
-                    // D_V=512: V stored without WHT (direct Lloyd-Max) → no IWHT needed
-                    // Just write accumulated values directly (already in attn_rot domain)
-                    // The model's output projection handles de-rotation
+                    // D_V=512: 512-point IWHT + sign undo (matching K's 512-WHT encode)
+                    static constexpr uint8_t tbq_signs_512_v[64] = {
+                        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+                        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+                        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+                        0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+                        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
+                        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+                        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
+                        0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+                    };
                     __syncthreads();
-                    float * buf_base = (float *) &KQ[0];
-                    const int dst_base = (((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D_V;
-                    for (int i0 = 0; i0 < D_V; i0 += nthreads) {
-                        if (i0 + tid < D_V) {
-                            dst[dst_base + i0 + tid] = buf_base[i0 + tid];
-                        }
+                    float * buf = (float *) &KQ[0];
+                    // Load 4 elements per thread: [tid, tid+128, tid+256, tid+384]
+                    float f0 = buf[tid], f1 = buf[tid+128], f2 = buf[tid+256], f3 = buf[tid+384];
+                    // Stages 0-4: warp shuffle (same butterfly as forward WHT)
+                    #pragma unroll
+                    for (int s = 0; s < 5; s++) {
+                        float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                        float o1 = __shfl_xor_sync(0xffffffff, f1, 1 << s, WARP_SIZE);
+                        float o2 = __shfl_xor_sync(0xffffffff, f2, 1 << s, WARP_SIZE);
+                        float o3 = __shfl_xor_sync(0xffffffff, f3, 1 << s, WARP_SIZE);
+                        if (tid & (1 << s)) { f0 = o0 - f0; f1 = o1 - f1; f2 = o2 - f2; f3 = o3 - f3; }
+                        else                { f0 = f0 + o0; f1 = f1 + o1; f2 = f2 + o2; f3 = f3 + o3; }
                     }
+                    // Stages 5-6: shared memory
+                    buf[tid] = f0; buf[tid+128] = f1; buf[tid+256] = f2; buf[tid+384] = f3;
+                    __syncthreads();
+                    { float u0=buf[tid],v0=buf[tid^32]; float u1=buf[tid+128],v1=buf[(tid+128)^32];
+                      float u2=buf[tid+256],v2=buf[(tid+256)^32]; float u3=buf[tid+384],v3=buf[(tid+384)^32];
+                      f0=(tid&32)?v0-u0:u0+v0; f1=(tid&32)?v1-u1:u1+v1;
+                      f2=(tid&32)?v2-u2:u2+v2; f3=(tid&32)?v3-u3:u3+v3; }
+                    buf[tid] = f0; buf[tid+128] = f1; buf[tid+256] = f2; buf[tid+384] = f3;
+                    __syncthreads();
+                    { float u0=buf[tid],v0=buf[tid^64]; float u1=buf[tid+128],v1=buf[(tid+128)^64];
+                      float u2=buf[tid+256],v2=buf[(tid+256)^64]; float u3=buf[tid+384],v3=buf[(tid+384)^64];
+                      f0=(tid&64)?v0-u0:u0+v0; f1=(tid&64)?v1-u1:u1+v1;
+                      f2=(tid&64)?v2-u2:u2+v2; f3=(tid&64)?v3-u3:u3+v3; }
+                    // Stage 7 (stride 128): register pairs
+                    { float u = f0, v = f1; f0 = u + v; f1 = u - v; }
+                    { float u = f2, v = f3; f2 = u + v; f3 = u - v; }
+                    // Stage 8 (stride 256): register pairs
+                    { float u = f0, v = f2; f0 = u + v; f2 = u - v; }
+                    { float u = f1, v = f3; f1 = u + v; f3 = u - v; }
+                    // Sign undo + normalize (/512)
+                    const uint8_t * sv = tbq_signs_512_v;
+                    float s0 = ((sv[tid>>3]>>( tid    &7))&1) ? -1.0f : 1.0f;
+                    float s1 = ((sv[(tid+128)>>3]>>((tid+128)&7))&1) ? -1.0f : 1.0f;
+                    float s2 = ((sv[(tid+256)>>3]>>((tid+256)&7))&1) ? -1.0f : 1.0f;
+                    float s3 = ((sv[(tid+384)>>3]>>((tid+384)&7))&1) ? -1.0f : 1.0f;
+                    const int dst_base = (((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D_V;
+                    dst[dst_base + tid]     = f0 * s0 / 512.0f;
+                    dst[dst_base + tid+128] = f1 * s1 / 512.0f;
+                    dst[dst_base + tid+256] = f2 * s2 / 512.0f;
+                    dst[dst_base + tid+384] = f3 * s3 / 512.0f;
                 } else {
                 static constexpr uint8_t tbq_signs_v[32] = {
                     0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
