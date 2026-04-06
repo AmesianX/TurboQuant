@@ -36,12 +36,27 @@ Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐�
 5. **TBQ_TUNING 빌드 모드**: `cmake -DGGML_CUDA_FA_TBQ_TUNING=ON`으로 fattn 템플릿 컴파일을 최소화(tbq3_0-tbq3_0 + 진단용 조합만). centroid/dither 미세조정 시 rebuild 시간 10초 이내.
 
 **추천 설정:**
+
+모델: [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) (Q4_K_XL)
+
 ```bash
 # 최고 품질 (f16 초과, 4.2x 압축)
-./llama-server --cache-type-k tbqp3 --cache-type-v tbq3 ...
+./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+    -t 4 -c 262144 -n 32768 --parallel 1 \
+    --cont-batching --jinja --reasoning-format auto \
+    --n-gpu-layers 999 --flash-attn on \
+    -b 1024 -ub 512 --no-mmap \
+    --cache-type-k tbqp3 --cache-type-v tbq3 \
+    --temp 0 --host 127.0.0.1 --port 8889
 
 # 단순 설정 (f16 동급, 4.2x 압축)
-./llama-server --cache-type-k tbq3 --cache-type-v tbq3 ...
+./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+    -t 4 -c 262144 -n 32768 --parallel 1 \
+    --cont-batching --jinja --reasoning-format auto \
+    --n-gpu-layers 999 --flash-attn on \
+    -b 1024 -ub 512 --no-mmap \
+    --cache-type-k tbq3 --cache-type-v tbq3 \
+    --temp 0 --host 127.0.0.1 --port 8889
 ```
 > SWA K+V는 자동으로 f16 업그레이드됩니다. 추가 설정 불필요.
 
@@ -513,12 +528,27 @@ This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It
 3. **QJL D=512 Restored**: Previously removed as "ineffective at D=512" — SWA noise was masking QJL improvement. With SWA f16 bypass, tbqp3 K outperforms tbq3 K (37.4 > 37.0). attn_rot auto-disabled for TBQP (prevents triple rotation).
 
 4. **Recommended config:**
+
+Model: [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) (Q4_K_XL)
+
 ```bash
 # Best quality (exceeds f16, 4.2x compression)
-./llama-server --cache-type-k tbqp3 --cache-type-v tbq3 ...
+./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+    -t 4 -c 262144 -n 32768 --parallel 1 \
+    --cont-batching --jinja --reasoning-format auto \
+    --n-gpu-layers 999 --flash-attn on \
+    -b 1024 -ub 512 --no-mmap \
+    --cache-type-k tbqp3 --cache-type-v tbq3 \
+    --temp 0 --host 127.0.0.1 --port 8889
 
 # Simple config (matches f16, 4.2x compression)
-./llama-server --cache-type-k tbq3 --cache-type-v tbq3 ...
+./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+    -t 4 -c 262144 -n 32768 --parallel 1 \
+    --cont-batching --jinja --reasoning-format auto \
+    --n-gpu-layers 999 --flash-attn on \
+    -b 1024 -ub 512 --no-mmap \
+    --cache-type-k tbq3 --cache-type-v tbq3 \
+    --temp 0 --host 127.0.0.1 --port 8889
 ```
 > SWA K+V auto-upgraded to f16. No additional configuration needed.
 
