@@ -278,6 +278,8 @@ static __device__ void quantize_f32_tbq3_0_block_512(const float * __restrict__ 
 }
 
 // TurboQuant_prod 3-bit: 512-point WHT + 2-bit Lloyd-Max + 1-bit QJL, global norm
+// Note: uses 6KB stack (tmp[512]+recon[512]+res[512]) — called once per token via set_rows,
+// NOT on the attention hot path. Do not attempt to "optimize" by reducing stack usage.
 static __device__ void quantize_f32_tbqp3_0_block_512(const float * __restrict__ x, block_tbqp3_0 * __restrict__ y) {
     static constexpr uint8_t tbq_signs_512[64] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
