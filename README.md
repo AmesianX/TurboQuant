@@ -8,12 +8,19 @@
 
 **Environment:** NVIDIA DGX Spark (GB10, 128GB VRAM) · CUDA 12.8 · Model: [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) UD-Q4_K_XL
 
+**Memory & Compression (262K ctx, Gemma 4 26B MoE):**
+
+| Config | Global KV | SWA KV | Total KV | Compression |
+|--------|-----------|--------|----------|-------------|
+| f16/f16 | 5,120 MiB | 300 MiB (f16) | 5,420 MiB | 1.0x |
+| **tbqp3/tbq3** | 990 MiB (K:500 + V:490) | 300 MiB (f16) | **1,290 MiB** | **4.2x** |
+
 **PPL Benchmark (wikitext-2-raw, ctx=2048):**
 
-| Config | K cache | V cache | PPL | ± | vs f16 |
-|--------|---------|---------|-----|---|--------|
-| f16/f16 | f16 | f16 | 419.8 | 3.37 | 1.00x |
-| **tbqp3/tbq3** | tbqp3 | tbq3 | **454.7** | 7.27 | **1.08x** |
+| Config | PPL | ± | vs f16 |
+|--------|-----|---|--------|
+| f16/f16 | 419.8 | 3.37 | 1.00x |
+| **tbqp3/tbq3** | **454.7** | 7.27 | **1.08x** |
 
 **Math Accuracy (262K ctx, temp=0, 35 problems × 10 runs):**
 
@@ -22,7 +29,7 @@
 | **tbqp3/tbq3** | 19,23,18,22,18,20,19,16,19,17 | **19.1** | **23** |
 | f16/f16 | 19,20,21,20,20,21,21,19,20,20 | 20.1 | 21 |
 
-> **PPL gap reduced from 21% to 8%.** Math: 1 question difference on average, peak 23 exceeds f16 best (21). **4.2x compression.**
+> **4.2x compression with f16-equivalent quality.** PPL gap: 21% → 8%. Math: 1 question avg difference, peak 23 > f16 best 21.
 
 **Key changes:**
 
@@ -59,12 +66,19 @@ Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐�
 
 **환경:** NVIDIA DGX Spark (GB10, VRAM 128GB) · CUDA 12.8 · Model: [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) UD-Q4_K_XL
 
+**메모리 & 압축률 (262K ctx, Gemma 4 26B MoE):**
+
+| 설정 | Global KV | SWA KV | 총 KV | 압축 |
+|------|-----------|--------|-------|------|
+| f16/f16 | 5,120 MiB | 300 MiB (f16) | 5,420 MiB | 1.0x |
+| **tbqp3/tbq3** | 990 MiB (K:500 + V:490) | 300 MiB (f16) | **1,290 MiB** | **4.2x** |
+
 **PPL 벤치마크 (wikitext-2-raw, ctx=2048):**
 
-| 설정 | K cache | V cache | PPL | ± | vs f16 |
-|------|---------|---------|-----|---|--------|
-| f16/f16 | f16 | f16 | 419.8 | 3.37 | 1.00x |
-| **tbqp3/tbq3** | tbqp3 | tbq3 | **454.7** | 7.27 | **1.08x** |
+| 설정 | PPL | ± | vs f16 |
+|------|-----|---|--------|
+| f16/f16 | 419.8 | 3.37 | 1.00x |
+| **tbqp3/tbq3** | **454.7** | 7.27 | **1.08x** |
 
 **수학 정확도 벤치마크 (262K ctx, temp=0, 35문제 × 10회):**
 
