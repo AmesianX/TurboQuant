@@ -1500,24 +1500,7 @@ common_init_result::common_init_result(common_params & params) :
       } // end is_any_tbq
     }
 
-    // D=512 K cache: QJL (TBQP) does not help — downgrade to TBQ (MSE only)
-    // Tested 8 QJL variants at D=512, all degraded quality. TBQ3/f16 = f16 identical.
-    if (head_dim == 512) {
-        ggml_type orig_k = cparams.type_k;
-        bool downgraded = false;
-             if (cparams.type_k == GGML_TYPE_TBQP3_0) { cparams.type_k = GGML_TYPE_TBQ3_0; downgraded = true; }
-        else if (cparams.type_k == GGML_TYPE_TBQP4_0) { cparams.type_k = GGML_TYPE_TBQ4_0; downgraded = true; }
-        if (downgraded) {
-            LOG_WRN("\n");
-            LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
-            LOG_WRN("║  head_dim=512: QJL (TBQP) not effective — auto-corrected    ║\n");
-            LOG_WRN("║  %s → %s (MSE only, no QJL)                    ║\n",
-                    ggml_type_name(orig_k), ggml_type_name(cparams.type_k));
-            LOG_WRN("║  Recommended: --cache-type-k tbq3 --cache-type-v f16        ║\n");
-            LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
-            LOG_WRN("\n");
-        }
-    }
+    // D=512 K cache: TBQP3 (QJL) now supported at D=512 with SWA f16 bypass
 
     // D=512 V cache type validation: only f16 and TBQ types have flash attention dispatch
     if (head_dim == 512) {
