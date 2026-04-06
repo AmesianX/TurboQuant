@@ -233,9 +233,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * V = dst->src[2];
 
 #ifdef GGML_CUDA_FA_TBQ_TUNING
-    // TBQ tuning + SWA V f16 support
+    // TBQ tuning + SWA f16 + QJL support
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
     FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
 #elif defined(GGML_CUDA_FA_ALL_QUANTS)
