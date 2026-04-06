@@ -307,11 +307,9 @@ llama_kv_cache::llama_kv_cache(
         (is_tbq_k || !hparams.is_n_embd_k_gqa_variable()) &&
         hparams.n_embd_head_k() % 64 == 0;
 
-    attn_rot_v =
-        !attn_rot_disable &&
-        ggml_is_quantized(type_v) &&
-        (is_tbq_v || !hparams.is_n_embd_v_gqa_variable()) &&
-        hparams.n_embd_head_v() % 64 == 0;
+    // V rotation disabled: IWHT decode path does not undo attn_rot,
+    // so rotated V values would produce incorrect attention output.
+    attn_rot_v = false;
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d\n", __func__, attn_rot_k);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d\n", __func__, attn_rot_v);
