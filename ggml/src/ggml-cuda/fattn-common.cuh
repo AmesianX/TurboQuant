@@ -770,28 +770,36 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
          0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
     };
 
-    const float norm = __half2float(K_tbq[0].d);
-    float sum = 0.0f;
+    // D=512: two 256-blocks, each with own norm. Sum both contributions.
+    constexpr int n_blocks = D / 256;
+    float total = 0.0f;
 
-    #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
-        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int byte_idx = k; // D=QK_K, so elem%QK_K/2 = k
+    for (int blk = 0; blk < n_blocks; blk++) {
+        const float norm = __half2float(K_tbq[blk].d);
+        float sum = 0.0f;
 
-        const uint8_t packed = K_tbq[0].qs[byte_idx];
-        const float cent_lo = c4[packed & 0xF];
-        const float cent_hi = c4[packed >> 4];
+        #pragma unroll
+        for (int k_KQ_0 = 0; k_KQ_0 < 128; k_KQ_0 += nthreads) {
+            const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+            const int byte_idx = k; // 128 bytes per block (256 elements * 4 bits / 8)
 
+            const uint8_t packed = K_tbq[blk].qs[byte_idx];
+            const float cent_lo = c4[packed & 0xF];
+            const float cent_hi = c4[packed >> 4];
+
+            const int q_idx = blk * (128/nthreads) + k_KQ_0/nthreads;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
+            const float2 q = __half22float2(((const half2 *) Q_v)[q_idx]);
 #else
-        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
+            const float2 q = ((const float2 *) Q_v)[q_idx];
 #endif
 
-        sum += q.x * cent_lo + q.y * cent_hi;
+            sum += q.x * cent_lo + q.y * cent_hi;
+        }
+        total += norm * sum;
     }
 
-    return norm * sum;
+    return total;
 }
 
 // TBQ3_0: 3-bit fused attention score
