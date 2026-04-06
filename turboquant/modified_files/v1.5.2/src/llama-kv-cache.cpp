@@ -287,10 +287,7 @@ llama_kv_cache::llama_kv_cache(
                        || type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2
                        || type_k == GGML_TYPE_TBQ3_4  || type_k == GGML_TYPE_TBQ4_4
                        || type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4;
-    const bool is_tbq_v = type_v == GGML_TYPE_TBQ3_0  || type_v == GGML_TYPE_TBQ4_0
-                       || type_v == GGML_TYPE_TBQ3_1  || type_v == GGML_TYPE_TBQ4_1
-                       || type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2
-                       || type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4;
+    // is_tbq_v removed: V rotation disabled (IWHT decode has no inverse rotation)
 
     // TBQP (QJL) types: disable attn_rot for K — QJL already provides its own random projection,
     // triple rotation (attn_rot + WHT + QJL) is redundant. Benchmarked: OFF avg 37.0 > ON avg 35.4.
