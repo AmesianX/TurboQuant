@@ -906,11 +906,14 @@ static __global__ void flash_attn_ext_vec(
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
 
-                // Quantization-aware attention sharpening for TBQ K types:
-                // 3-bit noise flattens softmax → sharpen scores to restore decisiveness
-                // α = 1 + 1/(2×SQNR) where SQNR_3bit ≈ 13.8 → α ≈ 1.036
-                if constexpr (type_K == GGML_TYPE_TBQ3_0 || type_K == GGML_TYPE_TBQP3_0) {
+                // Quantization-aware attention sharpening: α = 1 + 1/(2×SQNR)
+                // Compensates softmax flattening from K quantization noise.
+                // TBQP3: 2-bit MSE + 1-bit QJL adds extra projection noise → α = 1.036
+                // TBQ3:  3-bit Lloyd-Max, cleaner noise profile → α = 1.016
+                if constexpr (type_K == GGML_TYPE_TBQP3_0) {
                     sum *= 1.036f;
+                } else if constexpr (type_K == GGML_TYPE_TBQ3_0) {
+                    sum *= 1.016f;
                 }
 
                 if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
