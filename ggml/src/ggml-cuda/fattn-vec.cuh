@@ -906,6 +906,13 @@ static __global__ void flash_attn_ext_vec(
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
 
+                // Quantization-aware attention sharpening for TBQ K types:
+                // 3-bit noise flattens softmax → sharpen scores to restore decisiveness
+                // α = 1 + 1/(2×SQNR) where SQNR_3bit ≈ 13.8 → α ≈ 1.036
+                if constexpr (type_K == GGML_TYPE_TBQ3_0 || type_K == GGML_TYPE_TBQP3_0) {
+                    sum *= 1.036f;
+                }
+
                 if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
                     KQ_reg[j] = sum;
                 }
@@ -969,13 +976,6 @@ static __global__ void flash_attn_ext_vec(
                     dequantize_V(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
-                // Heavy-tail compensation for D=512 nowht global V (SWA D=256 unaffected)
-                if constexpr ((type_V == GGML_TYPE_TBQ3_0 || type_V == GGML_TYPE_TBQ4_0) && D_V == 512) {
-#pragma unroll
-                    for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
-                        tmp[i_VKQ_1] = __hmul2(tmp[i_VKQ_1], __float2half2_rn(1.15f));
-                    }
-                }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
@@ -1013,13 +1013,6 @@ static __global__ void flash_attn_ext_vec(
                     dequantize_V(V + k*nb21, tmp, v_elem);
                 }
                 // Heavy-tail centroid compensation: scale V only for D=512 nowht (global layers)
-                if constexpr ((type_V == GGML_TYPE_TBQ3_0 || type_V == GGML_TYPE_TBQ4_0) && D_V == 512) {
-#pragma unroll
-                    for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
-                        tmp[i_VKQ_1].x *= 1.15f;
-                        tmp[i_VKQ_1].y *= 1.15f;
-                    }
-                }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll

@@ -238,29 +238,22 @@ static __device__ void quantize_f32_tbq3_0_block_512(const float * __restrict__ 
                 tmp[i+j] = u+v; tmp[i+j+len] = u-v;
             }
 
-    // Global norm over all 512 WHT elements — shared by both blocks
-    // This preserves cross-block scale consistency (key insight for 512-WHT quality)
-    float global_sq = 0.0f;
-    for (int j = 0; j < 512; j++) global_sq += tmp[j] * tmp[j];
-    float global_norm = sqrtf(global_sq / 512.0f); // normalize so elements ~ N(0,1)
-
-    if (global_norm < 1e-10f) {
-        for (int blk = 0; blk < 2; blk++) {
-            y[blk].d = __float2half(0.0f);
-            for (int j = 0; j < QK_K*3/8; j++) y[blk].qs[j] = 0;
-        }
-        return;
-    }
-
-    float inv_norm = 1.0f / global_norm;
-
-    // Store SAME global_norm in both blocks — dequant reads block.d for each
-    y[0].d = __float2half(global_norm);
-    y[1].d = __float2half(global_norm);
-
-    // Quantize each 256-element half with shared norm
+    // Per-block norm: each 256-half gets its own norm after 512-WHT
     for (int blk = 0; blk < 2; blk++) {
         float * blk_data = tmp + blk * 256;
+
+        float blk_sq = 0.0f;
+        for (int j = 0; j < 256; j++) blk_sq += blk_data[j] * blk_data[j];
+        float blk_norm = sqrtf(blk_sq / 256.0f);
+
+        if (blk_norm < 1e-10f) {
+            y[blk].d = __float2half(0.0f);
+            for (int j = 0; j < QK_K*3/8; j++) y[blk].qs[j] = 0;
+            continue;
+        }
+
+        float inv_norm = 1.0f / blk_norm;
+        y[blk].d = __float2half(blk_norm);
 
         int bit_pos = 0;
         for (int j = 0; j < QK_K*3/8; j++) y[blk].qs[j] = 0;
@@ -317,6 +310,8 @@ static __device__ void quantize_f32_tbqp3_0_block_512(const float * __restrict__
                 tmp[i+j] = u+v; tmp[i+j+len] = u-v;
             }
 
+    // Global norm for TBQP3: QJL residual uses cross-block 512-WHT,
+    // so all elements must be in the same normalized space
     float global_sq = 0.0f;
     for (int j = 0; j < 512; j++) global_sq += tmp[j] * tmp[j];
     float global_norm = sqrtf(global_sq / 512.0f);
