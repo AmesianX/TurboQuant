@@ -777,16 +777,28 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_TBQP3_0) {
-        // Note: D=512 TBQP3 auto-downgraded to TBQ3 in common.cpp (QJL ineffective at D=512)
-        set_rows_cuda_quant<idx_t, block_tbqp3_0, QK_K, quantize_f32_tbqp3_0_block>(
-            src0_d, src1_d, (block_tbqp3_0*)dst->data,
-            ne00, ne01, ne02, ne03,
-            ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03,
-            nb10, nb11, nb12,
-            nb1, nb2, nb3,
-            stream
-        );
+        const int32_t head_dim = dst->op_params[0];
+        if (head_dim >= 512) {
+            set_rows_cuda_quant_512<idx_t, block_tbqp3_0, QK_K, quantize_f32_tbqp3_0_block_512>(
+                src0_d, src1_d, (block_tbqp3_0*)dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        } else {
+            set_rows_cuda_quant<idx_t, block_tbqp3_0, QK_K, quantize_f32_tbqp3_0_block>(
+                src0_d, src1_d, (block_tbqp3_0*)dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        }
     } else if (dst->type == GGML_TYPE_TBQP4_0) {
         set_rows_cuda_quant<idx_t, block_tbqp4_0, QK_K, quantize_f32_tbqp4_0_block>(
             src0_d, src1_d, (block_tbqp4_0*)dst->data,
