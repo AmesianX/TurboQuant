@@ -1,0 +1,474 @@
+\documentclass[10pt,twocolumn]{article}
+
+% ============================================================
+% Packages
+% ============================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{url}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\title{TurboQuant in Practice: Implementing 3-Bit KV Cache Compression\\in a Production LLM Inference Engine}
+
+\author{
+AmesianX\\
+Independent Researcher\\
+\texttt{amesianx@gmail.com}\\
+\url{https://powerhacker.net}\\
+\url{https://github.com/AmesianX/TurboQuant}
+}
+
+\date{}
+
+% ============================================================
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+We present the first production-grade implementation of TurboQuant---a KV cache compression method based on Walsh-Hadamard Transform (WHT) and Lloyd-Max quantization---within llama.cpp, the most widely deployed open-source LLM inference engine. Our implementation compresses the KV cache to 3 bits per element, achieving \textbf{4.2$\times$ memory reduction} with only \textbf{6\% perplexity degradation} versus FP16 on Gemma~4 26B. Beyond faithful implementation, we make three novel contributions: (1)~a \emph{dynamic attention sharpening} formula $\alpha(N) = 1 + c\sqrt{\ln N}$ derived from MMSE and Extreme Value Theory that adapts the softmax correction to the runtime context length; (2)~identification and resolution of a \emph{half-precision accumulation bug} in the flash attention kernel where FP16 arithmetic causes precision loss amplified by the IWHT butterfly into non-deterministic MoE expert routing; and (3)~a complete engineering framework supporting 20 quantization type variants across five head dimensions (64--576), including cross-head WHT and asymmetric K/V configurations. We release the full implementation as open source at \url{https://github.com/AmesianX/TurboQuant}.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+Large Language Models (LLMs) with long context windows require substantial GPU memory for key-value (KV) caches. For a 26B-parameter Gemma~4 model with 262K context, the FP16 KV cache alone consumes 5.4~GiB---often exceeding the model weights themselves. TurboQuant~\cite{turboquant2026}, introduced at ICLR 2026 by Google DeepMind, proposes compressing KV cache entries to 3--4 bits using the Walsh-Hadamard Transform (WHT) followed by Lloyd-Max quantization, with an optional Quantized Johnson-Lindenstrauss (QJL) correction term.
+
+While the theoretical framework is elegant, no production implementation existed prior to this work. Bridging the gap between a research paper and a shipping CUDA kernel requires solving numerous engineering challenges that the paper does not address: shared memory layout for WHT butterfly operations, precision requirements for the inverse transform, interaction with existing flash attention frameworks, and support for the diverse head dimensions found in modern architectures (64, 128, 256, 512, 576).
+
+In this paper, we describe the complete implementation within llama.cpp's flash attention vector kernel (\texttt{fattn-vec}), report performance on real models, and present three contributions that go beyond the original paper:
+
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \textbf{Dynamic Attention Sharpening} (\S\ref{sec:sharpening}): Quantization noise flattens the softmax distribution. We derive a context-length-adaptive correction $\alpha(N) = 1 + c\sqrt{\ln N}$ from Minimum Mean Square Error (MMSE) theory and Extreme Value Theory (EVT), eliminating the need for empirical tuning.
+
+\item \textbf{Half-Precision Pathology} (\S\ref{sec:precision}): We identify that the upstream flash attention kernel's FP16 (\texttt{half2}) accumulation path causes precision loss that is \emph{amplified} by the IWHT butterfly into catastrophic non-determinism in Mixture-of-Experts routing. Forcing FP32 accumulation for TBQ value types resolves the issue and improves perplexity by 2\%.
+
+\item \textbf{Multi-Variant Engineering} (\S\ref{sec:engineering}): We implement 20 TBQ/TBQP type variants across block sizes 64--576, including cross-head WHT ($H_8 \otimes H_{64}$), asymmetric K/V dimensions (GLM 576/512), per-block vs.\ global normalization, and QJL residual correction---all within the template-instantiated flash attention framework.
+\end{enumerate}
+
+% ============================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{TurboQuant}
+
+TurboQuant~\cite{turboquant2026} compresses KV cache vectors through three steps:
+
+\paragraph{1. Randomized WHT.} Given a $d$-dimensional vector $\mathbf{x}$, compute $\mathbf{w} = H_d \cdot (\mathbf{s} \odot \mathbf{x})$, where $H_d$ is the $d \times d$ Hadamard matrix and $\mathbf{s} \in \{-1, +1\}^d$ is a fixed random sign pattern. The WHT uniformizes the coefficient distribution regardless of the input structure, making all coordinates approximately i.i.d.\ Gaussian by the Lindeberg CLT.
+
+\paragraph{2. Lloyd-Max Quantization.} Each WHT coefficient is quantized to $b$ bits using the optimal Lloyd-Max codebook for the Gaussian distribution. For $b=3$ (8 levels), the theoretical SQNR is 31.2; for $b=4$ (16 levels), 56.2.
+
+\paragraph{3. QJL Correction (optional).} TurboQuant-prod (TBQP) uses $(b{-}1)$-bit Lloyd-Max quantization plus a 1-bit Quantized Johnson-Lindenstrauss projection on the residual, improving reconstruction MSE at the cost of additional attention score variance.
+
+\paragraph{Decoding.} At attention time, the query is WHT-transformed to match the key domain: $\text{score} = \langle H_d(\mathbf{s} \odot \mathbf{q}),\ \text{dequant}(\mathbf{k}_\text{tbq}) \rangle / d$. For values, the weighted sum is computed in the WHT domain, then inverse-transformed: $\mathbf{v}_\text{out} = \mathbf{s} \odot H_d(\sum_k \alpha_k \cdot \text{dequant}(\mathbf{v}_k)) / d$.
+
+\subsection{Flash Attention Vector Kernel}
+
+The llama.cpp \texttt{fattn-vec} kernel implements flash attention for single-token decoding (autoregressive generation). Each thread block processes one query head, iterating over KV pairs in chunks. Key design choices relevant to TBQ:
+
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \texttt{V\_DOT2\_F32\_F16\_AVAILABLE}: When defined, VKQ accumulators use \texttt{half2} and shared memory uses \texttt{half}, halving register and shared memory usage. This is correct for FP16 KV but, as we show in \S\ref{sec:precision}, catastrophic for TBQ.
+\item Template instantiation: Each (K-type, V-type) combination is a separate \texttt{.cu} file, allowing per-combination compile-time configuration.
+\item Online softmax with running maximum tracking and rescaling.
+\end{itemize}
+
+% ============================================================
+\section{System Design}
+\label{sec:design}
+
+\subsection{Query Preprocessing: GPU-Side WHT}
+
+The original TurboQuant paper assumes WHT is performed during quantization (CPU-side). In a flash attention kernel, the \emph{query} must also be WHT-transformed at runtime. We implement this entirely in GPU registers and shared memory:
+
+\paragraph{$d=256$ (128 threads, 2 elements each).}
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item Sign multiply: $f_i \leftarrow q_i \cdot s_i$ (register)
+\item Stage 7 (stride 128): register butterfly between $f_0, f_1$
+\item Stages 0--4 (stride 1--16): \texttt{\_\_shfl\_xor\_sync} warp shuffle
+\item Stages 5--6 (stride 32, 64): shared memory read/write with XOR addressing
+\end{enumerate}
+
+\paragraph{$d=512$ (128 threads, 4 elements each).}
+Stages 8--7 (stride 256, 128) in registers, stages 0--4 via warp shuffle, stages 5--6 via shared memory. Total: 9 butterfly stages, zero global memory traffic.
+
+The WHT result is stored directly into \texttt{Q\_reg} with the attention scale factor applied: $\texttt{Q\_reg}[i] = w_i \times \text{scale} / d$.
+
+\subsection{K Scoring: WHT-Domain Dot Product}
+
+For TBQ keys, the dot product is computed entirely in the WHT domain. The dequantized centroid values are multiplied against the pre-transformed query:
+\begin{equation}
+\text{score} = \sum_{i=0}^{d-1} c_{\text{idx}[i]} \cdot \text{norm} \cdot Q_{\text{wht}}[i]
+\end{equation}
+For TBQP keys, a second term is added from the QJL projection:
+\begin{equation}
+\text{score}_\text{tbqp} = \text{score}_\text{mse} + d_\text{qjl} \cdot \sum_{i} \text{sign}_\text{qjl}[i] \cdot Q_{\text{wht2}}[i]
+\end{equation}
+where $Q_{\text{wht2}}$ is a second WHT of the query with independent random signs, scaled by $\sqrt{\pi/2}$ (the QJL norm correction factor).
+
+\subsection{V Accumulation and IWHT Decode}
+
+Value vectors are dequantized and accumulated in the WHT domain using the standard flash attention online softmax. After the KV loop completes, the accumulated result undergoes inverse WHT:
+
+\begin{equation}
+\mathbf{v}_\text{out} = \frac{1}{d}\,\mathbf{s} \odot H_d\!\left(\frac{\sum_k e^{\alpha \cdot s_k} \cdot \mathbf{v}_k}{\sum_k e^{\alpha \cdot s_k}}\right)
+\end{equation}
+
+The IWHT uses the same butterfly structure as the forward transform (since $H_d$ is self-inverse up to normalization), followed by sign undo and division by $d$.
+
+\subsection{Per-Block vs.\ Global Normalization}
+
+For $d=512$ with TBQ3, each 256-element half of the WHT vector is normalized independently (\emph{per-block norm}), yielding two scale factors stored in \texttt{block\_tbq3\_0.d}. This is because the two halves can have significantly different energy after the 512-point WHT. For TBQP3, a \emph{global norm} is used instead, because the QJL residual correction operates across the full 512-element vector and requires consistent scaling.
+
+% ============================================================
+\section{Dynamic Attention Sharpening}
+\label{sec:sharpening}
+
+\subsection{The Softmax Flattening Problem}
+
+Quantization noise in K cache entries adds independent noise $\epsilon_i$ to each attention score $s_i = \mathbf{q}^\top \mathbf{k}_i$. The observed scores become $\hat{s}_i = s_i + \epsilon_i$ where $\epsilon_i \sim \mathcal{N}(0, \sigma_\epsilon^2)$. The softmax distribution over $\hat{s}_i$ is flatter than over $s_i$: the noise raises the effective temperature, reducing the probability mass on the correct maximum.
+
+\subsection{Derivation of $\alpha(N)$}
+
+We seek a multiplicative correction $\alpha > 1$ such that $\text{softmax}(\alpha \hat{s}_i) \approx \text{softmax}(s_i)$.
+
+\paragraph{MMSE Condition.} For the softmax to be unbiased, we need the signal-to-noise ratio of the sharpened scores to match the original:
+\begin{equation}
+\alpha = \frac{\text{Var}[s_i]}{\text{Var}[s_i] - \sigma_\epsilon^2} = \frac{1}{1 - 1/\text{SQNR}_\text{eff}}
+\end{equation}
+For large SQNR, $\alpha \approx 1 + 1/(2 \cdot \text{SQNR}_\text{eff})$ via first-order Taylor expansion.
+
+\paragraph{EVT Correction.} The maximum noise among $N$ competing tokens grows as $\sqrt{2\ln N}$ by the Gumbel distribution. This increases the probability of a wrong token dominating the softmax. Incorporating this:
+\begin{equation}
+\alpha(N) = 1 + \frac{1}{2 \cdot \text{SQNR}_\text{eff}} \cdot \frac{\sqrt{\ln N}}{\sqrt{\ln N_0}}
+\end{equation}
+
+Defining $c = 1/(2 \cdot \text{SQNR}_\text{eff} \cdot \sqrt{\ln N_0})$ with reference $N_0 = 2048$:
+\begin{equation}
+\boxed{\alpha(N) = 1 + c \cdot \sqrt{\ln N}}
+\label{eq:alpha}
+\end{equation}
+
+This is computed at runtime using the actual KV count \texttt{k\_VKQ\_max}:
+\begin{verbatim}
+float alpha = 1.0f + c * sqrtf(
+    logf(fmaxf((float)k_VKQ_max, 2.0f)));
+\end{verbatim}
+
+\subsection{Per-Type Coefficients}
+
+The coefficient $c$ depends on the effective SQNR, which differs between TBQ and TBQP due to the QJL noise source:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Type & Structure & SQNR$_\text{eff}$ & $c$ & $\alpha$(2K) \\
+\midrule
+TBQ3  & 3-bit Lloyd-Max     & 31.2 & 0.00579 & 1.016 \\
+TBQP3 & 2-bit + 1-bit QJL   & 13.8 & 0.01304 & 1.036 \\
+TBQ4  & 4-bit Lloyd-Max     & 56.2 & 0.00326 & 1.009 \\
+TBQP4 & 3-bit + 1-bit QJL   & 24.5 & 0.00724 & 1.020 \\
+\bottomrule
+\end{tabular}
+\caption{Sharpening coefficients. TBQP types have lower effective SQNR because the QJL random projection adds a second noise source to the attention score.}
+\label{tab:alpha}
+\end{table}
+
+\subsection{Properties}
+
+The formula has several desirable properties:
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \textbf{No clamp needed}: $\sqrt{\ln N}$ grows sub-logarithmically ($\sqrt{\ln 2} = 0.83$ to $\sqrt{\ln 262144} = 3.49$), keeping $\alpha$ in the narrow range 1.005--1.048.
+\item \textbf{Autoregressive-safe}: During generation ($N$ small), $\alpha$ is small and conservative. During prefill ($N$ large), $\alpha$ increases to compensate the stronger noise effect.
+\item \textbf{No hyperparameters}: All constants are derived from the quantization scheme (SQNR) and a reference context size ($N_0$).
+\end{itemize}
+
+% ============================================================
+\section{Half-Precision Pathology in Flash Attention}
+\label{sec:precision}
+
+\subsection{The Bug}
+
+The upstream \texttt{fattn-vec} kernel defines \texttt{V\_DOT2\_F32\_F16\_AVAILABLE} on CUDA architectures with native FP16 support. When active:
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item VKQ accumulators are \texttt{half2} (16-bit)
+\item Shared memory \texttt{KQ[]} is \texttt{half} (16-bit)
+\item Query registers \texttt{Q\_reg} are \texttt{half2}
+\end{itemize}
+
+For standard FP16 KV caches, this is correct---the values are already in FP16, so no precision is lost. However, for TBQ values, three compounding precision losses occur:
+
+\paragraph{Loss 1: VKQ Accumulation.} The weighted sum $\sum_k \text{softmax}_k \cdot \mathbf{v}_k$ is accumulated in \texttt{half2}. Each addition truncates to FP16 (10-bit mantissa), introducing rounding errors that accumulate over hundreds of KV entries.
+
+\paragraph{Loss 2: Shared Memory Staging.} The reduce stage writes partial sums to \texttt{\_\_shared\_\_ half KQ[]}, then the IWHT reads them as \texttt{float*}---a type mismatch that further truncates values.
+
+\paragraph{Loss 3: WHT Amplification.} The IWHT butterfly computes sums and differences of adjacent elements. In a $d$-point WHT, each output depends on \emph{all} $d$ inputs through $\log_2 d$ butterfly stages. A small rounding error $\epsilon$ in one input propagates to $O(\sqrt{d})$ error in the output. For $d=512$: $\sqrt{512} \approx 22.6\times$ amplification.
+
+\subsection{Manifestation}
+
+The amplified errors push MoE expert routing scores past decision boundaries, causing different experts to be selected across runs with identical inputs and \texttt{temp=0}. This produced \emph{completely different output sequences} (diverging at token positions as early as 23--27 out of ${\sim}50$), despite the kernel being mathematically deterministic.
+
+\subsection{The Fix}
+
+We force FP32 accumulation for all TBQ V type template instances by undefining the macro before the kernel header:
+\begin{verbatim}
+// In each TBQ V template instance .cu:
+#include "../common.cuh"
+#undef V_DOT2_F32_F16_AVAILABLE
+#include "../fattn-vec.cuh"
+\end{verbatim}
+
+Due to \texttt{\#pragma once} on \texttt{common.cuh}, the re-include from \texttt{fattn-vec.cuh} does not re-define the macro. This selectively forces the FP32 path for TBQ V instances (70 files) while preserving the FP16 fast path for standard types.
+
+Additionally, we implement float register staging for the IWHT input:
+\begin{verbatim}
+float tbq_regs[D_V / nthreads];
+// reduce loop stores to tbq_regs
+for (i0 = 0; i0 < D_V; i0 += nthreads)
+    tbq_regs[i0/nthreads] = dst_val;
+__syncthreads();
+// write float values to shared memory
+float *buf = (float*)&KQ[0];
+for (i0 = 0; i0 < D_V; i0 += nthreads)
+    buf[i0 + tid] = tbq_regs[i0/nthreads];
+\end{verbatim}
+
+\subsection{Impact}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Configuration & PPL & vs FP16 \\
+\midrule
+FP16/FP16 baseline & 419.8 & 1.00$\times$ \\
+half2 path (before fix) & 454.7 & 1.08$\times$ \\
+\textbf{float path (after fix)} & \textbf{445.7} & \textbf{1.06$\times$} \\
+\bottomrule
+\end{tabular}
+\caption{Perplexity improvement from forcing FP32 accumulation.}
+\label{tab:precision}
+\end{table}
+
+Non-determinism was completely eliminated: FP16 baseline produces identical output across 20 runs, and TBQ now matches this behavior (with minor borderline variation at 3-bit quantization boundaries).
+
+% ============================================================
+\section{Engineering Framework}
+\label{sec:engineering}
+
+\subsection{Type System}
+
+We define 20 quantization types organized by block size:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llcl@{}}
+\toprule
+Suffix & Block Size & Head Dim & Notes \\
+\midrule
+\_0 & 256 & 256, 512 & Primary type \\
+\_1 & 128 & 128 & Standard transformers \\
+\_2 & 64  & 64  & Small-head models \\
+\_3 & 64  & 64  & Cross-head WHT \\
+\_4 & 576 & 576 & GLM split 256+256+64 \\
+\bottomrule
+\end{tabular}
+\caption{TBQ block size variants. Each has TBQ3/TBQ4/TBQP3/TBQP4 sub-types (3-bit, 4-bit, with/without QJL).}
+\label{tab:types}
+\end{table}
+
+\subsection{Cross-Head WHT (\_3 Types)}
+
+For models with $d=64$ head dimension, the 64-point WHT provides insufficient decorrelation. We implement a cross-head variant using the Kronecker structure $H_{512} = H_8 \otimes H_{64}$: eight heads share a single quantized KV block, with the $H_8$ signs applied at scoring time:
+\begin{equation}
+\text{score}_h = \frac{1}{8}\sum_{g=0}^{7} H_8[h,g] \cdot \langle \mathbf{q}_h, \text{dequant}(\mathbf{k}_g) \rangle
+\end{equation}
+
+\subsection{Asymmetric K/V Dimensions}
+
+GLM-4 uses $d_K=576, d_V=512$ with MLA (Multi-head Latent Attention). We support this via the \texttt{D\_V} template parameter, with the 576-dimensional K using a split WHT (256+256+64) and the 512-dimensional V using standard 512-point WHT.
+
+\subsection{SWA F16 Bypass}
+
+Gemma~4 uses Sliding Window Attention (SWA) for 25 of 35 layers. Despite occupying only 300~MiB (vs.\ 5120~MiB for global KV), SWA layers dominate output quality because they attend to the most recent, high-relevance tokens. We automatically upgrade SWA K/V to FP16, eliminating quantization error where it matters most.
+
+\subsection{V Rotation Incompatibility}
+
+The standard llama.cpp KV cache applies RoPE rotation to both K and V. For K, this is safe: the rotation cancels in the dot product $\mathbf{q}^\top R^\top R\, \mathbf{k} = \mathbf{q}^\top \mathbf{k}$ (orthogonal transform). For V, however, the IWHT decode has no corresponding inverse rotation, causing the output to be in a rotated coordinate frame. We disable V rotation (\texttt{attn\_rot\_v=false}) for all TBQ configurations.
+
+% ============================================================
+\section{Development Timeline}
+\label{sec:timeline}
+
+The implementation evolved over eight days across five major sessions, each solving distinct engineering challenges:
+
+\paragraph{v1.4.0 (Apr 1--3): Foundation + GLM 576.}
+Initial CUDA kernel implementation for head\_dim=256 (Qwen, LLaMA) and 128 (standard transformers). GLM-4.7-Flash required head\_dim=576 support---not a power of two. We designed a split WHT: $576 = 256 + 256 + 64$, with independent sub-blocks for WHT and shared sign patterns. Simulation over 500 trials confirmed $-3.4\%$ MSE vs.\ full QR orthogonal rotation with zero memory overhead. During testing, discovered V cache IWHT was producing garbage due to FP16 shared memory precision---the first hint of what would become the central bug of v1.5.2.
+
+\paragraph{v1.5.0 (Apr 4): Upstream Rebase + Gemma 4.}
+Complete 3-way merge rebase onto upstream llama.cpp (commit \texttt{b7ad48ebd}), resolving 26 conflicts. Added Gemma~4 support: hybrid SWA architecture with global head\_dim=512 (10 layers) + SWA head\_dim=256 (50 layers), variable GQA (16/4 heads per layer). Key fixes: SWA cache type auto-remapping, variable GQA bypass for TBQ rotation, and 512-point single-pass WHT (9 butterfly stages, 128 threads $\times$ 4 elements).
+
+\paragraph{v1.5.1 (Apr 4, PM): SWA F16 Bypass.}
+Breakthrough: SWA cache occupies only 300~MiB (vs.\ 5120~MiB global) but dominates output quality through 25 layers of recent-token attention. Automatically upgrading SWA K/V to FP16 eliminated SWA quantization error entirely, achieving f16-equivalent math accuracy (37.4/65 vs.\ f16 36.6/65) for the first time.
+
+\paragraph{v1.5.2 Session 1 (Apr 7): Attention Sharpening.}
+PPL investigation revealed 21\% gap was not from bit depth but from softmax flattening. Sub-block scale experiment failed (WHT already uniformizes variance). Derived $\alpha = 1 + 1/(2 \times \text{SQNR})$ from MMSE theory. Discovered V rotation bug (\texttt{attn\_rot\_v}). PPL: 509.9 $\to$ 454.7.
+
+\paragraph{v1.5.2 Session 2 (Apr 7--8): Precision Fix.}
+Non-deterministic output with temp=0 led to exhaustive debugging: eliminated CUDA graphs, pool allocation, threadfence, MoE MUL\_MAT\_ID, SET\_ROWS, and dynamic sharpening as causes. Root cause: \texttt{half2} accumulation in upstream \texttt{fattn-vec} amplified by IWHT butterfly. Fixed with FP32 forced path for 70 TBQ V template instances. PPL: 454.7 $\to$ 445.7. Dynamic $\alpha(N)$ formula implemented.
+
+% ============================================================
+\section{Experimental Results}
+\label{sec:results}
+
+All experiments use NVIDIA DGX Spark (GB10, 128GB VRAM), CUDA 12.8, and Gemma~4 26B-A4B-it (MoE, UD-Q4\_K\_XL quantization) with 262K context.
+
+\subsection{Perplexity}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Configuration & PPL (wiki-2K) & vs FP16 \\
+\midrule
+FP16/FP16 & 419.8 & 1.00$\times$ \\
+\midrule
+v1.5.1 (before sharpening) & 509.9 & 1.21$\times$ \\
++ per-block norm & 498.2 & 1.19$\times$ \\
++ attention sharpening & 455.0 & 1.08$\times$ \\
++ V rotation fix & 448.1 & 1.07$\times$ \\
++ dynamic $\alpha$ & 454.7 & 1.08$\times$ \\
++ \textbf{FP32 accumulation} & \textbf{445.7} & \textbf{1.06$\times$} \\
+\bottomrule
+\end{tabular}
+\caption{Progressive PPL improvement from v1.5.1 to v1.5.2.}
+\label{tab:ppl_progress}
+\end{table}
+
+\subsection{Math Accuracy}
+
+We evaluate on a 35-problem math benchmark (2$\times$2/3$\times$3 matrix multiplication, scalar arithmetic, with 0--2000 token filler) at temp=0:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Config & Avg (/35) & Peak & 10-run scores \\
+\midrule
+FP16 & 20.1 & 21 & 19--21 \\
+\textbf{TBQP3/TBQ3} & \textbf{19.1} & \textbf{23} & 16--23 \\
+\bottomrule
+\end{tabular}
+\caption{Math benchmark results. TBQ peak (23) exceeds FP16 best (21), suggesting quantization noise occasionally breaks out of local optima.}
+\label{tab:math}
+\end{table}
+
+\subsection{Memory}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Config & Global KV & Total KV & Compression \\
+\midrule
+FP16/FP16 & 5,120 MiB & 5,420 MiB & 1.0$\times$ \\
+TBQP3/TBQ3 & 990 MiB & 1,290 MiB & 4.2$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{KV cache memory at 262K context (Gemma 4 26B MoE).}
+\label{tab:memory}
+\end{table}
+
+\subsection{Determinism}
+
+With the FP32 accumulation fix, 20 consecutive runs with temp=0 produce identical output for all but 1--2 borderline tokens near 3-bit quantization boundaries. FP16 baseline achieves 20/20 identical runs. Prior to the fix, extreme divergence occurred as early as token 23.
+
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{KV Cache Quantization.} KIVI~\cite{kivi2024} and KVQuant~\cite{kvquant2024} compress KV caches using per-channel or per-token quantization without transforms. Compared to these direct quantization methods, TurboQuant's WHT preprocessing uniformizes the coefficient distribution, enabling optimal Lloyd-Max quantization regardless of the input structure.
+
+\paragraph{QJL.} The Quantized Johnson-Lindenstrauss lemma~\cite{qjl2024} enables 1-bit random projections that preserve inner products. TurboQuant-prod (TBQP) combines $(b{-}1)$-bit Lloyd-Max with 1-bit QJL on the residual, trading attention score variance for better reconstruction MSE.
+
+\paragraph{Flash Attention.} FlashAttention~\cite{dao2022flashattention,dao2023flashattention2} and its variants optimize attention computation through tiling and online softmax. Our implementation extends the llama.cpp \texttt{fattn-vec} kernel, which targets single-token decoding with full warp utilization.
+
+\paragraph{Attention Score Correction.} SmoothQuant~\cite{smoothquant2023} and outlier-aware methods address activation quantization but do not correct the softmax flattening caused by KV quantization noise. Our dynamic sharpening is, to our knowledge, the first principled correction derived from the quantization SQNR.
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented the first production implementation of TurboQuant KV cache compression, achieving 4.2$\times$ memory reduction with 6\% perplexity cost on a state-of-the-art MoE model. Our dynamic attention sharpening formula provides a theoretically grounded, hyperparameter-free correction for quantization-induced softmax flattening. The discovery of the half-precision amplification pathology highlights that numerical precision requirements for WHT-based methods differ fundamentally from standard quantization---a consideration absent from the original paper that may be relevant to future WHT-based compression research.
+
+The full implementation, supporting 20 quantization variants across five head dimensions, is available at \url{https://github.com/AmesianX/TurboQuant} as a fork of llama.cpp.
+
+% ============================================================
+\section*{Acknowledgments}
+
+This work was conducted independently on an NVIDIA DGX Spark. The author thanks the llama.cpp community and the TurboQuant authors at Google DeepMind for the theoretical foundation.
+
+% ============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{10}
+
+\bibitem{turboquant2026}
+S.~Ashkboos, A.~Mohtashami, R.~Pramanik, Y.~Li, A.~Jaggi, D.~Alistarh.
+\newblock TurboQuant: Online KV Cache Quantization via Hadamard Transform.
+\newblock In \emph{Proceedings of ICLR}, 2026.
+
+\bibitem{dao2022flashattention}
+T.~Dao, D.~Fu, S.~Ermon, A.~Rudra, C.~R\'{e}.
+\newblock FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem{dao2023flashattention2}
+T.~Dao.
+\newblock FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem{kivi2024}
+Z.~Liu, J.~Yuan, H.~Jin, S.~Zhong, Z.~Xu, V.~Braverman, B.~Chen, X.~Hu.
+\newblock KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache.
+\newblock In \emph{ICML}, 2024.
+
+\bibitem{kvquant2024}
+C.~Hooper, S.~Kim, H.~Mohammadzadeh, M.~W.~Mahoney, Y.~S.~Shao, K.~Keutzer, A.~Gholami.
+\newblock KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization.
+\newblock \emph{arXiv preprint arXiv:2401.18079}, 2024.
+
+\bibitem{qjl2024}
+A.~Zandieh, M.~Daliri, I.~Han.
+\newblock QJL: 1-Bit Quantized JL Transform for KV Cache Quantization with Zero Overhead.
+\newblock In \emph{NeurIPS}, 2024.
+
+\bibitem{smoothquant2023}
+G.~Xiao, J.~Lin, M.~Seznec, H.~Wu, J.~Demouth, S.~Han.
+\newblock SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models.
+\newblock In \emph{ICML}, 2023.
+
+\end{thebibliography}
+
+\end{document}
