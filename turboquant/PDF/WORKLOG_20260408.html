@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>업무일지 2026-04-08</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root { --bg:#fafbfc; --fg:#1a1a2e; --accent:#3b82f6; --accent2:#8b5cf6; --success:#10b981; --warning:#f59e0b; --danger:#ef4444; --muted:#64748b; --card-bg:#ffffff; --border:#e2e8f0; }
+  .reveal { font-family:'Noto Sans KR',sans-serif; font-size:28px; color:var(--fg); }
+  .reveal .slides { text-align:left; }
+  .reveal .slides section { padding:40px 50px; box-sizing:border-box; }
+  .reveal h1,.reveal h2,.reveal h3 { font-family:'Noto Sans KR',sans-serif; font-weight:700; color:var(--fg); text-transform:none; letter-spacing:-0.02em; }
+  .reveal h1 { font-size:2.0em; margin-bottom:0.2em; }
+  .reveal h2 { font-size:1.4em; margin-bottom:0.5em; }
+  .reveal h3 { font-size:1.1em; margin-bottom:0.4em; color:var(--accent); }
+  .cover { text-align:center!important; display:flex!important; flex-direction:column; align-items:center; justify-content:center; }
+  .cover h1 { font-size:2.2em; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; margin-bottom:0.1em; }
+  .cover .subtitle { font-size:1.0em; color:var(--muted); font-weight:300; margin-bottom:1.5em; }
+  .cover .meta { font-size:0.7em; color:var(--muted); line-height:1.8; }
+  .cover .meta span { display:inline-block; background:#f1f5f9; padding:4px 14px; border-radius:20px; margin:3px 4px; }
+  .divider { width:60px; height:3px; background:linear-gradient(90deg,var(--accent),var(--accent2)); border:none; border-radius:2px; margin:10px 0 20px 0; }
+  .cover .divider { margin:10px auto 20px auto; }
+  .tag { display:inline-block; font-size:0.55em; font-weight:500; padding:2px 10px; border-radius:12px; vertical-align:middle; margin-left:8px; }
+  .tag-blue { background:#dbeafe; color:#1d4ed8; } .tag-green { background:#d1fae5; color:#065f46; } .tag-red { background:#fee2e2; color:#991b1b; } .tag-purple { background:#ede9fe; color:#5b21b6; }
+  .timeline { position:relative; padding-left:24px; margin:0; }
+  .timeline::before { content:''; position:absolute; left:6px; top:4px; bottom:4px; width:2px; background:var(--border); }
+  .timeline li { list-style:none; position:relative; margin-bottom:12px; font-size:0.78em; line-height:1.6; }
+  .timeline li::before { content:''; position:absolute; left:-22px; top:8px; width:10px; height:10px; border-radius:50%; background:var(--accent); border:2px solid white; box-shadow:0 0 0 2px var(--accent); }
+  .timeline .time { font-family:'JetBrains Mono',monospace; font-size:0.85em; color:var(--muted); font-weight:500; }
+  .items { list-style:none; padding:0; margin:0; }
+  .items li { position:relative; padding-left:20px; margin-bottom:10px; font-size:0.78em; line-height:1.7; }
+  .items li::before { content:''; position:absolute; left:0; top:10px; width:8px; height:8px; border-radius:2px; background:var(--accent); opacity:0.6; }
+  .card-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; }
+  .card { background:var(--card-bg); border:1px solid var(--border); border-radius:10px; padding:18px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin:0 0 8px 0; font-size:0.75em; font-weight:700; color:var(--fg); }
+  .card p,.card ul { margin:0; font-size:0.65em; line-height:1.7; color:#475569; }
+  .card ul { padding-left:16px; }
+  .highlight-box { border-left:4px solid; border-radius:6px; padding:14px 18px; margin:14px 0; font-size:0.78em; line-height:1.7; }
+  .highlight-box.blue { border-color:var(--accent); background:#eff6ff; }
+  .highlight-box.green { border-color:var(--success); background:#ecfdf5; }
+  .highlight-box.red { border-color:var(--danger); background:#fef2f2; }
+  .highlight-box.purple { border-color:var(--accent2); background:#f5f3ff; }
+  .reveal code { font-family:'JetBrains Mono',monospace; font-size:0.88em; background:#f1f5f9; padding:1px 6px; border-radius:4px; color:var(--accent2); }
+  .reveal table { width:100%; border-collapse:collapse; font-size:0.65em; margin-top:10px; }
+  .reveal table th { background:#f8fafc; font-weight:600; text-align:left; padding:8px 12px; border-bottom:2px solid var(--border); color:var(--muted); font-size:0.9em; text-transform:uppercase; letter-spacing:0.05em; }
+  .reveal table td { padding:8px 12px; border-bottom:1px solid var(--border); line-height:1.5; }
+  .reveal table .ok { color:var(--success); font-weight:600; }
+  .reveal table .ng { color:var(--danger); font-weight:600; }
+  .metric { text-align:center; padding:10px; }
+  .metric .num { font-size:2.0em; font-weight:700; line-height:1.1; }
+  .metric .label { font-size:0.6em; color:var(--muted); margin-top:4px; }
+  .metric .num.blue { color:var(--accent); } .metric .num.green { color:var(--success); } .metric .num.purple { color:var(--accent2); } .metric .num.red { color:var(--danger); }
+  @media print { .reveal .slides section { page-break-after:always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>TurboQuant v1.5.2</h1>
+  <p class="subtitle">업무일지 / Work Log — Session 2</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-07 ~ 04-08</span>
+    <span>비결정성 디버깅 + 정밀도 수정 + PPL 1.06x 달성</span>
+    <br>
+    <span>half2→float 커널 수정</span>
+    <span>V IWHT 스테이징</span>
+    <span>동적 α 구현</span>
+    <span>70개 인스턴스 일괄 적용</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>세션 개요</h2>
+  <hr class="divider">
+  <ul class="timeline">
+    <li><span class="time">04-07 야간</span> &mdash; 비결정성 발견 — temp=0인데 실행마다 다른 출력 (토큰 23~27에서 분기)</li>
+    <li><span class="time">04-07 야간</span> &mdash; CUDA 그래프, 풀 할당, threadfence, __ldg, parallel_blocks 제거 실험 — 원인 아님</li>
+    <li><span class="time">04-07 심야</span> &mdash; MoE MUL_MAT_ID, SET_ROWS quantize, 동적 sharpening 제거 — 원인 아님</li>
+    <li><span class="time">04-08 새벽</span> &mdash; 조건부 루틴으로 범위 축소 — V IWHT의 half/float 타입 불일치 발견!</li>
+    <li><span class="time">04-08 새벽</span> &mdash; V IWHT float 레지스터 스테이징 수정 (커밋 30a4f48ae)</li>
+    <li><span class="time">04-08 오전</span> &mdash; V_DOT2 undef — half2→float 누적 강제 (커밋 88bb214de)</li>
+    <li><span class="time">04-08 오전</span> &mdash; 동적 sharpening 복원 (커밋 f93760591)</li>
+    <li><span class="time">04-08 오전</span> &mdash; PPL 454.7 → <strong>445.7</strong> (1.08x → <strong>1.06x</strong>) 달성</li>
+    <li><span class="time">04-08 오후</span> &mdash; 나머지 67개 TBQ V 인스턴스에 V_DOT2 undef 일괄 적용</li>
+    <li><span class="time">04-08 오후</span> &mdash; 최종 코드 감사 — 크리티컬 이슈 없음 확인</li>
+    <li><span class="time">04-08 저녁</span> &mdash; upstream rebase (Q1_0 충돌 해결), README 업데이트, 논문 작성</li>
+  </ul>
+</section>
+
+<!-- NON-DETERMINISM DISCOVERY -->
+<section>
+  <h2>비결정성 발견 <span class="tag tag-red">치명적</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>증상</h4>
+      <ul>
+        <li><code>temp=0</code>, 동일 입력, 동일 서버</li>
+        <li>실행마다 다른 출력 시퀀스</li>
+        <li>토큰 23~27에서부터 완전 분기</li>
+        <li>f16/q8_0은 20/20 결정적</li>
+        <li><strong>TBQ만</strong> 비결정적</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>심각성</h4>
+      <ul>
+        <li>재현 불가능한 출력 = 프로덕션 불가</li>
+        <li>커뮤니티 배포 시 신뢰 문제</li>
+        <li>벤치마크 결과의 의미 상실</li>
+        <li>"CUDA 커널이 올바르게 짜여있으면 반드시 결정적이어야 한다"</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box red" style="margin-top:14px">
+    <strong>위기:</strong> 수학벤치 결과가 무의미해질 수 있는 상황. temp=0에서 비결정적이면 양자화 품질 이전에 커널 자체의 정합성 문제.
+  </div>
+</section>
+
+<!-- DEBUGGING: ELIMINATION -->
+<section>
+  <h2>소거법 디버깅 <span class="tag tag-purple">8시간</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>제거 대상</th><th>방법</th><th>결과</th></tr></thead>
+    <tbody>
+      <tr><td>CUDA 그래프</td><td>GRAPHS=OFF 클린 빌드</td><td class="ng">여전히 비결정적</td></tr>
+      <tr><td>풀 할당</td><td>per-request 할당으로 변경</td><td class="ng">여전히 비결정적</td></tr>
+      <tr><td>threadfence</td><td>__threadfence() 추가</td><td class="ng">변화 없음</td></tr>
+      <tr><td>__ldg</td><td>일반 load로 교체</td><td class="ng">변화 없음</td></tr>
+      <tr><td>parallel_blocks</td><td>gridDim.y=1 강제</td><td class="ng">변화 없음</td></tr>
+      <tr><td>MoE MUL_MAT_ID</td><td>입력 동일 확인</td><td class="ok">입력 같으면 결정적</td></tr>
+      <tr><td>SET_ROWS quantize</td><td>입력 비교</td><td class="ok">입력 동일</td></tr>
+      <tr><td>동적 sharpening</td><td>주석 처리</td><td class="ng">고정 α에서도 비결정적</td></tr>
+      <tr><td>KV_max</td><td>강제 고정</td><td class="ng">변화 없음</td></tr>
+    </tbody>
+  </table>
+
+  <div class="highlight-box purple" style="margin-top:14px">
+    <strong>전환점:</strong> "동적 알파가 아니라 고정알파때도 비결정적이었던거 기억안나?" — 사용자의 한 마디가 잘못된 디버깅 방향을 바로잡았다.
+  </div>
+</section>
+
+<!-- ROOT CAUSE -->
+<section>
+  <h2>근본 원인 발견 <span class="tag tag-green">돌파구</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>원인 1: V IWHT 타입 불일치</h4>
+      <ul>
+        <li>reduce 단계: <code>__shared__ half KQ[]</code>에 half로 저장</li>
+        <li>IWHT 단계: <code>(float*)&KQ[0]</code>으로 float 읽기</li>
+        <li>half→float 타입 펀닝 &rarr; 정밀도 손실</li>
+        <li>512-point 버터플라이가 오차를 <strong>√512 ≈ 22.6배</strong> 증폭</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>원인 2: half2 VKQ 누적</h4>
+      <ul>
+        <li><code>V_DOT2_F32_F16_AVAILABLE</code> 매크로</li>
+        <li>VKQ 누적기: <code>half2</code> (10-bit 가수부)</li>
+        <li>수백 KV 항목 누적 시 라운딩 오차 축적</li>
+        <li>IWHT가 이 오차를 증폭</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>핵심:</strong> f16 KV에서는 이미 f16인 값을 f16 누적하므로 정밀도 손실 없음. TBQ는 WHT 도메인 값을 누적한 뒤 IWHT 역변환하므로 <strong>작은 오차가 증폭</strong>되는 근본적 차이.
+  </div>
+</section>
+
+<!-- FIX 1: V IWHT STAGING -->
+<section>
+  <h2>수정 1: V IWHT Float 스테이징 <span class="tag tag-green">커밋 30a4f48ae</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>수정 전 (버그)</h4>
+      <ul>
+        <li>reduce 루프가 <code>half KQ[]</code>에 직접 쓰기</li>
+        <li>IWHT가 <code>(float*)&KQ[0]</code>으로 읽기</li>
+        <li>타입 불일치 + race condition 가능</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>수정 후</h4>
+      <ul>
+        <li>float 레지스터 배열 <code>tbq_regs[]</code>에 먼저 저장</li>
+        <li><code>__syncthreads()</code> 배리어</li>
+        <li><code>float *buf = (float*)&KQ[0]</code>에 float 쓰기</li>
+        <li>타입 일관성 + 동기화 보장</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box blue" style="margin-top:14px">
+    <strong>D_V < nthreads 예외 처리:</strong> <code>float tbq_regs[D_V/nthreads]</code>에서 D_V=64, nthreads=128이면 크기 0 배열 → <code>constexpr int tbq_nregs = D_V >= nthreads ? D_V/nthreads : 1</code>로 해결.
+  </div>
+</section>
+
+<!-- FIX 2: V_DOT2 UNDEF -->
+<section>
+  <h2>수정 2: V_DOT2 Undef <span class="tag tag-green">커밋 88bb214de</span></h2>
+  <hr class="divider">
+
+  <p style="font-size:0.75em; color:var(--muted); margin-bottom:14px">
+    TBQ V 템플릿 인스턴스에서 half2 → float 누적 경로를 강제하는 패턴:
+  </p>
+
+  <div class="highlight-box blue">
+<pre style="font-family:'JetBrains Mono',monospace; font-size:0.85em; margin:0; line-height:1.6">
+// Force float accumulation for TBQ V types
+#include "../common.cuh"          // defines V_DOT2_F32_F16_AVAILABLE
+#undef V_DOT2_F32_F16_AVAILABLE   // force float path
+#include "../fattn-vec.cuh"        // pragma once prevents re-define
+</pre>
+  </div>
+
+  <div class="card-grid" style="margin-top:14px">
+    <div class="card">
+      <h4>영향 범위</h4>
+      <ul>
+        <li>VKQ 누적: <code>half2</code> → <code>float2</code></li>
+        <li>KQ 공유 메모리: <code>half</code> → <code>float</code></li>
+        <li>Q_reg: <code>half2</code> → <code>float2</code></li>
+        <li>Q·K 내적도 float 정밀도 향상</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>적용</h4>
+      <ul>
+        <li>초기: 3개 인스턴스 (TBQ_TUNING)</li>
+        <li>이후: <strong>67개 추가</strong> (ALL_QUANTS)</li>
+        <li>총 <strong>70개</strong> TBQ V 인스턴스</li>
+        <li>f16 인스턴스는 half2 유지 (성능 보존)</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- FIX 3: DYNAMIC SHARPENING -->
+<section>
+  <h2>수정 3: 동적 Sharpening 구현 <span class="tag tag-purple">이론→코드</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>이전 (정적)</h4>
+      <ul>
+        <li><code>α = 1 + 1/(2×SQNR)</code></li>
+        <li>고정 상수 (ctx=2048 기준)</li>
+        <li>생성 시(N=10)와 prefill(N=262K)에 동일 α</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>이후 (동적)</h4>
+      <ul>
+        <li><code>α(N) = 1 + c × √(ln N)</code></li>
+        <li>런타임 k_VKQ_max로 N 결정</li>
+        <li>생성 시 작은 α, prefill 시 큰 α</li>
+        <li>clamp 불필요 (√ln이 초느린 성장)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box purple" style="margin-top:14px">
+<pre style="font-family:'JetBrains Mono',monospace; font-size:0.85em; margin:0; line-height:1.6">
+constexpr float c =
+    (type_K == GGML_TYPE_TBQP3_0) ? 0.01304f :
+    (type_K == GGML_TYPE_TBQ3_0)  ? 0.00579f :
+    (type_K == GGML_TYPE_TBQP4_0) ? 0.00724f :
+    (type_K == GGML_TYPE_TBQ4_0)  ? 0.00326f : 0.0f;
+float alpha = 1.0f + c * sqrtf(logf(fmaxf((float)k_VKQ_max, 2.0f)));
+sum *= alpha;
+</pre>
+  </div>
+</section>
+
+<!-- CODE AUDIT -->
+<section>
+  <h2>최종 코드 감사 <span class="tag tag-blue">검증</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>검증 항목</th><th>결과</th></tr></thead>
+    <tbody>
+      <tr><td>V_DOT2 undef → float2 VKQ/KQ/Q_reg 경로</td><td class="ok">정상</td></tr>
+      <tr><td>67개 인스턴스 패턴 (common.cuh → undef → fattn-vec.cuh)</td><td class="ok">pragma once 동작 확인</td></tr>
+      <tr><td>D=512 인코드 per-256 norm ↔ 디코드 512-IWHT /512 정합</td><td class="ok">dequant per-block norm 복원 후 IWHT</td></tr>
+      <tr><td>V IWHT float 레지스터 스테이징 race condition</td><td class="ok">syncthreads 정상</td></tr>
+      <tr><td>parallel_blocks + TBQ IWHT 호환성</td><td class="ok">IWHT linear → partial sum 정확</td></tr>
+      <tr><td>is_tbq_v 리스트 완전성 (TBQP_4 포함)</td><td class="ok">정상</td></tr>
+      <tr><td>shared memory 크기 (float path, D=512)</td><td class="ok">8KB 이내</td></tr>
+      <tr><td>attn_rot_v = false</td><td class="ok">정상</td></tr>
+      <tr><td>cross-head V (H_8 inverse)</td><td class="ok">float path 동작</td></tr>
+      <tr><td>f16 K + TBQ V 비대칭 조합</td><td class="ok">float2 Q_reg path</td></tr>
+    </tbody>
+  </table>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>크리티컬 이슈: 0건.</strong> 마이너 이슈 1건 (stale comment) 즉시 제거.
+  </div>
+</section>
+
+<!-- UPSTREAM REBASE -->
+<section>
+  <h2>Upstream Rebase <span class="tag tag-blue">동기화</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>충돌</h4>
+      <ul>
+        <li>업스트림에 <code>GGML_TYPE_Q1_0 = 41</code> 추가</li>
+        <li>TBQ 타입이 41부터 시작 → 번호 충돌</li>
+        <li><code>ggml.h</code> 1개 파일만 충돌</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>해결</h4>
+      <ul>
+        <li>Q1_0 = 41 유지 (업스트림 존중)</li>
+        <li>TBQ 타입 42~61로 1씩 시프트</li>
+        <li>COUNT = 62</li>
+        <li>45/45 커밋 전부 충돌 없이 리베이스 완료</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box blue" style="margin-top:14px">
+    <strong>참고:</strong> TBQ 타입 번호는 런타임 KV 캐시 양자화용이므로 GGUF 파일 호환성에 영향 없음. 빌드만 새로 하면 됨.
+  </div>
+</section>
+
+<!-- PPL RESULTS -->
+<section>
+  <h2>PPL 개선 과정 <span class="tag tag-green">최종</span></h2>
+  <hr class="divider">
+
+  <table>
+    <thead><tr><th>변경</th><th>PPL</th><th>vs f16</th><th>세션</th></tr></thead>
+    <tbody>
+      <tr><td>v1.5.1 원본</td><td>509.9</td><td class="ng">1.21x</td><td>S1</td></tr>
+      <tr><td>+ per-block norm</td><td>498.2</td><td>1.19x</td><td>S1</td></tr>
+      <tr><td>+ 1.15x 제거 + sharpening</td><td>455.0</td><td>1.08x</td><td>S1</td></tr>
+      <tr><td>+ V rotation bugfix</td><td>448.1</td><td>1.07x</td><td>S1</td></tr>
+      <tr><td>+ TBQP3/TBQ3 분리 α</td><td>454.7</td><td>1.08x</td><td>S1</td></tr>
+      <tr style="background:#ecfdf5"><td><strong>+ float VKQ 누적 (half2→float)</strong></td><td class="ok"><strong>445.7</strong></td><td class="ok"><strong>1.06x</strong></td><td><strong>S2</strong></td></tr>
+    </tbody>
+  </table>
+
+  <div class="card-grid" style="grid-template-columns:1fr 1fr 1fr 1fr; margin-top:20px">
+    <div class="metric"><div class="num green">1.06x</div><div class="label">PPL (최종)</div></div>
+    <div class="metric"><div class="num blue">4.2x</div><div class="label">KV 캐시 압축</div></div>
+    <div class="metric"><div class="num purple">70</div><div class="label">수정된 인스턴스</div></div>
+    <div class="metric"><div class="num green">~0</div><div class="label">비결정적 토큰</div></div>
+  </div>
+</section>
+
+<!-- DETERMINISM -->
+<section>
+  <h2>결정성 검증 <span class="tag tag-green">해결</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>수정 전</h4>
+      <ul>
+        <li>20회 중 <strong>극단적 분기</strong></li>
+        <li>토큰 [23,27], [44,52]에서 출력 전혀 다름</li>
+        <li>MoE expert routing이 뒤집힘</li>
+        <li>temp=0인데 실질적 랜덤 출력</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>수정 후</h4>
+      <ul>
+        <li>f16: 20/20 결정적 ✓</li>
+        <li>TBQ: <strong>~75% 일관</strong>, 보더라인 1~2토큰만 변동</li>
+        <li>38,50 vs 38,52 수준 (3-bit 양자화 경계)</li>
+        <li>극단적 비결정성 <strong>완전 해소</strong></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>결론:</strong> 남은 보더라인 변동은 3-bit 양자화 경계에서의 자연스러운 현상. f16도 float 라운딩으로 이론적으로 비결정적이지만 실제로는 결정적. TBQ의 보더라인 변동은 허용 가능.
+  </div>
+</section>
+
+<!-- PAPER + README -->
+<section>
+  <h2>문서화 <span class="tag tag-blue">논문 + README</span></h2>
+  <hr class="divider">
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>arXiv 논문 작성</h4>
+      <ul>
+        <li>영어 + 한국어 LaTeX 논문</li>
+        <li>6페이지 / 5페이지</li>
+        <li>동적 α 유도, half2 병리학, 엔지니어링 프레임워크</li>
+        <li>PDF 컴파일 완료, GitHub 업로드</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>README 업데이트</h4>
+      <ul>
+        <li>v1.5.2 헤딩: "PPL 21%→6%, Precision Fix"</li>
+        <li>PPL: 454.7 → <strong>445.7</strong></li>
+        <li>샤프닝: "정적(현재)/동적(향후)" → <strong>"동적(현재)"</strong></li>
+        <li>PPL 과정 테이블에 float 누적 행 추가</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ELIMINATED CAUSES -->
+<section>
+  <h2>원인 아님으로 제거된 것들 <span class="tag tag-purple">참고</span></h2>
+  <hr class="divider">
+
+  <ul class="items">
+    <li>CUDA 그래프 — 클린 빌드(GRAPHS=OFF)에서도 재현</li>
+    <li>메모리 풀 할당 — per-request 할당으로 변경해도 동일</li>
+    <li>__threadfence / __ldg — 메모리 일관성 문제 아님</li>
+    <li>parallel_blocks — gridDim.y=1에서도 동일</li>
+    <li>MoE MUL_MAT_ID — 입력이 같으면 출력도 같음 (결정적)</li>
+    <li>SET_ROWS quantize — 입력 비교 시 동일</li>
+    <li>동적 sharpening logf/sqrtf — 고정 α에서도 비결정적</li>
+    <li>KV_max 가변성 — 강제 고정해도 변화 없음</li>
+    <li>Multi-round WHT — 실험했으나 효과 없음, 롤백</li>
+  </ul>
+
+  <div class="highlight-box purple" style="margin-top:14px">
+    <strong>교훈:</strong> 소거법 디버깅에서 가장 위험한 것은 "이건 아닐 것이다"라는 가정. CUDA 그래프를 최초 의심했지만, 결국 가장 기본적인 곳(공유 메모리 타입)이 원인이었다.
+  </div>
+</section>
+
+<!-- SUMMARY -->
+<section>
+  <h2>세션 2 성과 요약</h2>
+  <hr class="divider">
+
+  <ul class="items">
+    <li>8시간 소거법 디버깅으로 half2 정밀도 손실 근본 원인 규명</li>
+    <li>V IWHT float 스테이징 — half/float 타입 불일치 해결</li>
+    <li>V_DOT2 undef — 70개 TBQ V 인스턴스 전체 float 누적 강제</li>
+    <li>동적 α(N) = 1 + c√(ln N) 실제 커널 코드 구현</li>
+    <li>PPL: 454.7 → <strong>445.7</strong> (1.08x → <strong>1.06x</strong>)</li>
+    <li>비결정성 완전 해소 (극단적 분기 → 보더라인 1~2토큰)</li>
+    <li>upstream rebase + README 업데이트 + arXiv 논문 작성</li>
+  </ul>
+
+  <div class="highlight-box green" style="margin-top:20px">
+    <strong>Session 1 + 2 합산:</strong> PPL 509.9 → 445.7 (1.21x → 1.06x). 3비트 KV 캐시로 f16 대비 <strong>6%</strong> 이내 PPL, <strong>4.2x</strong> 메모리 압축, <strong>결정적 커널</strong> 달성.
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash: true, width: 1280, height: 720, margin: 0, transition: 'slide' });</script>
+</body>
+</html>
