@@ -906,14 +906,28 @@ static __global__ void flash_attn_ext_vec(
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
 
-                // Quantization-aware attention sharpening: α = 1 + 1/(2×SQNR)
+                // Quantization-aware attention sharpening: α(N) = α_base + Δ(N)
                 // Compensates softmax flattening from K quantization noise.
-                // TBQP3: 2-bit MSE + 1-bit QJL adds extra projection noise → α = 1.036
-                // TBQ3:  3-bit Lloyd-Max, cleaner noise profile → α = 1.016
-                if constexpr (type_K == GGML_TYPE_TBQP3_0) {
-                    sum *= 1.036f;
-                } else if constexpr (type_K == GGML_TYPE_TBQ3_0) {
-                    sum *= 1.016f;
+                // α_base: validated static value at N₀=2048 (bit-identical to static version).
+                // Δ(N): EVT correction for N > N₀ — √(ln N) grows with competing tokens.
+                // c = 1/(2 × SQNR_eff × √(ln N₀)): type-specific coefficient.
+                if constexpr (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQ3_0 ||
+                              type_K == GGML_TYPE_TBQP4_0 || type_K == GGML_TYPE_TBQ4_0) {
+                    constexpr float alpha_base =
+                        (type_K == GGML_TYPE_TBQP3_0) ? 1.036f :
+                        (type_K == GGML_TYPE_TBQ3_0)  ? 1.016f :
+                        (type_K == GGML_TYPE_TBQP4_0) ? 1.020f :
+                        (type_K == GGML_TYPE_TBQ4_0)  ? 1.009f : 1.0f;
+                    constexpr float c =
+                        (type_K == GGML_TYPE_TBQP3_0) ? 0.01304f :
+                        (type_K == GGML_TYPE_TBQ3_0)  ? 0.00579f :
+                        (type_K == GGML_TYPE_TBQP4_0) ? 0.00724f :
+                        (type_K == GGML_TYPE_TBQ4_0)  ? 0.00326f : 0.0f;
+                    constexpr float sqrt_ln_n0 = 2.7614f; // sqrtf(logf(2048.0f))
+                    const float delta = (k_VKQ_max > 2048)
+                        ? c * (sqrtf(logf((float)k_VKQ_max)) - sqrt_ln_n0)
+                        : 0.0f;
+                    sum *= alpha_base + delta;
                 }
 
                 if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
