@@ -906,21 +906,8 @@ static __global__ void flash_attn_ext_vec(
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
 
-                // Quantization-aware attention sharpening: α(N) = 1 + c × √(ln N)
-                // Compensates softmax flattening from K quantization noise.
-                // √(ln N) from Extreme Value Theory — max noise among N tokens grows as √(2 ln N).
-                // c = 1/(2 × SQNR_eff × √(ln N₀)): derived from MMSE theory.
-                // No clamp — α naturally adapts: small N (generation) → small α, large N (prefill/PPL) → large α.
-                if constexpr (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQ3_0 ||
-                              type_K == GGML_TYPE_TBQP4_0 || type_K == GGML_TYPE_TBQ4_0) {
-                    constexpr float c =
-                        (type_K == GGML_TYPE_TBQP3_0) ? 0.01304f :
-                        (type_K == GGML_TYPE_TBQ3_0)  ? 0.00579f :
-                        (type_K == GGML_TYPE_TBQP4_0) ? 0.00724f :
-                        (type_K == GGML_TYPE_TBQ4_0)  ? 0.00326f : 0.0f;
-                    const float alpha = 1.0f + c * sqrtf(logf(fmaxf((float)k_VKQ_max, 2.0f)));
-                    sum *= alpha;
-                }
+                // DEBUG: sharpening disabled to test determinism
+                // if constexpr (...) { sum *= alpha; }
 
                 if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
                     KQ_reg[j] = sum;
@@ -1144,6 +1131,19 @@ static __global__ void flash_attn_ext_vec(
             KQ_sum[j_VKQ] = KQ_sum_shared[j_VKQ][threadIdx.x];
             KQ_sum[j_VKQ] = warp_reduce_sum(KQ_sum[j_VKQ]);
 
+            // For TBQ V types: reduce to registers first, then sync, then write as float.
+            // This avoids: (1) half precision loss that IWHT amplifies into non-determinism,
+            //              (2) race condition from float writes overlapping VKQ_tmp data.
+            constexpr bool is_tbq_v = type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0
+                           || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
+                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
+                           || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3
+                           || type_V == GGML_TYPE_TBQ4_4 || type_V == GGML_TYPE_TBQ3_4
+                           || type_V == GGML_TYPE_TBQP4_4 || type_V == GGML_TYPE_TBQP3_4;
+
+            constexpr int tbq_nregs = D_V >= nthreads ? D_V / nthreads : 1;
+            float tbq_regs[tbq_nregs];
+
 #pragma unroll
             for (int i0 = 0; i0 < D_V; i0 += nthreads) {
                 float dst_val = 0;
@@ -1157,16 +1157,20 @@ static __global__ void flash_attn_ext_vec(
                 if (gridDim.y == 1) {
                     dst_val /= KQ_sum[j_VKQ];
                 }
-                // For TBQ V: store to shared memory for IWHT post-processing
-                if constexpr (type_V == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ3_0
-                           || type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1
-                           || type_V == GGML_TYPE_TBQ4_2 || type_V == GGML_TYPE_TBQ3_2
-                           || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3
-                           || type_V == GGML_TYPE_TBQ4_4 || type_V == GGML_TYPE_TBQ3_4
-                           || type_V == GGML_TYPE_TBQP4_4 || type_V == GGML_TYPE_TBQP3_4) {
-                    KQ[i0 + tid] = dst_val; // reuse KQ shared memory
+                if constexpr (is_tbq_v) {
+                    tbq_regs[i0 / nthreads] = dst_val;
                 } else {
                     dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D_V + i0 + tid] = dst_val;
+                }
+            }
+
+            // TBQ V: all warps done reading VKQ_tmp → safe to write float to KQ
+            if constexpr (is_tbq_v) {
+                __syncthreads();
+                float * buf = (float *) &KQ[0];
+#pragma unroll
+                for (int i0 = 0; i0 < D_V; i0 += nthreads) {
+                    buf[i0 + tid] = tbq_regs[i0 / nthreads];
                 }
             }
 
@@ -1186,7 +1190,7 @@ static __global__ void flash_attn_ext_vec(
                     };
                     __syncthreads();
                     float * buf = (float *) &KQ[0];
-                    // Load 4 elements per thread: [tid, tid+128, tid+256, tid+384]
+                    // buf already contains float values from the reduce stage above
                     float f0 = buf[tid], f1 = buf[tid+128], f2 = buf[tid+256], f3 = buf[tid+384];
                     // Stages 0-4: warp shuffle (same butterfly as forward WHT)
                     #pragma unroll
