@@ -83,13 +83,14 @@ The range is narrow (1.007–1.048) because √(ln N) grows very slowly. Even 12
 
 ```bash
 # Recommended (f16-equivalent, 4.2x compression)
-./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
     -t 4 -c 262144 -n 32768 --parallel 1 \
-    --cont-batching --jinja --reasoning-format auto \
+    --cont-batching --jinja \
+    --reasoning off --reasoning-budget 0 --reasoning-format none \
     --n-gpu-layers 999 --flash-attn on \
     -b 1024 -ub 512 --no-mmap \
     --cache-type-k tbqp3 --cache-type-v tbq3 \
-    --temp 0 --host 127.0.0.1 --port 8889
+    --temp 0 --host 0.0.0.0 --port 8888
 ```
 > SWA K+V auto-upgraded to f16. No extra config needed.
 
@@ -198,13 +199,14 @@ TBQ3는 per-element reconstruction error가 작지만(8레벨), TBQP3의 QJL 보
 
 ```bash
 # 최고 품질 (f16 동급, 4.2x 압축)
-./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
     -t 4 -c 262144 -n 32768 --parallel 1 \
-    --cont-batching --jinja --reasoning-format auto \
+    --cont-batching --jinja \
+    --reasoning off --reasoning-budget 0 --reasoning-format none \
     --n-gpu-layers 999 --flash-attn on \
     -b 1024 -ub 512 --no-mmap \
     --cache-type-k tbqp3 --cache-type-v tbq3 \
-    --temp 0 --host 127.0.0.1 --port 8889
+    --temp 0 --host 0.0.0.0 --port 8888
 ```
 > SWA K+V는 자동으로 f16 업그레이드됩니다. 추가 설정 불필요.
 
@@ -238,13 +240,14 @@ TBQ3는 per-element reconstruction error가 작지만(8레벨), TBQP3의 QJL 보
 
 ```bash
 # 추천 설정 (v1.5.1)
-./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
     -t 4 -c 262144 -n 32768 --parallel 1 \
-    --cont-batching --jinja --reasoning-format auto \
+    --cont-batching --jinja \
+    --reasoning off --reasoning-budget 0 --reasoning-format none \
     --n-gpu-layers 999 --flash-attn on \
     -b 1024 -ub 512 --no-mmap \
     --cache-type-k tbqp3 --cache-type-v tbq3 \
-    --temp 0 --host 127.0.0.1 --port 8889
+    --temp 0 --host 0.0.0.0 --port 8888
 ```
 > SWA K+V는 자동으로 f16 업그레이드됩니다. 추가 설정 불필요.
 
@@ -721,22 +724,24 @@ Model: [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-
 
 ```bash
 # Best quality (exceeds f16, 4.2x compression)
-./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
     -t 4 -c 262144 -n 32768 --parallel 1 \
-    --cont-batching --jinja --reasoning-format auto \
+    --cont-batching --jinja \
+    --reasoning off --reasoning-budget 0 --reasoning-format none \
     --n-gpu-layers 999 --flash-attn on \
     -b 1024 -ub 512 --no-mmap \
     --cache-type-k tbqp3 --cache-type-v tbq3 \
-    --temp 0 --host 127.0.0.1 --port 8889
+    --temp 0 --host 0.0.0.0 --port 8888
 
 # Simple config (matches f16, 4.2x compression)
-./llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
     -t 4 -c 262144 -n 32768 --parallel 1 \
-    --cont-batching --jinja --reasoning-format auto \
+    --cont-batching --jinja \
+    --reasoning off --reasoning-budget 0 --reasoning-format none \
     --n-gpu-layers 999 --flash-attn on \
     -b 1024 -ub 512 --no-mmap \
     --cache-type-k tbq3 --cache-type-v tbq3 \
-    --temp 0 --host 127.0.0.1 --port 8889
+    --temp 0 --host 0.0.0.0 --port 8888
 ```
 > SWA K+V auto-upgraded to f16. No additional configuration needed.
 
