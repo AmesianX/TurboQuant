@@ -1021,7 +1021,6 @@ static __global__ void flash_attn_ext_vec(
                 } else {
                     dequantize_V(V + k*nb21, tmp, v_elem);
                 }
-                // Heavy-tail centroid compensation: scale V only for D=512 nowht (global layers)
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
