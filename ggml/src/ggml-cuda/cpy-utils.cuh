@@ -1548,7 +1548,7 @@ static __device__ void quantize_f32_tbqp4_3_xhead(
         for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] * inv_norm - recon[j]);
         outs[h]->d_qjl = __float2half((res_abs/TBQ_K64)*blk_norm);
         for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
-        for (int j = 0; j < TBQ_K64; j++) { if (seg[j]-recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1<<(j%8)); }
+        for (int j = 0; j < TBQ_K64; j++) { if (seg[j] * inv_norm - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1<<(j%8)); }
     }
 }
 
