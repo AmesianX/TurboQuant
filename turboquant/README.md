@@ -2,7 +2,7 @@
 
 > Implementation of [TurboQuant (ICLR 2026, Google DeepMind)](https://arxiv.org/abs/2504.19874) — KV cache compression via Walsh-Hadamard Transform + Lloyd-Max quantization with QJL correction
 
-**🇰🇷 [한국어 버전은 아래를 클릭하세요](#-한국어)**
+**🇰🇷 [한국어 버전은 아래를 클릭하세요](#korean)**
 
 ### 🆕 v1.5.2 — PPL 21%→6%, Precision Fix, Deterministic Kernel
 
@@ -114,7 +114,8 @@ Use shorthand names (`tbq3`, `tbqp3`, etc.) — internal suffixes (`_0`, `_1`, e
 
 ---
 
-<details>
+<a id="korean"></a>
+<details open>
 <summary>🇰🇷 한국어</summary>
 
 ## 개요
