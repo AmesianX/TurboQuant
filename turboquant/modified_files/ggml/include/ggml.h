@@ -428,27 +428,28 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_TBQ3_0  = 41, // TurboQuant 3-bit (rotation + Lloyd-Max)
-        GGML_TYPE_TBQ4_0  = 42, // TurboQuant 4-bit (rotation + Lloyd-Max)
-        GGML_TYPE_TBQP3_0 = 43, // TurboQuant_prod 3-bit (2-bit Lloyd-Max + 1-bit QJL)
-        GGML_TYPE_TBQP4_0 = 44, // TurboQuant_prod 4-bit (3-bit Lloyd-Max + 1-bit QJL)
-        GGML_TYPE_TBQ3_1  = 45, // TurboQuant 3-bit, blck_size=128 (head_dim=128)
-        GGML_TYPE_TBQ4_1  = 46, // TurboQuant 4-bit, blck_size=128 (head_dim=128)
-        GGML_TYPE_TBQP3_1 = 47, // TurboQuant_prod 3-bit, blck_size=128 (head_dim=128)
-        GGML_TYPE_TBQP4_1 = 48, // TurboQuant_prod 4-bit, blck_size=128 (head_dim=128)
-        GGML_TYPE_TBQ3_2  = 49, // TurboQuant 3-bit, blck_size=64 (head_dim=64)
-        GGML_TYPE_TBQ4_2  = 50, // TurboQuant 4-bit, blck_size=64 (head_dim=64)
-        GGML_TYPE_TBQP3_2 = 51, // TurboQuant_prod 3-bit, blck_size=64 (head_dim=64)
-        GGML_TYPE_TBQP4_2 = 52, // TurboQuant_prod 4-bit, blck_size=64 (head_dim=64)
-        GGML_TYPE_TBQ3_3  = 53, // TurboQuant 3-bit, cross-head WHT (8×64=512)
-        GGML_TYPE_TBQ4_3  = 54, // TurboQuant 4-bit, cross-head WHT (8×64=512)
-        GGML_TYPE_TBQP3_3 = 55, // TurboQuant_prod 3-bit, cross-head WHT (8×64=512)
-        GGML_TYPE_TBQP4_3 = 56, // TurboQuant_prod 4-bit, cross-head WHT (8×64=512)
-        GGML_TYPE_TBQ3_4  = 57, // TurboQuant 3-bit, blck_size=576 (head_dim=576, split 256+256+64)
-        GGML_TYPE_TBQ4_4  = 58, // TurboQuant 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
-        GGML_TYPE_TBQP3_4 = 59, // TurboQuant_prod 3-bit, blck_size=576 (head_dim=576, split 256+256+64)
-        GGML_TYPE_TBQP4_4 = 60, // TurboQuant_prod 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
-        GGML_TYPE_COUNT   = 61,
+        GGML_TYPE_Q1_0    = 41,
+        GGML_TYPE_TBQ3_0  = 42, // TurboQuant 3-bit (rotation + Lloyd-Max)
+        GGML_TYPE_TBQ4_0  = 43, // TurboQuant 4-bit (rotation + Lloyd-Max)
+        GGML_TYPE_TBQP3_0 = 44, // TurboQuant_prod 3-bit (2-bit Lloyd-Max + 1-bit QJL)
+        GGML_TYPE_TBQP4_0 = 45, // TurboQuant_prod 4-bit (3-bit Lloyd-Max + 1-bit QJL)
+        GGML_TYPE_TBQ3_1  = 46, // TurboQuant 3-bit, blck_size=128 (head_dim=128)
+        GGML_TYPE_TBQ4_1  = 47, // TurboQuant 4-bit, blck_size=128 (head_dim=128)
+        GGML_TYPE_TBQP3_1 = 48, // TurboQuant_prod 3-bit, blck_size=128 (head_dim=128)
+        GGML_TYPE_TBQP4_1 = 49, // TurboQuant_prod 4-bit, blck_size=128 (head_dim=128)
+        GGML_TYPE_TBQ3_2  = 50, // TurboQuant 3-bit, blck_size=64 (head_dim=64)
+        GGML_TYPE_TBQ4_2  = 51, // TurboQuant 4-bit, blck_size=64 (head_dim=64)
+        GGML_TYPE_TBQP3_2 = 52, // TurboQuant_prod 3-bit, blck_size=64 (head_dim=64)
+        GGML_TYPE_TBQP4_2 = 53, // TurboQuant_prod 4-bit, blck_size=64 (head_dim=64)
+        GGML_TYPE_TBQ3_3  = 54, // TurboQuant 3-bit, cross-head WHT (8×64=512)
+        GGML_TYPE_TBQ4_3  = 55, // TurboQuant 4-bit, cross-head WHT (8×64=512)
+        GGML_TYPE_TBQP3_3 = 56, // TurboQuant_prod 3-bit, cross-head WHT (8×64=512)
+        GGML_TYPE_TBQP4_3 = 57, // TurboQuant_prod 4-bit, cross-head WHT (8×64=512)
+        GGML_TYPE_TBQ3_4  = 58, // TurboQuant 3-bit, blck_size=576 (head_dim=576, split 256+256+64)
+        GGML_TYPE_TBQ4_4  = 59, // TurboQuant 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
+        GGML_TYPE_TBQP3_4 = 60, // TurboQuant_prod 3-bit, blck_size=576 (head_dim=576, split 256+256+64)
+        GGML_TYPE_TBQP4_4 = 61, // TurboQuant_prod 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
+        GGML_TYPE_COUNT   = 62,
     };
 
     // precision
@@ -485,6 +486,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
     };
 
     // available tensor operations:
@@ -920,15 +922,17 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
-    GGML_API struct ggml_tensor * ggml_add1(
+    GGML_DEPRECATED(GGML_API struct ggml_tensor * ggml_add1(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
-            struct ggml_tensor  * b);
+            struct ggml_tensor  * b),
+        "use ggml_add instead");
 
-    GGML_API struct ggml_tensor * ggml_add1_inplace(
+    GGML_DEPRECATED(GGML_API struct ggml_tensor * ggml_add1_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
-            struct ggml_tensor  * b);
+            struct ggml_tensor  * b),
+        "use ggml_add_inplace instead");
 
     // dst = a
     // view(dst, nb1, nb2, nb3, offset) += b

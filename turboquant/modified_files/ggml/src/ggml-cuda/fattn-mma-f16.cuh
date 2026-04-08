@@ -1854,6 +1854,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     // V_is_K_view: true for ALL MLA (DKQ=576). TBQ and TBQP both use spatial K.
     // V = K view = spatial. QJL applied as scalar correction via raw_K_data.
     const bool V_is_K_view = (DKQ == 576);
+    GGML_UNUSED(V_is_K_view);
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);

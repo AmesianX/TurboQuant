@@ -111,7 +111,16 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-    if (GGML_CUDA_FA_ALL_QUANTS)
+    if (GGML_CUDA_FA_TBQ_TUNING)
+        list(APPEND GGML_SOURCES_CUDA
+            template-instances/fattn-vec-instance-tbq3_0-tbq3_0.cu
+            template-instances/fattn-vec-instance-tbqp3_0-tbq3_0.cu
+            template-instances/fattn-vec-instance-tbq3_0-f16.cu
+            template-instances/fattn-vec-instance-tbqp3_0-f16.cu
+            template-instances/fattn-vec-instance-f16-tbq3_0.cu
+            template-instances/fattn-vec-instance-f16-f16.cu)
+        add_compile_definitions(GGML_CUDA_FA_TBQ_TUNING)
+    elseif (GGML_CUDA_FA_ALL_QUANTS)
         file(GLOB   SRCS "template-instances/fattn-vec*.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
