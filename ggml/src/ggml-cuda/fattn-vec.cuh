@@ -913,12 +913,30 @@ static __global__ void flash_attn_ext_vec(
                 // No clamp — α naturally adapts: small N (generation) → small α, large N (prefill/PPL) → large α.
                 if constexpr (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQ3_0 ||
                               type_K == GGML_TYPE_TBQP4_0 || type_K == GGML_TYPE_TBQ4_0) {
+                    // D≥256: sharpening — SQNR high enough that correct token usually wins
                     constexpr float c =
                         (type_K == GGML_TYPE_TBQP3_0) ? 0.01304f :
                         (type_K == GGML_TYPE_TBQ3_0)  ? 0.00579f :
                         (type_K == GGML_TYPE_TBQP4_0) ? 0.00724f :
                         (type_K == GGML_TYPE_TBQ4_0)  ? 0.00326f : 0.0f;
                     const float alpha = 1.0f + c * sqrtf(logf(fmaxf((float)k_VKQ_max, 2.0f)));
+                    sum *= alpha;
+                }
+                // D=64 (_2 and _3): dynamic MMSE softening
+                // SQNR too low at head_dim=64, noise corrupts attention ranking
+                // α(N) = SQNR / (SQNR + √(ln N / ln N₀)): more softening for longer context
+                if constexpr (type_K == GGML_TYPE_TBQP3_2 || type_K == GGML_TYPE_TBQP3_3 ||
+                              type_K == GGML_TYPE_TBQ3_2  || type_K == GGML_TYPE_TBQ3_3  ||
+                              type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP4_3 ||
+                              type_K == GGML_TYPE_TBQ4_2  || type_K == GGML_TYPE_TBQ4_3) {
+                    constexpr float sqnr =
+                        (type_K == GGML_TYPE_TBQP3_2 || type_K == GGML_TYPE_TBQP3_3) ?  3.45f :
+                        (type_K == GGML_TYPE_TBQ3_2  || type_K == GGML_TYPE_TBQ3_3)  ?  7.80f :
+                        (type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP4_3) ?  6.13f :
+                        (type_K == GGML_TYPE_TBQ4_2  || type_K == GGML_TYPE_TBQ4_3)  ? 14.05f : 1.0f;
+                    constexpr float ln_n0 = 7.6246f; // ln(2048)
+                    const float evt = sqrtf(logf(fmaxf((float)k_VKQ_max, 2.0f)) / ln_n0);
+                    const float alpha = sqnr / (sqnr + evt);
                     sum *= alpha;
                 }
 

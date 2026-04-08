@@ -1401,12 +1401,12 @@ common_init_result::common_init_result(common_params & params) :
 
         // Auto-map _0 types to correct _N based on head_dim
         auto tbq_resolve = [&](ggml_type type, bool is_key) -> ggml_type {
-            struct tbq_map { ggml_type from; ggml_type to_256; ggml_type to_128; ggml_type to_64; ggml_type to_576; };
+            struct tbq_map { ggml_type from; ggml_type to_256; ggml_type to_128; ggml_type to_64; ggml_type to_576; ggml_type to_cross_head; };
             static const tbq_map maps[] = {
-                { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2,  GGML_TYPE_TBQ3_4  },
-                { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2,  GGML_TYPE_TBQ4_4  },
-                { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQP3_4 },
-                { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQP4_4 },
+                { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2,  GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_3  },
+                { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2,  GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_3  },
+                { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_3 },
+                { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_3 },
             };
 
             // Also catch _1/_2/_4 types that don't match head_dim (user specified directly)
@@ -1439,14 +1439,21 @@ common_init_result::common_init_result(common_params & params) :
                         return m.to_128;
                     } else if (head_dim == 64) {
                         if (is_key) {
+                            // head_dim=64 K: force TBQ (drop QJL) + cross-head WHT
+                            // QJL adds noise to attention scores — at D=64, this noise exceeds
+                            // the signal gap and causes repetition loops. Pure 3-bit Lloyd-Max
+                            // (TBQ3) has 2.3× better score SQNR than TBQP3 (2-bit+QJL).
+                            ggml_type forced = GGML_TYPE_TBQ3_3; // default cross-head 3-bit
+                            if (type == GGML_TYPE_TBQ4_0 || type == GGML_TYPE_TBQP4_0) {
+                                forced = GGML_TYPE_TBQ4_3; // 4-bit cross-head
+                            }
                             LOG_WRN("\n");
-                            LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
-                            LOG_WRN("║  TurboQuant: head_dim=%d detected — K cache forced to q8_0  ║\n", head_dim);
-                            LOG_WRN("║  WHT quantization degrades attention accuracy at dim<128.   ║\n");
-                            LOG_WRN("║  V cache uses %s (WHT is OK for values)                 ║\n", ggml_type_name(m.to_64));
-                            LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
+                            LOG_WRN("╔══════════════════════════════════════════════════════════════════╗\n");
+                            LOG_WRN("║  TurboQuant: head_dim=%d — K forced to %s (cross-head, no QJL)  ║\n", head_dim, ggml_type_name(forced));
+                            LOG_WRN("║  QJL adds score noise at D=64 → pure Lloyd-Max for K precision  ║\n");
+                            LOG_WRN("╚══════════════════════════════════════════════════════════════════╝\n");
                             LOG_WRN("\n");
-                            return GGML_TYPE_Q8_0;
+                            return forced;
                         }
                         LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
                                 __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
