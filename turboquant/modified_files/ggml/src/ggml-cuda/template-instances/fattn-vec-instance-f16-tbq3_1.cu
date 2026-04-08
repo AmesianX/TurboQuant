@@ -1,3 +1,7 @@
+// Force float accumulation for TBQ V types
+#include "../common.cuh"
+#undef V_DOT2_F32_F16_AVAILABLE
+
 // Asymmetric: F16 keys + TBQ3_1 values
 
 #include "../fattn-vec.cuh"

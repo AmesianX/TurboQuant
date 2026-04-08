@@ -1,3 +1,7 @@
+// Force float accumulation for TBQ V types
+#include "../common.cuh"
+#undef V_DOT2_F32_F16_AVAILABLE
+
 // TurboQuant 576-block: TBQP3_4 keys + TBQ3_4 values
 
 #include "../fattn-vec.cuh"

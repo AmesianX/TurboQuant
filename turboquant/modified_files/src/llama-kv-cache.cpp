@@ -287,22 +287,26 @@ llama_kv_cache::llama_kv_cache(
                        || type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2
                        || type_k == GGML_TYPE_TBQ3_4  || type_k == GGML_TYPE_TBQ4_4
                        || type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4;
-    const bool is_tbq_v = type_v == GGML_TYPE_TBQ3_0  || type_v == GGML_TYPE_TBQ4_0
-                       || type_v == GGML_TYPE_TBQ3_1  || type_v == GGML_TYPE_TBQ4_1
-                       || type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2
-                       || type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4;
+    // is_tbq_v removed: V rotation disabled (IWHT decode has no inverse rotation)
+
+    // TBQP (QJL) types: disable attn_rot for K — QJL already provides its own random projection,
+    // triple rotation (attn_rot + WHT + QJL) is redundant. Benchmarked: OFF avg 37.0 > ON avg 35.4.
+    // TBQ (non-QJL) types: keep attn_rot — double rotation (attn_rot + WHT) helps decorrelation.
+    const bool is_tbqp_k = type_k == GGML_TYPE_TBQP3_0 || type_k == GGML_TYPE_TBQP4_0
+                        || type_k == GGML_TYPE_TBQP3_1 || type_k == GGML_TYPE_TBQP4_1
+                        || type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2
+                        || type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4;
 
     attn_rot_k =
         !attn_rot_disable &&
+        !is_tbqp_k &&
         ggml_is_quantized(type_k) &&
         (is_tbq_k || !hparams.is_n_embd_k_gqa_variable()) &&
         hparams.n_embd_head_k() % 64 == 0;
 
-    attn_rot_v =
-        !attn_rot_disable &&
-        ggml_is_quantized(type_v) &&
-        (is_tbq_v || !hparams.is_n_embd_v_gqa_variable()) &&
-        hparams.n_embd_head_v() % 64 == 0;
+    // V rotation disabled: IWHT decode path does not undo attn_rot,
+    // so rotated V values would produce incorrect attention output.
+    attn_rot_v = false;
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d\n", __func__, attn_rot_k);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d\n", __func__, attn_rot_v);
@@ -1231,7 +1235,12 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
+
+    // pass head_dim via op_params for TBQ 512-point WHT dispatch
+    result->op_params[0] = (int32_t) n_embd_head;
+
+    return result;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1266,7 +1275,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
+        // V cache: same 512-WHT as K (sign+WHT+global norm via quantize_f32_tbq3_0_block_512)
+        // 512-IWHT applied at attention output time in fattn-vec.cuh
+        ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
+        result->op_params[0] = (int32_t) n_embd_head;
+        return result;
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {

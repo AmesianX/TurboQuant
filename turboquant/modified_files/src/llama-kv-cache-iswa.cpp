@@ -119,6 +119,14 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         }
     }
 
+    // SWA cache is tiny (~57 MiB) — use f16 for both K and V to eliminate SWA quantization error
+    // SWA has 25 layers vs 5 global layers, so SWA errors dominate quality loss
+    if (type_k_swa != GGML_TYPE_F16 || type_v_swa != GGML_TYPE_F16) {
+        LLAMA_LOG_INFO("%s: SWA K+V upgraded to f16 for quality (SWA cache is small)\n", __func__);
+        type_k_swa = GGML_TYPE_F16;
+        type_v_swa = GGML_TYPE_F16;
+    }
+
     kv_swa = std::make_unique<llama_kv_cache>(
             model, type_k_swa, type_v_swa,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,

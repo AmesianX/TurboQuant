@@ -1232,6 +1232,7 @@ common_init_result::common_init_result(common_params & params) :
 
     // TurboQuant auto-mapping: resolve _0 placeholder to correct _N based on head_dim
     // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
+    int32_t head_dim = 0; // outside block scope — used by D=512 validation at lines 1504/1522
     {
         // Quick check: skip entirely if neither K nor V uses TBQ types
         auto is_any_tbq = [](ggml_type t) -> bool {
@@ -1250,7 +1251,6 @@ common_init_result::common_init_result(common_params & params) :
       if (is_any_tbq(cparams.type_k) || is_any_tbq(cparams.type_v)) {
         // Detect KV head dimension with multi-signal cross-validation
         // TurboQuant WHT requires exact head_dim — wrong value = garbage output
-        int32_t head_dim = 0;
         int32_t s_val_outer = 0; // V head_dim for asymmetric models (e.g. GLM K=576, V=512)
         auto is_supported_dim = [](int dim) -> bool {
             if (dim <= 0) return false;
@@ -1497,6 +1497,28 @@ common_init_result::common_init_result(common_params & params) :
             }
         }
       } // end is_any_tbq
+    }
+
+    // D=512 K cache: TBQP3 (QJL) now supported at D=512 with SWA f16 bypass
+
+    // D=512 V cache type validation: only f16 and TBQ types have flash attention dispatch
+    if (head_dim == 512) {
+        const ggml_type vt = cparams.type_v;
+        const bool v_ok = vt == GGML_TYPE_F16 || vt == GGML_TYPE_F32
+            || vt == GGML_TYPE_TBQ3_0  || vt == GGML_TYPE_TBQ4_0
+            || vt == GGML_TYPE_TBQ3_1  || vt == GGML_TYPE_TBQ4_1
+            || vt == GGML_TYPE_TBQ3_2  || vt == GGML_TYPE_TBQ4_2
+            || vt == GGML_TYPE_TBQ3_4  || vt == GGML_TYPE_TBQ4_4;
+        if (!v_ok) {
+            LOG_WRN("\n");
+            LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
+            LOG_WRN("║  head_dim=512: V cache type '%s' not supported          ║\n", ggml_type_name(vt));
+            LOG_WRN("║  Only f16 and TBQ types have flash attention at D=512.      ║\n");
+            LOG_WRN("║  Falling back to f16 for V cache.                           ║\n");
+            LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
+            LOG_WRN("\n");
+            cparams.type_v = GGML_TYPE_F16;
+        }
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);
