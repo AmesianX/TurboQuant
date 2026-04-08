@@ -427,9 +427,31 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
 }
 
 static std::string get_all_kv_cache_types() {
+    // Show user-friendly names: hide _0/_1/_2/_3/_4 TBQ suffixes,
+    // show shorthand (tbq3, tbqp3, etc.) instead
+    static const std::unordered_map<ggml_type, std::string> tbq_display = {
+        {GGML_TYPE_TBQ3_0,  "tbq3"},   {GGML_TYPE_TBQ4_0,  "tbq4"},
+        {GGML_TYPE_TBQP3_0, "tbqp3"},  {GGML_TYPE_TBQP4_0, "tbqp4"},
+    };
+    std::set<std::string> seen_tbq;
     std::ostringstream msg;
+    bool first = true;
     for (const auto & type : kv_cache_types) {
-        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+        std::string name;
+        auto it = tbq_display.find(type);
+        if (it != tbq_display.end()) {
+            if (seen_tbq.count(it->second)) continue;
+            seen_tbq.insert(it->second);
+            name = it->second;
+        } else {
+            // Skip internal TBQ subtypes (_1, _2, _3, _4) from display
+            std::string raw = ggml_type_name(type);
+            if (raw.find("tbq") != std::string::npos || raw.find("tbqp") != std::string::npos) continue;
+            name = raw;
+        }
+        if (!first) msg << ", ";
+        msg << name;
+        first = false;
     }
     return msg.str();
 }
