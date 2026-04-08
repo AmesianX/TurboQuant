@@ -303,6 +303,24 @@ For models with $d=64$ head dimension, the 64-point WHT provides insufficient de
 \text{score}_h = \frac{1}{8}\sum_{g=0}^{7} H_8[h,g] \cdot \langle \mathbf{q}_h, \text{dequant}(\mathbf{k}_g) \rangle
 \end{equation}
 
+Two critical fixes were required for cross-head to function:
+
+\paragraph{Per-head normalization.} The initial implementation used a global L2 norm across all 512 WHT coefficients. When one head dominates in energy, the remaining heads are quantized with an inappropriate scale, losing information. We switch to per-head RMS normalization (same principle as per-block norm for $d=512$).
+
+\paragraph{QJL removal for K at $d=64$.} TBQP types use $(b{-}1)$-bit Lloyd-Max plus 1-bit QJL. At $d=64$, the QJL random projection adds noise to the attention score that \emph{exceeds} the signal gap between correct and runner-up tokens. Pure 3-bit Lloyd-Max (TBQ3, 8 centroids) achieves $2.3\times$ better score SQNR than TBQP3 (2-bit + QJL). We automatically remap K from TBQP$\to$TBQ at $d=64$, dedicating all bits to centroid precision.
+
+\subsection{MMSE Dynamic Softening ($d=64$)}
+
+At $d \geq 256$, quantization noise is small relative to the attention gap, and \emph{sharpening} ($\alpha > 1$) compensates softmax flattening. At $d=64$, the noise is large enough to corrupt the token ranking itself. Sharpening then amplifies confidence in wrong tokens, causing repetition loops.
+
+We derive an MMSE-optimal \emph{softening} correction:
+\begin{equation}
+\alpha(N) = \frac{\text{SQNR}}{\text{SQNR} + \sqrt{\ln N / \ln N_0}}
+\end{equation}
+where $\text{SQNR}$ is the effective signal-to-quantization-noise ratio at $d=64$, and $N_0 = 2048$. This gives $\alpha < 1$: the softmax is made \emph{flatter}, reducing overconfidence. The EVT term $\sqrt{\ln N / \ln N_0}$ increases softening for longer contexts where more noise-boosted candidates compete.
+
+This creates a unified framework: the same MMSE/EVT theory produces sharpening at high SQNR ($d \geq 256$) and softening at low SQNR ($d = 64$).
+
 \subsection{Asymmetric K/V Dimensions}
 
 GLM-4 uses $d_K=576, d_V=512$ with MLA (Multi-head Latent Attention). We support this via the \texttt{D\_V} template parameter, with the 576-dimensional K using a split WHT (256+256+64) and the 512-dimensional V using standard 512-point WHT.
