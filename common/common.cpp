@@ -1447,10 +1447,12 @@ common_init_result::common_init_result(common_params & params) :
                                 forced = GGML_TYPE_TBQ4_3; // 4-bit cross-head
                             }
                             LOG_WRN("\n");
-                            LOG_WRN("╔══════════════════════════════════════════════════════════════════╗\n");
-                            LOG_WRN("║  TurboQuant: head_dim=%d — K forced to %s (cross-head, no QJL)  ║\n", head_dim, ggml_type_name(forced));
-                            LOG_WRN("║  QJL adds score noise at D=64 → pure Lloyd-Max for K precision  ║\n");
-                            LOG_WRN("╚══════════════════════════════════════════════════════════════════╝\n");
+                            LOG_WRN("\n");
+                            LOG_WRN("╔════════════════════════════════════════════════════════════════════════\n");
+                            LOG_WRN("║  TurboQuant: head_dim=%d — K forced to %s (cross-head, no QJL)\n", head_dim, ggml_type_name(forced));
+                            LOG_WRN("║  QJL adds score noise at D=64 → pure Lloyd-Max for K precision\n");
+                            LOG_WRN("╚════════════════════════════════════════════════════════════════════════\n");
+                            LOG_WRN("\n");
                             LOG_WRN("\n");
                             return forced;
                         }
