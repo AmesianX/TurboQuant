@@ -94,6 +94,22 @@ The range is narrow (1.007–1.048) because √(ln N) grows very slowly. Even 12
 ```
 > SWA K+V auto-upgraded to f16. No extra config needed.
 
+**Supported K/V combinations:**
+
+Use shorthand names (`tbq3`, `tbqp3`, etc.) — internal suffixes (`_0`, `_1`, etc.) are auto-mapped by head dimension.
+
+| `--cache-type-k` \ `--cache-type-v` | f16 | q8_0 | q4_0 | tbq3 | tbq4 |
+|--------------------------------------|-----|------|------|------|------|
+| **f16** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **q8_0** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **q4_0** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **tbq3** | ✅ | ✅ | — | ✅ | ✅ |
+| **tbq4** | ✅ | ✅ | — | ✅ | ✅ |
+| **tbqp3** | ✅ | ✅ | — | ✅ | ✅ |
+| **tbqp4** | ✅ | ✅ | — | ✅ | ✅ |
+
+> **`tbqp` types are K-only.** Do NOT use `tbqp3`/`tbqp4` for `--cache-type-v` — QJL correction operates on Q·K dot product and has no meaning for V cache. Recommended: `--cache-type-k tbqp3 --cache-type-v tbq3`.
+
 ---
 
 <details>
@@ -209,6 +225,22 @@ TBQ3는 per-element reconstruction error가 작지만(8레벨), TBQP3의 QJL 보
     --temp 0 --host 0.0.0.0 --port 8888
 ```
 > SWA K+V는 자동으로 f16 업그레이드됩니다. 추가 설정 불필요.
+
+**지원 K/V 조합:**
+
+숏핸드 이름(`tbq3`, `tbqp3` 등)을 사용하세요 — 내부 접미사(`_0`, `_1` 등)는 head dimension에 따라 자동 매핑됩니다.
+
+| `--cache-type-k` \ `--cache-type-v` | f16 | q8_0 | q4_0 | tbq3 | tbq4 |
+|--------------------------------------|-----|------|------|------|------|
+| **f16** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **q8_0** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **q4_0** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **tbq3** | ✅ | ✅ | — | ✅ | ✅ |
+| **tbq4** | ✅ | ✅ | — | ✅ | ✅ |
+| **tbqp3** | ✅ | ✅ | — | ✅ | ✅ |
+| **tbqp4** | ✅ | ✅ | — | ✅ | ✅ |
+
+> **`tbqp` 타입은 K 전용입니다.** `--cache-type-v`에 `tbqp3`/`tbqp4`를 사용하지 마세요 — QJL 보정은 Q·K 내적에서만 동작하며 V cache에는 의미가 없습니다. 추천: `--cache-type-k tbqp3 --cache-type-v tbq3`.
 
 ---
 
