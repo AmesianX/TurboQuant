@@ -2,6 +2,8 @@
 
 > Implementation of [TurboQuant (ICLR 2026, Google DeepMind)](https://arxiv.org/abs/2504.19874) — KV cache compression via Walsh-Hadamard Transform + Lloyd-Max quantization with QJL correction
 
+**🇰🇷 [한국어 버전은 아래를 클릭하세요](#-한국어)**
+
 ### 🆕 v1.5.2 — PPL 21%→6%, Precision Fix, Deterministic Kernel
 
 **Critical precision loss in flash attention kernel fixed. 3-bit KV cache now deterministic and achieves 1.06x f16 PPL.**
