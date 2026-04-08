@@ -252,10 +252,10 @@ index 3b49ead96..99fb734a9 100644
        - name: Upload release
          id: upload_release
 diff --git a/README.md b/README.md
-index be23abcea..f6889cda4 100644
+index be23abcea..3536ff355 100644
 --- a/README.md
 +++ b/README.md
-@@ -1,596 +1,1532 @@
+@@ -1,596 +1,1536 @@
 -# llama.cpp
 +# TurboQuant KV Cache Compression for llama.cpp
  
@@ -330,6 +330,10 @@ index be23abcea..f6889cda4 100644
 +5. **Per-block Norm (TBQ3 D=512)**: Independent norm per 256-half after 512-WHT. TBQP3 keeps global norm (QJL uses cross-block WHT).
 +6. **Removed 1.15x V hack**: Replaced by principled attention sharpening.
 +7. **Fixed tbq4_0 D=512 OOB read**.
++8. **Fixed tbq4/tbqp4 D=512 WHT domain mismatch**: K encoding used 256-point WHT while Q used 512-point WHT. Added 512-point encode functions.
++9. **Cross-head WHT per-head norm (head_dim=64)**: Global L2 norm destroyed small heads' quantization quality. Changed to per-head RMS norm after 512-point WHT.
++10. **head_dim=64 K: auto QJL removal**: QJL adds score noise that exceeds signal gap at D=64. K automatically remapped from tbqp3→tbq3 (pure 3-bit Lloyd-Max) for maximum K score precision. V keeps original type.
++11. **Dynamic MMSE softening (head_dim=64)**: α(N) = SQNR/(SQNR + √(ln N/ln N₀)), opposite of sharpening — reduces overconfidence when SQNR is low.
  
 -```sh
 -# Use a local model file
@@ -2318,10 +2322,10 @@ index 2e0f46db5..34ab22823 100644
      return msg.str();
  }
 diff --git a/common/common.cpp b/common/common.cpp
-index 16f78debd..70eba435e 100644
+index 16f78debd..5a3330bfe 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1230,6 +1230,297 @@ common_init_result::common_init_result(common_params & params) :
+@@ -1230,6 +1230,304 @@ common_init_result::common_init_result(common_params & params) :
          cparams.n_samplers = pimpl->samplers_seq_config.size();
      }
  
@@ -2495,12 +2499,12 @@ index 16f78debd..70eba435e 100644
 +
 +        // Auto-map _0 types to correct _N based on head_dim
 +        auto tbq_resolve = [&](ggml_type type, bool is_key) -> ggml_type {
-+            struct tbq_map { ggml_type from; ggml_type to_256; ggml_type to_128; ggml_type to_64; ggml_type to_576; };
++            struct tbq_map { ggml_type from; ggml_type to_256; ggml_type to_128; ggml_type to_64; ggml_type to_576; ggml_type to_cross_head; };
 +            static const tbq_map maps[] = {
-+                { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2,  GGML_TYPE_TBQ3_4  },
-+                { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2,  GGML_TYPE_TBQ4_4  },
-+                { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQP3_4 },
-+                { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQP4_4 },
++                { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2,  GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_3  },
++                { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2,  GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_3  },
++                { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_3 },
++                { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_3 },
 +            };
 +
 +            // Also catch _1/_2/_4 types that don't match head_dim (user specified directly)
@@ -2533,14 +2537,21 @@ index 16f78debd..70eba435e 100644
 +                        return m.to_128;
 +                    } else if (head_dim == 64) {
 +                        if (is_key) {
++                            // head_dim=64 K: force TBQ (drop QJL) + cross-head WHT
++                            // QJL adds noise to attention scores — at D=64, this noise exceeds
++                            // the signal gap and causes repetition loops. Pure 3-bit Lloyd-Max
++                            // (TBQ3) has 2.3× better score SQNR than TBQP3 (2-bit+QJL).
++                            ggml_type forced = GGML_TYPE_TBQ3_3; // default cross-head 3-bit
++                            if (type == GGML_TYPE_TBQ4_0 || type == GGML_TYPE_TBQP4_0) {
++                                forced = GGML_TYPE_TBQ4_3; // 4-bit cross-head
++                            }
 +                            LOG_WRN("\n");
-+                            LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
-+                            LOG_WRN("║  TurboQuant: head_dim=%d detected — K cache forced to q8_0  ║\n", head_dim);
-+                            LOG_WRN("║  WHT quantization degrades attention accuracy at dim<128.   ║\n");
-+                            LOG_WRN("║  V cache uses %s (WHT is OK for values)                 ║\n", ggml_type_name(m.to_64));
-+                            LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
++                            LOG_WRN("╔══════════════════════════════════════════════════════════════════╗\n");
++                            LOG_WRN("║  TurboQuant: head_dim=%d — K forced to %s (cross-head, no QJL)  ║\n", head_dim, ggml_type_name(forced));
++                            LOG_WRN("║  QJL adds score noise at D=64 → pure Lloyd-Max for K precision  ║\n");
++                            LOG_WRN("╚══════════════════════════════════════════════════════════════════╝\n");
 +                            LOG_WRN("\n");
-+                            return GGML_TYPE_Q8_0;
++                            return forced;
 +                        }
 +                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
 +                                __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
@@ -3407,10 +3418,10 @@ index 79ccfe568..996d9d98d 100644
      switch (type) {
          case GGML_TYPE_Q4_0:
 diff --git a/ggml/src/ggml-cuda/cpy-utils.cuh b/ggml/src/ggml-cuda/cpy-utils.cuh
-index 7697c292d..ba485901b 100644
+index 7697c292d..c912991d4 100644
 --- a/ggml/src/ggml-cuda/cpy-utils.cuh
 +++ b/ggml/src/ggml-cuda/cpy-utils.cuh
-@@ -153,6 +153,1375 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
+@@ -153,6 +153,1405 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
      }
  }
  
@@ -4582,39 +4593,45 @@ index 7697c292d..ba485901b 100644
 +    block_tbq3_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
 +
 +    float tmp[512];
-+    float sum_sq = 0.0f;
 +    for (int h = 0; h < 8; h++)
-+        for (int j = 0; j < TBQ_K64; j++) {
-+            float v = heads[h][j];
-+            tmp[h*TBQ_K64 + j] = v;
-+            sum_sq += v * v;
-+        }
-+    float norm = sqrtf(sum_sq);
-+    ggml_half norm_h = __float2half(norm);
-+    if (norm < 1e-10f) {
-+        for (int h = 0; h < 8; h++) { outs[h]->d = norm_h; for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0; }
-+        return;
-+    }
-+    float inv_norm = 1.0f / norm;
++        for (int j = 0; j < TBQ_K64; j++)
++            tmp[h*TBQ_K64 + j] = heads[h][j];
++
++    // Apply signs + 512-point WHT
 +    for (int j = 0; j < 512; j++) {
 +        int sign = ((tbq_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-+        tmp[j] *= inv_norm * sign;
++        tmp[j] *= sign;
 +    }
-+    // 512-element serial WHT (9 stages)
 +    for (int len = 1; len < 512; len *= 2)
 +        for (int i = 0; i < 512; i += 2*len)
 +            for (int j = 0; j < len; j++) {
 +                float u = tmp[i+j], v = tmp[i+j+len];
 +                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
 +            }
-+    // Quantize into 8 blocks of 64 elements each
++
++    // Per-head norm after 512-WHT (same approach as per-block norm for D=512)
++    // Global norm destroys small heads — per-head norm preserves each head's scale
 +    for (int h = 0; h < 8; h++) {
-+        outs[h]->d = norm_h;
++        float * blk = tmp + h * TBQ_K64;
++        float blk_sq = 0.0f;
++        for (int j = 0; j < TBQ_K64; j++) blk_sq += blk[j] * blk[j];
++        float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
++
++        if (blk_norm < 1e-10f) {
++            outs[h]->d = __float2half(0.0f);
++            for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
++            continue;
++        }
++
++        float inv_norm = 1.0f / blk_norm;
++        outs[h]->d = __float2half(blk_norm);
++
 +        int bit_pos = 0;
 +        for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
 +        for (int j = 0; j < TBQ_K64; j++) {
++            float val = blk[j] * inv_norm;
 +            uint8_t idx = 7;
-+            for (int b = 0; b < 7; b++) { if (tmp[h*TBQ_K64+j] < b3[b]) { idx = b; break; } }
++            for (int b = 0; b < 7; b++) { if (val < b3[b]) { idx = b; break; } }
 +            int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
 +            outs[h]->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
 +            if (bit_off > 5) outs[h]->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
@@ -4639,26 +4656,38 @@ index 7697c292d..ba485901b 100644
 +    block_tbq4_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
 +
 +    float tmp[512];
-+    float sum_sq = 0.0f;
 +    for (int h = 0; h < 8; h++)
-+        for (int j = 0; j < TBQ_K64; j++) { float v = heads[h][j]; tmp[h*TBQ_K64+j] = v; sum_sq += v*v; }
-+    float norm = sqrtf(sum_sq);
-+    ggml_half norm_h = __float2half(norm);
-+    if (norm < 1e-10f) {
-+        for (int h = 0; h < 8; h++) { outs[h]->d = norm_h; for (int j = 0; j < TBQ_K64/2; j++) outs[h]->qs[j] = 0; }
-+        return;
-+    }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= inv_norm * sign; }
++        for (int j = 0; j < TBQ_K64; j++)
++            tmp[h*TBQ_K64+j] = heads[h][j];
++
++    // Apply signs + 512-point WHT
++    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= sign; }
 +    for (int len = 1; len < 512; len *= 2)
 +        for (int i = 0; i < 512; i += 2*len)
 +            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
++
++    // Per-head norm after 512-WHT
 +    for (int h = 0; h < 8; h++) {
-+        outs[h]->d = norm_h;
++        float * blk = tmp + h * TBQ_K64;
++        float blk_sq = 0.0f;
++        for (int j = 0; j < TBQ_K64; j++) blk_sq += blk[j] * blk[j];
++        float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
++
++        if (blk_norm < 1e-10f) {
++            outs[h]->d = __float2half(0.0f);
++            for (int j = 0; j < TBQ_K64/2; j++) outs[h]->qs[j] = 0;
++            continue;
++        }
++
++        float inv_norm = 1.0f / blk_norm;
++        outs[h]->d = __float2half(blk_norm);
++
 +        for (int j = 0; j < TBQ_K64/2; j++) {
 +            uint8_t idx0 = 15, idx1 = 15;
-+            for (int b = 0; b < 15; b++) { if (tmp[h*TBQ_K64+2*j]   < b4[b]) { idx0 = b; break; } }
-+            for (int b = 0; b < 15; b++) { if (tmp[h*TBQ_K64+2*j+1] < b4[b]) { idx1 = b; break; } }
++            float val0 = blk[2*j]   * inv_norm;
++            float val1 = blk[2*j+1] * inv_norm;
++            for (int b = 0; b < 15; b++) { if (val0 < b4[b]) { idx0 = b; break; } }
++            for (int b = 0; b < 15; b++) { if (val1 < b4[b]) { idx1 = b; break; } }
 +            outs[h]->qs[j] = idx0 | (idx1 << 4);
 +        }
 +    }
@@ -4681,47 +4710,52 @@ index 7697c292d..ba485901b 100644
 +    block_tbqp3_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
 +
 +    float tmp[512];
-+    float sum_sq = 0.0f;
 +    for (int h = 0; h < 8; h++)
-+        for (int j = 0; j < TBQ_K64; j++) { float v = heads[h][j]; tmp[h*TBQ_K64+j] = v; sum_sq += v*v; }
-+    float norm = sqrtf(sum_sq);
-+    ggml_half norm_h = __float2half(norm);
-+    if (norm < 1e-10f) {
-+        for (int h = 0; h < 8; h++) {
-+            outs[h]->d = norm_h; outs[h]->d_qjl = __float2half(0.0f);
-+            for (int j = 0; j < TBQ_K64/4; j++) outs[h]->qs[j] = 0;
-+            for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
-+        }
-+        return;
-+    }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= inv_norm * sign; }
++        for (int j = 0; j < TBQ_K64; j++)
++            tmp[h*TBQ_K64+j] = heads[h][j];
++
++    // Apply signs + 512-point WHT
++    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= sign; }
 +    for (int len = 1; len < 512; len *= 2)
 +        for (int i = 0; i < 512; i += 2*len)
 +            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-+    // Quantize per 64-element block: 2-bit centroid + direct sign
++
++    // Per-head norm + quantize: 2-bit centroid + direct sign
 +    for (int h = 0; h < 8; h++) {
-+        outs[h]->d = norm_h;
 +        float * seg = &tmp[h*TBQ_K64];
++        float blk_sq = 0.0f;
++        for (int j = 0; j < TBQ_K64; j++) blk_sq += seg[j] * seg[j];
++        float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
++
++        if (blk_norm < 1e-10f) {
++            outs[h]->d = __float2half(0.0f); outs[h]->d_qjl = __float2half(0.0f);
++            for (int j = 0; j < TBQ_K64/4; j++) outs[h]->qs[j] = 0;
++            for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++            continue;
++        }
++
++        float inv_norm = 1.0f / blk_norm;
++        outs[h]->d = __float2half(blk_norm);
++
 +        float recon[TBQ_K64];
-+        // 2-bit Lloyd-Max
 +        for (int j = 0; j < TBQ_K64/4; j++) {
 +            uint8_t packed = 0;
 +            for (int k = 0; k < 4; k++) {
++                float val = seg[j*4+k] * inv_norm;
 +                uint8_t idx = 3;
-+                for (int b = 0; b < 3; b++) { if (seg[j*4+k] < b2[b]) { idx = b; break; } }
++                for (int b = 0; b < 3; b++) { if (val < b2[b]) { idx = b; break; } }
 +                packed |= (idx & 0x3) << (k*2);
 +                recon[j*4+k] = c2[idx];
 +            }
 +            outs[h]->qs[j] = packed;
 +        }
-+        // Residual + Direct Sign
++        // Residual + Direct Sign (d_qjl relative to per-head norm)
 +        float res_abs = 0.0f;
-+        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] - recon[j]);
-+        outs[h]->d_qjl = __float2half((res_abs / TBQ_K64) * norm);
++        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] * inv_norm - recon[j]);
++        outs[h]->d_qjl = __float2half((res_abs / TBQ_K64) * blk_norm);
 +        for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
 +        for (int j = 0; j < TBQ_K64; j++) {
-+            if (seg[j] - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1 << (j%8));
++            if (seg[j] * inv_norm - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1 << (j%8));
 +        }
 +    }
 +}
@@ -4743,43 +4777,50 @@ index 7697c292d..ba485901b 100644
 +    block_tbqp4_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
 +
 +    float tmp[512];
-+    float sum_sq = 0.0f;
 +    for (int h = 0; h < 8; h++)
-+        for (int j = 0; j < TBQ_K64; j++) { float v = heads[h][j]; tmp[h*TBQ_K64+j] = v; sum_sq += v*v; }
-+    float norm = sqrtf(sum_sq);
-+    ggml_half norm_h = __float2half(norm);
-+    if (norm < 1e-10f) {
-+        for (int h = 0; h < 8; h++) {
-+            outs[h]->d = norm_h; outs[h]->d_qjl = __float2half(0.0f);
-+            for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
-+            for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
-+        }
-+        return;
-+    }
-+    float inv_norm = 1.0f / norm;
-+    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= inv_norm * sign; }
++        for (int j = 0; j < TBQ_K64; j++)
++            tmp[h*TBQ_K64+j] = heads[h][j];
++
++    // Apply signs + 512-point WHT
++    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= sign; }
 +    for (int len = 1; len < 512; len *= 2)
 +        for (int i = 0; i < 512; i += 2*len)
 +            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
++
++    // Per-head norm + quantize: 3-bit centroid + direct sign
 +    for (int h = 0; h < 8; h++) {
-+        outs[h]->d = norm_h;
 +        float * seg = &tmp[h*TBQ_K64];
++        float blk_sq = 0.0f;
++        for (int j = 0; j < TBQ_K64; j++) blk_sq += seg[j] * seg[j];
++        float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
++
++        if (blk_norm < 1e-10f) {
++            outs[h]->d = __float2half(0.0f); outs[h]->d_qjl = __float2half(0.0f);
++            for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
++            for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
++            continue;
++        }
++
++        float inv_norm = 1.0f / blk_norm;
++        outs[h]->d = __float2half(blk_norm);
++
 +        float recon[TBQ_K64];
 +        int bit_pos = 0;
 +        for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
 +        for (int j = 0; j < TBQ_K64; j++) {
++            float val = seg[j] * inv_norm;
 +            uint8_t idx = 7;
-+            for (int b = 0; b < 7; b++) { if (seg[j] < b3[b]) { idx = b; break; } }
++            for (int b = 0; b < 7; b++) { if (val < b3[b]) { idx = b; break; } }
 +            int byte_idx = bit_pos/8, bit_off = bit_pos%8;
 +            outs[h]->qs[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
 +            if (bit_off > 5) outs[h]->qs[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
 +            recon[j] = c3[idx]; bit_pos += 3;
 +        }
 +        float res_abs = 0.0f;
-+        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] - recon[j]);
-+        outs[h]->d_qjl = __float2half((res_abs/TBQ_K64)*norm);
++        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] * inv_norm - recon[j]);
++        outs[h]->d_qjl = __float2half((res_abs/TBQ_K64)*blk_norm);
 +        for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
-+        for (int j = 0; j < TBQ_K64; j++) { if (seg[j]-recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1<<(j%8)); }
++        for (int j = 0; j < TBQ_K64; j++) { if (seg[j] * inv_norm - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1<<(j%8)); }
 +    }
 +}
 +
@@ -6393,7 +6434,7 @@ index 26721cc4c..d5ef1c3c3 100644
  #endif // FLASH_ATTN_AVAILABLE
  }
 diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
-index f0bd42a57..a2ebc3292 100644
+index f0bd42a57..d39c9ca18 100644
 --- a/ggml/src/ggml-cuda/fattn-vec.cuh
 +++ b/ggml/src/ggml-cuda/fattn-vec.cuh
 @@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
@@ -7125,7 +7166,7 @@ index f0bd42a57..a2ebc3292 100644
                  if (use_logit_softcap) {
                      sum = logit_softcap*tanhf(sum);
                  }
-@@ -272,6 +906,22 @@ static __global__ void flash_attn_ext_vec(
+@@ -272,6 +906,40 @@ static __global__ void flash_attn_ext_vec(
  
                  KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
  
@@ -7136,6 +7177,7 @@ index f0bd42a57..a2ebc3292 100644
 +                // No clamp — α naturally adapts: small N (generation) → small α, large N (prefill/PPL) → large α.
 +                if constexpr (type_K == GGML_TYPE_TBQP3_0 || type_K == GGML_TYPE_TBQ3_0 ||
 +                              type_K == GGML_TYPE_TBQP4_0 || type_K == GGML_TYPE_TBQ4_0) {
++                    // D≥256: sharpening — SQNR high enough that correct token usually wins
 +                    constexpr float c =
 +                        (type_K == GGML_TYPE_TBQP3_0) ? 0.01304f :
 +                        (type_K == GGML_TYPE_TBQ3_0)  ? 0.00579f :
@@ -7144,11 +7186,28 @@ index f0bd42a57..a2ebc3292 100644
 +                    const float alpha = 1.0f + c * sqrtf(logf(fmaxf((float)k_VKQ_max, 2.0f)));
 +                    sum *= alpha;
 +                }
++                // D=64 (_2 and _3): dynamic MMSE softening
++                // SQNR too low at head_dim=64, noise corrupts attention ranking
++                // α(N) = SQNR / (SQNR + √(ln N / ln N₀)): more softening for longer context
++                if constexpr (type_K == GGML_TYPE_TBQP3_2 || type_K == GGML_TYPE_TBQP3_3 ||
++                              type_K == GGML_TYPE_TBQ3_2  || type_K == GGML_TYPE_TBQ3_3  ||
++                              type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP4_3 ||
++                              type_K == GGML_TYPE_TBQ4_2  || type_K == GGML_TYPE_TBQ4_3) {
++                    constexpr float sqnr =
++                        (type_K == GGML_TYPE_TBQP3_2 || type_K == GGML_TYPE_TBQP3_3) ?  3.45f :
++                        (type_K == GGML_TYPE_TBQ3_2  || type_K == GGML_TYPE_TBQ3_3)  ?  7.80f :
++                        (type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP4_3) ?  6.13f :
++                        (type_K == GGML_TYPE_TBQ4_2  || type_K == GGML_TYPE_TBQ4_3)  ? 14.05f : 1.0f;
++                    constexpr float ln_n0 = 7.6246f; // ln(2048)
++                    const float evt = sqrtf(logf(fmaxf((float)k_VKQ_max, 2.0f)) / ln_n0);
++                    const float alpha = sqnr / (sqnr + evt);
++                    sum *= alpha;
++                }
 +
                  if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
                      KQ_reg[j] = sum;
                  }
-@@ -294,12 +944,12 @@ static __global__ void flash_attn_ext_vec(
+@@ -294,12 +962,12 @@ static __global__ void flash_attn_ext_vec(
  #ifdef V_DOT2_F32_F16_AVAILABLE
              const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
  #pragma unroll
@@ -7163,7 +7222,7 @@ index f0bd42a57..a2ebc3292 100644
                  VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
                  VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
              }
-@@ -321,7 +971,7 @@ static __global__ void flash_attn_ext_vec(
+@@ -321,7 +989,7 @@ static __global__ void flash_attn_ext_vec(
                  KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
              }
  #pragma unroll
@@ -7172,7 +7231,7 @@ index f0bd42a57..a2ebc3292 100644
                  half2 tmp[V_rows_per_thread/2];
                  if constexpr (type_V == GGML_TYPE_BF16) {
                      float2 tmp_f[V_rows_per_thread/2];
-@@ -350,10 +1000,27 @@ static __global__ void flash_attn_ext_vec(
+@@ -350,10 +1018,27 @@ static __global__ void flash_attn_ext_vec(
                  KQ_k[j] = KQ[j*nthreads + k];
              }
  #pragma unroll
@@ -7203,7 +7262,7 @@ index f0bd42a57..a2ebc3292 100644
  #pragma unroll
                  for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
  #pragma unroll
-@@ -387,12 +1054,12 @@ static __global__ void flash_attn_ext_vec(
+@@ -387,12 +1072,12 @@ static __global__ void flash_attn_ext_vec(
  #ifdef V_DOT2_F32_F16_AVAILABLE
              const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
  #pragma unroll
@@ -7218,7 +7277,7 @@ index f0bd42a57..a2ebc3292 100644
                  VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
                  VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
              }
-@@ -432,31 +1099,31 @@ static __global__ void flash_attn_ext_vec(
+@@ -432,31 +1117,31 @@ static __global__ void flash_attn_ext_vec(
          KQ_max[j_VKQ] = kqmax_new;
  
  #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -7258,7 +7317,7 @@ index f0bd42a57..a2ebc3292 100644
              const int i_VKQ = i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*(V_rows_per_thread/2);
  
              ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ,                       &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
-@@ -472,24 +1139,328 @@ static __global__ void flash_attn_ext_vec(
+@@ -472,24 +1157,328 @@ static __global__ void flash_attn_ext_vec(
  
          __syncthreads();
  
@@ -7591,7 +7650,7 @@ index f0bd42a57..a2ebc3292 100644
              }
          }
  
-@@ -511,7 +1482,7 @@ static __global__ void flash_attn_ext_vec(
+@@ -511,7 +1500,7 @@ static __global__ void flash_attn_ext_vec(
                nb11, nb12, nb13,
                nb21, nb22, nb23,
                ne31, ne32, ne33,
@@ -7600,7 +7659,7 @@ index f0bd42a57..a2ebc3292 100644
      NO_DEVICE_CODE;
  #endif // FLASH_ATTN_AVAILABLE
  }
-@@ -519,17 +1490,17 @@ static __global__ void flash_attn_ext_vec(
+@@ -519,17 +1508,17 @@ static __global__ void flash_attn_ext_vec(
  #pragma clang diagnostic pop
  #endif // __clang__
  
@@ -7621,7 +7680,7 @@ index f0bd42a57..a2ebc3292 100644
  }
  
  template <int D, ggml_type type_K, ggml_type type_V>
-@@ -562,10 +1533,41 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
+@@ -562,10 +1551,41 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
      }
  }
  
@@ -7663,7 +7722,7 @@ index f0bd42a57..a2ebc3292 100644
  #define EXTERN_DECL_FATTN_VEC_CASES(D, type_K)             \
      extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_F16);  \
      extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_Q4_0); \
-@@ -598,3 +1600,107 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
+@@ -598,3 +1618,107 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
  EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
  EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
  EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
