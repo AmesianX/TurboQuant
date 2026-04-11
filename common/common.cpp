@@ -1438,21 +1438,16 @@ common_init_result::common_init_result(common_params & params) :
                         return m.to_128;
                     } else if (head_dim == 64) {
                         if (is_key) {
-                            // head_dim=64 K: force TBQ (drop QJL) + cross-head WHT
-                            // QJL adds noise to attention scores — at D=64, this noise exceeds
-                            // the signal gap and causes repetition loops. Pure 3-bit Lloyd-Max
-                            // (TBQ3) has 2.3× better score SQNR than TBQP3 (2-bit+QJL).
-                            ggml_type forced = GGML_TYPE_TBQ3_3; // default cross-head 3-bit
+                            // head_dim=64 K: TBQP3_3 (double WHT per-head + QJL)
+                            // QJL 1-bit is critical for multi-turn stability (7+ turns verified)
+                            ggml_type forced = GGML_TYPE_TBQP3_3;
                             if (type == GGML_TYPE_TBQ4_0 || type == GGML_TYPE_TBQP4_0) {
-                                forced = GGML_TYPE_TBQ4_3; // 4-bit cross-head
+                                forced = GGML_TYPE_TBQP4_3; // 4-bit + QJL
                             }
                             LOG_WRN("\n");
-                            LOG_WRN("\n");
                             LOG_WRN("╔════════════════════════════════════════════════════════════════════════\n");
-                            LOG_WRN("║  TurboQuant: head_dim=%d — K forced to %s (cross-head, no QJL)\n", head_dim, ggml_type_name(forced));
-                            LOG_WRN("║  QJL adds score noise at D=64 → pure Lloyd-Max for K precision\n");
+                            LOG_WRN("║  TurboQuant: head_dim=%d — K mapped to %s (double WHT per-head)\n", head_dim, ggml_type_name(forced));
                             LOG_WRN("╚════════════════════════════════════════════════════════════════════════\n");
-                            LOG_WRN("\n");
                             LOG_WRN("\n");
                             return forced;
                         }
