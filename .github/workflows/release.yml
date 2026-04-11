@@ -35,16 +35,37 @@ concurrency:
 env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
-  # Target: V100(70), A100(80), 3090Ti(86), 4090(89), H100(90), 5090(100,120)
-  CUDA_ARCHITECTURES: "70;80;86;89;90;100;120"
-
 jobs:
   windows-cuda:
     runs-on: windows-2022
 
     strategy:
       matrix:
-        cuda: ['12.4', '13.1']
+        include:
+          # V100 (sm_70)
+          - cuda: '12.4'
+            cuda_arch: '70'
+            gpu: 'V100-sm70'
+          # A100 (sm_80)
+          - cuda: '12.4'
+            cuda_arch: '80'
+            gpu: 'A100-sm80'
+          # RTX 3090 Ti (sm_86)
+          - cuda: '12.4'
+            cuda_arch: '86'
+            gpu: 'RTX3090Ti-sm86'
+          # RTX 4090 (sm_89)
+          - cuda: '12.4'
+            cuda_arch: '89'
+            gpu: 'RTX4090-sm89'
+          # H100 (sm_90)
+          - cuda: '12.4'
+            cuda_arch: '90'
+            gpu: 'H100-sm90'
+          # RTX 5090 (sm_100/120, requires CUDA 13.1+)
+          - cuda: '13.1'
+            cuda_arch: '100;120'
+            gpu: 'RTX5090-sm120'
 
     steps:
       - name: Clone
@@ -76,7 +97,7 @@ jobs:
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_CUDA=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="%CUDA_ARCHITECTURES%" ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.cuda_arch }}" ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
             %CMAKE_ARGS%
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
@@ -93,13 +114,13 @@ jobs:
         id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/Release/
-          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip .\build\bin\Release\*
+          7z a -snl llama-bin-win-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-          name: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          path: llama-bin-win-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.zip
+          name: llama-bin-win-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.zip
 
   linux-cuda:
     runs-on: ubuntu-22.04
@@ -109,6 +130,24 @@ jobs:
         include:
           - cuda: '12.8'
             image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
+            cuda_arch: '70'
+            gpu: 'V100-sm70'
+          - cuda: '12.8'
+            image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
+            cuda_arch: '80'
+            gpu: 'A100-sm80'
+          - cuda: '12.8'
+            image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
+            cuda_arch: '86'
+            gpu: 'RTX3090Ti-sm86'
+          - cuda: '12.8'
+            image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
+            cuda_arch: '89'
+            gpu: 'RTX4090-sm89'
+          - cuda: '12.8'
+            image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
+            cuda_arch: '90'
+            gpu: 'H100-sm90'
 
     steps:
       - name: Clone
@@ -122,7 +161,7 @@ jobs:
           docker run --rm \
             -v "${PWD}:/workspace" \
             -w /workspace \
-            -e CUDA_ARCHITECTURES="${{ env.CUDA_ARCHITECTURES }}" \
+            -e CUDA_ARCHITECTURES="${{ matrix.cuda_arch }}" \
             ${{ matrix.image }} \
             bash -c '
               set -e
@@ -133,7 +172,7 @@ jobs:
                 -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
                 -DGGML_NATIVE=OFF \
                 -DGGML_CUDA=ON \
-                -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+                -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.cuda_arch }}" \
                 ${{ env.CMAKE_ARGS }}
               cmake --build build --config Release -j $(nproc)
               chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
@@ -147,13 +186,13 @@ jobs:
         id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/
-          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-${{ matrix.cuda }}-x64.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-${{ matrix.cuda }}-x64.tar.gz
-          name: llama-bin-linux-cuda-${{ matrix.cuda }}-x64.tar.gz
+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.tar.gz
+          name: llama-bin-linux-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.tar.gz
 
   release:
     if: ${{ ( github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') ) || github.event.inputs.create_release == 'true' }}
