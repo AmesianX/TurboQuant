@@ -351,12 +351,12 @@
   <hr class="divider">
   <div class="meta">
     <span>2026-04-07 ~ 04-08</span>
-    <span>비결정성 디버깅 + 정밀도 수정 + PPL 1.06x Achieved</span>
+    <span>Non-determinism Debugging + Precision Fix + PPL 1.06x Achieved</span>
     <br>
-    <span>half2→float 커널 수정</span>
-    <span>V IWHT 스테이징</span>
-    <span>동적 α 구현</span>
-    <span>70개 인스턴스 Batch applied</span>
+    <span>half2&rarr;float Kernel Fix</span>
+    <span>V IWHT Staging</span>
+    <span>Dynamic &alpha; Implementation</span>
+    <span>70 Instances Bulk Update</span>
     <span>AmesianX</span>
   </div>
 </section>
@@ -366,74 +366,74 @@
   <h2>Session Overview</h2>
   <hr class="divider">
   <ul class="timeline">
-    <li><span class="time">04-07 Night</span> &mdash; Non-determinism Discovery — temp=0인데 실행마다 다른 출력 (토큰 23~27에서 분기)</li>
-    <li><span class="time">04-07 Night</span> &mdash; CUDA 그래프, 풀 할당, threadfence, __ldg, parallel_blocks 제거 Experiment — 원인 아님</li>
-    <li><span class="time">04-07 Late Night</span> &mdash; MoE MUL_MAT_ID, SET_ROWS quantize, 동적 sharpening 제거 — 원인 아님</li>
-    <li><span class="time">04-08 Dawn</span> &mdash; 조건부 루틴으로 범위 축소 — V IWHT의 half/float 타입 불일치 Discovery!</li>
-    <li><span class="time">04-08 Dawn</span> &mdash; V IWHT float 레지스터 스테이징 수정 (Commit 30a4f48ae)</li>
-    <li><span class="time">04-08 Morning</span> &mdash; V_DOT2 undef — half2→float 누적 강제 (Commit 88bb214de)</li>
-    <li><span class="time">04-08 Morning</span> &mdash; 동적 sharpening Restored (Commit f93760591)</li>
-    <li><span class="time">04-08 Morning</span> &mdash; PPL 454.7 → <strong>445.7</strong> (1.08x → <strong>1.06x</strong>) Achieved</li>
-    <li><span class="time">04-08 Afternoon</span> &mdash; Remaining 67개 TBQ V 인스턴스에 V_DOT2 undef Batch applied</li>
-    <li><span class="time">04-08 Afternoon</span> &mdash; Final Code Audit — No critical issues confirmed</li>
-    <li><span class="time">04-08 Evening</span> &mdash; upstream rebase (Q1_0 충돌 Solution), README 업데이트, 논문 작성</li>
+    <li><span class="time">04-07 Night</span> &mdash; Non-determinism discovered — different outputs per run despite temp=0 (divergence at tokens 23~27)</li>
+    <li><span class="time">04-07 Night</span> &mdash; CUDA graphs, pool allocation, threadfence, __ldg, parallel_blocks removal experiments — not the cause</li>
+    <li><span class="time">04-07 Late</span> &mdash; MoE MUL_MAT_ID, SET_ROWS quantize, dynamic sharpening removal — not the cause</li>
+    <li><span class="time">04-08 Dawn</span> &mdash; Narrowed down via conditional routines — half/float type mismatch found in V IWHT!</li>
+    <li><span class="time">04-08 Dawn</span> &mdash; V IWHT float register staging fix (commit 30a4f48ae)</li>
+    <li><span class="time">04-08 AM</span> &mdash; V_DOT2 undef — forced half2&rarr;float accumulation (commit 88bb214de)</li>
+    <li><span class="time">04-08 AM</span> &mdash; Dynamic sharpening restored (commit f93760591)</li>
+    <li><span class="time">04-08 AM</span> &mdash; PPL 454.7 &rarr; <strong>445.7</strong> (1.08x &rarr; <strong>1.06x</strong>) achieved</li>
+    <li><span class="time">04-08 PM</span> &mdash; V_DOT2 undef bulk applied to remaining 67 TBQ V instances</li>
+    <li><span class="time">04-08 PM</span> &mdash; Final code audit — no critical issues found</li>
+    <li><span class="time">04-08 Eve</span> &mdash; Upstream rebase (Q1_0 conflict resolved), README update, paper written</li>
   </ul>
 </section>
 
 <!-- NON-DETERMINISM DISCOVERY -->
 <section>
-  <h2>Non-determinism Discovery <span class="tag tag-red">CRITICAL</span></h2>
+  <h2>Non-Determinism Discovered <span class="tag tag-red">Critical</span></h2>
   <hr class="divider">
 
   <div class="card-grid">
     <div class="card">
       <h4>Symptoms</h4>
       <ul>
-        <li><code>temp=0</code>, 동일 입력, 동일 서버</li>
-        <li>실행마다 다른 출력 시퀀스</li>
-        <li>토큰 23~27에서부터 완전 분기</li>
-        <li>f16/q8_0은 20/20 결정적</li>
-        <li><strong>TBQ만</strong> 비결정적</li>
+        <li><code>temp=0</code>, same input, same server</li>
+        <li>Different output sequences per run</li>
+        <li>Complete divergence starting at tokens 23~27</li>
+        <li>f16/q8_0 were deterministic 20/20</li>
+        <li><strong>Only TBQ</strong> was non-deterministic</li>
       </ul>
     </div>
     <div class="card">
       <h4>Severity</h4>
       <ul>
-        <li>재현 불가능한 출력 = 프로덕션 불가</li>
-        <li>커뮤니티 배포 시 신뢰 Problem</li>
-        <li>벤치마크 Result의 의미 상실</li>
-        <li>"CUDA 커널이 올바르게 짜여있으면 반드시 결정적이어야 한다"</li>
+        <li>Non-reproducible output = not production-ready</li>
+        <li>Trust issue for community distribution</li>
+        <li>Benchmark results become meaningless</li>
+        <li>"If a CUDA kernel is correctly written, it must be deterministic"</li>
       </ul>
     </div>
   </div>
 
   <div class="highlight-box red" style="margin-top:14px">
-    <strong>위기:</strong> Math Bench Result가 무의미해질 수 있는 상황. temp=0에서 비결정적이면 양자화 품질 이전에 커널 자체의 정합성 Problem.
+    <strong>Crisis:</strong> Math benchmark results could become meaningless. If non-deterministic at temp=0, it's a kernel correctness issue before quantization quality.
   </div>
 </section>
 
 <!-- DEBUGGING: ELIMINATION -->
 <section>
-  <h2>Elimination Debugging <span class="tag tag-purple">8시간</span></h2>
+  <h2>Elimination Debugging <span class="tag tag-purple">8 Hours</span></h2>
   <hr class="divider">
 
   <table>
-    <thead><tr><th>Target</th><th>Method</th><th>Result</th></tr></thead>
+    <thead><tr><th>Eliminated Target</th><th>Method</th><th>Result</th></tr></thead>
     <tbody>
-      <tr><td>CUDA 그래프</td><td>GRAPHS=OFF 클린 빌드</td><td class="ng">여전히 비결정적</td></tr>
-      <tr><td>풀 할당</td><td>per-request 할당으로 변경</td><td class="ng">여전히 비결정적</td></tr>
-      <tr><td>threadfence</td><td>__threadfence() 추가</td><td class="ng">변화 없음</td></tr>
-      <tr><td>__ldg</td><td>일반 load로 교체</td><td class="ng">변화 없음</td></tr>
-      <tr><td>parallel_blocks</td><td>gridDim.y=1 강제</td><td class="ng">변화 없음</td></tr>
-      <tr><td>MoE MUL_MAT_ID</td><td>입력 동일 확인</td><td class="ok">입력 같으면 결정적</td></tr>
-      <tr><td>SET_ROWS quantize</td><td>입력 비교</td><td class="ok">입력 동일</td></tr>
-      <tr><td>동적 sharpening</td><td>주석 처리</td><td class="ng">고정 α에서도 비결정적</td></tr>
-      <tr><td>KV_max</td><td>강제 고정</td><td class="ng">변화 없음</td></tr>
+      <tr><td>CUDA Graphs</td><td>Clean build with GRAPHS=OFF</td><td class="ng">Still non-deterministic</td></tr>
+      <tr><td>Pool Allocation</td><td>Switched to per-request allocation</td><td class="ng">Still non-deterministic</td></tr>
+      <tr><td>threadfence</td><td>Added __threadfence()</td><td class="ng">No change</td></tr>
+      <tr><td>__ldg</td><td>Replaced with regular loads</td><td class="ng">No change</td></tr>
+      <tr><td>parallel_blocks</td><td>Forced gridDim.y=1</td><td class="ng">No change</td></tr>
+      <tr><td>MoE MUL_MAT_ID</td><td>Verified input identity</td><td class="ok">Deterministic with same input</td></tr>
+      <tr><td>SET_ROWS quantize</td><td>Input comparison</td><td class="ok">Inputs identical</td></tr>
+      <tr><td>Dynamic sharpening</td><td>Commented out</td><td class="ng">Non-deterministic even with fixed &alpha;</td></tr>
+      <tr><td>KV_max</td><td>Force-fixed</td><td class="ng">No change</td></tr>
     </tbody>
   </table>
 
   <div class="highlight-box purple" style="margin-top:14px">
-    <strong>전환점:</strong> "동적 알파가 아니라 고정알파때도 비결정적이었던거 기억안나?" — 사용자의 한 마디가 잘못된 디버깅 방향을 바로잡았다.
+    <strong>Turning point:</strong> "Don't you remember it was non-deterministic even with fixed alpha?" — a single remark from the user corrected the wrong debugging direction.
   </div>
 </section>
 
@@ -444,57 +444,57 @@
 
   <div class="card-grid">
     <div class="card">
-      <h4>원인 1: V IWHT 타입 불일치</h4>
+      <h4>Cause 1: V IWHT Type Mismatch</h4>
       <ul>
-        <li>reduce 단계: <code>__shared__ half KQ[]</code>에 half로 저장</li>
-        <li>IWHT 단계: <code>(float*)&KQ[0]</code>으로 float 읽기</li>
-        <li>half→float 타입 펀닝 &rarr; Precision Loss</li>
-        <li>512-point 버터플라이가 오차를 <strong>√512 ≈ 22.6배</strong> 증폭</li>
+        <li>Reduce stage: stored as half in <code>__shared__ half KQ[]</code></li>
+        <li>IWHT stage: read as float via <code>(float*)&KQ[0]</code></li>
+        <li>half&rarr;float type punning &rarr; precision loss</li>
+        <li>512-point butterfly amplified error by <strong>&radic;512 &asymp; 22.6x</strong></li>
       </ul>
     </div>
     <div class="card">
-      <h4>원인 2: half2 VKQ 누적</h4>
+      <h4>Cause 2: half2 VKQ Accumulation</h4>
       <ul>
-        <li><code>V_DOT2_F32_F16_AVAILABLE</code> 매크로</li>
-        <li>VKQ 누적기: <code>half2</code> (10-bit 가수부)</li>
-        <li>수백 KV 항목 누적 시 라운딩 오차 축적</li>
-        <li>IWHT가 이 오차를 증폭</li>
+        <li><code>V_DOT2_F32_F16_AVAILABLE</code> macro</li>
+        <li>VKQ accumulator: <code>half2</code> (10-bit mantissa)</li>
+        <li>Rounding error accumulates over hundreds of KV entries</li>
+        <li>IWHT amplifies this error</li>
       </ul>
     </div>
   </div>
 
   <div class="highlight-box green" style="margin-top:14px">
-    <strong>Key:</strong> f16 KV에서는 이미 f16인 값을 f16 누적하므로 Precision Loss 없음. TBQ는 WHT 도메인 값을 누적한 뒤 IWHT 역변환하므로 <strong>작은 오차가 증폭</strong>되는 근본적 차이.
+    <strong>Key insight:</strong> With f16 KV, values already in f16 are accumulated in f16 — no precision loss. TBQ accumulates WHT-domain values then inverse-transforms via IWHT, so <strong>small errors get amplified</strong> — a fundamental difference.
   </div>
 </section>
 
 <!-- FIX 1: V IWHT STAGING -->
 <section>
-  <h2>Fix 1: V IWHT Float 스테이징 <span class="tag tag-green">Commit 30a4f48ae</span></h2>
+  <h2>Fix 1: V IWHT Float Staging <span class="tag tag-green">Commit 30a4f48ae</span></h2>
   <hr class="divider">
 
   <div class="card-grid">
     <div class="card">
-      <h4>수정 전 (버그)</h4>
+      <h4>Before (Bug)</h4>
       <ul>
-        <li>reduce 루프가 <code>half KQ[]</code>에 직접 쓰기</li>
-        <li>IWHT가 <code>(float*)&KQ[0]</code>으로 읽기</li>
-        <li>타입 불일치 + race condition 가능</li>
+        <li>Reduce loop wrote directly to <code>half KQ[]</code></li>
+        <li>IWHT read via <code>(float*)&KQ[0]</code></li>
+        <li>Type mismatch + possible race condition</li>
       </ul>
     </div>
     <div class="card">
-      <h4>수정 후</h4>
+      <h4>After (Fix)</h4>
       <ul>
-        <li>float 레지스터 배열 <code>tbq_regs[]</code>에 먼저 저장</li>
-        <li><code>__syncthreads()</code> 배리어</li>
-        <li><code>float *buf = (float*)&KQ[0]</code>에 float 쓰기</li>
-        <li>타입 일관성 + 동기화 보장</li>
+        <li>Store first in float register array <code>tbq_regs[]</code></li>
+        <li><code>__syncthreads()</code> barrier</li>
+        <li>Write as float to <code>float *buf = (float*)&KQ[0]</code></li>
+        <li>Type consistency + synchronization guaranteed</li>
       </ul>
     </div>
   </div>
 
   <div class="highlight-box blue" style="margin-top:14px">
-    <strong>D_V < nthreads 예외 처리:</strong> <code>float tbq_regs[D_V/nthreads]</code>에서 D_V=64, nthreads=128이면 크기 0 배열 → <code>constexpr int tbq_nregs = D_V >= nthreads ? D_V/nthreads : 1</code>로 Solution.
+    <strong>D_V &lt; nthreads edge case:</strong> <code>float tbq_regs[D_V/nthreads]</code> with D_V=64, nthreads=128 yields zero-size array &rarr; solved with <code>constexpr int tbq_nregs = D_V >= nthreads ? D_V/nthreads : 1</code>.
   </div>
 </section>
 
@@ -504,7 +504,7 @@
   <hr class="divider">
 
   <p style="font-size:0.75em; color:var(--muted); margin-bottom:14px">
-    TBQ V 템플릿 인스턴스에서 half2 → float 누적 경로를 강제하는 패턴:
+    Pattern to force half2 &rarr; float accumulation path in TBQ V template instances:
   </p>
 
   <div class="highlight-box blue">
@@ -518,21 +518,21 @@
 
   <div class="card-grid" style="margin-top:14px">
     <div class="card">
-      <h4>영향 범위</h4>
+      <h4>Affected Scope</h4>
       <ul>
-        <li>VKQ 누적: <code>half2</code> → <code>float2</code></li>
-        <li>KQ 공유 메모리: <code>half</code> → <code>float</code></li>
-        <li>Q_reg: <code>half2</code> → <code>float2</code></li>
-        <li>Q·K 내적도 float 정밀도 향상</li>
+        <li>VKQ accumulation: <code>half2</code> &rarr; <code>float2</code></li>
+        <li>KQ shared memory: <code>half</code> &rarr; <code>float</code></li>
+        <li>Q_reg: <code>half2</code> &rarr; <code>float2</code></li>
+        <li>Q&middot;K dot product also gains float precision</li>
       </ul>
     </div>
     <div class="card">
-      <h4>적용</h4>
+      <h4>Application</h4>
       <ul>
-        <li>초기: 3개 인스턴스 (TBQ_TUNING)</li>
-        <li>이후: <strong>67개 추가</strong> (ALL_QUANTS)</li>
-        <li>총 <strong>70개</strong> TBQ V 인스턴스</li>
-        <li>f16 인스턴스는 half2 유지 (성능 보존)</li>
+        <li>Initial: 3 instances (TBQ_TUNING)</li>
+        <li>Later: <strong>67 more added</strong> (ALL_QUANTS)</li>
+        <li>Total: <strong>70</strong> TBQ V instances</li>
+        <li>f16 instances keep half2 (performance preserved)</li>
       </ul>
     </div>
   </div>
@@ -540,25 +540,25 @@
 
 <!-- FIX 3: DYNAMIC SHARPENING -->
 <section>
-  <h2>수정 3: 동적 Sharpening 구현 <span class="tag tag-purple">이론→코드</span></h2>
+  <h2>Fix 3: Dynamic Sharpening Implementation <span class="tag tag-purple">Theory&rarr;Code</span></h2>
   <hr class="divider">
 
   <div class="card-grid">
     <div class="card">
-      <h4>이전 (정적)</h4>
+      <h4>Before (Static)</h4>
       <ul>
-        <li><code>α = 1 + 1/(2×SQNR)</code></li>
-        <li>고정 상수 (ctx=2048 기준)</li>
-        <li>생성 시(N=10)와 prefill(N=262K)에 동일 α</li>
+        <li><code>&alpha; = 1 + 1/(2&times;SQNR)</code></li>
+        <li>Fixed constant (based on ctx=2048)</li>
+        <li>Same &alpha; for generation (N=10) and prefill (N=262K)</li>
       </ul>
     </div>
     <div class="card">
-      <h4>이후 (동적)</h4>
+      <h4>After (Dynamic)</h4>
       <ul>
-        <li><code>α(N) = 1 + c × √(ln N)</code></li>
-        <li>런타임 k_VKQ_max로 N 결정</li>
-        <li>생성 시 작은 α, prefill 시 큰 α</li>
-        <li>clamp 불필요 (√ln이 초느린 성장)</li>
+        <li><code>&alpha;(N) = 1 + c &times; &radic;(ln N)</code></li>
+        <li>N determined from runtime k_VKQ_max</li>
+        <li>Small &alpha; during generation, large &alpha; during prefill</li>
+        <li>No clamping needed (&radic;ln grows ultra-slowly)</li>
       </ul>
     </div>
   </div>
@@ -578,138 +578,138 @@ sum *= alpha;
 
 <!-- CODE AUDIT -->
 <section>
-  <h2>Final Code Audit <span class="tag tag-blue">검증</span></h2>
+  <h2>Final Code Audit <span class="tag tag-blue">Verification</span></h2>
   <hr class="divider">
 
   <table>
-    <thead><tr><th>검증 항목</th><th>Result</th></tr></thead>
+    <thead><tr><th>Verification Item</th><th>Result</th></tr></thead>
     <tbody>
-      <tr><td>V_DOT2 undef → float2 VKQ/KQ/Q_reg 경로</td><td class="ok">정상</td></tr>
-      <tr><td>67개 인스턴스 패턴 (common.cuh → undef → fattn-vec.cuh)</td><td class="ok">pragma once 동작 확인</td></tr>
-      <tr><td>D=512 인코드 per-256 norm ↔ 디코드 512-IWHT /512 정합</td><td class="ok">dequant per-block norm Restored 후 IWHT</td></tr>
-      <tr><td>V IWHT float 레지스터 스테이징 race condition</td><td class="ok">syncthreads 정상</td></tr>
-      <tr><td>parallel_blocks + TBQ IWHT 호환성</td><td class="ok">IWHT linear → partial sum 정확</td></tr>
-      <tr><td>is_tbq_v 리스트 완전성 (TBQP_4 포함)</td><td class="ok">정상</td></tr>
-      <tr><td>shared memory 크기 (float path, D=512)</td><td class="ok">8KB 이내</td></tr>
-      <tr><td>attn_rot_v = false</td><td class="ok">정상</td></tr>
-      <tr><td>cross-head V (H_8 inverse)</td><td class="ok">float path 동작</td></tr>
-      <tr><td>f16 K + TBQ V 비대칭 조합</td><td class="ok">float2 Q_reg path</td></tr>
+      <tr><td>V_DOT2 undef &rarr; float2 VKQ/KQ/Q_reg path</td><td class="ok">OK</td></tr>
+      <tr><td>67 instance pattern (common.cuh &rarr; undef &rarr; fattn-vec.cuh)</td><td class="ok">pragma once behavior confirmed</td></tr>
+      <tr><td>D=512 encode per-256 norm &harr; decode 512-IWHT /512 consistency</td><td class="ok">dequant per-block norm restored before IWHT</td></tr>
+      <tr><td>V IWHT float register staging race condition</td><td class="ok">syncthreads working correctly</td></tr>
+      <tr><td>parallel_blocks + TBQ IWHT compatibility</td><td class="ok">IWHT linear &rarr; partial sum correct</td></tr>
+      <tr><td>is_tbq_v list completeness (includes TBQP_4)</td><td class="ok">OK</td></tr>
+      <tr><td>Shared memory size (float path, D=512)</td><td class="ok">Within 8KB</td></tr>
+      <tr><td>attn_rot_v = false</td><td class="ok">OK</td></tr>
+      <tr><td>Cross-head V (H_8 inverse)</td><td class="ok">Works on float path</td></tr>
+      <tr><td>f16 K + TBQ V asymmetric combination</td><td class="ok">float2 Q_reg path</td></tr>
     </tbody>
   </table>
 
   <div class="highlight-box green" style="margin-top:14px">
-    <strong>크리티컬 이슈: 0건.</strong> 마이너 이슈 1건 (stale comment) 즉시 제거.
+    <strong>Critical issues: 0.</strong> 1 minor issue (stale comment) removed immediately.
   </div>
 </section>
 
 <!-- UPSTREAM REBASE -->
 <section>
-  <h2>Upstream Rebase <span class="tag tag-blue">동기화</span></h2>
+  <h2>Upstream Rebase <span class="tag tag-blue">Sync</span></h2>
   <hr class="divider">
 
   <div class="card-grid">
     <div class="card">
-      <h4>충돌</h4>
+      <h4>Conflict</h4>
       <ul>
-        <li>업스트림에 <code>GGML_TYPE_Q1_0 = 41</code> 추가</li>
-        <li>TBQ 타입이 41부터 시작 → 번호 충돌</li>
-        <li><code>ggml.h</code> 1개 파일만 충돌</li>
+        <li>Upstream added <code>GGML_TYPE_Q1_0 = 41</code></li>
+        <li>TBQ types started at 41 &rarr; number collision</li>
+        <li>Only 1 file conflicted: <code>ggml.h</code></li>
       </ul>
     </div>
     <div class="card">
-      <h4>Solution</h4>
+      <h4>Resolution</h4>
       <ul>
-        <li>Q1_0 = 41 유지 (업스트림 존중)</li>
-        <li>TBQ 타입 42~61로 1씩 시프트</li>
+        <li>Kept Q1_0 = 41 (respecting upstream)</li>
+        <li>Shifted TBQ types to 42~61 (+1 each)</li>
         <li>COUNT = 62</li>
-        <li>45/45 Commit 전부 충돌 없이 리베이스 완료</li>
+        <li>All 45/45 commits rebased without conflicts</li>
       </ul>
     </div>
   </div>
 
   <div class="highlight-box blue" style="margin-top:14px">
-    <strong>참고:</strong> TBQ 타입 번호는 런타임 KV 캐시 양자화용이므로 GGUF 파일 호환성에 영향 없음. 빌드만 새로 하면 됨.
+    <strong>Note:</strong> TBQ type numbers are for runtime KV cache quantization only, so no impact on GGUF file compatibility. Just needs a fresh build.
   </div>
 </section>
 
 <!-- PPL RESULTS -->
 <section>
-  <h2>PPL Improvement 과정 <span class="tag tag-green">최종</span></h2>
+  <h2>PPL Improvement Progress <span class="tag tag-green">Final</span></h2>
   <hr class="divider">
 
   <table>
-    <thead><tr><th>변경</th><th>PPL</th><th>vs f16</th><th>세션</th></tr></thead>
+    <thead><tr><th>Change</th><th>PPL</th><th>vs f16</th><th>Session</th></tr></thead>
     <tbody>
-      <tr><td>v1.5.1 원본</td><td>509.9</td><td class="ng">1.21x</td><td>S1</td></tr>
+      <tr><td>v1.5.1 original</td><td>509.9</td><td class="ng">1.21x</td><td>S1</td></tr>
       <tr><td>+ per-block norm</td><td>498.2</td><td>1.19x</td><td>S1</td></tr>
-      <tr><td>+ 1.15x 제거 + sharpening</td><td>455.0</td><td>1.08x</td><td>S1</td></tr>
+      <tr><td>+ 1.15x removal + sharpening</td><td>455.0</td><td>1.08x</td><td>S1</td></tr>
       <tr><td>+ V rotation bugfix</td><td>448.1</td><td>1.07x</td><td>S1</td></tr>
-      <tr><td>+ TBQP3/TBQ3 분리 α</td><td>454.7</td><td>1.08x</td><td>S1</td></tr>
-      <tr style="background:#ecfdf5"><td><strong>+ float VKQ 누적 (half2→float)</strong></td><td class="ok"><strong>445.7</strong></td><td class="ok"><strong>1.06x</strong></td><td><strong>S2</strong></td></tr>
+      <tr><td>+ TBQP3/TBQ3 separate &alpha;</td><td>454.7</td><td>1.08x</td><td>S1</td></tr>
+      <tr style="background:#ecfdf5"><td><strong>+ float VKQ accumulation (half2&rarr;float)</strong></td><td class="ok"><strong>445.7</strong></td><td class="ok"><strong>1.06x</strong></td><td><strong>S2</strong></td></tr>
     </tbody>
   </table>
 
   <div class="card-grid" style="grid-template-columns:1fr 1fr 1fr 1fr; margin-top:20px">
-    <div class="metric"><div class="num green">1.06x</div><div class="label">PPL (최종)</div></div>
-    <div class="metric"><div class="num blue">4.2x</div><div class="label">KV 캐시 압축</div></div>
-    <div class="metric"><div class="num purple">70</div><div class="label">수정된 인스턴스</div></div>
-    <div class="metric"><div class="num green">~0</div><div class="label">비결정적 토큰</div></div>
+    <div class="metric"><div class="num green">1.06x</div><div class="label">PPL (Final)</div></div>
+    <div class="metric"><div class="num blue">4.2x</div><div class="label">KV Cache Compression</div></div>
+    <div class="metric"><div class="num purple">70</div><div class="label">Instances Fixed</div></div>
+    <div class="metric"><div class="num green">~0</div><div class="label">Non-deterministic Tokens</div></div>
   </div>
 </section>
 
 <!-- DETERMINISM -->
 <section>
-  <h2>결정성 검증 <span class="tag tag-green">Solution</span></h2>
+  <h2>Determinism Verification <span class="tag tag-green">Resolved</span></h2>
   <hr class="divider">
 
   <div class="card-grid">
     <div class="card">
-      <h4>수정 전</h4>
+      <h4>Before Fix</h4>
       <ul>
-        <li>20회 중 <strong>극단적 분기</strong></li>
-        <li>토큰 [23,27], [44,52]에서 출력 전혀 다름</li>
-        <li>MoE expert routing이 뒤집힘</li>
-        <li>temp=0인데 실질적 랜덤 출력</li>
+        <li><strong>Extreme divergence</strong> in 20 runs</li>
+        <li>Completely different outputs at tokens [23,27], [44,52]</li>
+        <li>MoE expert routing flipped</li>
+        <li>Effectively random output despite temp=0</li>
       </ul>
     </div>
     <div class="card">
-      <h4>수정 후</h4>
+      <h4>After Fix</h4>
       <ul>
-        <li>f16: 20/20 결정적 ✓</li>
-        <li>TBQ: <strong>~75% 일관</strong>, 보더라인 1~2토큰만 변동</li>
-        <li>38,50 vs 38,52 수준 (3-bit 양자화 경계)</li>
-        <li>극단적 비결정성 <strong>완전 해소</strong></li>
+        <li>f16: 20/20 deterministic &#10003;</li>
+        <li>TBQ: <strong>~75% consistent</strong>, only 1~2 borderline tokens vary</li>
+        <li>38,50 vs 38,52 level (3-bit quantization boundary)</li>
+        <li>Extreme non-determinism <strong>completely eliminated</strong></li>
       </ul>
     </div>
   </div>
 
   <div class="highlight-box green" style="margin-top:14px">
-    <strong>결론:</strong> 남은 보더라인 변동은 3-bit 양자화 경계에서의 자연스러운 현상. f16도 float 라운딩으로 이론적으로 비결정적이지만 실제로는 결정적. TBQ의 보더라인 변동은 허용 가능.
+    <strong>Conclusion:</strong> Remaining borderline variation is a natural phenomenon at 3-bit quantization boundaries. Even f16 is theoretically non-deterministic due to float rounding but is deterministic in practice. TBQ's borderline variation is acceptable.
   </div>
 </section>
 
 <!-- PAPER + README -->
 <section>
-  <h2>문서화 <span class="tag tag-blue">논문 + README</span></h2>
+  <h2>Documentation <span class="tag tag-blue">Paper + README</span></h2>
   <hr class="divider">
 
   <div class="card-grid">
     <div class="card">
-      <h4>arXiv 논문 작성</h4>
+      <h4>arXiv Paper Written</h4>
       <ul>
-        <li>영어 + 한국어 LaTeX 논문</li>
-        <li>6페이지 / 5페이지</li>
-        <li>동적 α 유도, half2 병리학, 엔지니어링 프레임워크</li>
-        <li>PDF 컴파일 완료, GitHub 업로드</li>
+        <li>English + Korean LaTeX papers</li>
+        <li>6 pages / 5 pages</li>
+        <li>Dynamic &alpha; derivation, half2 pathology, engineering framework</li>
+        <li>PDF compiled, uploaded to GitHub</li>
       </ul>
     </div>
     <div class="card">
-      <h4>README 업데이트</h4>
+      <h4>README Updated</h4>
       <ul>
-        <li>v1.5.2 헤딩: "PPL 21%→6%, Precision Fix"</li>
-        <li>PPL: 454.7 → <strong>445.7</strong></li>
-        <li>샤프닝: "정적(현재)/동적(향후)" → <strong>"동적(현재)"</strong></li>
-        <li>PPL 과정 테이블에 float 누적 행 추가</li>
+        <li>v1.5.2 heading: "PPL 21%&rarr;6%, Precision Fix"</li>
+        <li>PPL: 454.7 &rarr; <strong>445.7</strong></li>
+        <li>Sharpening: "static(current)/dynamic(future)" &rarr; <strong>"dynamic(current)"</strong></li>
+        <li>Added float accumulation row to PPL progress table</li>
       </ul>
     </div>
   </div>
@@ -717,43 +717,43 @@ sum *= alpha;
 
 <!-- ELIMINATED CAUSES -->
 <section>
-  <h2>원인 아님으로 제거된 것들 <span class="tag tag-purple">참고</span></h2>
+  <h2>Eliminated Causes <span class="tag tag-purple">Reference</span></h2>
   <hr class="divider">
 
   <ul class="items">
-    <li>CUDA 그래프 — 클린 빌드(GRAPHS=OFF)에서도 재현</li>
-    <li>메모리 풀 할당 — per-request 할당으로 변경해도 동일</li>
-    <li>__threadfence / __ldg — 메모리 일관성 Problem 아님</li>
-    <li>parallel_blocks — gridDim.y=1에서도 동일</li>
-    <li>MoE MUL_MAT_ID — 입력이 같으면 출력도 같음 (결정적)</li>
-    <li>SET_ROWS quantize — 입력 비교 시 동일</li>
-    <li>동적 sharpening logf/sqrtf — 고정 α에서도 비결정적</li>
-    <li>KV_max 가변성 — 강제 고정해도 변화 없음</li>
-    <li>Multi-round WHT — Experiment했으나 효과 없음, 롤백</li>
+    <li>CUDA Graphs — reproduced on clean build (GRAPHS=OFF)</li>
+    <li>Memory Pool Allocation — same behavior with per-request allocation</li>
+    <li>__threadfence / __ldg — not a memory coherence issue</li>
+    <li>parallel_blocks — same behavior with gridDim.y=1</li>
+    <li>MoE MUL_MAT_ID — deterministic when inputs are identical</li>
+    <li>SET_ROWS quantize — inputs confirmed identical on comparison</li>
+    <li>Dynamic sharpening logf/sqrtf — non-deterministic even with fixed &alpha;</li>
+    <li>KV_max variability — no change even when force-fixed</li>
+    <li>Multi-round WHT — tested but no effect, rolled back</li>
   </ul>
 
   <div class="highlight-box purple" style="margin-top:14px">
-    <strong>교훈:</strong> Elimination Debugging에서 가장 위험한 것은 "이건 아닐 것이다"라는 가정. CUDA 그래프를 최초 의심했지만, 결국 가장 기본적인 곳(공유 메모리 타입)이 원인이었다.
+    <strong>Lesson learned:</strong> The most dangerous thing in elimination debugging is the assumption "this can't be it." CUDA graphs were the first suspect, but the root cause turned out to be the most basic thing — shared memory types.
   </div>
 </section>
 
 <!-- SUMMARY -->
 <section>
-  <h2>세션 2 성과 요약</h2>
+  <h2>Session 2 Summary</h2>
   <hr class="divider">
 
   <ul class="items">
-    <li>8시간 Elimination Debugging으로 half2 Precision Loss 근본 원인 규명</li>
-    <li>V IWHT float 스테이징 — half/float 타입 불일치 Solution</li>
-    <li>V_DOT2 undef — 70개 TBQ V 인스턴스 전체 float 누적 강제</li>
-    <li>동적 α(N) = 1 + c√(ln N) 실제 커널 코드 구현</li>
-    <li>PPL: 454.7 → <strong>445.7</strong> (1.08x → <strong>1.06x</strong>)</li>
-    <li>비결정성 완전 해소 (극단적 분기 → 보더라인 1~2토큰)</li>
-    <li>upstream rebase + README 업데이트 + arXiv 논문 작성</li>
+    <li>8-hour elimination debugging identified half2 precision loss as root cause</li>
+    <li>V IWHT float staging — resolved half/float type mismatch</li>
+    <li>V_DOT2 undef — forced float accumulation across all 70 TBQ V instances</li>
+    <li>Dynamic &alpha;(N) = 1 + c&radic;(ln N) implemented in actual kernel code</li>
+    <li>PPL: 454.7 &rarr; <strong>445.7</strong> (1.08x &rarr; <strong>1.06x</strong>)</li>
+    <li>Non-determinism fully resolved (extreme divergence &rarr; borderline 1~2 tokens)</li>
+    <li>Upstream rebase + README update + arXiv paper written</li>
   </ul>
 
   <div class="highlight-box green" style="margin-top:20px">
-    <strong>Session 1 + 2 합산:</strong> PPL 509.9 → 445.7 (1.21x → 1.06x). 3비트 KV 캐시로 f16 대비 <strong>6%</strong> 이내 PPL, <strong>4.2x</strong> 메모리 압축, <strong>결정적 커널</strong> Achieved.
+    <strong>Session 1 + 2 combined:</strong> PPL 509.9 &rarr; 445.7 (1.21x &rarr; 1.06x). 3-bit KV cache achieves <strong>6%</strong> PPL within f16, <strong>4.2x</strong> memory compression, and <strong>deterministic kernels</strong>.
   </div>
 </section>
 
