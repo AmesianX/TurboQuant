@@ -2,7 +2,7 @@
 #include "../common.cuh"
 #undef V_DOT2_F32_F16_AVAILABLE
 
-// TurboQuant cross-head: TBQ3_3 keys + TBQ3_2 values
+// TurboQuant double WHT per-head: TBQ3_3 keys + TBQ3_2 values
 
 #include "../fattn-vec.cuh"
 

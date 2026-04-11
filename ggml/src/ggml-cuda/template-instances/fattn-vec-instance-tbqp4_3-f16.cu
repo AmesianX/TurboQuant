@@ -1,4 +1,4 @@
-// TurboQuant cross-head: TBQP4_3 keys + F16 values
+// TurboQuant double WHT per-head: TBQP4_3 keys + F16 values
 
 #include "../fattn-vec.cuh"
 
