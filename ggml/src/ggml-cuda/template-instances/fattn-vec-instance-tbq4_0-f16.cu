@@ -1,3 +1,7 @@
+// Force float accumulation for TBQ K types
+#include "../common.cuh"
+#undef V_DOT2_F32_F16_AVAILABLE
+
 // TurboQuant KV cache: TBQ4_0 keys + F16 values
 // Only D=256 is valid (TBQ4_0 block size = QK_K = 256)
 

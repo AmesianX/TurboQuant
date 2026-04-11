@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "prompt-k-side.cuh"
 
 #include <cstdint>
 
@@ -1149,25 +1150,38 @@ static __device__ __forceinline__ void dequantize_V_tbq3_2(const void * __restri
 }
 
 // TBQP3_2: fused MSE + Direct Sign (64-block)
+// Dual mode: d_qjl < 0 → prefill TBQ3 (3-bit, 8 centroids), d_qjl >= 0 → normal TBQP3 (2-bit + QJL)
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_2(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
     const block_tbqp3_2 * K = (const block_tbqp3_2 *) K_c;
     GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
-    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f }; float sum = 0.0f;
+    static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
+    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+    float sum = 0.0f;
     #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2; const int ib = elem/TBQ_K64;
         const float norm = __half2float(K[ib].d); const float d_direct = __half2float(K[ib].d_qjl);
-        const float cent0 = c2[(K[ib].qs[(elem%TBQ_K64)/4]>>(((elem%TBQ_K64)%4)*2))&0x3];
-        const float cent1 = c2[(K[ib].qs[((elem+1)%TBQ_K64)/4]>>((((elem+1)%TBQ_K64)%4)*2))&0x3];
-        const int s0 = (K[ib].qjl[(elem%TBQ_K64)/8]>>((elem%TBQ_K64)%8))&1;
-        const int s1 = (K[ib].qjl[((elem+1)%TBQ_K64)/8]>>(((elem+1)%TBQ_K64)%8))&1;
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
 #else
         const float2 q = ((const float2*)Q_v)[k_KQ_0/nthreads];
 #endif
-        sum += norm*(q.x*cent0+q.y*cent1) + d_direct*((s0?q.x:-q.x)+(s1?q.y:-q.y));
+        if (d_direct < 0.0f) {
+            // Prefill TBQ3 mode: 3-bit from combined qs+qjl (24 bytes flat)
+            const uint8_t * combined = (const uint8_t *)K[ib].qs;
+            float cent0, cent1;
+            { int bp0=(elem%TBQ_K64)*3,by0=bp0/8,bo0=bp0%8; uint32_t v0=(uint32_t)combined[by0]>>bo0; if(bo0>5) v0|=(uint32_t)combined[by0+1]<<(8-bo0); cent0=c3[v0&0x7]; }
+            { int bp1=((elem+1)%TBQ_K64)*3,by1=bp1/8,bo1=bp1%8; uint32_t v1=(uint32_t)combined[by1]>>bo1; if(bo1>5) v1|=(uint32_t)combined[by1+1]<<(8-bo1); cent1=c3[v1&0x7]; }
+            sum += norm*(q.x*cent0 + q.y*cent1); // no QJL term
+        } else {
+            // Normal TBQP3: 2-bit centroid + QJL
+            const float cent0 = c2[(K[ib].qs[(elem%TBQ_K64)/4]>>(((elem%TBQ_K64)%4)*2))&0x3];
+            const float cent1 = c2[(K[ib].qs[((elem+1)%TBQ_K64)/4]>>((((elem+1)%TBQ_K64)%4)*2))&0x3];
+            const int s0 = (K[ib].qjl[(elem%TBQ_K64)/8]>>((elem%TBQ_K64)%8))&1;
+            const int s1 = (K[ib].qjl[((elem+1)%TBQ_K64)/8]>>(((elem+1)%TBQ_K64)%8))&1;
+            sum += norm*(q.x*cent0+q.y*cent1) + d_direct*((s0?q.x:-q.x)+(s1?q.y:-q.y));
+        }
     }
     return sum;
 }
@@ -2296,6 +2310,7 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
+
     // TBQP: Q stays spatial (K is spatial too). V = K view (spatial). No hacks.
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
         (const char *) Q->data,
@@ -2311,8 +2326,8 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        tbqp_wht_mode ? K_data_orig : nullptr,
-        tbqp_wht_mode ? (int32_t)K->nb[1] : 0,
+        tbqp_wht_mode ? K_data_orig : turboquant::get_prompt_k_ptr(K->data),
+        tbqp_wht_mode ? (int32_t)K->nb[1] : turboquant::get_prompt_k_stride(K->data),
         q_wht2_ptr,
         q_wht2_stride
     );

@@ -229,25 +229,27 @@ half2 경로 (수정 전) & 454.7 & 1.08$\times$ \\
 \_0 & 256 & 256, 512 & 주력 타입 \\
 \_1 & 128 & 128 & 표준 트랜스포머 \\
 \_2 & 64  & 64  & 소형 head 모델 \\
-\_3 & 64  & 64  & Cross-head WHT \\
+\_3 & 64  & 64  & Double WHT per-head \\
 \_4 & 576 & 576 & GLM 분할 256+256+64 \\
 \bottomrule
 \end{tabular}
 \caption{TBQ 블록 크기 변형. 각각 TBQ3/TBQ4/TBQP3/TBQP4 하위 타입이 있다.}
 \end{table}
 
-\subsection{Cross-Head WHT (\_3 타입)}
+\subsection{Double WHT Per-Head (\_3 타입)}
+\label{sec:double-wht}
 
-$d=64$ head dimension 모델에서는 64-point WHT의 탈상관이 불충분하다. Kronecker 구조 $H_{512} = H_8 \otimes H_{64}$를 이용한 cross-head 변형을 구현했다: 8개 head가 하나의 양자화된 KV 블록을 공유하고, $H_8$ 부호를 스코어링 시 적용:
+$d=64$ head dimension 모델에서는 single 64-point WHT의 CLT 수렴이 불충분하다 (excess kurtosis $\sim 3/\sqrt{64} \approx 0.375$). Cross-head WHT ($H_{512} = H_8 \otimes H_{64}$, 8개 head 결합)를 시도했으나 \textbf{실패}: Q는 64-WHT 도메인에 있는데 K는 512-WHT 도메인에 있어 어텐션 스코어가 완전히 붕괴했다.
+
+\paragraph{해결: Double WHT.} 독립적인 랜덤 부호 패턴 $S_1, S_2$로 WHT를 2회 적용한다:
 \begin{equation}
-\text{score}_h = \frac{1}{8}\sum_{g=0}^{7} H_8[h,g] \cdot \langle \mathbf{q}_h, \text{dequant}(\mathbf{k}_g) \rangle
+\mathbf{y} = H_{64}\, S_2\, H_{64}\, S_1\, \mathbf{x}
 \end{equation}
+K(인코딩)와 Q(스코어링) 모두에 동일한 double WHT를 적용하여 도메인 일치를 보장한다. Parseval 정리에 의해 $\langle \text{dWHT}(\mathbf{q}),\, \text{dWHT}(\mathbf{k}) \rangle = D^2 \langle \mathbf{q}, \mathbf{k} \rangle$이므로, 역변환 없이 double-WHT 도메인에서 직접 내적을 계산할 수 있다.
 
-동작을 위해 두 가지 핵심 수정이 필요했다:
+Double WHT는 excess kurtosis $\sim 3/D = 0.047$ (near-Gaussian)을 달성하며, 이는 single WHT $D=512$의 $\sim 3/\sqrt{512} = 0.133$보다 \emph{우수}하다.
 
-\paragraph{Per-head 정규화.} 초기 구현은 512개 WHT 계수 전체에 대한 global L2 norm을 사용했다. 한 head의 에너지가 지배적이면 나머지 head는 부적절한 스케일로 양자화되어 정보를 잃는다. $d=512$ per-block norm과 동일한 원리로 per-head RMS 정규화로 전환했다.
-
-\paragraph{$d=64$에서 K의 QJL 제거.} TBQP 타입은 $(b{-}1)$비트 Lloyd-Max + 1비트 QJL을 사용한다. $d=64$에서 QJL의 랜덤 프로젝션은 어텐션 스코어에 올바른 토큰과 차점자 사이의 signal gap을 \emph{초과}하는 노이즈를 추가한다. 순수 3비트 Lloyd-Max(TBQ3, 8 centroid)는 TBQP3(2비트+QJL) 대비 $2.3\times$ 높은 스코어 SQNR을 달성한다. $d=64$에서 K를 자동으로 TBQP$\to$TBQ로 전환하여 모든 비트를 centroid 정밀도에 집중한다.
+\paragraph{$d=64$에서 QJL 재활성화.} Double WHT의 개선된 CLT 수렴으로 QJL 랜덤 프로젝션 노이즈가 허용 범위 내에 들어온다. K는 항상 TBQP3\_3 (2비트 Lloyd-Max + 1비트 QJL + double WHT)으로 자동 매핑된다. QJL의 추가 1비트는 멀티턴에서 품질을 극적으로 개선한다: TBQ3\_3(QJL 없음)은 3--4턴에서 반복 루프, TBQP3\_3(QJL 포함)은 7턴 이상 정확한 답변을 유지한다.
 
 \subsection{MMSE 동적 소프트닝 ($d=64$)}
 

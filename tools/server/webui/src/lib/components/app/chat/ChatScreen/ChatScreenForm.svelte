@@ -95,7 +95,7 @@
 
 	$effect(() => {
 		if (previousIsLoading && !isLoading) {
-			setTimeout(() => chatFormRef?.focus(), 10);
+			setTimeout(() => chatFormRef?.focus(), 50);
 		}
 
 		previousIsLoading = isLoading;

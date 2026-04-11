@@ -41,7 +41,7 @@ Independent Researcher\\
 
 % ============================================================
 \begin{abstract}
-We present the first production-grade implementation of TurboQuant---a KV cache compression method based on Walsh-Hadamard Transform (WHT) and Lloyd-Max quantization---within llama.cpp, the most widely deployed open-source LLM inference engine. Our implementation compresses the KV cache to 3 bits per element, achieving \textbf{4.2$\times$ memory reduction} with only \textbf{6\% perplexity degradation} versus FP16 on Gemma~4 26B. Beyond faithful implementation, we make three novel contributions: (1)~a \emph{dynamic attention sharpening} formula $\alpha(N) = 1 + c\sqrt{\ln N}$ derived from MMSE and Extreme Value Theory that adapts the softmax correction to the runtime context length; (2)~identification and resolution of a \emph{half-precision accumulation bug} in the flash attention kernel where FP16 arithmetic causes precision loss amplified by the IWHT butterfly into non-deterministic MoE expert routing; and (3)~a complete engineering framework supporting 20 quantization type variants across five head dimensions (64--576), including cross-head WHT and asymmetric K/V configurations. We release the full implementation as open source at \url{https://github.com/AmesianX/TurboQuant}.
+We present the first production-grade implementation of TurboQuant---a KV cache compression method based on Walsh-Hadamard Transform (WHT) and Lloyd-Max quantization---within llama.cpp, the most widely deployed open-source LLM inference engine. Our implementation compresses the KV cache to 3 bits per element, achieving \textbf{4.2$\times$ memory reduction} with only \textbf{6\% perplexity degradation} versus FP16 on Gemma~4 26B. Beyond faithful implementation, we make three novel contributions: (1)~a \emph{dynamic attention sharpening} formula $\alpha(N) = 1 + c\sqrt{\ln N}$ derived from MMSE and Extreme Value Theory that adapts the softmax correction to the runtime context length; (2)~identification and resolution of a \emph{half-precision accumulation bug} in the flash attention kernel where FP16 arithmetic causes precision loss amplified by the IWHT butterfly into non-deterministic MoE expert routing; (3)~a \emph{double WHT} technique for head dimensions as small as 64 that achieves near-Gaussian CLT convergence (kurtosis $\sim$0.047) without cross-head mixing, enabling 3-bit KV cache at $d{=}64$ with 7+ turn multi-turn quality; and (4)~a complete engineering framework supporting 20 quantization type variants across five head dimensions (64--576), including asymmetric K/V configurations. We release the full implementation as open source at \url{https://github.com/AmesianX/TurboQuant}.
 \end{abstract}
 
 % ============================================================
@@ -288,7 +288,7 @@ Suffix & Block Size & Head Dim & Notes \\
 \_0 & 256 & 256, 512 & Primary type \\
 \_1 & 128 & 128 & Standard transformers \\
 \_2 & 64  & 64  & Small-head models \\
-\_3 & 64  & 64  & Cross-head WHT \\
+\_3 & 64  & 64  & Double WHT per-head \\
 \_4 & 576 & 576 & GLM split 256+256+64 \\
 \bottomrule
 \end{tabular}
@@ -296,18 +296,20 @@ Suffix & Block Size & Head Dim & Notes \\
 \label{tab:types}
 \end{table}
 
-\subsection{Cross-Head WHT (\_3 Types)}
+\subsection{Double WHT Per-Head (\_3 Types)}
+\label{sec:double-wht}
 
-For models with $d=64$ head dimension, the 64-point WHT provides insufficient decorrelation. We implement a cross-head variant using the Kronecker structure $H_{512} = H_8 \otimes H_{64}$: eight heads share a single quantized KV block, with the $H_8$ signs applied at scoring time:
+For models with $d=64$ head dimension, a single 64-point WHT provides insufficient CLT convergence (excess kurtosis $\sim 3/\sqrt{64} \approx 0.375$), resulting in a non-Gaussian distribution that degrades Lloyd-Max quantization quality. Cross-head WHT ($H_{512} = H_8 \otimes H_{64}$, combining 8 heads) was attempted but \textbf{failed}: Q remains in the 64-WHT domain while K is in the 512-WHT domain, creating a domain mismatch that corrupts attention scores.
+
+\paragraph{Solution: Double WHT.} We apply two rounds of WHT with independent random sign patterns $S_1, S_2$:
 \begin{equation}
-\text{score}_h = \frac{1}{8}\sum_{g=0}^{7} H_8[h,g] \cdot \langle \mathbf{q}_h, \text{dequant}(\mathbf{k}_g) \rangle
+\mathbf{y} = H_{64}\, S_2\, H_{64}\, S_1\, \mathbf{x}
 \end{equation}
+The same double WHT is applied to both K (during encoding) and Q (during scoring), ensuring domain agreement. By Parseval's theorem, $\langle \text{dWHT}(\mathbf{q}),\, \text{dWHT}(\mathbf{k}) \rangle = D^2 \langle \mathbf{q}, \mathbf{k} \rangle$, so the dot product can be computed directly in the double-WHT domain without inverse transform.
 
-Two critical fixes were required for cross-head to function:
+The double WHT achieves excess kurtosis $\sim 3/D = 0.047$ (near-Gaussian), \emph{better} than single WHT at $D=512$ ($\sim 3/\sqrt{512} = 0.133$). This enables optimal Lloyd-Max performance at $d=64$ without cross-head mixing.
 
-\paragraph{Per-head normalization.} The initial implementation used a global L2 norm across all 512 WHT coefficients. When one head dominates in energy, the remaining heads are quantized with an inappropriate scale, losing information. We switch to per-head RMS normalization (same principle as per-block norm for $d=512$).
-
-\paragraph{QJL removal for K at $d=64$.} TBQP types use $(b{-}1)$-bit Lloyd-Max plus 1-bit QJL. At $d=64$, the QJL random projection adds noise to the attention score that \emph{exceeds} the signal gap between correct and runner-up tokens. Pure 3-bit Lloyd-Max (TBQ3, 8 centroids) achieves $2.3\times$ better score SQNR than TBQP3 (2-bit + QJL). We automatically remap K from TBQP$\to$TBQ at $d=64$, dedicating all bits to centroid precision.
+\paragraph{QJL re-enabled at $d=64$.} With the improved CLT convergence from double WHT, the QJL random projection noise is now within acceptable bounds. K is always mapped to TBQP3\_3 (2-bit Lloyd-Max + 1-bit QJL + double WHT). The QJL extra bit provides critical quality improvement for multi-turn conversations: TBQ3\_3 (no QJL) degrades at 3--4 turns, while TBQP3\_3 (with QJL) maintains quality through 7+ turns with factually correct responses.
 
 \subsection{MMSE Dynamic Softening ($d=64$)}
 

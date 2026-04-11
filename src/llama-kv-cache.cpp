@@ -12,6 +12,8 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <dlfcn.h>
+
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -256,6 +258,39 @@ llama_kv_cache::llama_kv_cache(
         }
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+        // Pre-map KV cache pages into GPU page tables to prevent TLB page fault storms
+        // Critical for cross-head WHT on unified memory (DGX Spark / Grace Hopper)
+        // Uses cudaMemAdvise via dlsym — silently skipped if not available or not managed memory
+        {
+            const char * buf_name = ggml_backend_buffer_name(buf);
+            if (buf_name && strstr(buf_name, "CUDA") != nullptr) {
+                void * buf_base = ggml_backend_buffer_get_base(buf);
+                size_t buf_size = ggml_backend_buffer_get_size(buf);
+                if (buf_base && buf_size > 0) {
+                    typedef int (*cudaMemAdvise_t)(const void *, size_t, int, int);
+                    typedef int (*cudaGetLastError_t)(void);
+                    void * libcuda = dlopen("libcudart.so", RTLD_LAZY);
+                    if (libcuda) {
+                        auto memAdvise = (cudaMemAdvise_t)dlsym(libcuda, "cudaMemAdvise");
+                        auto getLastError = (cudaGetLastError_t)dlsym(libcuda, "cudaGetLastError");
+                        if (memAdvise) {
+                            int err = memAdvise(buf_base, buf_size, 5 /*cudaMemAdviseSetAccessedBy*/, 0);
+                            if (err == 0) {
+                                LLAMA_LOG_INFO("%s: cudaMemAdvise SetAccessedBy applied to KV buffer (%zu MiB)\n",
+                                        __func__, buf_size / (1024*1024));
+                            } else {
+                                // Not managed memory or not supported — clear error and continue
+                                if (getLastError) getLastError(); // reset CUDA error state
+                                LLAMA_LOG_INFO("%s: cudaMemAdvise not available for this buffer (err=%d), skipping\n",
+                                        __func__, err);
+                            }
+                        }
+                        dlclose(libcuda);
+                    }
+                }
+            }
+        }
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);

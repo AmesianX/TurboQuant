@@ -1438,21 +1438,19 @@ common_init_result::common_init_result(common_params & params) :
                         return m.to_128;
                     } else if (head_dim == 64) {
                         if (is_key) {
-                            // head_dim=64 K: force TBQ (drop QJL) + cross-head WHT
-                            // QJL adds noise to attention scores — at D=64, this noise exceeds
-                            // the signal gap and causes repetition loops. Pure 3-bit Lloyd-Max
-                            // (TBQ3) has 2.3× better score SQNR than TBQP3 (2-bit+QJL).
-                            ggml_type forced = GGML_TYPE_TBQ3_3; // default cross-head 3-bit
+                            // f16/q8_0: pass through without TBQ conversion (for testing)
+                            if (type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0) {
+                                return type;
+                            }
+                            // head_dim=64 K: double WHT per-head (_3 types)
+                            ggml_type forced = GGML_TYPE_TBQP3_3; // double WHT 2-bit+QJL + f16 side buffer for prefill
                             if (type == GGML_TYPE_TBQ4_0 || type == GGML_TYPE_TBQP4_0) {
-                                forced = GGML_TYPE_TBQ4_3; // 4-bit cross-head
+                                forced = GGML_TYPE_TBQ4_2; // per-head 4-bit
                             }
                             LOG_WRN("\n");
-                            LOG_WRN("\n");
                             LOG_WRN("╔════════════════════════════════════════════════════════════════════════\n");
-                            LOG_WRN("║  TurboQuant: head_dim=%d — K forced to %s (cross-head, no QJL)\n", head_dim, ggml_type_name(forced));
-                            LOG_WRN("║  QJL adds score noise at D=64 → pure Lloyd-Max for K precision\n");
+                            LOG_WRN("║  TurboQuant: head_dim=%d — K mapped to %s (double WHT per-head)\n", head_dim, ggml_type_name(forced));
                             LOG_WRN("╚════════════════════════════════════════════════════════════════════════\n");
-                            LOG_WRN("\n");
                             LOG_WRN("\n");
                             return forced;
                         }

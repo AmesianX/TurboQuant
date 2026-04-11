@@ -381,8 +381,6 @@ static_assert(sizeof(block_tbqp4_2) == 2*sizeof(ggml_half) + TBQ_K64*3/8 + TBQ_K
 
 // TurboQuant cross-head WHT variants (8 heads × 64 dims = 512-element WHT)
 // Block format identical to _2 (blck_size=64), but quantization spans 8 heads
-// The 'd' field stores the L2 norm of the 512-element concatenated vector
-
 typedef block_tbq3_2  block_tbq3_3;
 typedef block_tbq4_2  block_tbq4_3;
 typedef block_tbqp3_2 block_tbqp3_3;

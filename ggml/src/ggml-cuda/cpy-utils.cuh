@@ -984,6 +984,9 @@ static __device__ void quantize_f32_tbqp4_1_block(const float * __restrict__ x, 
 
 static __device__ void quantize_f32_tbq3_2_block(const float * __restrict__ x, block_tbq3_2 * __restrict__ y) {
     static constexpr uint8_t tbq_signs[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+    // Heavy-tail optimized boundaries for 64-point WHT (Student-t ν=10)
+    // 64-point WHT has insufficient CLT convergence → heavier tails than Gaussian
+    // Gaussian boundaries clip extreme values → information loss
     static constexpr float tbq3_boundaries[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
     float tmp[TBQ_K64];
     float sum_sq = 0.0f;
@@ -1289,23 +1292,16 @@ static __device__ void quantize_f32_tbqp4_4_block(const float * __restrict__ x, 
 }
 
 // ============================================================
-// TurboQuant cross-head WHT (8 heads × 64 = 512-element WHT)
-// H_512 = H_8 ⊗ H_64 — CLT convergence at d=512 for head_dim=64
+// TurboQuant double WHT per-head (D=64)
+// Two rounds of WHT with different signs → near-Gaussian distribution
 // ============================================================
 
-// 512-bit random sign pattern (first 8 bytes match tbq_signs for _2)
-static __device__ constexpr uint8_t tbq_signs_512[64] = {
-    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0
-    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
-    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
-    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
-    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
-    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
-    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
-    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
-};
+// Sign patterns for double WHT: S1, S2 must be mutually different
+static __device__ constexpr uint8_t tbq_signs_s1[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+static __device__ constexpr uint8_t tbq_signs_s2[8] = { 0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c };
 
-// Cross-head TBQ3: 8×64=512-element WHT, 3-bit Lloyd-Max
+// Double WHT TBQ3: per-head S1→WHT64→S2→WHT64, 3-bit Lloyd-Max
+// Uses xhead signature for set-rows compatibility but processes each head independently
 static __device__ void quantize_f32_tbq3_3_xhead(
     const float * __restrict__ x0, const float * __restrict__ x1,
     const float * __restrict__ x2, const float * __restrict__ x3,
@@ -1320,29 +1316,38 @@ static __device__ void quantize_f32_tbq3_3_xhead(
     const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
     block_tbq3_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
 
-    float tmp[512];
-    for (int h = 0; h < 8; h++)
-        for (int j = 0; j < TBQ_K64; j++)
-            tmp[h*TBQ_K64 + j] = heads[h][j];
-
-    // Apply signs + 512-point WHT
-    for (int j = 0; j < 512; j++) {
-        int sign = ((tbq_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-        tmp[j] *= sign;
-    }
-    for (int len = 1; len < 512; len *= 2)
-        for (int i = 0; i < 512; i += 2*len)
-            for (int j = 0; j < len; j++) {
-                float u = tmp[i+j], v = tmp[i+j+len];
-                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
-            }
-
-    // Per-head norm after 512-WHT (same approach as per-block norm for D=512)
-    // Global norm destroys small heads — per-head norm preserves each head's scale
+    // Process each head independently — no cross-head mixing
     for (int h = 0; h < 8; h++) {
-        float * blk = tmp + h * TBQ_K64;
+        float tmp[TBQ_K64];
+        for (int j = 0; j < TBQ_K64; j++) tmp[j] = heads[h][j];
+
+        // Round 1: S1 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s1[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // Round 2: S2 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s2[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // RMS norm → 3-bit quantize
         float blk_sq = 0.0f;
-        for (int j = 0; j < TBQ_K64; j++) blk_sq += blk[j] * blk[j];
+        for (int j = 0; j < TBQ_K64; j++) blk_sq += tmp[j] * tmp[j];
         float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
 
         if (blk_norm < 1e-10f) {
@@ -1357,7 +1362,7 @@ static __device__ void quantize_f32_tbq3_3_xhead(
         int bit_pos = 0;
         for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
         for (int j = 0; j < TBQ_K64; j++) {
-            float val = blk[j] * inv_norm;
+            float val = tmp[j] * inv_norm;
             uint8_t idx = 7;
             for (int b = 0; b < 7; b++) { if (val < b3[b]) { idx = b; break; } }
             int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
@@ -1368,7 +1373,7 @@ static __device__ void quantize_f32_tbq3_3_xhead(
     }
 }
 
-// Cross-head TBQ4: 8×64=512-element WHT, 4-bit Lloyd-Max
+// Double WHT TBQ4: per-head S1→WHT64→S2→WHT64, 4-bit Lloyd-Max
 static __device__ void quantize_f32_tbq4_3_xhead(
     const float * __restrict__ x0, const float * __restrict__ x1,
     const float * __restrict__ x2, const float * __restrict__ x3,
@@ -1383,22 +1388,37 @@ static __device__ void quantize_f32_tbq4_3_xhead(
     const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
     block_tbq4_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
 
-    float tmp[512];
-    for (int h = 0; h < 8; h++)
-        for (int j = 0; j < TBQ_K64; j++)
-            tmp[h*TBQ_K64+j] = heads[h][j];
-
-    // Apply signs + 512-point WHT
-    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= sign; }
-    for (int len = 1; len < 512; len *= 2)
-        for (int i = 0; i < 512; i += 2*len)
-            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-
-    // Per-head norm after 512-WHT
     for (int h = 0; h < 8; h++) {
-        float * blk = tmp + h * TBQ_K64;
+        float tmp[TBQ_K64];
+        for (int j = 0; j < TBQ_K64; j++) tmp[j] = heads[h][j];
+
+        // Round 1: S1 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s1[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // Round 2: S2 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s2[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // RMS norm
         float blk_sq = 0.0f;
-        for (int j = 0; j < TBQ_K64; j++) blk_sq += blk[j] * blk[j];
+        for (int j = 0; j < TBQ_K64; j++) blk_sq += tmp[j] * tmp[j];
         float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
 
         if (blk_norm < 1e-10f) {
@@ -1412,8 +1432,8 @@ static __device__ void quantize_f32_tbq4_3_xhead(
 
         for (int j = 0; j < TBQ_K64/2; j++) {
             uint8_t idx0 = 15, idx1 = 15;
-            float val0 = blk[2*j]   * inv_norm;
-            float val1 = blk[2*j+1] * inv_norm;
+            float val0 = tmp[2*j]   * inv_norm;
+            float val1 = tmp[2*j+1] * inv_norm;
             for (int b = 0; b < 15; b++) { if (val0 < b4[b]) { idx0 = b; break; } }
             for (int b = 0; b < 15; b++) { if (val1 < b4[b]) { idx1 = b; break; } }
             outs[h]->qs[j] = idx0 | (idx1 << 4);
@@ -1421,7 +1441,7 @@ static __device__ void quantize_f32_tbq4_3_xhead(
     }
 }
 
-// Cross-head TBQP3: 8×64=512-element WHT, 2-bit Lloyd-Max + 1-bit Direct Sign
+// Double WHT TBQP3: per-head S1→WHT64→S2→WHT64, 2-bit Lloyd-Max + 1-bit Direct Sign
 static __device__ void quantize_f32_tbqp3_3_xhead(
     const float * __restrict__ x0, const float * __restrict__ x1,
     const float * __restrict__ x2, const float * __restrict__ x3,
@@ -1437,22 +1457,37 @@ static __device__ void quantize_f32_tbqp3_3_xhead(
     const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
     block_tbqp3_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
 
-    float tmp[512];
-    for (int h = 0; h < 8; h++)
-        for (int j = 0; j < TBQ_K64; j++)
-            tmp[h*TBQ_K64+j] = heads[h][j];
-
-    // Apply signs + 512-point WHT
-    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= sign; }
-    for (int len = 1; len < 512; len *= 2)
-        for (int i = 0; i < 512; i += 2*len)
-            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-
-    // Per-head norm + quantize: 2-bit centroid + direct sign
     for (int h = 0; h < 8; h++) {
-        float * seg = &tmp[h*TBQ_K64];
+        float tmp[TBQ_K64];
+        for (int j = 0; j < TBQ_K64; j++) tmp[j] = heads[h][j];
+
+        // Round 1: S1 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s1[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // Round 2: S2 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s2[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // RMS norm
         float blk_sq = 0.0f;
-        for (int j = 0; j < TBQ_K64; j++) blk_sq += seg[j] * seg[j];
+        for (int j = 0; j < TBQ_K64; j++) blk_sq += tmp[j] * tmp[j];
         float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
 
         if (blk_norm < 1e-10f) {
@@ -1469,7 +1504,7 @@ static __device__ void quantize_f32_tbqp3_3_xhead(
         for (int j = 0; j < TBQ_K64/4; j++) {
             uint8_t packed = 0;
             for (int k = 0; k < 4; k++) {
-                float val = seg[j*4+k] * inv_norm;
+                float val = tmp[j*4+k] * inv_norm;
                 uint8_t idx = 3;
                 for (int b = 0; b < 3; b++) { if (val < b2[b]) { idx = b; break; } }
                 packed |= (idx & 0x3) << (k*2);
@@ -1479,16 +1514,94 @@ static __device__ void quantize_f32_tbqp3_3_xhead(
         }
         // Residual + Direct Sign (d_qjl relative to per-head norm)
         float res_abs = 0.0f;
-        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] * inv_norm - recon[j]);
+        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(tmp[j] * inv_norm - recon[j]);
         outs[h]->d_qjl = __float2half((res_abs / TBQ_K64) * blk_norm);
         for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
         for (int j = 0; j < TBQ_K64; j++) {
-            if (seg[j] * inv_norm - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1 << (j%8));
+            if (tmp[j] * inv_norm - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1 << (j%8));
         }
     }
 }
 
-// Cross-head TBQP4: 8×64=512-element WHT, 3-bit Lloyd-Max + 1-bit Direct Sign
+// Prefill HQ: TBQ3 (3-bit, 8 centroids) packed into TBQP3 block format
+// d_qjl = -1 flags "this is TBQ3 mode" for the decoder
+// qs[16] + qjl[8] = 24 bytes used as flat TBQ3 3-bit storage (64 × 3 / 8 = 24)
+static __device__ void quantize_f32_tbqp3_3_xhead_prefill(
+    const float * __restrict__ x0, const float * __restrict__ x1,
+    const float * __restrict__ x2, const float * __restrict__ x3,
+    const float * __restrict__ x4, const float * __restrict__ x5,
+    const float * __restrict__ x6, const float * __restrict__ x7,
+    block_tbqp3_3 * __restrict__ y0, block_tbqp3_3 * __restrict__ y1,
+    block_tbqp3_3 * __restrict__ y2, block_tbqp3_3 * __restrict__ y3,
+    block_tbqp3_3 * __restrict__ y4, block_tbqp3_3 * __restrict__ y5,
+    block_tbqp3_3 * __restrict__ y6, block_tbqp3_3 * __restrict__ y7) {
+
+    static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
+    const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
+    block_tbqp3_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
+
+    for (int h = 0; h < 8; h++) {
+        float tmp[TBQ_K64];
+        for (int j = 0; j < TBQ_K64; j++) tmp[j] = heads[h][j];
+
+        // Round 1: S1 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s1[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // Round 2: S2 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s2[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // RMS norm
+        float blk_sq = 0.0f;
+        for (int j = 0; j < TBQ_K64; j++) blk_sq += tmp[j] * tmp[j];
+        float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
+
+        if (blk_norm < 1e-10f) {
+            outs[h]->d = __float2half(0.0f);
+            outs[h]->d_qjl = __float2half(-1.0f); // prefill flag
+            for (int j = 0; j < TBQ_K64/4; j++) outs[h]->qs[j] = 0;
+            for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
+            continue;
+        }
+
+        float inv_norm = 1.0f / blk_norm;
+        outs[h]->d = __float2half(blk_norm);
+        outs[h]->d_qjl = __float2half(-1.0f); // prefill flag: negative = TBQ3 mode
+
+        // Pack 3-bit indices into qs[16] + qjl[8] = 24 bytes flat
+        uint8_t * combined = (uint8_t *)outs[h]->qs; // qs and qjl are contiguous
+        for (int j = 0; j < 24; j++) combined[j] = 0;
+        int bit_pos = 0;
+        for (int j = 0; j < TBQ_K64; j++) {
+            float val = tmp[j] * inv_norm;
+            uint8_t idx = 7;
+            for (int b = 0; b < 7; b++) { if (val < b3[b]) { idx = b; break; } }
+            int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
+            combined[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
+            if (bit_off > 5) combined[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
+            bit_pos += 3;
+        }
+    }
+}
+
+// Double WHT TBQP4: per-head S1→WHT64→S2→WHT64, 3-bit Lloyd-Max + 1-bit Direct Sign
 static __device__ void quantize_f32_tbqp4_3_xhead(
     const float * __restrict__ x0, const float * __restrict__ x1,
     const float * __restrict__ x2, const float * __restrict__ x3,
@@ -1504,22 +1617,37 @@ static __device__ void quantize_f32_tbqp4_3_xhead(
     const float * heads[8] = { x0,x1,x2,x3,x4,x5,x6,x7 };
     block_tbqp4_3 * outs[8] = { y0,y1,y2,y3,y4,y5,y6,y7 };
 
-    float tmp[512];
-    for (int h = 0; h < 8; h++)
-        for (int j = 0; j < TBQ_K64; j++)
-            tmp[h*TBQ_K64+j] = heads[h][j];
-
-    // Apply signs + 512-point WHT
-    for (int j = 0; j < 512; j++) { int sign = ((tbq_signs_512[j>>3]>>(j&7))&1)?-1:1; tmp[j] *= sign; }
-    for (int len = 1; len < 512; len *= 2)
-        for (int i = 0; i < 512; i += 2*len)
-            for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-
-    // Per-head norm + quantize: 3-bit centroid + direct sign
     for (int h = 0; h < 8; h++) {
-        float * seg = &tmp[h*TBQ_K64];
+        float tmp[TBQ_K64];
+        for (int j = 0; j < TBQ_K64; j++) tmp[j] = heads[h][j];
+
+        // Round 1: S1 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s1[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // Round 2: S2 → WHT64
+        for (int j = 0; j < TBQ_K64; j++) {
+            int sign = ((tbq_signs_s2[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
+
+        // RMS norm
         float blk_sq = 0.0f;
-        for (int j = 0; j < TBQ_K64; j++) blk_sq += seg[j] * seg[j];
+        for (int j = 0; j < TBQ_K64; j++) blk_sq += tmp[j] * tmp[j];
         float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
 
         if (blk_norm < 1e-10f) {
@@ -1536,7 +1664,7 @@ static __device__ void quantize_f32_tbqp4_3_xhead(
         int bit_pos = 0;
         for (int j = 0; j < TBQ_K64*3/8; j++) outs[h]->qs[j] = 0;
         for (int j = 0; j < TBQ_K64; j++) {
-            float val = seg[j] * inv_norm;
+            float val = tmp[j] * inv_norm;
             uint8_t idx = 7;
             for (int b = 0; b < 7; b++) { if (val < b3[b]) { idx = b; break; } }
             int byte_idx = bit_pos/8, bit_off = bit_pos%8;
@@ -1545,10 +1673,10 @@ static __device__ void quantize_f32_tbqp4_3_xhead(
             recon[j] = c3[idx]; bit_pos += 3;
         }
         float res_abs = 0.0f;
-        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(seg[j] * inv_norm - recon[j]);
+        for (int j = 0; j < TBQ_K64; j++) res_abs += fabsf(tmp[j] * inv_norm - recon[j]);
         outs[h]->d_qjl = __float2half((res_abs/TBQ_K64)*blk_norm);
         for (int j = 0; j < TBQ_K64/8; j++) outs[h]->qjl[j] = 0;
-        for (int j = 0; j < TBQ_K64; j++) { if (seg[j] * inv_norm - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1<<(j%8)); }
+        for (int j = 0; j < TBQ_K64; j++) { if (tmp[j] * inv_norm - recon[j] >= 0.0f) outs[h]->qjl[j/8] |= (1<<(j%8)); }
     }
 }
 

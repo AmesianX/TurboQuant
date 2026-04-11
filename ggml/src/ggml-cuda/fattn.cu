@@ -232,6 +232,42 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
 
+    // Side buffer redirect: TBQP3_3 with active side buffer → dispatch as f16 K
+    // Side buffer uses head-major layout identical to f16 KV cache
+    if (K->type == GGML_TYPE_TBQP3_3 && Q->ne[0] == 64) {
+        const char * side_ptr = turboquant::get_prompt_k_ptr(K->data);
+        int side_n = turboquant::get_prompt_k_stride(K->data);
+        if (side_ptr && side_n > 0) {
+            // Save originals
+            ggml_type orig_type = K->type;
+            void * orig_data = K->data;
+            int64_t orig_ne1 = K->ne[1];
+            size_t orig_nb0 = K->nb[0], orig_nb1 = K->nb[1];
+            size_t orig_nb2 = K->nb[2], orig_nb3 = K->nb[3];
+            // Override K to f16 pointing to token-major side buffer
+            // Keep ne[1] unchanged (256, padded by llama.cpp) — mask already covers 256 entries
+            // Side buffer has zeros beyond side_n from cudaMemsetAsync → masked as -inf
+            K->type = GGML_TYPE_F16;
+            K->data = (void *)side_ptr;
+            // ne[1] stays at orig_ne1 (256) — DO NOT override
+            K->nb[0] = sizeof(ggml_fp16_t);                                   // element = 2
+            K->nb[1] = K->ne[0] * K->ne[2] * sizeof(ggml_fp16_t);            // token stride (all heads) = 1024
+            K->nb[2] = K->ne[0] * sizeof(ggml_fp16_t);                        // head stride = 128
+            K->nb[3] = K->nb[1] * K->ne[1];
+            // Dispatch to f16 kernel (V type determined at compile time)
+            if (V->type == GGML_TYPE_TBQ3_2) {
+                ggml_cuda_flash_attn_ext_vec_case<64, GGML_TYPE_F16, GGML_TYPE_TBQ3_2>(ctx, dst);
+            } else if (V->type == GGML_TYPE_F16) {
+                ggml_cuda_flash_attn_ext_vec_case<64, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+            }
+            // Restore K
+            K->type = orig_type; K->data = orig_data; K->ne[1] = orig_ne1;
+            K->nb[0] = orig_nb0; K->nb[1] = orig_nb1;
+            K->nb[2] = orig_nb2; K->nb[3] = orig_nb3;
+            return;
+        }
+    }
+
 #ifdef GGML_CUDA_FA_TBQ_TUNING
     // TBQ tuning + SWA f16 + QJL support + K/V split testing
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
@@ -241,6 +277,19 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_F16, GGML_TYPE_TBQ3_0)
+    // D=64 per-head _2
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_F16)
+    // D=64 double WHT _3
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_F16)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_F16)
+    // D=64 4-bit K
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_F16)
+    // D=64 K=f16 for testing
+    FATTN_VEC_CASE(64, GGML_TYPE_F16, GGML_TYPE_TBQ3_2)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
 #elif defined(GGML_CUDA_FA_ALL_QUANTS)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)

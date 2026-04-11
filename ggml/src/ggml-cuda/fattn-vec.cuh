@@ -98,9 +98,12 @@ static __global__ void flash_attn_ext_vec(
         && type_K != GGML_TYPE_TBQP3_3 && type_K != GGML_TYPE_TBQP4_3
         && type_K != GGML_TYPE_TBQ4_4 && type_K != GGML_TYPE_TBQ3_4
         && type_K != GGML_TYPE_TBQP3_4 && type_K != GGML_TYPE_TBQP4_4;
-    constexpr bool is_cross_head_K = type_K == GGML_TYPE_TBQ3_3 || type_K == GGML_TYPE_TBQ4_3
+    // _3 types: now double WHT per-head (not cross-head). No cross-head K/V.
+    constexpr bool is_cross_head_K = false;
+    constexpr bool is_cross_head_V = false;
+    // _3 types use double WHT: S1→WHT64→S2→WHT64 (two rounds for better CLT convergence)
+    constexpr bool is_double_wht_K = type_K == GGML_TYPE_TBQ3_3 || type_K == GGML_TYPE_TBQ4_3
         || type_K == GGML_TYPE_TBQP3_3 || type_K == GGML_TYPE_TBQP4_3;
-    constexpr bool is_cross_head_V = type_V == GGML_TYPE_TBQ3_3 || type_V == GGML_TYPE_TBQ4_3;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -556,42 +559,29 @@ static __global__ void flash_attn_ext_vec(
                       || type_K == GGML_TYPE_TBQ4_3 || type_K == GGML_TYPE_TBQ3_3
                       || type_K == GGML_TYPE_TBQP4_3 || type_K == GGML_TYPE_TBQP3_3) {
         // TurboQuant 64-block: D=64, nthreads=128, tid 0-63 participate in WHT
-        // WHT has 6 stages: stages 0-4 warp shuffle, stage 5 shared memory
-        // For cross-head _3: use kv_head-specific 64-bit sign slice from 512-bit pattern
-        static constexpr uint8_t tbq_signs_full[64] = {
-            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0 (same as _2)
-            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
-            0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
-            0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
-            0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
-            0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
-            0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
-            0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
-        };
-        // For _2 types: always use head 0's signs. For _3: use kv_head-specific slice.
-        const int q_signs_offset = (is_cross_head_K) ? ((head / gqa_ratio) % 8) * 8 : 0;
-        const uint8_t * tbq_signs = tbq_signs_full + q_signs_offset;
+        // _2: single WHT (S1→WHT64), _3: double WHT (S1→WHT64→S2→WHT64)
+        // Sign tables for WHT: _2 uses S1 only, _3 uses S1+S2 (double WHT)
+        static constexpr uint8_t tbq_s1[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+        static constexpr uint8_t tbq_s2[8] = { 0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c };
 
         for (int j = 0; j < ncols; ++j) {
             float * Q_wht = (float *) &KQ[0];
             const float * Q_f = (const float *) (Q + j*nb01);
 
-            // === WHT 1: MSE part — FP32 butterfly ===
+            // Round 1: S1 → WHT64 (same for both _2 and _3)
             {
                 float f0 = 0.0f;
                 if (tid < D) {
-                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                    float sign0 = ((tbq_s1[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
                     float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
                     f0 = q0 * sign0;
                 }
-                // Stages 0-4: warp shuffle (tid >= 64 carries f0=0, no data corruption)
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
                     float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; }
                     else                { f0 = f0 + o0; }
                 }
-                // Stage 5 (stride 32): shared memory
                 if (tid < D) { Q_wht[tid] = f0; }
                 __syncthreads();
                 if (tid < D) {
@@ -602,21 +592,45 @@ static __global__ void flash_attn_ext_vec(
                 __syncthreads();
             }
 
+            // Round 2: S2 → WHT64 (only for _3 double WHT types)
+            if constexpr (is_double_wht_K) {
+                float f0 = 0.0f;
+                if (tid < D) {
+                    float sign0 = ((tbq_s2[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                    f0 = Q_wht[tid] * sign0;
+                }
+                #pragma unroll
+                for (int s = 0; s < 5; s++) {
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                    if (tid & (1 << s)) { f0 = o0 - f0; }
+                    else                { f0 = f0 + o0; }
+                }
+                if (tid < D) { Q_wht[tid] = f0; }
+                __syncthreads();
+                if (tid < D) {
+                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
+                    f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
+                }
+                if (tid < D) { Q_wht[tid] = f0; }
+                __syncthreads();
+            }
+
+            // Scale: /D for Q_reg. Double WHT needs /D² total: /D here + /D after scoring
+            const float wht_scale = scale / (float)D;
+
             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
                 const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
-                const float v0 = Q_wht[2*i] * scale / (float)D;
-                const float v1 = Q_wht[2*i+1] * scale / (float)D;
+                const float v0 = Q_wht[2*i] * wht_scale;
+                const float v1 = Q_wht[2*i+1] * wht_scale;
 #ifdef V_DOT2_F32_F16_AVAILABLE
                 Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
 #else
                 Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
 #endif
             }
-
-            __syncthreads(); // ensure all warps finished Q_reg load before next j overwrites KQ
-
-            // Direct Sign: no second WHT needed for _2 TBQP types
+            __syncthreads();
         }
+
     } else if constexpr (type_K == GGML_TYPE_TBQ4_4 || type_K == GGML_TYPE_TBQ3_4
                       || type_K == GGML_TYPE_TBQP4_4 || type_K == GGML_TYPE_TBQP3_4) {
         // TurboQuant 576-block: D=576, split 256+256+64
@@ -880,22 +894,113 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 float sum;
                 if constexpr (is_cross_head_K) {
-                    // Cross-head scoring: combine 8 groups with H_8 signs
-                    // H_512 = H_8 ⊗ H_64 → score = (1/8)Σ_g H_8[h][g] · vec_dot(K_g, Q_wht)
+                    // Cross-head IWHT decoding: dequant 8 K blocks → H_8 inverse → IWHT64 → unsign → dot with raw Q
+                    // Q is in original domain (bypassed WHT), K is reconstructed to original domain
+                    static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
+                    static constexpr uint8_t iwht_signs[64] = {
+                        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+                        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+                        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+                        0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+                        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
+                        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+                        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
+                        0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+                    };
+
+                    // Step 1: Dequantize 8 K blocks and apply H_8 inverse for this head
+                    // K_reconstructed[j] = (1/8) × Σ_g H_8[kv_head_idx,g] × norm_g × centroid_g[j]
+                    // Each thread handles D/2/nthreads_KQ pairs of elements
                     sum = 0.0f;
-                    #pragma unroll
-                    for (int g = 0; g < 8; g++) {
-                        const char * K_g = K + (int64_t)(g - kv_head_idx) * nb12 + (int64_t)i_KQ * nb11;
-                        float partial = vec_dot_KQ(K_g, Q_reg[j], Q_i32[j], Q_ds[j]);
-                        const int h8_sign = (__popc(kv_head_idx & g) & 1) ? -1 : 1;
-                        sum += h8_sign * partial;
+                    for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
+                        const int tid_kq = (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                        const int k = i0 + tid_kq;
+                        const int elem = k * 2;
+
+                        // Accumulate H_8 inverse across 8 heads for this element pair
+                        float k_val0 = 0.0f, k_val1 = 0.0f;
+                        #pragma unroll
+                        for (int g = 0; g < 8; g++) {
+                            const char * K_g = K + (int64_t)(g - kv_head_idx) * nb12 + (int64_t)i_KQ * nb11;
+                            const block_tbq3_2 * K_tbq = (const block_tbq3_2 *) K_g;
+                            const float norm_g = __half2float(K_tbq[0].d);
+                            const float h8_sign = (__popc(kv_head_idx & g) & 1) ? -1.0f : 1.0f;
+
+                            // Dequant element pair
+                            float c0, c1;
+                            { int bp0=elem*3,by0=bp0/8,bo0=bp0%8; uint32_t v0=(uint32_t)K_tbq[0].qs[by0]>>bo0; if(bo0>5) v0|=(uint32_t)K_tbq[0].qs[by0+1]<<(8-bo0); c0=c3[v0&0x7]; }
+                            { int bp1=(elem+1)*3,by1=bp1/8,bo1=bp1%8; uint32_t v1=(uint32_t)K_tbq[0].qs[by1]>>bo1; if(bo1>5) v1|=(uint32_t)K_tbq[0].qs[by1+1]<<(8-bo1); c1=c3[v1&0x7]; }
+
+                            k_val0 += h8_sign * norm_g * c0;
+                            k_val1 += h8_sign * norm_g * c1;
+                        }
+                        k_val0 *= 0.125f; // 1/8 for H_8 inverse
+                        k_val1 *= 0.125f;
+
+                        // Now k_val0/k_val1 are in per-head 64-WHT domain
+                        // Store to shared memory for IWHT64
+                        float * k_buf = (float *) &KQ[0]; // reuse KQ shared memory
+                        k_buf[elem]   = k_val0;
+                        k_buf[elem+1] = k_val1;
                     }
-                    sum = warp_reduce_sum<nthreads_KQ>(sum);
-                    sum *= 0.125f; // 1/8
+                    __syncthreads();
+
+                    // Step 2: IWHT64 — 6-stage butterfly (in-place in shared memory)
+                    {
+                        float * k_buf = (float *) &KQ[0];
+                        if (tid < D) {
+                            float f0 = k_buf[tid];
+                            // Stages 0-4: warp shuffle
+                            #pragma unroll
+                            for (int s = 0; s < 5; s++) {
+                                float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                                if (tid & (1 << s)) { f0 = o0 - f0; }
+                                else                { f0 = f0 + o0; }
+                            }
+                            k_buf[tid] = f0;
+                        }
+                        __syncthreads();
+                        if (tid < D) {
+                            // Stage 5 (stride 32): shared memory
+                            float u0 = k_buf[tid], v0 = k_buf[tid ^ 32];
+                            float f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
+
+                            // Step 3: Undo signs and apply 1/D scaling
+                            const int sign_byte = kv_head_idx * 8 + (tid >> 3);
+                            float sign0 = ((iwht_signs[sign_byte] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                            k_buf[tid] = f0 * sign0 / (float)D;
+                        }
+                        __syncthreads();
+                    }
+
+                    // Step 4: Dot product raw Q × reconstructed K
+                    {
+                        float * k_buf = (float *) &KQ[0];
+                        float dot = 0.0f;
+                        for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
+                            const int tid_kq = (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                            const int k = i0 + tid_kq;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                            const float2 q = __half22float2(((const half2 *)Q_reg[j])[i0/nthreads_KQ]);
+#else
+                            const float2 q = ((const float2 *)Q_reg[j])[i0/nthreads_KQ];
+#endif
+                            dot += q.x * k_buf[2*k] + q.y * k_buf[2*k+1];
+                        }
+                        sum = warp_reduce_sum<nthreads_KQ>(dot);
+                    }
                 } else {
+                    // Standard quantized K path (TBQP3_3 or fallback)
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                     sum = warp_reduce_sum<nthreads_KQ>(sum);
+                    if constexpr (is_double_wht_K) {
+                        sum /= (float)D;
+                    }
                 }
+
+                // Numerical safety: clamp rare inf/nan from float edge cases
+                if (isnan(sum) || isinf(sum)) { sum = 0.0f; }
+
                 if (use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
                 }
@@ -922,21 +1027,39 @@ static __global__ void flash_attn_ext_vec(
                     const float alpha = 1.0f + c * sqrtf(logf(fmaxf((float)k_VKQ_max, 2.0f)));
                     sum *= alpha;
                 }
-                // D=64 (_2 and _3): dynamic MMSE softening
-                // SQNR too low at head_dim=64, noise corrupts attention ranking
-                // α(N) = SQNR / (SQNR + √(ln N / ln N₀)): more softening for longer context
-                if constexpr (type_K == GGML_TYPE_TBQP3_2 || type_K == GGML_TYPE_TBQP3_3 ||
-                              type_K == GGML_TYPE_TBQ3_2  || type_K == GGML_TYPE_TBQ3_3  ||
-                              type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP4_3 ||
-                              type_K == GGML_TYPE_TBQ4_2  || type_K == GGML_TYPE_TBQ4_3) {
+                // D=64 _2: MMSE softening (single WHT, low SQNR)
+                if constexpr (type_K == GGML_TYPE_TBQP3_2 ||
+                              type_K == GGML_TYPE_TBQ3_2  ||
+                              type_K == GGML_TYPE_TBQP4_2 ||
+                              type_K == GGML_TYPE_TBQ4_2) {
                     constexpr float sqnr =
-                        (type_K == GGML_TYPE_TBQP3_2 || type_K == GGML_TYPE_TBQP3_3) ?  3.45f :
-                        (type_K == GGML_TYPE_TBQ3_2  || type_K == GGML_TYPE_TBQ3_3)  ?  7.80f :
-                        (type_K == GGML_TYPE_TBQP4_2 || type_K == GGML_TYPE_TBQP4_3) ?  6.13f :
-                        (type_K == GGML_TYPE_TBQ4_2  || type_K == GGML_TYPE_TBQ4_3)  ? 14.05f : 1.0f;
-                    constexpr float ln_n0 = 7.6246f; // ln(2048)
+                        (type_K == GGML_TYPE_TBQP3_2) ?  3.45f :
+                        (type_K == GGML_TYPE_TBQ3_2)  ?  7.80f :
+                        (type_K == GGML_TYPE_TBQP4_2) ?  6.13f :
+                        (type_K == GGML_TYPE_TBQ4_2)  ? 14.05f : 1.0f;
+                    constexpr float ln_n0 = 7.6246f;
                     const float evt = sqrtf(logf(fmaxf((float)k_VKQ_max, 2.0f)) / ln_n0);
                     const float alpha = sqnr / (sqnr + evt);
+                    sum *= alpha;
+                }
+                // D=64 _3: SQNR-based dynamic sharpening (double WHT + QJL)
+                // With full side buffer (prompt+gen), all K is f16 → f_gen=0 → α=1 (no sharpening)
+                // Kept for fallback when side buffer is not active
+                if constexpr (type_K == GGML_TYPE_TBQP3_3 ||
+                              type_K == GGML_TYPE_TBQ3_3  ||
+                              type_K == GGML_TYPE_TBQP4_3 ||
+                              type_K == GGML_TYPE_TBQ4_3) {
+                    constexpr float sqnr =
+                        (type_K == GGML_TYPE_TBQP3_3) ?  8.35f :  // cos=0.945
+                        (type_K == GGML_TYPE_TBQ3_3)  ? 30.25f :  // cos=0.984
+                        (type_K == GGML_TYPE_TBQP4_3) ? 49.00f :  // cos≈0.990
+                        (type_K == GGML_TYPE_TBQ4_3)  ? 99.00f :  // cos≈0.995
+                        1.0f;
+                    constexpr float ln_n0 = 7.6246f;  // ln(2048)
+                    const float N = fmaxf((float)k_VKQ_max, 2.0f);
+                    const int prompt_len = (raw_K_data && raw_K_stride > 0) ? raw_K_stride : 0;
+                    const float f_gen = fmaxf(0.0f, (N - (float)prompt_len) / N);
+                    const float alpha = 1.0f + f_gen * sqrtf(logf(N) / ln_n0) / sqnr;
                     sum *= alpha;
                 }
 

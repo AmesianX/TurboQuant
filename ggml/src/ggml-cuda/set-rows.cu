@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "prompt-k-side.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -239,8 +240,9 @@ static __global__ void k_set_rows_xhead_v1(
         const int64_t ne11, const int64_t ne12,
         const int64_t s1, const int64_t s2, const int64_t s3,
         const int64_t groups_per_ne00,
-        const uint3 ne01_fd, const uint3 ne02_fd, const uint3 ne11_fd, const uint3 ne12_fd) {
-    const int64_t ig = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+        const uint3 ne01_fd, const uint3 ne02_fd, const uint3 ne11_fd, const uint3 ne12_fd,
+        const int64_t base_offset) {
+    const int64_t ig = base_offset + int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
     if (ig >= ne_total_groups) return;
     const int64_t i_g00 = ig % groups_per_ne00;
     const int64_t r1 = ig / groups_per_ne00;
@@ -277,22 +279,35 @@ static void set_rows_cuda_xhead_v1(
         cudaStream_t stream) {
     GGML_ASSERT(ne00 % TBQ_K64 == 0);
     const int64_t blks_per_ne00 = ne00 / TBQ_K64;
-    GGML_ASSERT(blks_per_ne00 % 8 == 0);
+    if (blks_per_ne00 % 8 != 0) {
+        fprintf(stderr, "\n\nFATAL: TurboQuant cross-head WHT requires n_head_kv divisible by 8.\n");
+        fprintf(stderr, "  ne00=%lld, blks_per_ne00=%lld (need %% 8 == 0)\n", (long long)ne00, (long long)blks_per_ne00);
+        fprintf(stderr, "  This model's KV head count is not compatible with cross-head WHT.\n");
+        fprintf(stderr, "  Use --cache-type-k q8_0 or --cache-type-k f16 instead.\n\n");
+        exit(1);
+    }
     const int64_t groups_per_ne00 = blks_per_ne00 / 8;
     const int64_t n_total = groups_per_ne00 * ne01 * ne02 * ne03;
     if (n_total == 0) return;
     constexpr int BS = 1; // 1 thread/block: heavy per-thread work (2KB+ stack)
-    const int nb = (n_total + BS - 1) / BS;
     const uint3 ne01_fd = init_fastdiv_values((uint32_t)ne01);
     const uint3 ne02_fd = init_fastdiv_values((uint32_t)ne02);
     const uint3 ne11_fd = init_fastdiv_values((uint32_t)ne11);
     const uint3 ne12_fd = init_fastdiv_values((uint32_t)ne12);
-    k_set_rows_xhead_v1<idx_t, block_type, quantize_xhead><<<nb, BS, 0, stream>>>(
-        src0_d, src1_d, dst_d, n_total,
-        nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
-        nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),
-        ne11, ne12, (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
-        groups_per_ne00, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+    // Batch kernel launches to prevent GPU memory system overload
+    // Each block uses 2KB+ local memory; launching 49K+ blocks at once
+    // can crash DGX Spark unified memory (TLB thrashing / page fault storm)
+    constexpr int64_t MAX_BLOCKS_PER_LAUNCH = 512;
+    for (int64_t base = 0; base < n_total; base += MAX_BLOCKS_PER_LAUNCH) {
+        const int64_t batch = (n_total - base < MAX_BLOCKS_PER_LAUNCH) ? (n_total - base) : MAX_BLOCKS_PER_LAUNCH;
+        const int batch_nb = (int)((batch + BS - 1) / BS);
+        k_set_rows_xhead_v1<idx_t, block_type, quantize_xhead><<<batch_nb, BS, 0, stream>>>(
+            src0_d, src1_d, dst_d, n_total,
+            nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
+            nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),
+            ne11, ne12, (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
+            groups_per_ne00, ne01_fd, ne02_fd, ne11_fd, ne12_fd, base);
+    }
     GGML_UNUSED(ne00); GGML_UNUSED(ne10); GGML_UNUSED(ne13);
 }
 
@@ -302,6 +317,7 @@ static void set_rows_cuda_xhead_v1(
 // 8 threads per group, each handles one head's 64-element WHT
 // Shared memory: 8×64 floats = 2KB per group for cross-head exchange
 // ============================================================
+
 
 // Per-head quantize helpers (called by each thread for its 64 elements)
 // These operate on tmp[64] in registers, writing to the output block
@@ -439,54 +455,31 @@ static __global__ void k_set_rows_xhead_v2(
         for (int j = 0; j < TBQ_K64; j++) tmp[j] = 0.0f;
     }
 
-    // Warp-level reduction for shared norm (sum across 8 heads)
-    float sum_sq = sum_sq_local;
-    #pragma unroll
-    for (int offset = 4; offset >= 1; offset >>= 1) {
-        sum_sq += __shfl_xor_sync(0xff << (local_group*8), sum_sq, offset, WARP_SIZE);
-    }
-    // Now all 8 threads have the same sum_sq (total across all heads)
-    float norm = sqrtf(sum_sq);
-
-    const bool zero_norm = (norm < 1e-10f);
-    if (active && zero_norm) {
-        block_type * out = (block_type *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3) + blk_base + h;
-        out->d = __float2half(0.0f);
-        for (int j = 0; j < (int)sizeof(out->qs); j++) out->qs[j] = 0;
-    }
-    // Don't return early — must participate in __syncthreads below
-    if (!active || zero_norm) {
-        // Still need to participate in all syncthreads
-        for (int j = 0; j < TBQ_K64; j++) tmp[j] = 0;
-    } else {
-
-    // Apply per-head signs + normalize
+    // Apply per-head signs (no normalization yet — per-head norm after full WHT)
     static __device__ constexpr uint8_t tbq_signs_512_k[64] = {
-        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
-        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
-        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
-        0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
-        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
-        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
-        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
-        0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0
+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
+        0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
+        0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
+        0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
+        0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
     };
-    const float inv_norm = 1.0f / norm;
-    const int sign_offset = h * 8; // byte offset for this head's 64-bit signs
-    for (int j = 0; j < TBQ_K64; j++) {
-        const int global_j = h * TBQ_K64 + j;
-        int sign = ((tbq_signs_512_k[global_j >> 3] >> (global_j & 7)) & 1) ? -1 : 1;
-        tmp[j] *= inv_norm * sign;
+    if (active) {
+        for (int j = 0; j < TBQ_K64; j++) {
+            const int global_j = h * TBQ_K64 + j;
+            int sign = ((tbq_signs_512_k[global_j >> 3] >> (global_j & 7)) & 1) ? -1 : 1;
+            tmp[j] *= sign;
+        }
+        // Phase 1: Per-head 64-element serial WHT (6 stages)
+        for (int len = 1; len < TBQ_K64; len *= 2)
+            for (int i = 0; i < TBQ_K64; i += 2*len)
+                for (int j = 0; j < len; j++) {
+                    float u = tmp[i+j], v = tmp[i+j+len];
+                    tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+                }
     }
-
-    // Phase 1: Per-head 64-element serial WHT (6 stages) — each thread independent
-    for (int len = 1; len < TBQ_K64; len *= 2)
-        for (int i = 0; i < TBQ_K64; i += 2*len)
-            for (int j = 0; j < len; j++) {
-                float u = tmp[i+j], v = tmp[i+j+len];
-                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
-            }
-    } // end else (active && !zero_norm)
 
     // Phase 2: Cross-head 8-element WHT (3 stages) via shared memory
     // All threads participate in syncthreads (including inactive ones)
@@ -512,13 +505,26 @@ static __global__ void k_set_rows_xhead_v2(
         __syncthreads();
     }
 
-    // Quantize this thread's 64 elements to output block
-    if (active && !zero_norm) {
+    // Per-head RMS norm after full 512-WHT (per-head norm preserves each head's scale)
+    // Then normalize and quantize
+    if (active) {
+        float blk_sq = 0.0f;
+        for (int j = 0; j < TBQ_K64; j++) blk_sq += tmp[j] * tmp[j];
+        float blk_norm = sqrtf(blk_sq / (float)TBQ_K64);
+
         block_type * out = (block_type *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3) + blk_base + h;
-        if constexpr (QT == XHEAD_TBQ3)  { xhead_quantize_tbq3(tmp, out, norm); }
-        if constexpr (QT == XHEAD_TBQ4)  { xhead_quantize_tbq4(tmp, out, norm); }
-        if constexpr (QT == XHEAD_TBQP3) { xhead_quantize_tbqp3(tmp, out, norm); }
-        if constexpr (QT == XHEAD_TBQP4) { xhead_quantize_tbqp4(tmp, out, norm); }
+
+        if (blk_norm < 1e-10f) {
+            out->d = __float2half(0.0f);
+            for (int j = 0; j < (int)sizeof(out->qs); j++) out->qs[j] = 0;
+        } else {
+            float inv_norm = 1.0f / blk_norm;
+            for (int j = 0; j < TBQ_K64; j++) tmp[j] *= inv_norm;
+            if constexpr (QT == XHEAD_TBQ3)  { xhead_quantize_tbq3(tmp, out, blk_norm); }
+            if constexpr (QT == XHEAD_TBQ4)  { xhead_quantize_tbq4(tmp, out, blk_norm); }
+            if constexpr (QT == XHEAD_TBQP3) { xhead_quantize_tbqp3(tmp, out, blk_norm); }
+            if constexpr (QT == XHEAD_TBQP4) { xhead_quantize_tbqp4(tmp, out, blk_norm); }
+        }
     }
 
     GGML_UNUSED(ne11); GGML_UNUSED(ne12);
@@ -933,9 +939,14 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_tbq4_3*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
     } else if (dst->type == GGML_TYPE_TBQP3_3) {
+        // Always encode to TBQP3 cache
         set_rows_cuda_xhead_v1<idx_t, block_tbqp3_3, quantize_f32_tbqp3_3_xhead>(
             src0_d, src1_d, (block_tbqp3_3*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        // Write f16 to side buffer for ALL tokens (prompt + generation)
+        // TBQP3_3 cache handles context window capacity, side buffer handles quality
+        // force_reset on large batch (ne01>10) = new request start
+        turboquant::write_side(dst->data, src0_d, src1_d, (int)ne00, (int)ne01, (int)nb01, stream, ne01 > 10);
     } else if (dst->type == GGML_TYPE_TBQP4_3) {
         set_rows_cuda_xhead_v1<idx_t, block_tbqp4_3, quantize_f32_tbqp4_3_xhead>(
             src0_d, src1_d, (block_tbqp4_3*)dst->data,

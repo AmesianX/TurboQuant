@@ -56,7 +56,15 @@ def generate_filler(target_tokens: int) -> str:
 # ── Answer checking ───────────────────────────────────────────────────────────
 
 def strip_thinking(s: str) -> str:
-    return re.sub(r'<think>.*?</think>', '', s, flags=re.DOTALL).strip()
+    s = re.sub(r'<think>.*?</think>', '', s, flags=re.DOTALL).strip()
+    # GPT OSS: strip analysis/commentary channels, keep only final channel content
+    s = re.sub(r'<\|channel\|>analysis<\|message\|>.*?<\|end\|>', '', s, flags=re.DOTALL)
+    s = re.sub(r'<\|channel\|>commentary<\|message\|>.*?<\|end\|>', '', s, flags=re.DOTALL)
+    # Strip remaining channel tags
+    s = re.sub(r'<\|channel\|>\w+<\|message\|>', '', s)
+    s = re.sub(r'<\|end\|>', '', s)
+    s = re.sub(r'<\|start\|>', '', s)
+    return s.strip()
 
 
 def normalize(s: str) -> str:
@@ -312,7 +320,8 @@ async def collect(args):
     cats = {}
     run_start = time.time()
 
-    async with aiohttp.ClientSession() as session:
+    headers = {"Authorization": "Bearer test1234!@X"}
+    async with aiohttp.ClientSession(headers=headers) as session:
         for test in tests:
             t0 = time.time()
             response, timing = await send_prompt(session, args.url, "gemma4",
