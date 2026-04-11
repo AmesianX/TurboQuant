@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="ko">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>업무일지 2026-04-04</title>
+<title>Work Log 2026-04-08 PM</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
 <style>
@@ -346,180 +346,180 @@
 
 <!-- COVER -->
 <section class="cover">
-  <h1>TurboQuant v1.5.0</h1>
-  <p class="subtitle">업무일지 / Work Log</p>
+  <h1>TurboQuant v1.5.2+</h1>
+  <p class="subtitle">Work Log — Session 3 (PM)</p>
   <hr class="divider">
   <div class="meta">
-    <span>2026-04-04</span>
-    <span>Upstream Rebase + Gemma 4 지원</span>
+    <span>2026-04-08 Afternoon</span>
+    <span>tbq4 D=512 수정 + head_dim=64 Cross-Head WHT 돌파</span>
     <br>
-    <span>3-way merge로 전체 리베이스</span>
-    <span>head_dim=512 vec 커널</span>
+    <span>4비트 WHT 도메인 불일치 수정</span>
+    <span>MMSE Dynamic Softening</span>
+    <span>QJL Noise discovered</span>
+    <span>Pauli Test Passed</span>
     <span>AmesianX</span>
   </div>
 </section>
 
 <!-- OVERVIEW -->
 <section>
-  <h2>세션 개요</h2>
+  <h2>Session Overview</h2>
   <hr class="divider">
   <ul class="timeline">
-    <li><span class="time">오전</span> &mdash; upstream llama.cpp 최신(b7ad48ebd)으로 전체 소스 리베이스</li>
-    <li><span class="time">오전</span> &mdash; 3-way merge (diff3): base=27b93cbd1, 충돌 26개 자동 해결</li>
-    <li><span class="time">오후</span> &mdash; 빌드 성공 + GLM-4.7-Flash / Qwen3.5-27B 정상 동작 확인</li>
-    <li><span class="time">오후</span> &mdash; main 브랜치 교체 (main-old 백업), force push</li>
-    <li><span class="time">오후</span> &mdash; Gemma 4 지원: SWA 재매핑 + attn_rot_k 수정 + D=512 2-pass WHT</li>
-    <li><span class="time">저녁</span> &mdash; Gemma 4 31B Dense + 26B MoE 벤치마크</li>
-    <li><span class="time">저녁</span> &mdash; Qwen3-14B V-cache 이슈 #11 검증 (f16=TBQ 동일)</li>
-    <li><span class="time">저녁</span> &mdash; v1.5.0 릴리즈 + 커뮤니티 댓글 (#20969)</li>
-    <li><span class="time">저녁</span> &mdash; upstream 첫 자동 머지 성공 (충돌 0, 2개 파일)</li>
+    <li><span class="time">Afternoon</span> &mdash; tbqp4/tbq4 테스트 &mdash; garbage 출력 Discovery, Math Bench 돌림</li>
+    <li><span class="time">Afternoon</span> &mdash; 근본 원인: tbq4_0/tbqp4_0 D=512 인코딩에 512-point WHT 누락</li>
+    <li><span class="time">Afternoon</span> &mdash; 수정: quantize_f32_tbq4_0_block_512 + tbqp4_0_block_512 추가</li>
+    <li><span class="time">Afternoon</span> &mdash; tbqp4/tbq4 Math Bench 20/35 = f16 동점 Achieved!</li>
+    <li><span class="time">Afternoon</span> &mdash; PPL 벤치: tbqp4/tbq4 1.08x vs f16 (tbqp3/tbq3 1.19x 같은 파일 기준)</li>
+    <li><span class="time">Evening</span> &mdash; head_dim=64 도전 &mdash; cross-head WHT 재시도</li>
+    <li><span class="time">Evening</span> &mdash; global L2 norm &rarr; per-head RMS norm 수정</li>
+    <li><span class="time">Evening</span> &mdash; Dynamic Sharpening _2/_3 적용 시도 &rarr; 악화 (SQNR 값 부적절)</li>
+    <li><span class="time">Night</span> &mdash; MMSE 이론: D=64는 샤프닝이 아니라 <strong>소프트닝</strong> 필요!</li>
+    <li><span class="time">Night</span> &mdash; K=f16 V=tbq3 Experiment &rarr; 완벽 (V는 Problem 아님, K가 병목)</li>
+    <li><span class="time">Night</span> &mdash; Key Discovery: QJL이 D=64에서 K 스코어 노이즈 주범!</li>
+    <li><span class="time">Night</span> &mdash; tbqp3 &rarr; tbq3 자동 전환 (QJL 제거) &rarr; <strong>Pauli Test Passed!</strong></li>
   </ul>
 </section>
 
-<!-- UPSTREAM REBASE -->
+<!-- TBQ4 D=512 FIX -->
 <section>
-  <h2>Upstream Rebase <span class="tag tag-purple">핵심</span></h2>
+  <h2>tbq4/tbqp4 D=512 수정 <span class="tag tag-red">Bug Fix</span></h2>
   <hr class="divider">
-
   <div class="card-grid">
     <div class="card">
-      <h4>문제</h4>
+      <h4>Problem</h4>
       <ul>
-        <li>기존: upstream과 별도 히스토리</li>
-        <li>동기화 = 수백 커밋 수동 패치</li>
-        <li><code>git merge-base</code> 불가</li>
+        <li>tbq4_0/tbqp4_0 인코딩: 256-point WHT만 수행</li>
+        <li>Q 전처리: 512-point WHT 수행</li>
+        <li>WHT 도메인 불일치 &rarr; garbage 출력</li>
+        <li>tbq3는 이미 512 버전 있었음</li>
       </ul>
     </div>
     <div class="card">
-      <h4>해결</h4>
+      <h4>수정</h4>
       <ul>
-        <li>fork point: <code>27b93cbd1</code></li>
-        <li><code>diff3 -m</code> 3-way merge</li>
-        <li>TBQ overlap &rarr; ours, 비-TBQ &rarr; upstream</li>
+        <li><code>quantize_f32_tbq4_0_block_512</code> 추가</li>
+        <li><code>quantize_f32_tbqp4_0_block_512</code> 추가</li>
+        <li>set-rows.cu: head_dim&ge;512 디스패치</li>
+        <li>Math Bench 20/35 = f16 동점 &check;</li>
       </ul>
     </div>
   </div>
-
-  <div class="highlight-box green" style="margin-top:14px">
-    <strong>결과:</strong> 앞으로 <code>git fetch upstream && git merge upstream/master</code> 한 줄로 동기화. 첫 자동 머지 테스트: <strong>충돌 0개</strong>, 2개 파일 자동 합침.
-  </div>
 </section>
 
-<!-- GEMMA 4 -->
+<!-- CROSS-HEAD BREAKTHROUGH -->
 <section>
-  <h2>Gemma 4 지원 <span class="tag tag-blue">신규</span></h2>
+  <h2>Cross-Head WHT 돌파 <span class="tag tag-green">브레이크스루</span></h2>
   <hr class="divider">
-
-  <p style="font-size:0.75em; color:var(--muted); margin-bottom:14px">
-    Gemma 4: hybrid SWA &mdash; global head_dim=512 (10L) + SWA head_dim=256 (50L), 가변 GQA (16/4)
-  </p>
-
   <div class="card-grid">
     <div class="card">
-      <h4>버그 1: SWA 타입 불일치</h4>
-      <p>global head_dim=512로 매핑된 TBQ 타입이 SWA 캐시(256)에도 적용 &rarr; 크래시<br>
-      <strong>수정:</strong> <code>llama_kv_cache_iswa</code>에서 SWA head_dim 감지, 자동 재매핑</p>
+      <h4>1. Per-Head RMS Norm</h4>
+      <ul>
+        <li>이전: global L2 norm (8 head 공유)</li>
+        <li>Problem: 에너지 큰 head가 norm 지배</li>
+        <li>작은 head 정보 손실 &rarr; garbage</li>
+        <li>수정: 각 head 독립 RMS norm</li>
+      </ul>
     </div>
     <div class="card">
-      <h4>버그 2: attn_rot_k 비활성화</h4>
-      <p>가변 GQA &rarr; <code>is_n_embd_k_gqa_variable()=true</code> &rarr; WHT rotation 꺼짐 &rarr; garbage<br>
-      <strong>수정:</strong> TBQ 타입일 때 variable GQA 체크 우회</p>
-    </div>
-    <div class="card">
-      <h4>버그 3: D=512 Q WHT 미처리</h4>
-      <p>_0 타입 Q WHT가 256 단일 블록만 처리. D=512면 절반 누락<br>
-      <strong>수정:</strong> <code>n_sub_blocks = D/256</code> 루프로 2-pass</p>
-    </div>
-    <div class="card">
-      <h4>D=512 vec dispatch</h4>
-      <p><code>FATTN_VEC_CASE(512, ...)</code> 추가<br>
-      <code>get_best_fattn_kernel</code>: D&le;512 TBQ &rarr; VEC<br>
-      template instance 16개 추가</p>
+      <h4>2. QJL Noise discovered</h4>
+      <ul>
+        <li>TBQP3: 2-bit MSE + 1-bit QJL</li>
+        <li>QJL의 랜덤 프로젝션 &rarr; K 스코어 노이즈</li>
+        <li>D=256: 노이즈 작음 (무시 가능)</li>
+        <li><strong>D=64: 노이즈가 signal gap 초과!</strong></li>
+      </ul>
     </div>
   </div>
-</section>
-
-<!-- BENCHMARK GEMMA 4 -->
-<section>
-  <h2>벤치마크: Gemma 4 <span class="tag tag-green">검증</span></h2>
-  <hr class="divider">
-
-  <h3>31B-it Dense (UD-Q4_K_XL, DGX Spark GB10)</h3>
-  <table>
-    <thead><tr><th>캐시</th><th>GPU 메모리</th><th>압축</th><th>PP t/s</th><th>TG t/s</th><th>PPL</th><th>수학</th><th>파울리</th></tr></thead>
-    <tbody>
-      <tr><td>f16/f16</td><td>41,500 MiB</td><td>1.0x</td><td>152.9</td><td>10.1</td><td>309.7</td><td>42/65 (64.6%)</td><td class="ok">PASS</td></tr>
-      <tr style="background:#eff6ff"><td><strong>tbqp3/tbq3</strong></td><td><strong>23,215 MiB</strong></td><td class="ok"><strong>1.8x</strong></td><td>112.9</td><td>9.0</td><td>212.1</td><td>32/65 (49.2%)</td><td class="ok"><strong>PASS</strong></td></tr>
-    </tbody>
-  </table>
-
-  <h3 style="margin-top:20px">26B-A4B MoE (UD-Q4_K_XL, DGX Spark GB10)</h3>
-  <table>
-    <thead><tr><th>캐시</th><th>GPU 메모리</th><th>압축</th><th>TG t/s</th><th>수학</th><th>파울리</th></tr></thead>
-    <tbody>
-      <tr><td>f16/f16</td><td>5,720 MiB</td><td>1.0x</td><td>56.4</td><td>37/65 (56.9%)</td><td class="ok">PASS</td></tr>
-      <tr style="background:#eff6ff"><td><strong>tbqp3/tbq3</strong></td><td><strong>1,106 MiB</strong></td><td class="ok"><strong>5.2x</strong></td><td>41.1</td><td>30/65 (46.2%)</td><td class="ok"><strong>PASS</strong></td></tr>
-    </tbody>
-  </table>
-
-  <div class="highlight-box blue" style="margin-top:14px">
-    65개 테스트 중 f16과 TBQ는 <strong>55개(Dense)/58개(MoE)에서 동일한 결과</strong>. 차이는 작은 수치 오차 (예: 160&rarr;150, 519&rarr;509).
-  </div>
-</section>
-
-<!-- QWEN3-14B -->
-<section>
-  <h2>이슈 #11 검증: Qwen3-14B <span class="tag tag-green">해결</span></h2>
-  <hr class="divider">
-
-  <p style="font-size:0.75em; color:var(--muted); margin-bottom:14px">
-    V-cache 정밀도 버그 보고 &mdash; Rust bindings, head_dim=128, 1500t+ recall 저하 주장
-  </p>
-
-  <table>
-    <thead><tr><th>캐시</th><th>수학 정확도</th><th>KV 메모리</th></tr></thead>
-    <tbody>
-      <tr><td>f16/f16</td><td>22/65 (33.8%)</td><td>20,480 MiB</td></tr>
-      <tr style="background:#eff6ff"><td><strong>tbqp3/tbq3</strong></td><td class="ok"><strong>22/65 (33.8%)</strong></td><td><strong>8,160 MiB</strong></td></tr>
-    </tbody>
-  </table>
-
   <div class="highlight-box green" style="margin-top:14px">
-    <strong>결과:</strong> f16과 TBQ <strong>완벽 동일 정확도</strong>. divergent 18개 중 f16 9승, TBQ 9승. 모델 자체 한계(33.8%)이지 TBQ 문제 아님. <strong>메모리 2.5배 절약.</strong>
+    <strong>해법:</strong> head_dim=64에서 K를 tbqp3 &rarr; tbq3 자동 전환. 3비트 전부 Lloyd-Max centroid에 투자. SQNR 2.3배 향상 (3.45 &rarr; 7.8).
   </div>
 </section>
 
-<!-- ISSUE RESPONSE -->
+<!-- MMSE SOFTENING -->
 <section>
-  <h2>이슈 대응 <span class="tag tag-blue">커뮤니티</span></h2>
+  <h2>MMSE Dynamic Softening <span class="tag tag-purple">이론</span></h2>
   <hr class="divider">
-
-  <table>
-    <thead><tr><th>#</th><th>제목</th><th>대응</th><th>상태</th></tr></thead>
+  <div class="card-grid">
+    <div class="card">
+      <h4>D&ge;256: 샤프닝 (α &gt; 1)</h4>
+      <ul>
+        <li>SQNR 높음 &rarr; 올바른 토큰이 거의 항상 1등</li>
+        <li>softmax 약간 평탄화 &rarr; α로 보정</li>
+        <li><code>&alpha;(N) = 1 + c &times; &radic;(ln N)</code></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>D=64: 소프트닝 (α &lt; 1)</h4>
+      <ul>
+        <li>SQNR 낮음 &rarr; 노이즈가 순위 뒤집음</li>
+        <li>샤프닝하면 잘못된 답에 올인</li>
+        <li><code>&alpha;(N) = SQNR / (SQNR + &radic;(ln N / ln N₀))</code></li>
+      </ul>
+    </div>
+  </div>
+  <table style="margin-top:14px">
+    <thead><tr><th>타입</th><th>SQNR</th><th>&alpha;(N=10)</th><th>&alpha;(N=2048)</th><th>&alpha;(N=131K)</th></tr></thead>
     <tbody>
-      <tr><td>#11</td><td>V-cache 정밀도 (Qwen3-14B)</td><td>벤치 돌려서 f16=TBQ 증명</td><td class="ok">답변</td></tr>
-      <tr><td>#12</td><td>Metal GPU 지원 요청</td><td>CUDA 전용, 2200줄+ 포팅 필요 설명</td><td class="ok">답변</td></tr>
-      <tr><td>#9</td><td>Gemma 4 지원 요청</td><td>구현 완료, 벤치마크 게시</td><td class="ok">닫음</td></tr>
-      <tr><td>#6</td><td>Gemma 4 지원 (중복)</td><td>#9 참조</td><td class="ok">닫음</td></tr>
-      <tr><td>#20969</td><td>llama.cpp 디스커션</td><td>v1.5.0 벤치 + 대결표 게시</td><td class="ok">게시</td></tr>
+      <tr><td>TBQP3 _2/_3</td><td>3.45</td><td>0.863</td><td class="ok">0.775</td><td>0.735</td></tr>
+      <tr><td>TBQ3 _2/_3</td><td>7.80</td><td>0.934</td><td class="ok">0.886</td><td>0.863</td></tr>
+      <tr><td>TBQ4 _2/_3</td><td>14.05</td><td>0.963</td><td class="ok">0.934</td><td>0.919</td></tr>
     </tbody>
   </table>
 </section>
 
-<!-- METRICS -->
+<!-- ISOLATION TEST -->
 <section>
-  <h2>v1.5.0 성과 요약</h2>
+  <h2>K vs V 분리 Experiment <span class="tag tag-blue">검증</span></h2>
   <hr class="divider">
-
-  <div class="card-grid" style="grid-template-columns:1fr 1fr 1fr 1fr">
-    <div class="metric"><div class="num green">5.2x</div><div class="label">Gemma 4 MoE 압축</div></div>
-    <div class="metric"><div class="num blue">0</div><div class="label">upstream 머지 충돌</div></div>
-    <div class="metric"><div class="num purple">5</div><div class="label">지원 아키텍처</div></div>
-    <div class="metric"><div class="num green">4/4</div><div class="label">파울리 PASS</div></div>
+  <table>
+    <thead><tr><th>K</th><th>V</th><th>파울리 테스트</th><th>결론</th></tr></thead>
+    <tbody>
+      <tr><td>f16</td><td>f16</td><td class="ok">✅ 완벽</td><td>기준</td></tr>
+      <tr><td>f16</td><td>tbq3_2</td><td class="ok">✅ 완벽</td><td><strong>V는 Problem 아님</strong></td></tr>
+      <tr><td>tbqp3_3</td><td>f16</td><td class="ng">❌ 루프</td><td><strong>K가 병목</strong></td></tr>
+      <tr><td>tbqp3_3</td><td>tbq3_2</td><td class="ng">❌ 루프</td><td>K 노이즈 확인</td></tr>
+      <tr style="background:#ecfdf5"><td><strong>tbq3_3</strong></td><td>tbq3_2</td><td class="ok"><strong>✅ 통과!</strong></td><td><strong>QJL 제거 = Solution</strong></td></tr>
+    </tbody>
+  </table>
+  <div class="highlight-box green" style="margin-top:14px">
+    <strong>결론:</strong> V는 3비트로 충분. K에서 QJL을 빼고 순수 3비트 Lloyd-Max를 쓰면 head_dim=64에서도 동작.
   </div>
+</section>
 
-  <div class="highlight-box purple" style="margin-top:20px">
-    <strong>남은 작업:</strong> Gemma 4 수학 정확도 개선 (tbq4 4-bit 테스트), MMA 텐서코어 D=512 이식, upstream 정기 동기화 (1-2주 간격)
+<!-- SQNR COMPARISON -->
+<section>
+  <h2>TBQP3 vs TBQ3 K 스코어 품질 <span class="tag tag-purple">수학</span></h2>
+  <hr class="divider">
+  <table>
+    <thead><tr><th>타입</th><th>구조</th><th>Score SQNR (D=64)</th><th>노이즈/시그널</th></tr></thead>
+    <tbody>
+      <tr><td><strong>TBQ3</strong></td><td>3-bit Lloyd-Max (8 centroid)</td><td class="ok"><strong>7.8</strong></td><td class="ok"><strong>35.8%</strong></td></tr>
+      <tr><td>TBQP3</td><td>2-bit MSE + 1-bit QJL</td><td class="ng">3.45</td><td class="ng">53.8%</td></tr>
+    </tbody>
+  </table>
+  <div class="highlight-box purple" style="margin-top:14px">
+    <strong>Key:</strong> QJL의 1-bit 랜덤 프로젝션은 K reconstruction MSE를 줄이지만 attention score에 <strong>두 번째 노이즈 소스</strong>를 추가. D=256에서는 무시 가능하지만 D=64에서는 signal gap(~1.0)을 초과(1.67). TBQ3로 3비트 전부 centroid에 투자하면 max noise=1.11로 gap 이내.
+  </div>
+</section>
+
+<!-- RESULTS -->
+<section>
+  <h2>최종 Result <span class="tag tag-green">Achieved</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li>tbq4/tbqp4 D=512: WHT 도메인 불일치 수정, Math Bench 20/35 = f16 동점</li>
+    <li>head_dim=64 cross-head: per-head RMS norm으로 양자화 품질 Restored</li>
+    <li>K QJL Noise discovered: tbqp3 &rarr; tbq3 자동 전환으로 SQNR 2.3배 향상</li>
+    <li>MMSE Dynamic Softening: D&ge;256 샤프닝 / D=64 소프트닝 이론 통합</li>
+    <li>GPT OSS 120B (head_dim=64) 파울리 테스트 <strong>통과</strong></li>
+    <li>릴리즈 워크플로우 수정 (master&rarr;main, 아키텍처별 빌드)</li>
+  </ul>
+  <div class="card-grid" style="grid-template-columns:1fr 1fr 1fr 1fr; margin-top:20px">
+    <div class="metric"><div class="num green">D=64</div><div class="label">cross-head 동작</div></div>
+    <div class="metric"><div class="num blue">2.3x</div><div class="label">SQNR 향상 (QJL 제거)</div></div>
+    <div class="metric"><div class="num purple">α&lt;1</div><div class="label">MMSE 소프트닝</div></div>
+    <div class="metric"><div class="num green">PASS</div><div class="label">파울리 테스트</div></div>
   </div>
 </section>
 
