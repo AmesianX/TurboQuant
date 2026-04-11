@@ -1,0 +1,102 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{turboquant2026}
+\citation{turboquant2026}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Background}{1}{section.2}\protected@file@percent }
+\newlabel{sec:background}{{2}{1}{Background}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}TurboQuant}{1}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{1. Randomized WHT.}{1}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{2. Lloyd-Max Quantization.}{2}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{3. QJL Correction (optional).}{2}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Decoding.}{2}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Flash Attention Vector Kernel}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}System Design}{2}{section.3}\protected@file@percent }
+\newlabel{sec:design}{{3}{2}{System Design}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Query Preprocessing: GPU-Side WHT}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{$d=256$ (128 threads, 2 elements each).}{2}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{$d=512$ (128 threads, 4 elements each).}{2}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}K Scoring: WHT-Domain Dot Product}{2}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}V Accumulation and IWHT Decode}{2}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Per-Block vs.\ Global Normalization}{2}{subsection.3.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Dynamic Attention Sharpening}{2}{section.4}\protected@file@percent }
+\newlabel{sec:sharpening}{{4}{2}{Dynamic Attention Sharpening}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}The Softmax Flattening Problem}{2}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Derivation of $\alpha (N)$}{3}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{MMSE Condition.}{3}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{EVT Correction.}{3}{section*.9}\protected@file@percent }
+\newlabel{eq:alpha}{{6}{3}{EVT Correction}{equation.4.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Per-Type Coefficients}{3}{subsection.4.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Sharpening coefficients. TBQP types have lower effective SQNR because the QJL random projection adds a second noise source to the attention score.}}{3}{table.caption.10}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{tab:alpha}{{1}{3}{Sharpening coefficients. TBQP types have lower effective SQNR because the QJL random projection adds a second noise source to the attention score}{table.caption.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Properties}{3}{subsection.4.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Half-Precision Pathology in Flash Attention}{3}{section.5}\protected@file@percent }
+\newlabel{sec:precision}{{5}{3}{Half-Precision Pathology in Flash Attention}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}The Bug}{3}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Loss 1: VKQ Accumulation.}{3}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Loss 2: Shared Memory Staging.}{3}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Loss 3: WHT Amplification.}{3}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Manifestation}{3}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}The Fix}{3}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Impact}{4}{subsection.5.4}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Perplexity improvement from forcing FP32 accumulation.}}{4}{table.caption.14}\protected@file@percent }
+\newlabel{tab:precision}{{2}{4}{Perplexity improvement from forcing FP32 accumulation}{table.caption.14}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Engineering Framework}{4}{section.6}\protected@file@percent }
+\newlabel{sec:engineering}{{6}{4}{Engineering Framework}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Type System}{4}{subsection.6.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces TBQ block size variants. Each has TBQ3/TBQ4/TBQP3/TBQP4 sub-types (3-bit, 4-bit, with/without QJL).}}{4}{table.caption.15}\protected@file@percent }
+\newlabel{tab:types}{{3}{4}{TBQ block size variants. Each has TBQ3/TBQ4/TBQP3/TBQP4 sub-types (3-bit, 4-bit, with/without QJL)}{table.caption.15}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Double WHT Per-Head (\_3 Types, $d=64$)}{4}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Replacement: Double WHT per-head.}{4}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{QJL critical at $d=64$.}{4}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}MMSE Dynamic Softening ($d=64$)}{4}{subsection.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Asymmetric K/V Dimensions}{4}{subsection.6.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}SWA F16 Bypass}{4}{subsection.6.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.6}V Rotation Incompatibility}{5}{subsection.6.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Development Timeline}{5}{section.7}\protected@file@percent }
+\newlabel{sec:timeline}{{7}{5}{Development Timeline}{section.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{v1.4.0 (Apr 1--3): Foundation + GLM 576.}{5}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{v1.5.0 (Apr 4): Upstream Rebase + Gemma 4.}{5}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{v1.5.1 (Apr 4, PM): SWA F16 Bypass.}{5}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{v1.5.2 Session 1 (Apr 7): Attention Sharpening.}{5}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{v1.5.2 Session 2 (Apr 7--8): Precision Fix.}{5}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{v1.5.3 (Apr 11--12): Double WHT for $d=64$ + Side Buffer Experiment.}{5}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Experimental Results}{5}{section.8}\protected@file@percent }
+\newlabel{sec:results}{{8}{5}{Experimental Results}{section.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Perplexity}{5}{subsection.8.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Progressive PPL improvement from v1.5.1 to v1.5.2.}}{5}{table.caption.24}\protected@file@percent }
+\newlabel{tab:ppl_progress}{{4}{5}{Progressive PPL improvement from v1.5.1 to v1.5.2}{table.caption.24}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Math Accuracy}{5}{subsection.8.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Math benchmark results. On Gemma 4, TBQ peak (23) exceeds FP16 best (21). On GPT-OSS 120B ($d=64$), TBQ4 K achieves f16-equivalent 35/35; TBQP3\_3 supports Korean conversation but lacks matrix precision.}}{5}{table.caption.25}\protected@file@percent }
+\newlabel{tab:math}{{5}{5}{Math benchmark results. On Gemma 4, TBQ peak (23) exceeds FP16 best (21). On GPT-OSS 120B ($d=64$), TBQ4 K achieves f16-equivalent 35/35; TBQP3\_3 supports Korean conversation but lacks matrix precision}{table.caption.25}{}}
+\citation{kivi2024}
+\citation{kvquant2024}
+\citation{qjl2024}
+\citation{dao2022flashattention}
+\citation{dao2023flashattention2}
+\citation{smoothquant2023}
+\bibstyle{plain}
+\bibcite{turboquant2026}{1}
+\bibcite{dao2022flashattention}{2}
+\bibcite{dao2023flashattention2}{3}
+\bibcite{kivi2024}{4}
+\bibcite{kvquant2024}{5}
+\bibcite{qjl2024}{6}
+\bibcite{smoothquant2023}{7}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Memory}{6}{subsection.8.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces KV cache memory at 262K context (Gemma 4 26B MoE).}}{6}{table.caption.26}\protected@file@percent }
+\newlabel{tab:memory}{{6}{6}{KV cache memory at 262K context (Gemma 4 26B MoE)}{table.caption.26}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}Determinism}{6}{subsection.8.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{6}{section.9}\protected@file@percent }
+\newlabel{sec:related}{{9}{6}{Related Work}{section.9}{}}
+\@writefile{toc}{\contentsline {paragraph}{KV Cache Quantization.}{6}{section*.27}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{QJL.}{6}{section*.28}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Flash Attention.}{6}{section*.29}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Attention Score Correction.}{6}{section*.30}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Conclusion}{6}{section.10}\protected@file@percent }
+\newlabel{sec:conclusion}{{10}{6}{Conclusion}{section.10}{}}
+\gdef \@abspage@last{6}

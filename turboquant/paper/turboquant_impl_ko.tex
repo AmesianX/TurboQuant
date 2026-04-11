@@ -40,7 +40,7 @@ AmesianX\\
 
 % ============================================================
 \begin{abstract}
-본 논문은 Walsh-Hadamard Transform(WHT)과 Lloyd-Max 양자화 기반 KV 캐시 압축 방법인 TurboQuant을, 가장 널리 배포된 오픈소스 LLM 추론 엔진 llama.cpp에 세계 최초로 프로덕션 수준으로 구현한 결과를 제시한다. 본 구현은 KV 캐시를 요소당 3비트로 압축하여 Gemma~4 26B 모델에서 FP16 대비 \textbf{4.2배 메모리 절감}과 \textbf{6\% perplexity 저하}만을 달성했다. 원본 논문의 충실한 구현을 넘어 세 가지 독창적 기여를 한다: (1)~MMSE와 극치 통계학(EVT)에서 유도한 \emph{동적 어텐션 샤프닝} 공식 $\alpha(N) = 1 + c\sqrt{\ln N}$; (2)~flash attention 커널의 \emph{반정밀도 누적 버그} 발견 및 해결 — FP16 산술의 정밀도 손실이 IWHT 버터플라이에 의해 증폭되어 MoE expert routing이 비결정적으로 동작하는 문제; (3)~5개 head dimension(64--576)에 걸친 20개 양자화 타입 변형, cross-head WHT, 비대칭 K/V 구성을 지원하는 완전한 엔지니어링 프레임워크. 전체 구현을 \url{https://github.com/AmesianX/TurboQuant}에 오픈소스로 공개한다.
+본 논문은 Walsh-Hadamard Transform(WHT)과 Lloyd-Max 양자화 기반 KV 캐시 압축 방법인 TurboQuant을, 가장 널리 배포된 오픈소스 LLM 추론 엔진 llama.cpp에 세계 최초로 프로덕션 수준으로 구현한 결과를 제시한다. 본 구현은 KV 캐시를 요소당 3비트로 압축하여 Gemma~4 26B 모델에서 FP16 대비 \textbf{4.2배 메모리 절감}과 \textbf{6\% perplexity 저하}만을 달성했다. 원본 논문의 충실한 구현을 넘어 세 가지 독창적 기여를 한다: (1)~MMSE와 극치 통계학(EVT)에서 유도한 \emph{동적 어텐션 샤프닝} 공식 $\alpha(N) = 1 + c\sqrt{\ln N}$; (2)~flash attention 커널의 \emph{반정밀도 누적 버그} 발견 및 해결 — FP16 산술의 정밀도 손실이 IWHT 버터플라이에 의해 증폭되어 MoE expert routing이 비결정적으로 동작하는 문제; (3)~5개 head dimension(64--576)에 걸친 20개 양자화 타입 변형, double WHT per-head, 비대칭 K/V 구성을 지원하는 완전한 엔지니어링 프레임워크. 전체 구현을 \url{https://github.com/AmesianX/TurboQuant}에 오픈소스로 공개한다.
 \end{abstract}
 
 % ============================================================
@@ -58,7 +58,7 @@ AmesianX\\
 
 \item \textbf{반정밀도 병리학} (\S\ref{sec:precision}): 업스트림 flash attention 커널의 FP16(\texttt{half2}) 누적 경로가 정밀도 손실을 야기하고, 이것이 IWHT 버터플라이에 의해 \emph{증폭}되어 MoE expert routing에서 치명적 비결정성을 초래함을 발견하고 해결했다. TBQ 밸류 타입에 FP32 누적을 강제하여 perplexity가 2\% 개선되었다.
 
-\item \textbf{다중 변형 엔지니어링} (\S\ref{sec:engineering}): 블록 크기 64--576에 걸친 20개 TBQ/TBQP 타입 변형을 구현했다. cross-head WHT($H_8 \otimes H_{64}$), 비대칭 K/V dimension(GLM 576/512), 블록별 vs.\ 전역 정규화, QJL 잔차 보정을 포함하며, 모두 템플릿 인스턴스화된 flash attention 프레임워크 내에서 동작한다.
+\item \textbf{다중 변형 엔지니어링} (\S\ref{sec:engineering}): 블록 크기 64--576에 걸친 20개 TBQ/TBQP 타입 변형을 구현했다. double WHT per-head($d=64$), 비대칭 K/V dimension(GLM 576/512), 블록별 vs.\ 전역 정규화, QJL 잔차 보정을 포함하며, 모두 템플릿 인스턴스화된 flash attention 프레임워크 내에서 동작한다.
 \end{enumerate}
 
 % ============================================================
@@ -229,7 +229,7 @@ half2 경로 (수정 전) & 454.7 & 1.08$\times$ \\
 \_0 & 256 & 256, 512 & 주력 타입 \\
 \_1 & 128 & 128 & 표준 트랜스포머 \\
 \_2 & 64  & 64  & 소형 head 모델 \\
-\_3 & 64  & 64  & Cross-head WHT \\
+\_3 & 64  & 64  & Double WHT per-head \\
 \_4 & 576 & 576 & GLM 분할 256+256+64 \\
 \bottomrule
 \end{tabular}
@@ -238,7 +238,7 @@ half2 경로 (수정 전) & 454.7 & 1.08$\times$ \\
 
 \subsection{Double WHT Per-Head (\_3 타입, $d=64$)}
 
-\textbf{참고:} 이전 버전에서 기술한 cross-head WHT 접근법($H_{512} = H_8 \otimes H_{64}$)은 Q-K 도메인 불일치로 인해 \textbf{폐기}되었다. Q는 64차원 per-head 공간에서 동작하는 반면 K는 512차원 cross-head 공간에 있어 어떤 IWHT 복원도 이 간극을 해소할 수 없었다.
+\textbf{참고:} 이전 버전에서 기술한 double WHT per-head 접근법($H_{512} = H_8 \otimes H_{64}$)은 Q-K 도메인 불일치로 인해 \textbf{폐기}되었다. Q는 64차원 per-head 공간에서 동작하는 반면 K는 512차원 cross-head 공간에 있어 어떤 IWHT 복원도 이 간극을 해소할 수 없었다.
 
 \paragraph{대체: Double WHT per-head.} 서로 다른 부호 패턴으로 WHT를 두 라운드 적용한다: $S_1 \to \text{WHT}_{64} \to S_2 \to \text{WHT}_{64}$. 이를 통해 첨도(kurtosis) $0.375 \to 0.047$ (거의 가우시안)을 달성하며, 단일 WHT보다 훨씬 우수한 탈상관을 보인다. Q와 K 모두 동일한 double WHT를 거치므로 Parseval 정리가 직접 적용되어 역변환이 불필요하다. 속도 영향은 무시할 수 있는 수준이다 (head당 $\sim$384 FLOP 추가).
 
