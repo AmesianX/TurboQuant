@@ -43,8 +43,8 @@
 6. **Removed 1.15x V hack**: Replaced by principled attention sharpening.
 7. **Fixed tbq4_0 D=512 OOB read**.
 8. **Fixed tbq4/tbqp4 D=512 WHT domain mismatch**: K encoding used 256-point WHT while Q used 512-point WHT. Added 512-point encode functions.
-9. **Cross-head WHT per-head norm (head_dim=64)**: Global L2 norm destroyed small heads' quantization quality. Changed to per-head RMS norm after 512-point WHT.
-10. **head_dim=64 K: auto QJL removal**: QJL adds score noise that exceeds signal gap at D=64. K automatically remapped from tbqp3→tbq3 (pure 3-bit Lloyd-Max) for maximum K score precision. V keeps original type.
+9. **Double WHT per-head (head_dim=64)**: Cross-head 512-point WHT abandoned (Q-K domain mismatch). Replaced with S1→WHT64→S2→WHT64 double WHT per-head. Kurtosis 0.375→0.047 (near-Gaussian). Q and K in same domain — no IWHT needed.
+10. **head_dim=64 K: TBQP3_3 (QJL enabled)**: QJL 1-bit correction critical for multi-turn stability (7+ turns verified). K auto-mapped to TBQP3_3 (2-bit Lloyd-Max + 1-bit QJL + double WHT).
 11. **Dynamic MMSE softening (head_dim=64)**: α(N) = SQNR/(SQNR + √(ln N/ln N₀)), opposite of sharpening — reduces overconfidence when SQNR is low.
 
 ### Attention Sharpening — Theory & Dynamic α Formula
