@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Work Log 2026-04-11~12</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root { --bg:#fafbfc; --fg:#1a1a2e; --accent:#3b82f6; --accent2:#8b5cf6; --success:#10b981; --warning:#f59e0b; --danger:#ef4444; --muted:#64748b; --card-bg:#ffffff; --border:#e2e8f0; }
+  .reveal { font-family:'Noto Sans KR',sans-serif; font-size:28px; color:var(--fg); }
+  .reveal .slides { text-align:left; }
+  .reveal .slides section { padding:40px 50px; box-sizing:border-box; }
+  .reveal h1,.reveal h2,.reveal h3 { font-family:'Noto Sans KR',sans-serif; font-weight:700; color:var(--fg); text-transform:none; letter-spacing:-0.02em; }
+  .reveal h1 { font-size:2.0em; margin-bottom:0.2em; }
+  .reveal h2 { font-size:1.4em; margin-bottom:0.5em; }
+  .reveal h3 { font-size:1.1em; margin-bottom:0.4em; color:var(--accent); }
+  .cover { text-align:center!important; display:flex!important; flex-direction:column; align-items:center; justify-content:center; }
+  .cover h1 { font-size:2.2em; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; margin-bottom:0.1em; }
+  .cover .subtitle { font-size:1.0em; color:var(--muted); font-weight:300; margin-bottom:1.5em; }
+  .cover .meta { font-size:0.7em; color:var(--muted); line-height:1.8; }
+  .cover .meta span { display:inline-block; background:#f1f5f9; padding:4px 14px; border-radius:20px; margin:3px 4px; }
+  .divider { width:60px; height:3px; background:linear-gradient(90deg,var(--accent),var(--accent2)); border:none; border-radius:2px; margin:10px 0 20px 0; }
+  .cover .divider { margin:10px auto 20px auto; }
+  .tag { display:inline-block; font-size:0.55em; font-weight:500; padding:2px 10px; border-radius:12px; vertical-align:middle; margin-left:8px; }
+  .tag-blue { background:#dbeafe; color:#1d4ed8; } .tag-green { background:#d1fae5; color:#065f46; } .tag-red { background:#fee2e2; color:#991b1b; } .tag-purple { background:#ede9fe; color:#5b21b6; }
+  .items { list-style:none; padding:0; margin:0; }
+  .items li { position:relative; padding-left:20px; margin-bottom:10px; font-size:0.78em; line-height:1.7; }
+  .items li::before { content:''; position:absolute; left:0; top:10px; width:8px; height:8px; border-radius:2px; background:var(--accent); opacity:0.6; }
+  .card-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:12px; }
+  .card { background:var(--card-bg); border:1px solid var(--border); border-radius:10px; padding:18px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin:0 0 8px 0; font-size:0.75em; font-weight:700; color:var(--fg); }
+  .card p,.card ul { margin:0; font-size:0.65em; line-height:1.7; color:#475569; }
+  .card ul { padding-left:16px; }
+  .highlight-box { border-left:4px solid; border-radius:6px; padding:14px 18px; margin:14px 0; font-size:0.78em; line-height:1.7; }
+  .highlight-box.blue { border-color:var(--accent); background:#eff6ff; }
+  .highlight-box.green { border-color:var(--success); background:#ecfdf5; }
+  .highlight-box.red { border-color:var(--danger); background:#fef2f2; }
+  .highlight-box.purple { border-color:var(--accent2); background:#f5f3ff; }
+  .reveal code { font-family:'JetBrains Mono',monospace; font-size:0.88em; background:#f1f5f9; padding:1px 6px; border-radius:4px; color:var(--accent2); }
+  .reveal table { width:100%; border-collapse:collapse; font-size:0.65em; margin-top:10px; }
+  .reveal table th { background:#f8fafc; font-weight:600; text-align:left; padding:8px 12px; border-bottom:2px solid var(--border); color:var(--muted); font-size:0.9em; text-transform:uppercase; letter-spacing:0.05em; }
+  .reveal table td { padding:8px 12px; border-bottom:1px solid var(--border); line-height:1.5; }
+  .reveal table .ok { color:var(--success); font-weight:600; }
+  .reveal table .ng { color:var(--danger); font-weight:600; }
+  .metric { text-align:center; padding:10px; }
+  .metric .num { font-size:2.0em; font-weight:700; line-height:1.1; }
+  .metric .label { font-size:0.6em; color:var(--muted); margin-top:4px; }
+  .metric .num.blue { color:var(--accent); } .metric .num.green { color:var(--success); } .metric .num.purple { color:var(--accent2); } .metric .num.red { color:var(--danger); }
+  @media print { .reveal .slides section { page-break-after:always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>TurboQuant v1.5.3</h1>
+  <p class="subtitle">Work Log — Side Buffer Experiment + Double WHT Integration</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-11 ~ 04-12</span>
+    <span>GPT-OSS 120B · head_dim=64</span>
+    <br>
+    <span>f16 Side Buffer 35/35</span>
+    <span>src1 인덱스 버그 발견</span>
+    <span>3+1비트 Idea</span>
+    <span>TBQ4 35/35 검증</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>Session Overview</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>Goal</h4>
+      <p>Improve TBQP3_3 (3-bit K) math precision.<br>Achieve f16 K equivalent quality.</p>
+    </div>
+    <div class="card">
+      <h4>Results</h4>
+      <p>Side buffer experiment achieved 35/35.<br>TBQP3_3 original: Korean ✅, math ❌<br>TBQ4 recommended: 35/35 ✅</p>
+    </div>
+    <div class="card">
+      <h4>Key Discovery</h4>
+      <p><strong>src1 index mapping</strong> — side buffer must use same KV position mapping as set-rows.</p>
+    </div>
+    <div class="card">
+      <h4>Idea</h4>
+      <p><strong>3+1 bit split</strong> — VRAM 3-bit + system RAM 1-bit = 4-bit quality.</p>
+    </div>
+  </div>
+</section>
+
+<!-- SIDE BUFFER EXPERIMENT -->
+<section>
+  <h2>f16 Side Buffer Experiment <span class="tag tag-green">35/35</span></h2>
+  <hr class="divider">
+  <div class="highlight-box green">
+    Intercept original K as f16 before quantization into a separate buffer. Attention reads f16 instead of quantized data.
+  </div>
+  <ul class="items">
+    <li><strong>Phase 1~3:</strong> WHT 도메인 f16 → raw f16 → generation 포함 → 수제 dot product</li>
+    <li><strong>Phase 4~5:</strong> sharpening, *D/D 보상, Q WHT 스킵 → 효과 미미</li>
+    <li><strong>Phase 6:</strong> f16 커널 redirect (fattn.tu에서 K→F16 override) → 거의 성공</li>
+    <li><strong>Phase 7:</strong> 값 비교 디버깅 → <strong>src1 인덱스 누락</strong> 발견!</li>
+    <li><strong>Phase 8:</strong> src1 적용 → <strong>35/35 math bench, Multi-turn 성공</strong></li>
+  </ul>
+</section>
+
+<!-- SRC1 BUG -->
+<section>
+  <h2>Root Cause: src1 Index <span class="tag tag-red">BUG</span></h2>
+  <hr class="divider">
+  <div class="highlight-box red">
+    set-rows stores at specific KV cache positions via <code>src1[i]</code>.<br>
+    side buffer stored sequentially (0,1,2...) → <strong>position mismatch</strong>.
+  </div>
+  <table>
+    <tr><th>Component</th><th>Before</th><th>After</th></tr>
+    <tr><td>KV 캐시</td><td>src1[0]=5 → position 5</td><td>Same</td></tr>
+    <tr><td>Side buffer</td><td class="ng">token 0 → position 0 ✗</td><td class="ok">token 0 → position 5 ✓</td></tr>
+  </table>
+  <div class="highlight-box blue">
+    <strong>Lesson:</strong> Measure, don't guess. Found by directly comparing f16 vs side buffer values.
+  </div>
+</section>
+
+<!-- 3+1 BIT IDEA -->
+<section>
+  <h2>3+1비트 분할 Idea <span class="tag tag-purple">미구현</span></h2>
+  <hr class="divider">
+  <div class="highlight-box purple">
+    VRAM 3-bit (engineering pride) + system RAM 1-bit = 4-bit quality
+  </div>
+  <table>
+    <tr><th>Mode</th><th>VRAM</th><th>RAM</th><th>Quality</th><th>Speed Impact</th></tr>
+    <tr><td>3+0</td><td>3비트</td><td>0</td><td>cos 0.945</td><td>None</td></tr>
+    <tr><td><strong>3+1</strong></td><td>3비트</td><td>1비트</td><td>cos ~0.990</td><td>0.025ms</td></tr>
+    <tr><td>3+5</td><td>3비트</td><td>5비트</td><td>q8_0급</td><td>0.125ms</td></tr>
+    <tr><td>3+13</td><td>3비트</td><td>13비트</td><td>f16급</td><td>0.31ms</td></tr>
+  </table>
+  <p style="font-size:0.7em; color:var(--muted);">TBQ4 = 35/35 검증 → 3+1비트로 Same Quality 기대. cudaHostAlloc zero-copy 사용.</p>
+</section>
+
+<!-- MATH BENCH -->
+<section>
+  <h2>Math Bench Results <span class="tag tag-blue">35문제</span></h2>
+  <hr class="divider">
+  <table>
+    <tr><th>Config</th><th>K 캐시</th><th>V 캐시</th><th>Math</th><th>한글</th><th>Multi-turn</th></tr>
+    <tr><td>f16/f16</td><td>f16</td><td>f16</td><td class="ok">35/35</td><td class="ok">✅</td><td class="ok">✅</td></tr>
+    <tr><td>side buffer</td><td>f16 (side)</td><td>tbq3_2</td><td class="ok">35/35</td><td class="ok">✅</td><td class="ok">✅</td></tr>
+    <tr><td><strong>tbq4/tbq3</strong></td><td>tbq4_2</td><td>tbq3_2</td><td class="ok">35/35</td><td class="ok">✅</td><td class="ok">✅</td></tr>
+    <tr><td>tbqp3/tbq3</td><td>tbqp3_3</td><td>tbq3_2</td><td class="ng">❌</td><td class="ok">✅</td><td class="ok">✅ (9턴+)</td></tr>
+  </table>
+  <div class="highlight-box green">
+    <strong>Recommended:</strong> <code>--cache-type-k tbq4 --cache-type-v tbq3</code> → 35/35 Math + 한글 + Multi-turn
+  </div>
+</section>
+
+<!-- CODE CHANGES -->
+<section>
+  <h2>v1.5.3 Code Changes</h2>
+  <hr class="divider">
+  <ul class="items">
+    <li><strong>common.cpp:</strong> head_dim=64 K → TBQP3_3 매핑 (QJL 재활성화)</li>
+    <li><strong>fattn-vec.cuh:</strong> is_cross_head_K=false, is_double_wht_K 플래그, Q Round 2, /D 보상</li>
+    <li><strong>cpy-utils.cuh:</strong> K 인코딩 double WHT per-head (512-point cross-head 폐기)</li>
+    <li><strong>fattn.cu:</strong> TBQ_TUNING D=64 전체 인스턴스 디스패치</li>
+    <li><strong>CMakeLists.txt:</strong> TBQ_TUNING D=64 인스턴스 파일 등록</li>
+    <li><strong>ggml.h + 인스턴스 24개:</strong> 주석 cross-head → double WHT per-head</li>
+    <li><strong>논문 tex/PDF:</strong> Cross-head 섹션 폐기, double WHT 교체</li>
+  </ul>
+</section>
+
+<!-- BRANCHES -->
+<section>
+  <h2>Git Status</h2>
+  <hr class="divider">
+  <table>
+    <tr><th>브랜치</th><th>Content</th><th>Status</th></tr>
+    <tr><td><code>main</code></td><td>v1.5.3 + upstream merge</td><td class="ok">pushed</td></tr>
+    <tr><td><code>experiment/side-buffer-f16</code></td><td>f16 side buffer 35/35</td><td class="ok">pushed</td></tr>
+    <tr><td><code>v1.5.3</code> 태그</td><td>release tag</td><td class="ok">pushed</td></tr>
+  </table>
+  <div class="highlight-box blue">
+    CI: CUDA 온리 워크플로우 (Windows CUDA 12.4/13.1 + Linux Docker CUDA 12.8)<br>
+    아키텍처: sm_70 (V100), sm_80 (A100), sm_86 (3090Ti), sm_89 (4090), sm_90 (H100), sm_100/120 (5090)
+  </div>
+</section>
+
+<!-- NEXT -->
+<section>
+  <h2>Next Steps</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>TBQP3_3 Math 개선</h4>
+      <ul>
+        <li>Achieve matrix precision with 3-bit K</li>
+        <li>Retune sharpening/softening</li>
+        <li>Leverage side buffer experiment findings</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>3+1 Bit Implementation</h4>
+      <ul>
+        <li>VRAM 3비트 + RAM 1비트</li>
+        <li>cudaHostAlloc zero-copy</li>
+        <li>Modify vec_dot (dual memory read)</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Multi-turn 안정성</h4>
+      <ul>
+        <li>Investigate channel tag parser issue</li>
+        <li>LCP caching + side buffer integration</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>CI/Release</h4>
+      <ul>
+        <li>Verify workflow builds</li>
+        <li>Binary release distribution</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash:true, slideNumber:'c/t', width:1280, height:720, margin:0.04, transition:'fade', transitionSpeed:'fast' });</script>
+</body>
+</html>
