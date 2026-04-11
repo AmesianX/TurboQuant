@@ -236,18 +236,13 @@ half2 경로 (수정 전) & 454.7 & 1.08$\times$ \\
 \caption{TBQ 블록 크기 변형. 각각 TBQ3/TBQ4/TBQP3/TBQP4 하위 타입이 있다.}
 \end{table}
 
-\subsection{Cross-Head WHT (\_3 타입)}
+\subsection{Double WHT Per-Head (\_3 타입, $d=64$)}
 
-$d=64$ head dimension 모델에서는 64-point WHT의 탈상관이 불충분하다. Kronecker 구조 $H_{512} = H_8 \otimes H_{64}$를 이용한 cross-head 변형을 구현했다: 8개 head가 하나의 양자화된 KV 블록을 공유하고, $H_8$ 부호를 스코어링 시 적용:
-\begin{equation}
-\text{score}_h = \frac{1}{8}\sum_{g=0}^{7} H_8[h,g] \cdot \langle \mathbf{q}_h, \text{dequant}(\mathbf{k}_g) \rangle
-\end{equation}
+\textbf{참고:} 이전 버전에서 기술한 cross-head WHT 접근법($H_{512} = H_8 \otimes H_{64}$)은 Q-K 도메인 불일치로 인해 \textbf{폐기}되었다. Q는 64차원 per-head 공간에서 동작하는 반면 K는 512차원 cross-head 공간에 있어 어떤 IWHT 복원도 이 간극을 해소할 수 없었다.
 
-동작을 위해 두 가지 핵심 수정이 필요했다:
+\paragraph{대체: Double WHT per-head.} 서로 다른 부호 패턴으로 WHT를 두 라운드 적용한다: $S_1 \to \text{WHT}_{64} \to S_2 \to \text{WHT}_{64}$. 이를 통해 첨도(kurtosis) $0.375 \to 0.047$ (거의 가우시안)을 달성하며, 단일 WHT보다 훨씬 우수한 탈상관을 보인다. Q와 K 모두 동일한 double WHT를 거치므로 Parseval 정리가 직접 적용되어 역변환이 불필요하다. 속도 영향은 무시할 수 있는 수준이다 (head당 $\sim$384 FLOP 추가).
 
-\paragraph{Per-head 정규화.} 초기 구현은 512개 WHT 계수 전체에 대한 global L2 norm을 사용했다. 한 head의 에너지가 지배적이면 나머지 head는 부적절한 스케일로 양자화되어 정보를 잃는다. $d=512$ per-block norm과 동일한 원리로 per-head RMS 정규화로 전환했다.
-
-\paragraph{$d=64$에서 K의 QJL 제거.} TBQP 타입은 $(b{-}1)$비트 Lloyd-Max + 1비트 QJL을 사용한다. $d=64$에서 QJL의 랜덤 프로젝션은 어텐션 스코어에 올바른 토큰과 차점자 사이의 signal gap을 \emph{초과}하는 노이즈를 추가한다. 순수 3비트 Lloyd-Max(TBQ3, 8 centroid)는 TBQP3(2비트+QJL) 대비 $2.3\times$ 높은 스코어 SQNR을 달성한다. $d=64$에서 K를 자동으로 TBQP$\to$TBQ로 전환하여 모든 비트를 centroid 정밀도에 집중한다.
+\paragraph{$d=64$에서 QJL 필수.} 이전 분석과 달리, QJL의 1비트 보정은 멀티턴 안정성에 \emph{필수적}이다. QJL 없이(TBQ3\_3) 대화하면 3--4턴에서 반복 루프에 빠진다. QJL 포함(TBQP3\_3)시 7턴 이상 정확한 응답이 검증되었다. $d=64$에서 K는 자동으로 TBQP3\_3으로 매핑된다.
 
 \subsection{MMSE 동적 소프트닝 ($d=64$)}
 

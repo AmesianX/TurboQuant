@@ -296,18 +296,13 @@ Suffix & Block Size & Head Dim & Notes \\
 \label{tab:types}
 \end{table}
 
-\subsection{Cross-Head WHT (\_3 Types)}
+\subsection{Double WHT Per-Head (\_3 Types, $d=64$)}
 
-For models with $d=64$ head dimension, the 64-point WHT provides insufficient decorrelation. We implement a cross-head variant using the Kronecker structure $H_{512} = H_8 \otimes H_{64}$: eight heads share a single quantized KV block, with the $H_8$ signs applied at scoring time:
-\begin{equation}
-\text{score}_h = \frac{1}{8}\sum_{g=0}^{7} H_8[h,g] \cdot \langle \mathbf{q}_h, \text{dequant}(\mathbf{k}_g) \rangle
-\end{equation}
+\textbf{Note:} The cross-head WHT approach ($H_{512} = H_8 \otimes H_{64}$) described in earlier versions has been \textbf{abandoned} due to Q-K domain mismatch---Q operates in the 64-dim per-head space while K was in the 512-dim cross-head space. No IWHT reconstruction could bridge this gap.
 
-Two critical fixes were required for cross-head to function:
+\paragraph{Replacement: Double WHT per-head.} We apply two rounds of WHT with different sign patterns: $S_1 \to \text{WHT}_{64} \to S_2 \to \text{WHT}_{64}$. This achieves kurtosis $0.375 \to 0.047$ (near-Gaussian), much better decorrelation than single WHT. Both Q and K undergo the same double WHT, so Parseval's theorem applies directly---no inverse transform needed. Speed impact is negligible ($\sim$384 extra FLOPs per head).
 
-\paragraph{Per-head normalization.} The initial implementation used a global L2 norm across all 512 WHT coefficients. When one head dominates in energy, the remaining heads are quantized with an inappropriate scale, losing information. We switch to per-head RMS normalization (same principle as per-block norm for $d=512$).
-
-\paragraph{QJL removal for K at $d=64$.} TBQP types use $(b{-}1)$-bit Lloyd-Max plus 1-bit QJL. At $d=64$, the QJL random projection adds noise to the attention score that \emph{exceeds} the signal gap between correct and runner-up tokens. Pure 3-bit Lloyd-Max (TBQ3, 8 centroids) achieves $2.3\times$ better score SQNR than TBQP3 (2-bit + QJL). We automatically remap K from TBQP$\to$TBQ at $d=64$, dedicating all bits to centroid precision.
+\paragraph{QJL critical at $d=64$.} Contrary to earlier findings, QJL's 1-bit correction is \emph{essential} for multi-turn stability. Without QJL (TBQ3\_3), conversations collapse into repetition loops after 3--4 turns. With QJL (TBQP3\_3), 7+ turns verified with correct responses. K is automatically mapped to TBQP3\_3 at $d=64$.
 
 \subsection{MMSE Dynamic Softening ($d=64$)}
 
