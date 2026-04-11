@@ -351,11 +351,11 @@
   <hr class="divider">
   <div class="meta">
     <span>2026-04-08 Afternoon</span>
-    <span>tbq4 D=512 수정 + head_dim=64 Cross-Head WHT 돌파</span>
+    <span>tbq4 D=512 Fix + head_dim=64 Cross-Head WHT Breakthrough</span>
     <br>
-    <span>4비트 WHT 도메인 불일치 수정</span>
+    <span>4-bit WHT Domain Mismatch Fix</span>
     <span>MMSE Dynamic Softening</span>
-    <span>QJL Noise discovered</span>
+    <span>QJL Noise Discovery</span>
     <span>Pauli Test Passed</span>
     <span>AmesianX</span>
   </div>
@@ -366,42 +366,42 @@
   <h2>Session Overview</h2>
   <hr class="divider">
   <ul class="timeline">
-    <li><span class="time">Afternoon</span> &mdash; tbqp4/tbq4 테스트 &mdash; garbage 출력 Discovery, Math Bench 돌림</li>
-    <li><span class="time">Afternoon</span> &mdash; 근본 원인: tbq4_0/tbqp4_0 D=512 인코딩에 512-point WHT 누락</li>
-    <li><span class="time">Afternoon</span> &mdash; 수정: quantize_f32_tbq4_0_block_512 + tbqp4_0_block_512 추가</li>
-    <li><span class="time">Afternoon</span> &mdash; tbqp4/tbq4 Math Bench 20/35 = f16 동점 Achieved!</li>
-    <li><span class="time">Afternoon</span> &mdash; PPL 벤치: tbqp4/tbq4 1.08x vs f16 (tbqp3/tbq3 1.19x 같은 파일 기준)</li>
-    <li><span class="time">Evening</span> &mdash; head_dim=64 도전 &mdash; cross-head WHT 재시도</li>
-    <li><span class="time">Evening</span> &mdash; global L2 norm &rarr; per-head RMS norm 수정</li>
-    <li><span class="time">Evening</span> &mdash; Dynamic Sharpening _2/_3 적용 시도 &rarr; 악화 (SQNR 값 부적절)</li>
-    <li><span class="time">Night</span> &mdash; MMSE 이론: D=64는 샤프닝이 아니라 <strong>소프트닝</strong> 필요!</li>
-    <li><span class="time">Night</span> &mdash; K=f16 V=tbq3 Experiment &rarr; 완벽 (V는 Problem 아님, K가 병목)</li>
-    <li><span class="time">Night</span> &mdash; Key Discovery: QJL이 D=64에서 K 스코어 노이즈 주범!</li>
-    <li><span class="time">Night</span> &mdash; tbqp3 &rarr; tbq3 자동 전환 (QJL 제거) &rarr; <strong>Pauli Test Passed!</strong></li>
+    <li><span class="time">PM</span> &mdash; tbqp4/tbq4 testing &mdash; garbage output found, ran math bench</li>
+    <li><span class="time">PM</span> &mdash; Root cause: 512-point WHT missing in tbq4_0/tbqp4_0 D=512 encoding</li>
+    <li><span class="time">PM</span> &mdash; Fix: added quantize_f32_tbq4_0_block_512 + tbqp4_0_block_512</li>
+    <li><span class="time">PM</span> &mdash; tbqp4/tbq4 math bench 20/35 = tied with f16!</li>
+    <li><span class="time">PM</span> &mdash; PPL bench: tbqp4/tbq4 1.08x vs f16 (tbqp3/tbq3 1.19x on same file)</li>
+    <li><span class="time">Eve</span> &mdash; head_dim=64 challenge &mdash; cross-head WHT retry</li>
+    <li><span class="time">Eve</span> &mdash; global L2 norm &rarr; per-head RMS norm fix</li>
+    <li><span class="time">Eve</span> &mdash; Dynamic sharpening _2/_3 attempt &rarr; degraded (SQNR values inappropriate)</li>
+    <li><span class="time">Night</span> &mdash; MMSE theory: D=64 needs <strong>softening</strong>, not sharpening!</li>
+    <li><span class="time">Night</span> &mdash; K=f16 V=tbq3 experiment &rarr; perfect (V is not the problem, K is the bottleneck)</li>
+    <li><span class="time">Night</span> &mdash; Key finding: QJL is the primary source of K score noise at D=64!</li>
+    <li><span class="time">Night</span> &mdash; tbqp3 &rarr; tbq3 auto-switch (QJL removed) &rarr; <strong>Pauli test passed!</strong></li>
   </ul>
 </section>
 
 <!-- TBQ4 D=512 FIX -->
 <section>
-  <h2>tbq4/tbqp4 D=512 수정 <span class="tag tag-red">Bug Fix</span></h2>
+  <h2>tbq4/tbqp4 D=512 Fix <span class="tag tag-red">Bug Fix</span></h2>
   <hr class="divider">
   <div class="card-grid">
     <div class="card">
       <h4>Problem</h4>
       <ul>
-        <li>tbq4_0/tbqp4_0 인코딩: 256-point WHT만 수행</li>
-        <li>Q 전처리: 512-point WHT 수행</li>
-        <li>WHT 도메인 불일치 &rarr; garbage 출력</li>
-        <li>tbq3는 이미 512 버전 있었음</li>
+        <li>tbq4_0/tbqp4_0 encoding: only performed 256-point WHT</li>
+        <li>Q preprocessing: performed 512-point WHT</li>
+        <li>WHT domain mismatch &rarr; garbage output</li>
+        <li>tbq3 already had the 512 version</li>
       </ul>
     </div>
     <div class="card">
-      <h4>수정</h4>
+      <h4>Fix</h4>
       <ul>
-        <li><code>quantize_f32_tbq4_0_block_512</code> 추가</li>
-        <li><code>quantize_f32_tbqp4_0_block_512</code> 추가</li>
-        <li>set-rows.cu: head_dim&ge;512 디스패치</li>
-        <li>Math Bench 20/35 = f16 동점 &check;</li>
+        <li>Added <code>quantize_f32_tbq4_0_block_512</code></li>
+        <li>Added <code>quantize_f32_tbqp4_0_block_512</code></li>
+        <li>set-rows.cu: head_dim&ge;512 dispatch</li>
+        <li>Math bench 20/35 = tied with f16 &check;</li>
       </ul>
     </div>
   </div>
@@ -409,57 +409,57 @@
 
 <!-- CROSS-HEAD BREAKTHROUGH -->
 <section>
-  <h2>Cross-Head WHT 돌파 <span class="tag tag-green">브레이크스루</span></h2>
+  <h2>Cross-Head WHT Breakthrough <span class="tag tag-green">Breakthrough</span></h2>
   <hr class="divider">
   <div class="card-grid">
     <div class="card">
       <h4>1. Per-Head RMS Norm</h4>
       <ul>
-        <li>이전: global L2 norm (8 head 공유)</li>
-        <li>Problem: 에너지 큰 head가 norm 지배</li>
-        <li>작은 head 정보 손실 &rarr; garbage</li>
-        <li>수정: 각 head 독립 RMS norm</li>
+        <li>Before: global L2 norm (shared across 8 heads)</li>
+        <li>Problem: high-energy heads dominated the norm</li>
+        <li>Low-energy heads lost information &rarr; garbage</li>
+        <li>Fix: independent RMS norm per head</li>
       </ul>
     </div>
     <div class="card">
-      <h4>2. QJL Noise discovered</h4>
+      <h4>2. QJL Noise Discovery</h4>
       <ul>
         <li>TBQP3: 2-bit MSE + 1-bit QJL</li>
-        <li>QJL의 랜덤 프로젝션 &rarr; K 스코어 노이즈</li>
-        <li>D=256: 노이즈 작음 (무시 가능)</li>
-        <li><strong>D=64: 노이즈가 signal gap 초과!</strong></li>
+        <li>QJL's random projection &rarr; K score noise</li>
+        <li>D=256: noise is small (negligible)</li>
+        <li><strong>D=64: noise exceeds signal gap!</strong></li>
       </ul>
     </div>
   </div>
   <div class="highlight-box green" style="margin-top:14px">
-    <strong>해법:</strong> head_dim=64에서 K를 tbqp3 &rarr; tbq3 자동 전환. 3비트 전부 Lloyd-Max centroid에 투자. SQNR 2.3배 향상 (3.45 &rarr; 7.8).
+    <strong>Solution:</strong> Auto-switch K from tbqp3 &rarr; tbq3 at head_dim=64. Invest all 3 bits in Lloyd-Max centroids. SQNR improved 2.3x (3.45 &rarr; 7.8).
   </div>
 </section>
 
 <!-- MMSE SOFTENING -->
 <section>
-  <h2>MMSE Dynamic Softening <span class="tag tag-purple">이론</span></h2>
+  <h2>MMSE Dynamic Softening <span class="tag tag-purple">Theory</span></h2>
   <hr class="divider">
   <div class="card-grid">
     <div class="card">
-      <h4>D&ge;256: 샤프닝 (α &gt; 1)</h4>
+      <h4>D&ge;256: Sharpening (&alpha; &gt; 1)</h4>
       <ul>
-        <li>SQNR 높음 &rarr; 올바른 토큰이 거의 항상 1등</li>
-        <li>softmax 약간 평탄화 &rarr; α로 보정</li>
+        <li>High SQNR &rarr; correct token almost always ranks first</li>
+        <li>softmax slightly flattened &rarr; corrected by &alpha;</li>
         <li><code>&alpha;(N) = 1 + c &times; &radic;(ln N)</code></li>
       </ul>
     </div>
     <div class="card">
-      <h4>D=64: 소프트닝 (α &lt; 1)</h4>
+      <h4>D=64: Softening (&alpha; &lt; 1)</h4>
       <ul>
-        <li>SQNR 낮음 &rarr; 노이즈가 순위 뒤집음</li>
-        <li>샤프닝하면 잘못된 답에 올인</li>
-        <li><code>&alpha;(N) = SQNR / (SQNR + &radic;(ln N / ln N₀))</code></li>
+        <li>Low SQNR &rarr; noise flips rankings</li>
+        <li>Sharpening goes all-in on the wrong answer</li>
+        <li><code>&alpha;(N) = SQNR / (SQNR + &radic;(ln N / ln N&#8320;))</code></li>
       </ul>
     </div>
   </div>
   <table style="margin-top:14px">
-    <thead><tr><th>타입</th><th>SQNR</th><th>&alpha;(N=10)</th><th>&alpha;(N=2048)</th><th>&alpha;(N=131K)</th></tr></thead>
+    <thead><tr><th>Type</th><th>SQNR</th><th>&alpha;(N=10)</th><th>&alpha;(N=2048)</th><th>&alpha;(N=131K)</th></tr></thead>
     <tbody>
       <tr><td>TBQP3 _2/_3</td><td>3.45</td><td>0.863</td><td class="ok">0.775</td><td>0.735</td></tr>
       <tr><td>TBQ3 _2/_3</td><td>7.80</td><td>0.934</td><td class="ok">0.886</td><td>0.863</td></tr>
@@ -470,56 +470,56 @@
 
 <!-- ISOLATION TEST -->
 <section>
-  <h2>K vs V 분리 Experiment <span class="tag tag-blue">검증</span></h2>
+  <h2>K vs V Isolation Test <span class="tag tag-blue">Verification</span></h2>
   <hr class="divider">
   <table>
-    <thead><tr><th>K</th><th>V</th><th>파울리 테스트</th><th>결론</th></tr></thead>
+    <thead><tr><th>K</th><th>V</th><th>Pauli Test</th><th>Conclusion</th></tr></thead>
     <tbody>
-      <tr><td>f16</td><td>f16</td><td class="ok">✅ 완벽</td><td>기준</td></tr>
-      <tr><td>f16</td><td>tbq3_2</td><td class="ok">✅ 완벽</td><td><strong>V는 Problem 아님</strong></td></tr>
-      <tr><td>tbqp3_3</td><td>f16</td><td class="ng">❌ 루프</td><td><strong>K가 병목</strong></td></tr>
-      <tr><td>tbqp3_3</td><td>tbq3_2</td><td class="ng">❌ 루프</td><td>K 노이즈 확인</td></tr>
-      <tr style="background:#ecfdf5"><td><strong>tbq3_3</strong></td><td>tbq3_2</td><td class="ok"><strong>✅ 통과!</strong></td><td><strong>QJL 제거 = Solution</strong></td></tr>
+      <tr><td>f16</td><td>f16</td><td class="ok">&#10003; Perfect</td><td>Baseline</td></tr>
+      <tr><td>f16</td><td>tbq3_2</td><td class="ok">&#10003; Perfect</td><td><strong>V is not the problem</strong></td></tr>
+      <tr><td>tbqp3_3</td><td>f16</td><td class="ng">&#10007; Loop</td><td><strong>K is the bottleneck</strong></td></tr>
+      <tr><td>tbqp3_3</td><td>tbq3_2</td><td class="ng">&#10007; Loop</td><td>K noise confirmed</td></tr>
+      <tr style="background:#ecfdf5"><td><strong>tbq3_3</strong></td><td>tbq3_2</td><td class="ok"><strong>&#10003; Passed!</strong></td><td><strong>QJL removal = solved</strong></td></tr>
     </tbody>
   </table>
   <div class="highlight-box green" style="margin-top:14px">
-    <strong>결론:</strong> V는 3비트로 충분. K에서 QJL을 빼고 순수 3비트 Lloyd-Max를 쓰면 head_dim=64에서도 동작.
+    <strong>Conclusion:</strong> V is fine at 3-bit. Removing QJL from K and using pure 3-bit Lloyd-Max makes head_dim=64 work.
   </div>
 </section>
 
 <!-- SQNR COMPARISON -->
 <section>
-  <h2>TBQP3 vs TBQ3 K 스코어 품질 <span class="tag tag-purple">수학</span></h2>
+  <h2>TBQP3 vs TBQ3 K Score Quality <span class="tag tag-purple">Math</span></h2>
   <hr class="divider">
   <table>
-    <thead><tr><th>타입</th><th>구조</th><th>Score SQNR (D=64)</th><th>노이즈/시그널</th></tr></thead>
+    <thead><tr><th>Type</th><th>Structure</th><th>Score SQNR (D=64)</th><th>Noise/Signal</th></tr></thead>
     <tbody>
       <tr><td><strong>TBQ3</strong></td><td>3-bit Lloyd-Max (8 centroid)</td><td class="ok"><strong>7.8</strong></td><td class="ok"><strong>35.8%</strong></td></tr>
       <tr><td>TBQP3</td><td>2-bit MSE + 1-bit QJL</td><td class="ng">3.45</td><td class="ng">53.8%</td></tr>
     </tbody>
   </table>
   <div class="highlight-box purple" style="margin-top:14px">
-    <strong>Key:</strong> QJL의 1-bit 랜덤 프로젝션은 K reconstruction MSE를 줄이지만 attention score에 <strong>두 번째 노이즈 소스</strong>를 추가. D=256에서는 무시 가능하지만 D=64에서는 signal gap(~1.0)을 초과(1.67). TBQ3로 3비트 전부 centroid에 투자하면 max noise=1.11로 gap 이내.
+    <strong>Key insight:</strong> QJL's 1-bit random projection reduces K reconstruction MSE but adds a <strong>second noise source</strong> to attention scores. At D=256 this is negligible, but at D=64 it exceeds the signal gap (~1.0) with noise of 1.67. With TBQ3, investing all 3 bits in centroids keeps max noise at 1.11, within the gap.
   </div>
 </section>
 
 <!-- RESULTS -->
 <section>
-  <h2>최종 Result <span class="tag tag-green">Achieved</span></h2>
+  <h2>Final Results <span class="tag tag-green">Achieved</span></h2>
   <hr class="divider">
   <ul class="items">
-    <li>tbq4/tbqp4 D=512: WHT 도메인 불일치 수정, Math Bench 20/35 = f16 동점</li>
-    <li>head_dim=64 cross-head: per-head RMS norm으로 양자화 품질 Restored</li>
-    <li>K QJL Noise discovered: tbqp3 &rarr; tbq3 자동 전환으로 SQNR 2.3배 향상</li>
-    <li>MMSE Dynamic Softening: D&ge;256 샤프닝 / D=64 소프트닝 이론 통합</li>
-    <li>GPT OSS 120B (head_dim=64) 파울리 테스트 <strong>통과</strong></li>
-    <li>릴리즈 워크플로우 수정 (master&rarr;main, 아키텍처별 빌드)</li>
+    <li>tbq4/tbqp4 D=512: WHT domain mismatch fixed, math bench 20/35 = tied with f16</li>
+    <li>head_dim=64 cross-head: quantization quality restored with per-head RMS norm</li>
+    <li>K QJL noise discovered: tbqp3 &rarr; tbq3 auto-switch improved SQNR 2.3x</li>
+    <li>MMSE dynamic softening: unified theory for D&ge;256 sharpening / D=64 softening</li>
+    <li>GPT OSS 120B (head_dim=64) Pauli test <strong>passed</strong></li>
+    <li>Release workflow fixed (master&rarr;main, per-architecture builds)</li>
   </ul>
   <div class="card-grid" style="grid-template-columns:1fr 1fr 1fr 1fr; margin-top:20px">
-    <div class="metric"><div class="num green">D=64</div><div class="label">cross-head 동작</div></div>
-    <div class="metric"><div class="num blue">2.3x</div><div class="label">SQNR 향상 (QJL 제거)</div></div>
-    <div class="metric"><div class="num purple">α&lt;1</div><div class="label">MMSE 소프트닝</div></div>
-    <div class="metric"><div class="num green">PASS</div><div class="label">파울리 테스트</div></div>
+    <div class="metric"><div class="num green">D=64</div><div class="label">Cross-head Working</div></div>
+    <div class="metric"><div class="num blue">2.3x</div><div class="label">SQNR Improvement (QJL Removed)</div></div>
+    <div class="metric"><div class="num purple">&alpha;&lt;1</div><div class="label">MMSE Softening</div></div>
+    <div class="metric"><div class="num green">PASS</div><div class="label">Pauli Test</div></div>
   </div>
 </section>
 
