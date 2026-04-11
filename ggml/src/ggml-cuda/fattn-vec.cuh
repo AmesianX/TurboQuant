@@ -98,8 +98,8 @@ static __global__ void flash_attn_ext_vec(
         && type_K != GGML_TYPE_TBQP3_3 && type_K != GGML_TYPE_TBQP4_3
         && type_K != GGML_TYPE_TBQ4_4 && type_K != GGML_TYPE_TBQ3_4
         && type_K != GGML_TYPE_TBQP3_4 && type_K != GGML_TYPE_TBQP4_4;
-    constexpr bool is_cross_head_K = type_K == GGML_TYPE_TBQ3_3 || type_K == GGML_TYPE_TBQ4_3
-        || type_K == GGML_TYPE_TBQP3_3 || type_K == GGML_TYPE_TBQP4_3;
+    // _3 types: double WHT per-head (not cross-head). Cross-head abandoned — Q-K domain mismatch at D=64.
+    constexpr bool is_cross_head_K = false;
     constexpr bool is_cross_head_V = type_V == GGML_TYPE_TBQ3_3 || type_V == GGML_TYPE_TBQ4_3;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();

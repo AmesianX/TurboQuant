@@ -118,7 +118,22 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-tbq3_0-f16.cu
             template-instances/fattn-vec-instance-tbqp3_0-f16.cu
             template-instances/fattn-vec-instance-f16-tbq3_0.cu
-            template-instances/fattn-vec-instance-f16-f16.cu)
+            template-instances/fattn-vec-instance-f16-f16.cu
+            template-instances/fattn-vec-instance-tbq3_2-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbq3_2-f16.cu
+            template-instances/fattn-vec-instance-tbq3_3-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbq3_3-f16.cu
+            template-instances/fattn-vec-instance-tbqp3_3-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbqp3_3-f16.cu
+            template-instances/fattn-vec-instance-tbqp3_3-q8_0.cu
+            template-instances/fattn-vec-instance-tbq4_2-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbq4_2-f16.cu
+            template-instances/fattn-vec-instance-tbq4_3-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbq4_3-f16.cu
+            template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbqp4_3-f16.cu
+            template-instances/fattn-vec-instance-f16-tbq3_2.cu
+            template-instances/fattn-vec-instance-q8_0-tbq3_2.cu)
         add_compile_definitions(GGML_CUDA_FA_TBQ_TUNING)
     elseif (GGML_CUDA_FA_ALL_QUANTS)
         file(GLOB   SRCS "template-instances/fattn-vec*.cu")
