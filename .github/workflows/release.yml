@@ -82,6 +82,13 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
 
+      - name: Copy Cuda runtime into build
+        run: |
+          $dst='.\build\bin\Release\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+
       - name: Pack artifacts
         id: pack_artifacts
         run: |
@@ -93,21 +100,6 @@ jobs:
         with:
           path: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
           name: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-
-      - name: Copy and pack Cuda runtime
-        run: |
-          echo "Cuda install location: ${{ env.CUDA_PATH }}"
-          $dst='.\build\bin\cudart\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip $dst\*
-
-      - name: Upload Cuda runtime
-        uses: actions/upload-artifact@v6
-        with:
-          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-          name: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
 
   linux-cuda:
     runs-on: ubuntu-22.04
@@ -139,9 +131,7 @@ jobs:
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_RPATH="\$ORIGIN" \
                 -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-                -DGGML_BACKEND_DL=ON \
                 -DGGML_NATIVE=OFF \
-                -DGGML_CPU_ALL_VARIANTS=ON \
                 -DGGML_CUDA=ON \
                 -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
                 ${{ env.CMAKE_ARGS }}
