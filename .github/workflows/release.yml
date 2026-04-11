@@ -194,6 +194,53 @@ jobs:
           path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.tar.gz
           name: llama-bin-linux-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.tar.gz
 
+  # DGX Spark (GB10, aarch64, Blackwell sm_120, Ubuntu 24.04, CUDA 13.x)
+  linux-cuda-aarch64:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install CUDA Toolkit
+        run: |
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-12-8 build-essential cmake git
+
+      - name: Build
+        run: |
+          export PATH=/usr/local/cuda-12.8/bin:$PATH
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="120" \
+            -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-DGXSpark-aarch64-sm120.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-DGXSpark-aarch64-sm120.tar.gz
+          name: llama-bin-linux-cuda12.8-DGXSpark-aarch64-sm120.tar.gz
+
   release:
     if: ${{ ( github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') ) || github.event.inputs.create_release == 'true' }}
 
@@ -205,6 +252,7 @@ jobs:
     needs:
       - windows-cuda
       - linux-cuda
+      - linux-cuda-aarch64
 
     steps:
       - name: Clone
