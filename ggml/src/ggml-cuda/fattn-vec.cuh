@@ -101,6 +101,9 @@ static __global__ void flash_attn_ext_vec(
     // _3 types: double WHT per-head (not cross-head). Cross-head abandoned — Q-K domain mismatch at D=64.
     constexpr bool is_cross_head_K = false;
     constexpr bool is_cross_head_V = type_V == GGML_TYPE_TBQ3_3 || type_V == GGML_TYPE_TBQ4_3;
+    // _3 types use double WHT: S1→WHT64→S2→WHT64 (two rounds for better CLT convergence)
+    constexpr bool is_double_wht_K = type_K == GGML_TYPE_TBQ3_3 || type_K == GGML_TYPE_TBQ4_3
+        || type_K == GGML_TYPE_TBQP3_3 || type_K == GGML_TYPE_TBQP4_3;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -556,42 +559,29 @@ static __global__ void flash_attn_ext_vec(
                       || type_K == GGML_TYPE_TBQ4_3 || type_K == GGML_TYPE_TBQ3_3
                       || type_K == GGML_TYPE_TBQP4_3 || type_K == GGML_TYPE_TBQP3_3) {
         // TurboQuant 64-block: D=64, nthreads=128, tid 0-63 participate in WHT
-        // WHT has 6 stages: stages 0-4 warp shuffle, stage 5 shared memory
-        // For cross-head _3: use kv_head-specific 64-bit sign slice from 512-bit pattern
-        static constexpr uint8_t tbq_signs_full[64] = {
-            0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,  // head 0 (same as _2)
-            0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,  // head 1
-            0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,  // head 2
-            0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,  // head 3
-            0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,  // head 4
-            0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,  // head 5
-            0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,  // head 6
-            0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,  // head 7
-        };
-        // For _2 types: always use head 0's signs. For _3: use kv_head-specific slice.
-        const int q_signs_offset = (is_cross_head_K) ? ((head / gqa_ratio) % 8) * 8 : 0;
-        const uint8_t * tbq_signs = tbq_signs_full + q_signs_offset;
+        // _2: single WHT (S1→WHT64), _3: double WHT (S1→WHT64→S2→WHT64)
+        // Sign tables for WHT: _2 uses S1 only, _3 uses S1+S2 (double WHT)
+        static constexpr uint8_t tbq_s1[8] = { 0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e };
+        static constexpr uint8_t tbq_s2[8] = { 0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c };
 
         for (int j = 0; j < ncols; ++j) {
             float * Q_wht = (float *) &KQ[0];
             const float * Q_f = (const float *) (Q + j*nb01);
 
-            // === WHT 1: MSE part — FP32 butterfly ===
+            // Round 1: S1 → WHT64 (same for both _2 and _3)
             {
                 float f0 = 0.0f;
                 if (tid < D) {
-                    float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                    float sign0 = ((tbq_s1[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
                     float q0 = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[tid];
                     f0 = q0 * sign0;
                 }
-                // Stages 0-4: warp shuffle (tid >= 64 carries f0=0, no data corruption)
                 #pragma unroll
                 for (int s = 0; s < 5; s++) {
                     float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
                     if (tid & (1 << s)) { f0 = o0 - f0; }
                     else                { f0 = f0 + o0; }
                 }
-                // Stage 5 (stride 32): shared memory
                 if (tid < D) { Q_wht[tid] = f0; }
                 __syncthreads();
                 if (tid < D) {
@@ -602,20 +592,43 @@ static __global__ void flash_attn_ext_vec(
                 __syncthreads();
             }
 
+            // Round 2: S2 → WHT64 (only for _3 double WHT types)
+            if constexpr (is_double_wht_K) {
+                float f0 = 0.0f;
+                if (tid < D) {
+                    float sign0 = ((tbq_s2[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+                    f0 = Q_wht[tid] * sign0;
+                }
+                #pragma unroll
+                for (int s = 0; s < 5; s++) {
+                    float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << s, WARP_SIZE);
+                    if (tid & (1 << s)) { f0 = o0 - f0; }
+                    else                { f0 = f0 + o0; }
+                }
+                if (tid < D) { Q_wht[tid] = f0; }
+                __syncthreads();
+                if (tid < D) {
+                    float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32];
+                    f0 = (tid & 32) ? (v0 - u0) : (u0 + v0);
+                }
+                if (tid < D) { Q_wht[tid] = f0; }
+                __syncthreads();
+            }
+
+            // Scale: /D for Q_reg. Double WHT needs /D² total: /D here + /D after scoring
+            const float wht_scale = scale / (float)D;
+
             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
                 const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
-                const float v0 = Q_wht[2*i] * scale / (float)D;
-                const float v1 = Q_wht[2*i+1] * scale / (float)D;
+                const float v0 = Q_wht[2*i] * wht_scale;
+                const float v1 = Q_wht[2*i+1] * wht_scale;
 #ifdef V_DOT2_F32_F16_AVAILABLE
                 Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(v0), __float2half(v1));
 #else
                 Q_reg[j][i0/nthreads_KQ] = make_float2(v0, v1);
 #endif
             }
-
-            __syncthreads(); // ensure all warps finished Q_reg load before next j overwrites KQ
-
-            // Direct Sign: no second WHT needed for _2 TBQP types
+            __syncthreads();
         }
     } else if constexpr (type_K == GGML_TYPE_TBQ4_4 || type_K == GGML_TYPE_TBQ3_4
                       || type_K == GGML_TYPE_TBQP4_4 || type_K == GGML_TYPE_TBQP3_4) {
@@ -896,6 +909,12 @@ static __global__ void flash_attn_ext_vec(
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                     sum = warp_reduce_sum<nthreads_KQ>(sum);
                 }
+
+                // Double WHT: apply second /D after scoring (/D in Q × /D here = /D² total)
+                if constexpr (is_double_wht_K) {
+                    sum /= (float)D;
+                }
+
                 if (use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
                 }

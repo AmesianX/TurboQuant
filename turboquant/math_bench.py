@@ -312,7 +312,8 @@ async def collect(args):
     cats = {}
     run_start = time.time()
 
-    async with aiohttp.ClientSession() as session:
+    headers = {"Authorization": "Bearer test1234!@X"}
+    async with aiohttp.ClientSession(headers=headers) as session:
         for test in tests:
             t0 = time.time()
             response, timing = await send_prompt(session, args.url, "gemma4",

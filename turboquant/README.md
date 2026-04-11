@@ -4,7 +4,33 @@
 
 **🇰🇷 [한국어 버전은 아래를 클릭하세요](#korean)**
 
-### 🆕 v1.5.2 — PPL 21%→6%, Precision Fix, Deterministic Kernel
+### 🆕 v1.5.3 — Double WHT Per-Head for head_dim=64 (GPT-OSS 120B)
+
+**Cross-head WHT abandoned. Replaced with double WHT per-head (S1→WHT64→S2→WHT64) for D=64 models. QJL 1-bit correction re-enabled — critical for multi-turn stability.**
+
+**Environment:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · Model: GPT-OSS 120B (MXFP4)
+
+**Math Accuracy (35 problems, temp=0):**
+
+| Config | K cache | V cache | Math (/35) | Korean | Multi-turn |
+|--------|---------|---------|------------|--------|------------|
+| f16/f16 | f16 | f16 | **35/35** | ✅ | ✅ |
+| **tbq4/tbq3** | tbq4_2 | tbq3_2 | **35/35** | ✅ | ✅ |
+| tbqp3/tbq3 | tbqp3_3 | tbq3_2 | ❌ (matrix) | ✅ | ✅ (9+ turns) |
+
+> **Recommended:** `--cache-type-k tbq4 --cache-type-v tbq3` for head_dim=64 models.
+> 4-bit K achieves f16-equivalent math accuracy (35/35) with 3-bit V compression.
+> 3-bit K (tbqp3) supports Korean conversation and multi-turn but cannot reliably compute matrix operations.
+
+**v1.5.3 Key Changes:**
+
+1. **Double WHT per-head (D=64)**: Cross-head WHT (512-point, $H_8 \otimes H_{64}$) abandoned due to Q-K domain mismatch. Replaced with S1→WHT64→S2→WHT64 double WHT per-head. Kurtosis 0.375→0.047 (near-Gaussian).
+2. **QJL re-enabled for K at D=64**: Contrary to v1.5.2 (which removed QJL), the 1-bit QJL correction is critical for multi-turn stability. Without QJL: repetition loops at turn 3-4. With QJL (TBQP3_3): 9+ turns verified.
+3. **TBQ_TUNING D=64 instances**: All D=64 K/V combinations added to TBQ_TUNING build (tbqp3_3, tbq3_3, tbq4_2, f16, q8_0 × tbq3_2/f16).
+
+---
+
+### v1.5.2 — PPL 21%→6%, Precision Fix, Deterministic Kernel
 
 **Critical precision loss in flash attention kernel fixed. 3-bit KV cache now deterministic and achieves 1.06x f16 PPL.**
 
@@ -126,7 +152,33 @@ Use shorthand names (`tbq3`, `tbqp3`, etc.) — internal suffixes (`_0`, `_1`, e
 
 Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
 
-### 🆕 v1.5.2 — PPL 21%→6%, 정밀도 수정, 결정적 커널
+### 🆕 v1.5.3 — Double WHT Per-Head for head_dim=64 (GPT-OSS 120B)
+
+**Cross-head WHT 폐기. Double WHT per-head (S1→WHT64→S2→WHT64)로 교체. QJL 1비트 보정 재활성화 — 멀티턴 안정성에 필수.**
+
+**환경:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · 모델: GPT-OSS 120B (MXFP4)
+
+**수학 정확도 벤치마크 (35문제, temp=0):**
+
+| 설정 | K 캐시 | V 캐시 | 수학 (/35) | 한국어 | 멀티턴 |
+|------|--------|--------|-----------|--------|--------|
+| f16/f16 | f16 | f16 | **35/35** | ✅ | ✅ |
+| **tbq4/tbq3** | tbq4_2 | tbq3_2 | **35/35** | ✅ | ✅ |
+| tbqp3/tbq3 | tbqp3_3 | tbq3_2 | ❌ (행렬) | ✅ | ✅ (9턴+) |
+
+> **권장:** head_dim=64 모델에서는 `--cache-type-k tbq4 --cache-type-v tbq3` 사용.
+> 4비트 K가 f16 동급 수학 정확도(35/35) 달성. 3비트 V 압축과 조합.
+> 3비트 K(tbqp3)는 한국어 대화와 멀티턴은 지원하나 행렬 연산 정확도 부족.
+
+**v1.5.3 핵심 변경:**
+
+1. **Double WHT per-head (D=64)**: Cross-head WHT(512-point, $H_8 \otimes H_{64}$) 폐기 — Q-K 도메인 불일치. S1→WHT64→S2→WHT64 double WHT per-head로 교체. 첨도(kurtosis) 0.375→0.047 (근사 가우시안).
+2. **D=64 K에 QJL 재활성화**: v1.5.2에서 제거했던 QJL을 복원. 1비트 QJL 보정이 멀티턴 안정성에 필수. QJL 없으면 3-4턴에서 반복 루프. QJL 있으면(TBQP3_3) 9턴+ 검증.
+3. **TBQ_TUNING D=64 인스턴스**: D=64 모든 K/V 조합을 TBQ_TUNING 빌드에 추가 (tbqp3_3, tbq3_3, tbq4_2, f16, q8_0 × tbq3_2/f16).
+
+---
+
+### v1.5.2 — PPL 21%→6%, 정밀도 수정, 결정적 커널
 
 **Flash attention 커널의 치명적 정밀도 손실 수정. 3비트 KV cache가 이제 결정적(deterministic)으로 동작하며 f16 대비 PPL 6% 달성.**
 
