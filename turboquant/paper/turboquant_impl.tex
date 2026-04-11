@@ -41,7 +41,7 @@ Independent Researcher\\
 
 % ============================================================
 \begin{abstract}
-We present the first production-grade implementation of TurboQuant---a KV cache compression method based on Walsh-Hadamard Transform (WHT) and Lloyd-Max quantization---within llama.cpp, the most widely deployed open-source LLM inference engine. Our implementation compresses the KV cache to 3 bits per element, achieving \textbf{4.2$\times$ memory reduction} with only \textbf{6\% perplexity degradation} versus FP16 on Gemma~4 26B. Beyond faithful implementation, we make three novel contributions: (1)~a \emph{dynamic attention sharpening} formula $\alpha(N) = 1 + c\sqrt{\ln N}$ derived from MMSE and Extreme Value Theory that adapts the softmax correction to the runtime context length; (2)~identification and resolution of a \emph{half-precision accumulation bug} in the flash attention kernel where FP16 arithmetic causes precision loss amplified by the IWHT butterfly into non-deterministic MoE expert routing; and (3)~a complete engineering framework supporting 20 quantization type variants across five head dimensions (64--576), including cross-head WHT and asymmetric K/V configurations. We release the full implementation as open source at \url{https://github.com/AmesianX/TurboQuant}.
+We present the first production-grade implementation of TurboQuant---a KV cache compression method based on Walsh-Hadamard Transform (WHT) and Lloyd-Max quantization---within llama.cpp, the most widely deployed open-source LLM inference engine. Our implementation compresses the KV cache to 3 bits per element, achieving \textbf{4.2$\times$ memory reduction} with only \textbf{6\% perplexity degradation} versus FP16 on Gemma~4 26B. Beyond faithful implementation, we make three novel contributions: (1)~a \emph{dynamic attention sharpening} formula $\alpha(N) = 1 + c\sqrt{\ln N}$ derived from MMSE and Extreme Value Theory that adapts the softmax correction to the runtime context length; (2)~identification and resolution of a \emph{half-precision accumulation bug} in the flash attention kernel where FP16 arithmetic causes precision loss amplified by the IWHT butterfly into non-deterministic MoE expert routing; and (3)~a complete engineering framework supporting 20 quantization type variants across five head dimensions (64--576), including double WHT per-head for $d{=}64$ and asymmetric K/V configurations. We release the full implementation as open source at \url{https://github.com/AmesianX/TurboQuant}.
 \end{abstract}
 
 % ============================================================
@@ -59,7 +59,7 @@ In this paper, we describe the complete implementation within llama.cpp's flash 
 
 \item \textbf{Half-Precision Pathology} (\S\ref{sec:precision}): We identify that the upstream flash attention kernel's FP16 (\texttt{half2}) accumulation path causes precision loss that is \emph{amplified} by the IWHT butterfly into catastrophic non-determinism in Mixture-of-Experts routing. Forcing FP32 accumulation for TBQ value types resolves the issue and improves perplexity by 2\%.
 
-\item \textbf{Multi-Variant Engineering} (\S\ref{sec:engineering}): We implement 20 TBQ/TBQP type variants across block sizes 64--576, including cross-head WHT ($H_8 \otimes H_{64}$), asymmetric K/V dimensions (GLM 576/512), per-block vs.\ global normalization, and QJL residual correction---all within the template-instantiated flash attention framework.
+\item \textbf{Multi-Variant Engineering} (\S\ref{sec:engineering}): We implement 20 TBQ/TBQP type variants across block sizes 64--576, including double WHT per-head for $d=64$, asymmetric K/V dimensions (GLM 576/512), per-block vs.\ global normalization, and QJL residual correction---all within the template-instantiated flash attention framework.
 \end{enumerate}
 
 % ============================================================
@@ -288,7 +288,7 @@ Suffix & Block Size & Head Dim & Notes \\
 \_0 & 256 & 256, 512 & Primary type \\
 \_1 & 128 & 128 & Standard transformers \\
 \_2 & 64  & 64  & Small-head models \\
-\_3 & 64  & 64  & Cross-head WHT \\
+\_3 & 64  & 64  & Double WHT per-head \\
 \_4 & 576 & 576 & GLM split 256+256+64 \\
 \bottomrule
 \end{tabular}
@@ -349,6 +349,9 @@ PPL investigation revealed 21\% gap was not from bit depth but from softmax flat
 \paragraph{v1.5.2 Session 2 (Apr 7--8): Precision Fix.}
 Non-deterministic output with temp=0 led to exhaustive debugging: eliminated CUDA graphs, pool allocation, threadfence, MoE MUL\_MAT\_ID, SET\_ROWS, and dynamic sharpening as causes. Root cause: \texttt{half2} accumulation in upstream \texttt{fattn-vec} amplified by IWHT butterfly. Fixed with FP32 forced path for 70 TBQ V template instances. PPL: 454.7 $\to$ 445.7. Dynamic $\alpha(N)$ formula implemented.
 
+\paragraph{v1.5.3 (Apr 11--12): Double WHT for $d=64$ + Side Buffer Experiment.}
+Cross-head WHT ($H_{512} = H_8 \otimes H_{64}$) abandoned due to Q-K domain mismatch at $d=64$. Replaced with double WHT per-head: $S_1 \to \text{WHT}_{64} \to S_2 \to \text{WHT}_{64}$ (kurtosis 0.375 $\to$ 0.047). QJL re-enabled for K at $d=64$ (critical for multi-turn stability---9+ turns verified). Experimental f16 side buffer achieved 35/35 math (stored in branch \texttt{experiment/side-buffer-f16}). Key discovery: \texttt{src1} index mapping required for KV position consistency. Recommended production config for $d=64$: \texttt{--cache-type-k tbq4 --cache-type-v tbq3} (35/35 math verified on GPT-OSS 120B).
+
 % ============================================================
 \section{Experimental Results}
 \label{sec:results}
@@ -385,15 +388,19 @@ We evaluate on a 35-problem math benchmark (2$\times$2/3$\times$3 matrix multipl
 \begin{table}[h]
 \centering
 \small
-\begin{tabular}{@{}lccc@{}}
+\begin{tabular}{@{}lcccc@{}}
 \toprule
-Config & Avg (/35) & Peak & 10-run scores \\
+Config & Model & Avg (/35) & Peak & 10-run scores \\
 \midrule
-FP16 & 20.1 & 21 & 19--21 \\
-\textbf{TBQP3/TBQ3} & \textbf{19.1} & \textbf{23} & 16--23 \\
+FP16 & Gemma 4 26B & 20.1 & 21 & 19--21 \\
+\textbf{TBQP3/TBQ3} & Gemma 4 26B & \textbf{19.1} & \textbf{23} & 16--23 \\
+\midrule
+FP16 & GPT-OSS 120B & 35/35 & 35 & --- \\
+\textbf{TBQ4/TBQ3} & GPT-OSS 120B & \textbf{35/35} & \textbf{35} & --- \\
+TBQP3\_3/TBQ3 & GPT-OSS 120B & \multicolumn{3}{c}{Korean {\checkmark}, matrix math {\texttimes}} \\
 \bottomrule
 \end{tabular}
-\caption{Math benchmark results. TBQ peak (23) exceeds FP16 best (21), suggesting quantization noise occasionally breaks out of local optima.}
+\caption{Math benchmark results. On Gemma 4, TBQ peak (23) exceeds FP16 best (21). On GPT-OSS 120B ($d=64$), TBQ4 K achieves f16-equivalent 35/35; TBQP3\_3 supports Korean conversation but lacks matrix precision.}
 \label{tab:math}
 \end{table}
 
