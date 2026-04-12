@@ -133,7 +133,13 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu
             template-instances/fattn-vec-instance-tbqp4_3-f16.cu
             template-instances/fattn-vec-instance-f16-tbq3_2.cu
-            template-instances/fattn-vec-instance-q8_0-tbq3_2.cu)
+            template-instances/fattn-vec-instance-q8_0-tbq3_2.cu
+            # GLM-4.7-Flash / DeepSeek-V2/V3 MLA (D=576 K, D_V=512 V): 576x512 ASYM instances
+            # Added for quality experiment — VEC path for MLA to apply v1.5.2 improvements.
+            template-instances/fattn-vec-instance-tbqp3_4-asym576x512.cu
+            template-instances/fattn-vec-instance-tbq3_4-asym576x512.cu
+            template-instances/fattn-vec-instance-tbqp4_4-asym576x512.cu
+            template-instances/fattn-vec-instance-tbq4_4-asym576x512.cu)
         add_compile_definitions(GGML_CUDA_FA_TBQ_TUNING)
     elseif (GGML_CUDA_FA_ALL_QUANTS)
         file(GLOB   SRCS "template-instances/fattn-vec*.cu")
