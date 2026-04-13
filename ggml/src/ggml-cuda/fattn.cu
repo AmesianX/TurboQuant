@@ -271,6 +271,19 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(64, GGML_TYPE_F16, GGML_TYPE_TBQ3_2)
     FATTN_VEC_CASE(64, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_2)
 
+    // D=128 (_1) — Qwen3-14B, Llama, Mistral, Qwen3-30B-A3B, etc.
+    // NOTE: no TBQP4_1-TBQP4_1 instance yet (primoco bug report: tbqp4/tbqp4 flash attn
+    // crash on head_dim=128). V=TBQP* normally auto-downgrades to TBQ* in common.cpp.
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ4_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,    GGML_TYPE_TBQ4_1)   // primoco recommended: q8_0 K + tbq4 V
+
     // GLM-4.7-Flash / DeepSeek-V2/V3 MLA: K=576 (TBQP3_4/TBQ3_4), V=512
     // V-as-K-view (MLA absorption): V->type == K->type at dispatch time (TBQP3_4 + TBQP3_4, etc.)
     // Quality experiment: force VEC path for MLA to apply v1.5.2 improvements.
