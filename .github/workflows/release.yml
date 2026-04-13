@@ -35,133 +35,305 @@ concurrency:
 env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+# =====================================================================
+# TurboQuant release workflow — ONE INDEPENDENT JOB PER GPU/OS COMBO
+# =====================================================================
+# Do NOT collapse into a strategy:matrix. One failing GPU must not
+# cancel the other 11 builds. User has been stuck for weeks on this.
+# If you're editing this file after an upstream merge, back up first
+# to ~/work/cuda_research/release_workflow_YYYYMMDD.yml.
+# =====================================================================
+
 jobs:
-  windows-cuda:
+  # ======================= Windows CUDA builds ========================
+
+  windows-cuda-v100:
     runs-on: windows-2022
-
-    strategy:
-      matrix:
-        include:
-          # V100 (sm_70)
-          - cuda: '12.4'
-            cuda_arch: '70'
-            gpu: 'V100-sm70'
-          # A100 (sm_80)
-          - cuda: '12.4'
-            cuda_arch: '80'
-            gpu: 'A100-sm80'
-          # RTX 3090 Ti (sm_86)
-          - cuda: '12.4'
-            cuda_arch: '86'
-            gpu: 'RTX3090Ti-sm86'
-          # RTX 4090 (sm_89)
-          - cuda: '12.4'
-            cuda_arch: '89'
-            gpu: 'RTX4090-sm89'
-          # H100 (sm_90)
-          - cuda: '12.4'
-            cuda_arch: '90'
-            gpu: 'H100-sm90'
-          # RTX 5090 (sm_100/120, requires CUDA 13.1+)
-          - cuda: '13.1'
-            cuda_arch: '100;120'
-            gpu: 'RTX5090-sm120'
-
     steps:
       - name: Clone
-        id: checkout
         uses: actions/checkout@v6
-
       - name: Install ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: windows-cuda-${{ matrix.gpu }}
+          key: windows-cuda-V100-sm70
           variant: ccache
           evict-old-files: 1d
-
       - name: Install Cuda Toolkit
         uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda_version: ${{ matrix.cuda }}
-
+          cuda_version: '12.4'
       - name: Install Ninja
-        id: install_ninja
-        run: |
-          choco install ninja
-
+        run: choco install ninja
       - name: Build
-        id: cmake_build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_CUDA=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.cuda_arch }}" ^
+            -DCMAKE_CUDA_ARCHITECTURES="70" ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
             ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
-
       - name: Copy Cuda runtime into build
         run: |
           $dst='.\build\bin\Release\'
           robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
           robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
           robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-
       - name: Pack artifacts
-        id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/Release/
-          7z a -snl llama-bin-win-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.zip .\build\bin\Release\*
-
+          7z a -snl llama-bin-win-cuda12.4-V100-sm70.zip .\build\bin\Release\*
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.zip
-          name: llama-bin-win-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.zip
+          path: llama-bin-win-cuda12.4-V100-sm70.zip
+          name: llama-bin-win-cuda12.4-V100-sm70.zip
 
-  linux-cuda:
-    runs-on: ubuntu-22.04
-
-    strategy:
-      matrix:
-        include:
-          - cuda: '12.8'
-            image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
-            cuda_arch: '70'
-            gpu: 'V100-sm70'
-          - cuda: '12.8'
-            image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
-            cuda_arch: '80'
-            gpu: 'A100-sm80'
-          - cuda: '12.8'
-            image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
-            cuda_arch: '86'
-            gpu: 'RTX3090Ti-sm86'
-          - cuda: '12.8'
-            image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
-            cuda_arch: '89'
-            gpu: 'RTX4090-sm89'
-          - cuda: '12.8'
-            image: 'nvidia/cuda:12.8.0-devel-ubuntu22.04'
-            cuda_arch: '90'
-            gpu: 'H100-sm90'
-
+  windows-cuda-a100:
+    runs-on: windows-2022
     steps:
       - name: Clone
-        id: checkout
+        uses: actions/checkout@v6
+      - name: Install ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-cuda-A100-sm80
+          variant: ccache
+          evict-old-files: 1d
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="80" ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            ${{ env.CMAKE_ARGS }}
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+      - name: Copy Cuda runtime into build
+        run: |
+          $dst='.\build\bin\Release\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/Release/
+          7z a -snl llama-bin-win-cuda12.4-A100-sm80.zip .\build\bin\Release\*
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cuda12.4-A100-sm80.zip
+          name: llama-bin-win-cuda12.4-A100-sm80.zip
+
+  windows-cuda-3090ti:
+    runs-on: windows-2022
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+      - name: Install ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-cuda-RTX3090Ti-sm86
+          variant: ccache
+          evict-old-files: 1d
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="86" ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            ${{ env.CMAKE_ARGS }}
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+      - name: Copy Cuda runtime into build
+        run: |
+          $dst='.\build\bin\Release\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/Release/
+          7z a -snl llama-bin-win-cuda12.4-RTX3090Ti-sm86.zip .\build\bin\Release\*
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cuda12.4-RTX3090Ti-sm86.zip
+          name: llama-bin-win-cuda12.4-RTX3090Ti-sm86.zip
+
+  windows-cuda-4090:
+    runs-on: windows-2022
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+      - name: Install ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-cuda-RTX4090-sm89
+          variant: ccache
+          evict-old-files: 1d
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="89" ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            ${{ env.CMAKE_ARGS }}
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+      - name: Copy Cuda runtime into build
+        run: |
+          $dst='.\build\bin\Release\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/Release/
+          7z a -snl llama-bin-win-cuda12.4-RTX4090-sm89.zip .\build\bin\Release\*
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cuda12.4-RTX4090-sm89.zip
+          name: llama-bin-win-cuda12.4-RTX4090-sm89.zip
+
+  windows-cuda-h100:
+    runs-on: windows-2022
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+      - name: Install ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-cuda-H100-sm90
+          variant: ccache
+          evict-old-files: 1d
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="90" ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            ${{ env.CMAKE_ARGS }}
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+      - name: Copy Cuda runtime into build
+        run: |
+          $dst='.\build\bin\Release\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/Release/
+          7z a -snl llama-bin-win-cuda12.4-H100-sm90.zip .\build\bin\Release\*
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cuda12.4-H100-sm90.zip
+          name: llama-bin-win-cuda12.4-H100-sm90.zip
+
+  windows-cuda-5090:
+    # RTX 5090 (sm_100/120) requires CUDA 13.1+
+    runs-on: windows-2022
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+      - name: Install ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-cuda-RTX5090-sm120
+          variant: ccache
+          evict-old-files: 1d
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.1'
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="100;120" ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            ${{ env.CMAKE_ARGS }}
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+      - name: Copy Cuda runtime into build
+        run: |
+          $dst='.\build\bin\Release\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/Release/
+          7z a -snl llama-bin-win-cuda13.1-RTX5090-sm120.zip .\build\bin\Release\*
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cuda13.1-RTX5090-sm120.zip
+          name: llama-bin-win-cuda13.1-RTX5090-sm120.zip
+
+  # ======================== Linux CUDA builds =========================
+
+  linux-cuda-v100:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
       - name: Build with Docker
         run: |
           docker run --rm \
             -v "${PWD}:/workspace" \
             -w /workspace \
-            ${{ matrix.image }} \
+            nvidia/cuda:12.8.0-devel-ubuntu22.04 \
             bash -c '
               set -e
               apt-get update && apt-get install -y build-essential cmake git
@@ -171,46 +343,199 @@ jobs:
                 -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
                 -DGGML_NATIVE=OFF \
                 -DGGML_CUDA=ON \
-                -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.cuda_arch }}" \
+                -DCMAKE_CUDA_ARCHITECTURES="70" \
                 ${{ env.CMAKE_ARGS }}
               cmake --build build --config Release -j $(nproc)
               chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
             '
-
       - name: Determine tag name
         id: tag
         uses: ./.github/actions/get-tag-name
-
       - name: Pack artifacts
-        id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/
-          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
-
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-V100-sm70.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.tar.gz
-          name: llama-bin-linux-cuda${{ matrix.cuda }}-${{ matrix.gpu }}.tar.gz
+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-V100-sm70.tar.gz
+          name: llama-bin-linux-cuda12.8-V100-sm70.tar.gz
 
-  # DGX Spark (GB10, aarch64, Blackwell sm_120, Ubuntu 24.04, CUDA 13.x)
-  linux-cuda-aarch64:
-    runs-on: ubuntu-24.04-arm
-
+  linux-cuda-a100:
+    runs-on: ubuntu-22.04
     steps:
       - name: Clone
-        id: checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Build with Docker
+        run: |
+          docker run --rm \
+            -v "${PWD}:/workspace" \
+            -w /workspace \
+            nvidia/cuda:12.8.0-devel-ubuntu22.04 \
+            bash -c '
+              set -e
+              apt-get update && apt-get install -y build-essential cmake git
+              cmake -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_RPATH="\$ORIGIN" \
+                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+                -DGGML_NATIVE=OFF \
+                -DGGML_CUDA=ON \
+                -DCMAKE_CUDA_ARCHITECTURES="80" \
+                ${{ env.CMAKE_ARGS }}
+              cmake --build build --config Release -j $(nproc)
+              chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
+            '
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-A100-sm80.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-A100-sm80.tar.gz
+          name: llama-bin-linux-cuda12.8-A100-sm80.tar.gz
 
+  linux-cuda-3090ti:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Build with Docker
+        run: |
+          docker run --rm \
+            -v "${PWD}:/workspace" \
+            -w /workspace \
+            nvidia/cuda:12.8.0-devel-ubuntu22.04 \
+            bash -c '
+              set -e
+              apt-get update && apt-get install -y build-essential cmake git
+              cmake -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_RPATH="\$ORIGIN" \
+                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+                -DGGML_NATIVE=OFF \
+                -DGGML_CUDA=ON \
+                -DCMAKE_CUDA_ARCHITECTURES="86" \
+                ${{ env.CMAKE_ARGS }}
+              cmake --build build --config Release -j $(nproc)
+              chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
+            '
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX3090Ti-sm86.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX3090Ti-sm86.tar.gz
+          name: llama-bin-linux-cuda12.8-RTX3090Ti-sm86.tar.gz
+
+  linux-cuda-4090:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Build with Docker
+        run: |
+          docker run --rm \
+            -v "${PWD}:/workspace" \
+            -w /workspace \
+            nvidia/cuda:12.8.0-devel-ubuntu22.04 \
+            bash -c '
+              set -e
+              apt-get update && apt-get install -y build-essential cmake git
+              cmake -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_RPATH="\$ORIGIN" \
+                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+                -DGGML_NATIVE=OFF \
+                -DGGML_CUDA=ON \
+                -DCMAKE_CUDA_ARCHITECTURES="89" \
+                ${{ env.CMAKE_ARGS }}
+              cmake --build build --config Release -j $(nproc)
+              chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
+            '
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX4090-sm89.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX4090-sm89.tar.gz
+          name: llama-bin-linux-cuda12.8-RTX4090-sm89.tar.gz
+
+  linux-cuda-h100:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Build with Docker
+        run: |
+          docker run --rm \
+            -v "${PWD}:/workspace" \
+            -w /workspace \
+            nvidia/cuda:12.8.0-devel-ubuntu22.04 \
+            bash -c '
+              set -e
+              apt-get update && apt-get install -y build-essential cmake git
+              cmake -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_RPATH="\$ORIGIN" \
+                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+                -DGGML_NATIVE=OFF \
+                -DGGML_CUDA=ON \
+                -DCMAKE_CUDA_ARCHITECTURES="90" \
+                ${{ env.CMAKE_ARGS }}
+              cmake --build build --config Release -j $(nproc)
+              chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
+            '
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-H100-sm90.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-H100-sm90.tar.gz
+          name: llama-bin-linux-cuda12.8-H100-sm90.tar.gz
+
+  # ===== DGX Spark (GB10, aarch64, Blackwell sm_100, Ubuntu 24.04) =====
+
+  linux-cuda-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Install CUDA Toolkit
         run: |
           wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
           sudo apt-get install -y cuda-toolkit-12-8 build-essential cmake git
-
       - name: Build
         run: |
           export PATH=/usr/local/cuda-12.8/bin:$PATH
@@ -224,21 +549,20 @@ jobs:
             -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j $(nproc)
-
       - name: Determine tag name
         id: tag
         uses: ./.github/actions/get-tag-name
-
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
           tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-DGXSpark-aarch64-sm100.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
           path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-DGXSpark-aarch64-sm100.tar.gz
           name: llama-bin-linux-cuda12.8-DGXSpark-aarch64-sm100.tar.gz
+
+  # =============================== Release ============================
 
   release:
     if: ${{ ( github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') ) || github.event.inputs.create_release == 'true' }}
@@ -248,63 +572,62 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    # Each job is independent; release only waits for them.
+    # `needs:` does NOT require success — with `if: always() && contains(...)`
+    # we could make release run even if some builds fail. For now we still
+    # require all to succeed; flip this if partial releases are desired.
     needs:
-      - windows-cuda
-      - linux-cuda
+      - windows-cuda-v100
+      - windows-cuda-a100
+      - windows-cuda-3090ti
+      - windows-cuda-4090
+      - windows-cuda-h100
+      - windows-cuda-5090
+      - linux-cuda-v100
+      - linux-cuda-a100
+      - linux-cuda-3090ti
+      - linux-cuda-4090
+      - linux-cuda-h100
       - linux-cuda-aarch64
 
     steps:
       - name: Clone
-        id: checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Determine tag name
-        id: tag
-        uses: ./.github/actions/get-tag-name
-
       - name: Download artifacts
-        id: download-artifact
         uses: actions/download-artifact@v7
         with:
           path: ./artifact
           merge-multiple: true
 
       - name: Move artifacts
-        id: move_artifacts
         run: |
           mkdir -p ./artifact/release
           mv ./artifact/*.tar.gz ./artifact/release/ 2>/dev/null || true
           mv ./artifact/*.zip ./artifact/release/ 2>/dev/null || true
           ls -la ./artifact/release/
 
-      - name: Create release
-        id: create_release
-        uses: anzz1/action-create-release@v1
+      # Upload binaries to the LATEST existing semver release (e.g. v1.5.3).
+      # The release itself is created manually by the maintainer; this workflow
+      # only attaches freshly-built binaries. NEVER creates a new release or tag.
+      - name: Find latest semver release
+        id: latest
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.tag.outputs.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh release list --repo ${{ github.repository }} --limit 20 --json tagName --jq '[.[].tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0]')
+          if [ -z "$TAG" ]; then
+            echo "ERROR: no semver release (v*.*.*) found — create one manually first with 'gh release create v1.x.y ...'"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Uploading to existing release: $TAG"
 
-      - name: Upload release
-        id: upload_release
-        uses: actions/github-script@v3
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            const path = require('path');
-            const fs = require('fs');
-            const release_id = '${{ steps.create_release.outputs.id }}';
-            for (let file of await fs.readdirSync('./artifact/release')) {
-              if (path.extname(file) === '.gz' || path.extname(file) === '.zip') {
-                console.log('uploadReleaseAsset', file);
-                await github.repos.uploadReleaseAsset({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  release_id: release_id,
-                  name: file,
-                  data: await fs.readFileSync(`./artifact/release/${file}`)
-                });
-              }
-            }
+      - name: Upload binaries to latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd ./artifact/release
+          gh release upload "${{ steps.latest.outputs.tag }}" * --repo ${{ github.repository }} --clobber
