@@ -74,15 +74,29 @@ jobs:
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="70" ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
             ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
       - name: Copy Cuda runtime into build
+        shell: pwsh
         run: |
-          $dst='.\build\bin\Release\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          $dst = '.\build\bin\Release\'
+          # Try each possible location of CUDA runtime DLLs. Different CUDA versions
+          # put them in different places: 11.x had bin\x64, 12.4+ uses bin\ directly.
+          $paths = @(
+            "${env:CUDA_PATH}\bin",
+            "${env:CUDA_PATH}\bin\x64",
+            "${env:CUDA_PATH}\lib\x64"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              robocopy $p $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+            }
+          }
+          # robocopy exit codes: 0-7 = success, 8+ = error. Normalize so PowerShell
+          # does not fail the step on the "files copied" exit code (1).
+          if ($LASTEXITCODE -lt 8) { $LASTEXITCODE = 0 }
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/Release/
@@ -119,15 +133,29 @@ jobs:
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="80" ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
             ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
       - name: Copy Cuda runtime into build
+        shell: pwsh
         run: |
-          $dst='.\build\bin\Release\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          $dst = '.\build\bin\Release\'
+          # Try each possible location of CUDA runtime DLLs. Different CUDA versions
+          # put them in different places: 11.x had bin\x64, 12.4+ uses bin\ directly.
+          $paths = @(
+            "${env:CUDA_PATH}\bin",
+            "${env:CUDA_PATH}\bin\x64",
+            "${env:CUDA_PATH}\lib\x64"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              robocopy $p $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+            }
+          }
+          # robocopy exit codes: 0-7 = success, 8+ = error. Normalize so PowerShell
+          # does not fail the step on the "files copied" exit code (1).
+          if ($LASTEXITCODE -lt 8) { $LASTEXITCODE = 0 }
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/Release/
@@ -164,15 +192,29 @@ jobs:
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="86" ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
             ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
       - name: Copy Cuda runtime into build
+        shell: pwsh
         run: |
-          $dst='.\build\bin\Release\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          $dst = '.\build\bin\Release\'
+          # Try each possible location of CUDA runtime DLLs. Different CUDA versions
+          # put them in different places: 11.x had bin\x64, 12.4+ uses bin\ directly.
+          $paths = @(
+            "${env:CUDA_PATH}\bin",
+            "${env:CUDA_PATH}\bin\x64",
+            "${env:CUDA_PATH}\lib\x64"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              robocopy $p $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+            }
+          }
+          # robocopy exit codes: 0-7 = success, 8+ = error. Normalize so PowerShell
+          # does not fail the step on the "files copied" exit code (1).
+          if ($LASTEXITCODE -lt 8) { $LASTEXITCODE = 0 }
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/Release/
@@ -209,15 +251,29 @@ jobs:
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="89" ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
             ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
       - name: Copy Cuda runtime into build
+        shell: pwsh
         run: |
-          $dst='.\build\bin\Release\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          $dst = '.\build\bin\Release\'
+          # Try each possible location of CUDA runtime DLLs. Different CUDA versions
+          # put them in different places: 11.x had bin\x64, 12.4+ uses bin\ directly.
+          $paths = @(
+            "${env:CUDA_PATH}\bin",
+            "${env:CUDA_PATH}\bin\x64",
+            "${env:CUDA_PATH}\lib\x64"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              robocopy $p $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+            }
+          }
+          # robocopy exit codes: 0-7 = success, 8+ = error. Normalize so PowerShell
+          # does not fail the step on the "files copied" exit code (1).
+          if ($LASTEXITCODE -lt 8) { $LASTEXITCODE = 0 }
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/Release/
@@ -254,15 +310,29 @@ jobs:
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="90" ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
             ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
       - name: Copy Cuda runtime into build
+        shell: pwsh
         run: |
-          $dst='.\build\bin\Release\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          $dst = '.\build\bin\Release\'
+          # Try each possible location of CUDA runtime DLLs. Different CUDA versions
+          # put them in different places: 11.x had bin\x64, 12.4+ uses bin\ directly.
+          $paths = @(
+            "${env:CUDA_PATH}\bin",
+            "${env:CUDA_PATH}\bin\x64",
+            "${env:CUDA_PATH}\lib\x64"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              robocopy $p $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+            }
+          }
+          # robocopy exit codes: 0-7 = success, 8+ = error. Normalize so PowerShell
+          # does not fail the step on the "files copied" exit code (1).
+          if ($LASTEXITCODE -lt 8) { $LASTEXITCODE = 0 }
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/Release/
@@ -300,15 +370,29 @@ jobs:
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="100;120" ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
             ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
       - name: Copy Cuda runtime into build
+        shell: pwsh
         run: |
-          $dst='.\build\bin\Release\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          $dst = '.\build\bin\Release\'
+          # Try each possible location of CUDA runtime DLLs. Different CUDA versions
+          # put them in different places: 11.x had bin\x64, 12.4+ uses bin\ directly.
+          $paths = @(
+            "${env:CUDA_PATH}\bin",
+            "${env:CUDA_PATH}\bin\x64",
+            "${env:CUDA_PATH}\lib\x64"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              robocopy $p $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+            }
+          }
+          # robocopy exit codes: 0-7 = success, 8+ = error. Normalize so PowerShell
+          # does not fail the step on the "files copied" exit code (1).
+          if ($LASTEXITCODE -lt 8) { $LASTEXITCODE = 0 }
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/Release/
