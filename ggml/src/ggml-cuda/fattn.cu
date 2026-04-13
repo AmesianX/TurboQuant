@@ -241,64 +241,118 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * V = dst->src[2];
 
 #ifdef GGML_CUDA_FA_TBQ_TUNING
-    // TBQ tuning + SWA f16 + QJL support + K/V split testing
-    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
-    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
-    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)
-    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
-    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
-    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
-    FATTN_VEC_CASE(512, GGML_TYPE_F16, GGML_TYPE_TBQ3_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
-    // D=64 per-head _2 (single WHT)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_TBQ3_2)
-    // D=64 double WHT _3
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_TBQ3_2)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_2)
-    // D=64 4-bit K
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_TBQ3_2)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_TBQ3_2)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_2)
-    // D=64 V=f16 variants
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_F16)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3, GGML_TYPE_F16)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_F16)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_F16)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3, GGML_TYPE_F16)
-    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_F16)
-    // D=64 f16/q8_0 K + TBQ V (for comparison testing)
-    FATTN_VEC_CASE(64, GGML_TYPE_F16, GGML_TYPE_TBQ3_2)
-    FATTN_VEC_CASE(64, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_2)
+    // =====================================================================
+    // TBQ_TUNING: minimal-build experiment matrix for ablation testing
+    //
+    // Per head_dim we register the 11 essential combinations used for:
+    //   - f16/f16  baseline             (via FATTN_VEC_CASES_ALL_D below)
+    //   - f16/tbq3, f16/tbq4            V ablation (K=f16 reference)
+    //   - tbq3/f16, tbq4/f16            K ablation (MSE only)
+    //   - tbqp3/f16, tbqp4/f16          K ablation (MSE + QJL correction)
+    //   - tbq3/tbq3, tbq4/tbq4          both quantized (MSE)
+    //   - tbqp3/tbq3, tbqp4/tbq4        recommended defaults
+    //
+    // Mixed K/V combinations (tbq3/tbq4, tbqp3/tbq4, etc.) are also included
+    // so experiments never hit a dispatch crash mid-run.
+    //
+    // V is never TBQP (QJL is K-only; common.cpp auto-downgrades TBQP V → TBQ V).
+    // q4_0/q5_0 combos are excluded to keep the build small — user uses f16
+    // as the only non-TBQ K/V type for comparison.
+    //
+    // Do NOT collapse into a matrix strategy. Do NOT remove f16 combos.
+    // =====================================================================
 
-    // D=128 (_1) — Qwen3-14B, Llama, Mistral, Qwen3-30B-A3B, etc.
-    // NOTE: no TBQP4_1-TBQP4_1 instance yet (primoco bug report: tbqp4/tbqp4 flash attn
-    // crash on head_dim=128). V=TBQP* normally auto-downgrades to TBQ* in common.cpp.
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_1)
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_1)
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ3_1)
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)          // baseline
+
+    // ---- D=64 (GPT-OSS) — K uses _3 (double WHT per-head), V uses _2 ----
+    // f16 K + TBQ V (V ablation)
+    FATTN_VEC_CASE(64, GGML_TYPE_F16,     GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_F16,     GGML_TYPE_TBQ4_2)
+    // TBQ K + f16 V (K ablation)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_F16)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_F16)
+    // TBQ K + TBQ V (recommended + mixed)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_3,  GGML_TYPE_TBQ4_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_3,  GGML_TYPE_TBQ4_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ3_2)       // recommended default
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_TBQ4_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_3, GGML_TYPE_TBQ4_2)       // recommended 4-bit
+    // Legacy D=64 single-WHT _2 K (kept for regression comparison)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2,  GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2,  GGML_TYPE_TBQ3_2)
+    FATTN_VEC_CASE(64, GGML_TYPE_Q8_0,    GGML_TYPE_TBQ3_2)       // primoco: q8_0 K variant
+    FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_3, GGML_TYPE_Q8_0)
+
+    // ---- D=128 (_1) — Qwen3-14B, Llama, Mistral, Qwen3-30B-A3B ----
+    FATTN_VEC_CASE(128, GGML_TYPE_F16,     GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_F16,     GGML_TYPE_TBQ4_1)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1,  GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1,  GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_F16)
-    FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,    GGML_TYPE_TBQ4_1)   // primoco recommended: q8_0 K + tbq4 V
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ4_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ3_1)      // recommended default
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ4_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ4_1)      // recommended 4-bit
+    FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,    GGML_TYPE_TBQ4_1)      // primoco recommended
 
-    // GLM-4.7-Flash / DeepSeek-V2/V3 MLA: K=576 (TBQP3_4/TBQ3_4), V=512
-    // V-as-K-view (MLA absorption): V->type == K->type at dispatch time (TBQP3_4 + TBQP3_4, etc.)
+    // ---- D=256 (_0) — Qwen3.5, Qwen3-Next, etc. ----
+    FATTN_VEC_CASE(256, GGML_TYPE_F16,     GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_F16,     GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)      // recommended default
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)      // recommended 4-bit
+
+    // ---- D=512 (_0, 2× 256-block) — Gemma 4 global attention ----
+    FATTN_VEC_CASE(512, GGML_TYPE_F16,     GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_F16,     GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ3_0)      // recommended default
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)      // recommended 4-bit
+
+    // ---- D=576 MLA (_4) — GLM-4.7-Flash, DeepSeek-V2/V3 ----
+    // V-as-K-view (MLA absorption): V->type == K->type at dispatch time.
     // Quality experiment: force VEC path for MLA to apply v1.5.2 improvements.
-    // Kept inside TBQ_TUNING so builds with tuning=ON can still test GLM.
-    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_4)
     FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_4)
-    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_4)
     FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_4)
-    // Also support asymmetric cases (non-absorption / f16 V fallback)
-    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ3_0)
-    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_0)
-    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_0)
-    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_0)
-    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_4)
+    // Asymmetric fallbacks (non-absorption / f16 or tbq_0 V)
     FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_0)
 #elif defined(GGML_CUDA_FA_ALL_QUANTS)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
