@@ -112,44 +112,83 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
     if (GGML_CUDA_FA_TBQ_TUNING)
+        # =============================================================
+        # TBQ_TUNING minimal-build instance list.
+        # Must match fattn.cu TBQ_TUNING dispatch block (ctrl-f for the
+        # same-named section there). Every FATTN_VEC_CASE(D, K, V) in
+        # fattn.cu requires the corresponding fattn-vec-instance-<k>-<v>.cu
+        # file to be listed here, otherwise link fails at build time.
+        #
+        # Per head_dim we register 14 ablation combinations (K × V matrix)
+        # plus f16/f16 via fattn-vec-instance-f16-f16.cu.
+        # Do NOT collapse or prune — each entry is required for a
+        # specific ablation experiment the user runs.
+        # =============================================================
         list(APPEND GGML_SOURCES_CUDA
-            template-instances/fattn-vec-instance-tbq3_0-tbq3_0.cu
-            template-instances/fattn-vec-instance-tbqp3_0-tbq3_0.cu
-            template-instances/fattn-vec-instance-tbq3_0-f16.cu
-            template-instances/fattn-vec-instance-tbqp3_0-f16.cu
-            template-instances/fattn-vec-instance-f16-tbq3_0.cu
             template-instances/fattn-vec-instance-f16-f16.cu
-            template-instances/fattn-vec-instance-tbq3_2-tbq3_2.cu
-            template-instances/fattn-vec-instance-tbq3_2-f16.cu
-            template-instances/fattn-vec-instance-tbq3_3-tbq3_2.cu
-            template-instances/fattn-vec-instance-tbq3_3-f16.cu
-            template-instances/fattn-vec-instance-tbqp3_3-tbq3_2.cu
-            template-instances/fattn-vec-instance-tbqp3_3-f16.cu
-            template-instances/fattn-vec-instance-tbqp3_3-q8_0.cu
-            template-instances/fattn-vec-instance-tbq4_2-tbq3_2.cu
-            template-instances/fattn-vec-instance-tbq4_2-f16.cu
-            template-instances/fattn-vec-instance-tbq4_3-tbq3_2.cu
-            template-instances/fattn-vec-instance-tbq4_3-f16.cu
-            template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu
-            template-instances/fattn-vec-instance-tbqp4_3-f16.cu
+
+            # ---- D=64 (GPT-OSS) — K uses _3 (double WHT), V uses _2 ----
             template-instances/fattn-vec-instance-f16-tbq3_2.cu
+            template-instances/fattn-vec-instance-f16-tbq4_2.cu
+            template-instances/fattn-vec-instance-tbq3_3-f16.cu
+            template-instances/fattn-vec-instance-tbq4_3-f16.cu
+            template-instances/fattn-vec-instance-tbqp3_3-f16.cu
+            template-instances/fattn-vec-instance-tbqp4_3-f16.cu
+            template-instances/fattn-vec-instance-tbq3_3-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbq3_3-tbq4_2.cu
+            template-instances/fattn-vec-instance-tbq4_3-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbq4_3-tbq4_2.cu
+            template-instances/fattn-vec-instance-tbqp3_3-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbqp3_3-tbq4_2.cu
+            template-instances/fattn-vec-instance-tbqp4_3-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbqp4_3-tbq4_2.cu
+            # Legacy D=64 single-WHT _2 K (for regression comparison)
+            template-instances/fattn-vec-instance-tbq3_2-f16.cu
+            template-instances/fattn-vec-instance-tbq3_2-tbq3_2.cu
+            template-instances/fattn-vec-instance-tbq4_2-f16.cu
+            template-instances/fattn-vec-instance-tbq4_2-tbq3_2.cu
             template-instances/fattn-vec-instance-q8_0-tbq3_2.cu
-            # D=128 (_1): Qwen3-14B, Llama, Mistral, Qwen3-30B-A3B, etc.
-            template-instances/fattn-vec-instance-tbq3_1-tbq3_1.cu
-            template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu
-            template-instances/fattn-vec-instance-tbqp3_1-tbq3_1.cu
-            template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu
+            template-instances/fattn-vec-instance-tbqp3_3-q8_0.cu
+
+            # ---- D=128 (_1): Qwen3-14B, Llama, Mistral, Qwen3-30B-A3B ----
+            template-instances/fattn-vec-instance-f16-tbq3_1.cu
+            template-instances/fattn-vec-instance-f16-tbq4_1.cu
             template-instances/fattn-vec-instance-tbq3_1-f16.cu
             template-instances/fattn-vec-instance-tbq4_1-f16.cu
             template-instances/fattn-vec-instance-tbqp3_1-f16.cu
             template-instances/fattn-vec-instance-tbqp4_1-f16.cu
+            template-instances/fattn-vec-instance-tbq3_1-tbq3_1.cu
+            template-instances/fattn-vec-instance-tbq3_1-tbq4_1.cu
+            template-instances/fattn-vec-instance-tbq4_1-tbq3_1.cu
+            template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu
+            template-instances/fattn-vec-instance-tbqp3_1-tbq3_1.cu
+            template-instances/fattn-vec-instance-tbqp3_1-tbq4_1.cu
+            template-instances/fattn-vec-instance-tbqp4_1-tbq3_1.cu
+            template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu
             template-instances/fattn-vec-instance-q8_0-tbq4_1.cu
-            # GLM-4.7-Flash / DeepSeek-V2/V3 MLA (D=576 K, D_V=512 V): 576x512 ASYM instances
-            # Added for quality experiment — VEC path for MLA to apply v1.5.2 improvements.
-            template-instances/fattn-vec-instance-tbqp3_4-asym576x512.cu
+
+            # ---- D=256 and D=512 (_0): Qwen3.5, Qwen3-Next, Gemma 4 ----
+            # Same _0 instance files serve both D=256 and D=512 dispatch cases.
+            template-instances/fattn-vec-instance-f16-tbq3_0.cu
+            template-instances/fattn-vec-instance-f16-tbq4_0.cu
+            template-instances/fattn-vec-instance-tbq3_0-f16.cu
+            template-instances/fattn-vec-instance-tbq4_0-f16.cu
+            template-instances/fattn-vec-instance-tbqp3_0-f16.cu
+            template-instances/fattn-vec-instance-tbqp4_0-f16.cu
+            template-instances/fattn-vec-instance-tbq3_0-tbq3_0.cu
+            template-instances/fattn-vec-instance-tbq3_0-tbq4_0.cu
+            template-instances/fattn-vec-instance-tbq4_0-tbq3_0.cu
+            template-instances/fattn-vec-instance-tbq4_0-tbq4_0.cu
+            template-instances/fattn-vec-instance-tbqp3_0-tbq3_0.cu
+            template-instances/fattn-vec-instance-tbqp3_0-tbq4_0.cu
+            template-instances/fattn-vec-instance-tbqp4_0-tbq3_0.cu
+            template-instances/fattn-vec-instance-tbqp4_0-tbq4_0.cu
+
+            # ---- D=576 MLA (_4): GLM-4.7-Flash, DeepSeek-V2/V3 (ASYM 576x512) ----
             template-instances/fattn-vec-instance-tbq3_4-asym576x512.cu
-            template-instances/fattn-vec-instance-tbqp4_4-asym576x512.cu
-            template-instances/fattn-vec-instance-tbq4_4-asym576x512.cu)
+            template-instances/fattn-vec-instance-tbq4_4-asym576x512.cu
+            template-instances/fattn-vec-instance-tbqp3_4-asym576x512.cu
+            template-instances/fattn-vec-instance-tbqp4_4-asym576x512.cu)
         add_compile_definitions(GGML_CUDA_FA_TBQ_TUNING)
     elseif (GGML_CUDA_FA_ALL_QUANTS)
         file(GLOB   SRCS "template-instances/fattn-vec*.cu")
