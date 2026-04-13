@@ -1082,209 +1082,341 @@ static __device__ void quantize_f32_tbqp4_2_block(const float * __restrict__ x, 
 
 // ============================================================
 // TurboQuant 576-element (head_dim=576) quantization functions
-// Split: 256+256+64, each sub-block WHT'd independently
-// Sub-blocks 1,2 (256): reuse _0 signs/logic
-// Sub-block 3 (64): reuse _2 signs/logic
+//
+// MLA models (GLM-4.7-Flash, DeepSeek-V2/V3): K = concat(latent[512], rope[64]).
+//
+// Latent [0..512]: single-pass 512-point WHT + Lloyd-Max quantization.
+//   - Ported from Gemma 4 D=512 (_0 block_512) encoding in v1.5.2 breakthrough.
+//   - Single 512-WHT mixes cross-block energy at upper butterfly stages (better
+//     CLT convergence / Gaussianization than 256+256 independent WHT).
+//   - TBQ3/TBQ4: per-block 256 norm after 512-WHT (two different norms d1, d2).
+//   - TBQP3/TBQP4: global norm (d1 == d2) — QJL residual uses cross-block 512-WHT.
+//
+// rope [512..576]: f16 passthrough (rope magnitude ~80x latent; any quantization
+// error dominates attention score → v1.4.1 fix, unchanged).
+//
+// The 512-byte sign pattern below matches tbq_signs_512 used by Gemma 4 _0 block_512.
+// Parseval identity requires the Q preprocessing side in fattn-vec.cuh to use the
+// same 512-WHT structure on the latent part of Q.
 // ============================================================
 
 static __device__ void quantize_f32_tbq3_4_block(const float * __restrict__ x, block_tbq3_4 * __restrict__ y) {
-    static constexpr uint8_t signs_256[32] = {
+    // 512-byte sign pattern, matches Gemma 4 tbq_signs_512
+    static constexpr uint8_t tbq_signs_512[64] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
         0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
     };
     static constexpr float tbq3_boundaries[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
 
-    // Helper: quantize a sub-block with 3-bit Lloyd-Max
-    auto quant_sub = [&](const float * src, int dim, const uint8_t * signs, ggml_half * d_out, uint8_t * qs_out) {
-        float tmp[QK_K]; // max sub-block size is 256
-        float sum_sq = 0.0f;
-        for (int j = 0; j < dim; j++) sum_sq += src[j] * src[j];
-        float norm = sqrtf(sum_sq);
-        *d_out = __float2half(norm);
-        if (norm < 1e-10f) { for (int j = 0; j < dim*3/8; j++) qs_out[j] = 0; return; }
-        float inv_norm = 1.0f / norm;
-        for (int j = 0; j < dim; j++) {
-            int sign = ((signs[j>>3]>>(j&7))&1) ? -1 : 1;
-            tmp[j] = src[j] * inv_norm * sign;
+    float tmp[512];
+
+    // 1. Sign flip on raw 512
+    for (int j = 0; j < 512; j++) {
+        int sign = ((tbq_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * sign;
+    }
+    // 2. Single-pass 512-point WHT (9 stages)
+    for (int len = 1; len < 512; len *= 2)
+        for (int i = 0; i < 512; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // 3. Per-block 256 norm (TBQ3: each 256-half gets its own norm after 512-WHT)
+    ggml_half * d_out[2] = { &y->d1, &y->d2 };
+    uint8_t *  qs_out[2] = {  y->qs1,  y->qs2 };
+    for (int blk = 0; blk < 2; blk++) {
+        float * blk_data = tmp + blk * 256;
+
+        float blk_sq = 0.0f;
+        for (int j = 0; j < 256; j++) blk_sq += blk_data[j] * blk_data[j];
+        float blk_norm = sqrtf(blk_sq / 256.0f);
+
+        if (blk_norm < 1e-10f) {
+            *d_out[blk] = __float2half(0.0f);
+            for (int j = 0; j < QK_K*3/8; j++) qs_out[blk][j] = 0;
+            continue;
         }
-        for (int len = 1; len < dim; len *= 2)
-            for (int i = 0; i < dim; i += 2*len)
-                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
+
+        float inv_norm = 1.0f / blk_norm;
+        *d_out[blk] = __float2half(blk_norm);
+
         int bit_pos = 0;
-        for (int j = 0; j < dim*3/8; j++) qs_out[j] = 0;
-        for (int j = 0; j < dim; j++) {
+        for (int j = 0; j < QK_K*3/8; j++) qs_out[blk][j] = 0;
+        for (int j = 0; j < 256; j++) {
+            float val = blk_data[j] * inv_norm;
             uint8_t idx = 7;
-            for (int b = 0; b < 7; b++) { if (tmp[j] < tbq3_boundaries[b]) { idx = b; break; } }
+            for (int b = 0; b < 7; b++) { if (val < tbq3_boundaries[b]) { idx = b; break; } }
             int byte_idx = bit_pos/8, bit_off = bit_pos%8;
-            qs_out[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
-            if (bit_off > 5) qs_out[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
+            qs_out[blk][byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
+            if (bit_off > 5) qs_out[blk][byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
             bit_pos += 3;
         }
-    };
+    }
 
-    quant_sub(x,       QK_K,    signs_256, &y->d1, y->qs1);
-    quant_sub(x + 256, QK_K,    signs_256, &y->d2, y->qs2);
+    // 4. rope f16 passthrough (unchanged)
     for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
 }
 
 static __device__ void quantize_f32_tbq4_4_block(const float * __restrict__ x, block_tbq4_4 * __restrict__ y) {
-    static constexpr uint8_t signs_256[32] = {
+    static constexpr uint8_t tbq_signs_512[64] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
         0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+        0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+        0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
     };
     static constexpr float tbq4_boundaries[15] = {
         -2.4008f,-1.8435f,-1.4371f,-1.0993f,-0.7996f,-0.5225f,-0.2583f,0.0f,
         0.2583f,0.5225f,0.7996f,1.0993f,1.4371f,1.8435f,2.4008f,
     };
 
-    auto quant_sub = [&](const float * src, int dim, const uint8_t * signs, ggml_half * d_out, uint8_t * qs_out) {
-        float tmp[QK_K];
-        float sum_sq = 0.0f;
-        for (int j = 0; j < dim; j++) sum_sq += src[j] * src[j];
-        float norm = sqrtf(sum_sq);
-        *d_out = __float2half(norm);
-        if (norm < 1e-10f) { for (int j = 0; j < dim/2; j++) qs_out[j] = 0; return; }
-        float inv_norm = 1.0f / norm;
-        for (int j = 0; j < dim; j++) {
-            int sign = ((signs[j>>3]>>(j&7))&1) ? -1 : 1;
-            tmp[j] = src[j] * inv_norm * sign;
-        }
-        for (int len = 1; len < dim; len *= 2)
-            for (int i = 0; i < dim; i += 2*len)
-                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-        for (int j = 0; j < dim/2; j++) {
-            uint8_t idx0 = 15, idx1 = 15;
-            for (int b = 0; b < 15; b++) { if (tmp[2*j]   < tbq4_boundaries[b]) { idx0 = b; break; } }
-            for (int b = 0; b < 15; b++) { if (tmp[2*j+1] < tbq4_boundaries[b]) { idx1 = b; break; } }
-            qs_out[j] = idx0 | (idx1 << 4);
-        }
-    };
+    float tmp[512];
 
-    quant_sub(x,       QK_K,    signs_256, &y->d1, y->qs1);
-    quant_sub(x + 256, QK_K,    signs_256, &y->d2, y->qs2);
-    // Sub-block 3: f16 passthrough (rope)
+    // 1. Sign flip + 2. 512-WHT
+    for (int j = 0; j < 512; j++) {
+        int sign = ((tbq_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * sign;
+    }
+    for (int len = 1; len < 512; len *= 2)
+        for (int i = 0; i < 512; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // 3. Per-block 256 norm (TBQ4: each 256-half gets its own norm)
+    ggml_half * d_out[2] = { &y->d1, &y->d2 };
+    uint8_t *  qs_out[2] = {  y->qs1,  y->qs2 };
+    for (int blk = 0; blk < 2; blk++) {
+        float * blk_data = tmp + blk * 256;
+
+        float blk_sq = 0.0f;
+        for (int j = 0; j < 256; j++) blk_sq += blk_data[j] * blk_data[j];
+        float blk_norm = sqrtf(blk_sq / 256.0f);
+
+        if (blk_norm < 1e-10f) {
+            *d_out[blk] = __float2half(0.0f);
+            for (int j = 0; j < QK_K/2; j++) qs_out[blk][j] = 0;
+            continue;
+        }
+
+        float inv_norm = 1.0f / blk_norm;
+        *d_out[blk] = __float2half(blk_norm);
+
+        for (int j = 0; j < 256/2; j++) {
+            float val0 = blk_data[2*j  ] * inv_norm;
+            float val1 = blk_data[2*j+1] * inv_norm;
+            uint8_t idx0 = 15, idx1 = 15;
+            for (int b = 0; b < 15; b++) { if (val0 < tbq4_boundaries[b]) { idx0 = b; break; } }
+            for (int b = 0; b < 15; b++) { if (val1 < tbq4_boundaries[b]) { idx1 = b; break; } }
+            qs_out[blk][j] = idx0 | (idx1 << 4);
+        }
+    }
+
+    // 4. rope f16 passthrough (unchanged)
     for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
 }
 
 static __device__ void quantize_f32_tbqp3_4_block(const float * __restrict__ x, block_tbqp3_4 * __restrict__ y) {
-    static constexpr uint8_t signs_256[32] = {
+    static constexpr uint8_t tbq_signs_512[64] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
         0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
-    };
-    static constexpr uint8_t qjl_signs_256[32] = {
         0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
         0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+    };
+    static constexpr uint8_t qjl_signs_512[64] = {
+        0x21,0x4e,0x75,0x8d,0x12,0xa1,0x04,0x88,0x6c,0x5d,0x2c,0xb3,0x8c,0xe2,0x00,0xd4,
+        0x30,0xc2,0x15,0x38,0x2b,0xb0,0xa5,0x32,0xf8,0xbe,0x8a,0x1d,0x43,0x86,0xf3,0x6f,
+        0xbc,0x9b,0xdd,0xcb,0x05,0x8a,0x09,0xf3,0x2f,0x39,0x17,0x3c,0x6f,0xb8,0x75,0x78,
+        0x74,0x44,0x6f,0x2a,0x6a,0x23,0x25,0x0d,0x61,0x4f,0x35,0xbb,0x04,0x7b,0xbc,0x3d,
     };
     static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f };
     static constexpr float b2[3] = { -0.9816f,0.0f,0.9816f };
 
-    // Sub-block 1,2: 256-element, 2-bit Lloyd-Max + QJL SRHT correction
-    auto quant_sub_qjl = [&](const float * src, const uint8_t * signs, const uint8_t * qjl_s,
-                              ggml_half * d_out, ggml_half * d_qjl_out, uint8_t * qs_out, uint8_t * qjl_out) {
-        float tmp[QK_K], recon[QK_K];
-        float sum_sq = 0.0f;
-        for (int j = 0; j < QK_K; j++) sum_sq += src[j] * src[j];
-        float norm = sqrtf(sum_sq);
-        *d_out = __float2half(norm);
-        if (norm < 1e-10f) {
-            for (int j = 0; j < QK_K/4; j++) qs_out[j] = 0;
-            for (int j = 0; j < QK_K/8; j++) qjl_out[j] = 0;
-            *d_qjl_out = __float2half(0.0f); return;
-        }
-        float inv_norm = 1.0f / norm;
-        for (int j = 0; j < QK_K; j++) {
-            int sign = ((signs[j>>3]>>(j&7))&1) ? -1 : 1;
-            tmp[j] = src[j] * inv_norm * sign;
-        }
-        for (int len = 1; len < QK_K; len *= 2)
-            for (int i = 0; i < QK_K; i += 2*len)
-                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-        for (int j = 0; j < QK_K/4; j++) {
+    float tmp[512], recon[512];
+
+    // 1. Sign flip + 2. 512-WHT
+    for (int j = 0; j < 512; j++) {
+        int sign = ((tbq_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * sign;
+    }
+    for (int len = 1; len < 512; len *= 2)
+        for (int i = 0; i < 512; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // 3. Global norm for TBQP3 (QJL residual uses cross-block 512-WHT,
+    //    so all elements must share the same normalized space)
+    float global_sq = 0.0f;
+    for (int j = 0; j < 512; j++) global_sq += tmp[j] * tmp[j];
+    float global_norm = sqrtf(global_sq / 512.0f);
+
+    if (global_norm < 1e-10f) {
+        y->d1 = __float2half(0.0f); y->d2 = __float2half(0.0f);
+        y->d1_qjl = __float2half(0.0f); y->d2_qjl = __float2half(0.0f);
+        for (int j = 0; j < QK_K/4; j++) { y->qs1[j] = 0; y->qs2[j] = 0; }
+        for (int j = 0; j < QK_K/8; j++) { y->qjl1[j] = 0; y->qjl2[j] = 0; }
+        for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
+        return;
+    }
+
+    float inv_norm = 1.0f / global_norm;
+    y->d1 = __float2half(global_norm);
+    y->d2 = __float2half(global_norm);
+
+    // 4. 2-bit Lloyd-Max quantization per 256-half
+    uint8_t * qs_out[2] = { y->qs1, y->qs2 };
+    for (int blk = 0; blk < 2; blk++) {
+        float * blk_data = tmp + blk * 256;
+        for (int j = 0; j < 256/4; j++) {
             uint8_t packed = 0;
             for (int k = 0; k < 4; k++) {
+                float val = blk_data[j*4+k] * inv_norm;
                 uint8_t idx = 3;
-                for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } }
-                packed |= (idx&0x3)<<(k*2);
-                recon[j*4+k] = c2[idx];
+                for (int b = 0; b < 3; b++) { if (val < b2[b]) { idx = b; break; } }
+                packed |= (idx & 0x3) << (k*2);
+                recon[blk*256 + j*4+k] = c2[idx];
             }
-            qs_out[j] = packed;
+            qs_out[blk][j] = packed;
         }
-        float res[QK_K], res_sq = 0.0f;
-        for (int j = 0; j < QK_K; j++) { res[j] = tmp[j]-recon[j]; res_sq += res[j]*res[j]; }
-        float gamma = sqrtf(res_sq);
-        *d_qjl_out = __float2half(gamma * norm);
-        for (int j = 0; j < QK_K; j++) { int sign = ((qjl_s[j>>3]>>(j&7))&1)?-1:1; res[j] *= sign; }
-        for (int len = 1; len < QK_K; len *= 2)
-            for (int i = 0; i < QK_K; i += 2*len)
-                for (int j = 0; j < len; j++) { float u = res[i+j], v = res[i+j+len]; res[i+j] = u+v; res[i+j+len] = u-v; }
-        for (int j = 0; j < QK_K/8; j++) qjl_out[j] = 0;
-        for (int j = 0; j < QK_K; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
-    };
+    }
 
-    quant_sub_qjl(x,       signs_256, qjl_signs_256, &y->d1, &y->d1_qjl, y->qs1, y->qjl1);
-    quant_sub_qjl(x + 256, signs_256, qjl_signs_256, &y->d2, &y->d2_qjl, y->qs2, y->qjl2);
-    // Sub-block 3: f16 passthrough (rope)
+    // 5. QJL residual: 512-length residual, cross-block sign flip, 512-WHT, 1-bit signs
+    float res[512];
+    float res_sq = 0.0f;
+    for (int j = 0; j < 512; j++) {
+        res[j] = tmp[j] * inv_norm - recon[j];
+        res_sq += res[j] * res[j];
+    }
+    float gamma = sqrtf(res_sq);
+    float d_qjl = gamma * global_norm;
+    y->d1_qjl = __float2half(d_qjl);
+    y->d2_qjl = __float2half(d_qjl);
+
+    for (int j = 0; j < 512; j++) {
+        int sign = ((qjl_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        res[j] *= sign;
+    }
+    for (int len = 1; len < 512; len *= 2)
+        for (int i = 0; i < 512; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = res[i+j], v = res[i+j+len];
+                res[i+j] = u+v; res[i+j+len] = u-v;
+            }
+    uint8_t * qjl_out[2] = { y->qjl1, y->qjl2 };
+    for (int blk = 0; blk < 2; blk++) {
+        for (int j = 0; j < 256/8; j++) qjl_out[blk][j] = 0;
+        for (int j = 0; j < 256; j++) {
+            if (res[blk*256 + j] >= 0.0f) qjl_out[blk][j/8] |= (1 << (j%8));
+        }
+    }
+
+    // 6. rope f16 passthrough (unchanged)
     for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
 }
 
 static __device__ void quantize_f32_tbqp4_4_block(const float * __restrict__ x, block_tbqp4_4 * __restrict__ y) {
-    static constexpr uint8_t signs_256[32] = {
+    static constexpr uint8_t tbq_signs_512[64] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
         0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
-    };
-    static constexpr uint8_t qjl_signs_256[32] = {
         0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
         0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+    };
+    static constexpr uint8_t qjl_signs_512[64] = {
+        0x21,0x4e,0x75,0x8d,0x12,0xa1,0x04,0x88,0x6c,0x5d,0x2c,0xb3,0x8c,0xe2,0x00,0xd4,
+        0x30,0xc2,0x15,0x38,0x2b,0xb0,0xa5,0x32,0xf8,0xbe,0x8a,0x1d,0x43,0x86,0xf3,0x6f,
+        0xbc,0x9b,0xdd,0xcb,0x05,0x8a,0x09,0xf3,0x2f,0x39,0x17,0x3c,0x6f,0xb8,0x75,0x78,
+        0x74,0x44,0x6f,0x2a,0x6a,0x23,0x25,0x0d,0x61,0x4f,0x35,0xbb,0x04,0x7b,0xbc,0x3d,
     };
     static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
     static constexpr float b3[7] = { -1.7480f,-1.0500f,-0.5006f,0.0f,0.5006f,1.0500f,1.7480f };
 
-    // Sub-block 1,2: 256-element, 3-bit Lloyd-Max + QJL SRHT correction
-    auto quant_sub_qjl = [&](const float * src, const uint8_t * signs, const uint8_t * qjl_s,
-                              ggml_half * d_out, ggml_half * d_qjl_out, uint8_t * qs_out, uint8_t * qjl_out) {
-        float tmp[QK_K], recon[QK_K];
-        float sum_sq = 0.0f;
-        for (int j = 0; j < QK_K; j++) sum_sq += src[j] * src[j];
-        float norm = sqrtf(sum_sq);
-        *d_out = __float2half(norm);
-        if (norm < 1e-10f) {
-            for (int j = 0; j < QK_K*3/8; j++) qs_out[j] = 0;
-            for (int j = 0; j < QK_K/8; j++) qjl_out[j] = 0;
-            *d_qjl_out = __float2half(0.0f); return;
-        }
-        float inv_norm = 1.0f / norm;
-        for (int j = 0; j < QK_K; j++) {
-            int sign = ((signs[j>>3]>>(j&7))&1) ? -1 : 1;
-            tmp[j] = src[j] * inv_norm * sign;
-        }
-        for (int len = 1; len < QK_K; len *= 2)
-            for (int i = 0; i < QK_K; i += 2*len)
-                for (int j = 0; j < len; j++) { float u = tmp[i+j], v = tmp[i+j+len]; tmp[i+j] = u+v; tmp[i+j+len] = u-v; }
-        int bit_pos = 0;
-        for (int j = 0; j < QK_K*3/8; j++) qs_out[j] = 0;
-        for (int j = 0; j < QK_K; j++) {
-            uint8_t idx = 7;
-            for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
-            int byte_idx = bit_pos/8, bit_off = bit_pos%8;
-            qs_out[byte_idx] |= (uint8_t)((idx&0x7)<<bit_off);
-            if (bit_off > 5) qs_out[byte_idx+1] |= (uint8_t)((idx&0x7)>>(8-bit_off));
-            recon[j] = c3[idx]; bit_pos += 3;
-        }
-        float res[QK_K], res_sq = 0.0f;
-        for (int j = 0; j < QK_K; j++) { res[j] = tmp[j]-recon[j]; res_sq += res[j]*res[j]; }
-        float gamma = sqrtf(res_sq);
-        *d_qjl_out = __float2half(gamma * norm);
-        for (int j = 0; j < QK_K; j++) { int sign = ((qjl_s[j>>3]>>(j&7))&1)?-1:1; res[j] *= sign; }
-        for (int len = 1; len < QK_K; len *= 2)
-            for (int i = 0; i < QK_K; i += 2*len)
-                for (int j = 0; j < len; j++) { float u = res[i+j], v = res[i+j+len]; res[i+j] = u+v; res[i+j+len] = u-v; }
-        for (int j = 0; j < QK_K/8; j++) qjl_out[j] = 0;
-        for (int j = 0; j < QK_K; j++) { if (res[j] >= 0.0f) qjl_out[j/8] |= (1<<(j%8)); }
-    };
+    float tmp[512], recon[512];
 
-    quant_sub_qjl(x,       signs_256, qjl_signs_256, &y->d1, &y->d1_qjl, y->qs1, y->qjl1);
-    quant_sub_qjl(x + 256, signs_256, qjl_signs_256, &y->d2, &y->d2_qjl, y->qs2, y->qjl2);
-    // Sub-block 3: f16 passthrough (rope)
+    // 1. Sign flip + 2. 512-WHT
+    for (int j = 0; j < 512; j++) {
+        int sign = ((tbq_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * sign;
+    }
+    for (int len = 1; len < 512; len *= 2)
+        for (int i = 0; i < 512; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // 3. Global norm for TBQP4 (same as TBQP3 rationale)
+    float global_sq = 0.0f;
+    for (int j = 0; j < 512; j++) global_sq += tmp[j] * tmp[j];
+    float global_norm = sqrtf(global_sq / 512.0f);
+
+    if (global_norm < 1e-10f) {
+        y->d1 = __float2half(0.0f); y->d2 = __float2half(0.0f);
+        y->d1_qjl = __float2half(0.0f); y->d2_qjl = __float2half(0.0f);
+        for (int j = 0; j < QK_K*3/8; j++) { y->qs1[j] = 0; y->qs2[j] = 0; }
+        for (int j = 0; j < QK_K/8; j++) { y->qjl1[j] = 0; y->qjl2[j] = 0; }
+        for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
+        return;
+    }
+
+    float inv_norm = 1.0f / global_norm;
+    y->d1 = __float2half(global_norm);
+    y->d2 = __float2half(global_norm);
+
+    // 4. 3-bit Lloyd-Max quantization per 256-half
+    uint8_t * qs_out[2] = { y->qs1, y->qs2 };
+    for (int blk = 0; blk < 2; blk++) {
+        float * blk_data = tmp + blk * 256;
+        int bit_pos = 0;
+        for (int j = 0; j < QK_K*3/8; j++) qs_out[blk][j] = 0;
+        for (int j = 0; j < 256; j++) {
+            float val = blk_data[j] * inv_norm;
+            uint8_t idx = 7;
+            for (int b = 0; b < 7; b++) { if (val < b3[b]) { idx = b; break; } }
+            int byte_idx = bit_pos/8, bit_off = bit_pos%8;
+            qs_out[blk][byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
+            if (bit_off > 5) qs_out[blk][byte_idx+1] |= (uint8_t)((idx & 0x7) >> (8-bit_off));
+            recon[blk*256 + j] = c3[idx];
+            bit_pos += 3;
+        }
+    }
+
+    // 5. QJL residual: 512-length residual, cross-block sign flip, 512-WHT, 1-bit signs
+    float res[512];
+    float res_sq = 0.0f;
+    for (int j = 0; j < 512; j++) {
+        res[j] = tmp[j] * inv_norm - recon[j];
+        res_sq += res[j] * res[j];
+    }
+    float gamma = sqrtf(res_sq);
+    float d_qjl = gamma * global_norm;
+    y->d1_qjl = __float2half(d_qjl);
+    y->d2_qjl = __float2half(d_qjl);
+
+    for (int j = 0; j < 512; j++) {
+        int sign = ((qjl_signs_512[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        res[j] *= sign;
+    }
+    for (int len = 1; len < 512; len *= 2)
+        for (int i = 0; i < 512; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = res[i+j], v = res[i+j+len];
+                res[i+j] = u+v; res[i+j+len] = u-v;
+            }
+    uint8_t * qjl_out[2] = { y->qjl1, y->qjl2 };
+    for (int blk = 0; blk < 2; blk++) {
+        for (int j = 0; j < 256/8; j++) qjl_out[blk][j] = 0;
+        for (int j = 0; j < 256; j++) {
+            if (res[blk*256 + j] >= 0.0f) qjl_out[blk][j/8] |= (1 << (j%8));
+        }
+    }
+
+    // 6. rope f16 passthrough (unchanged)
     for (int j = 0; j < TBQ_K64; j++) y->rope[j] = __float2half(x[512 + j]);
 }
 

@@ -262,6 +262,35 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // D=64 f16/q8_0 K + TBQ V (for comparison testing)
     FATTN_VEC_CASE(64, GGML_TYPE_F16, GGML_TYPE_TBQ3_2)
     FATTN_VEC_CASE(64, GGML_TYPE_Q8_0, GGML_TYPE_TBQ3_2)
+
+    // D=128 (_1) — Qwen3-14B, Llama, Mistral, Qwen3-30B-A3B, etc.
+    // NOTE: no TBQP4_1-TBQP4_1 instance yet (primoco bug report: tbqp4/tbqp4 flash attn
+    // crash on head_dim=128). V=TBQP* normally auto-downgrades to TBQ* in common.cpp.
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ4_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1,  GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,    GGML_TYPE_TBQ4_1)   // primoco recommended: q8_0 K + tbq4 V
+
+    // GLM-4.7-Flash / DeepSeek-V2/V3 MLA: K=576 (TBQP3_4/TBQ3_4), V=512
+    // V-as-K-view (MLA absorption): V->type == K->type at dispatch time (TBQP3_4 + TBQP3_4, etc.)
+    // Quality experiment: force VEC path for MLA to apply v1.5.2 improvements.
+    // Kept inside TBQ_TUNING so builds with tuning=ON can still test GLM.
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_4)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_4)
+    // Also support asymmetric cases (non-absorption / f16 V fallback)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQP3_4, GGML_TYPE_F16)
+    FATTN_VEC_CASE_ASYM(576, 512, GGML_TYPE_TBQ3_4,  GGML_TYPE_F16)
 #elif defined(GGML_CUDA_FA_ALL_QUANTS)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
@@ -788,7 +817,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // TBQ: only vec kernel is implemented (no MMA/tile/WMMA support)
+    // TBQ kernel support (as of v1.5.3):
+    //   - D≤512 (Gemma 4 512, Qwen3.5 256, Llama/Qwen3 128, GPT-OSS 64): VEC kernel only
+    //   - D=576 asymmetric (GLM-4.7-Flash, DeepSeek-V2/V3 MLA): MMA kernel (v1.4.2+) with VEC fallback
+    //   - Tile/WMMA: not implemented
+    // NOTE: Gemma 4 / Qwen3.5 / others fall back from MMA (upstream default) to VEC when TBQ is used,
+    //       which means those models accept a speed regression vs f16. Quality work (v1.5.2) has been
+    //       applied only to the VEC path so far — the MMA path (MLA only) is stuck at v1.4.2 quality.
     const bool tbq_k_type = K->type == GGML_TYPE_TBQ4_0 || K->type == GGML_TYPE_TBQ3_0
      || K->type == GGML_TYPE_TBQP4_0 || K->type == GGML_TYPE_TBQP3_0
      || K->type == GGML_TYPE_TBQ4_1 || K->type == GGML_TYPE_TBQ3_1
@@ -805,18 +840,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3
      || V->type == GGML_TYPE_TBQ4_4 || V->type == GGML_TYPE_TBQ3_4;
     if (tbq_k_type || tbq_v_type) {
-        if (Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+        // EXPERIMENT (post-v1.5.3): route GLM MLA (D=576) to VEC kernel as well, to apply
+        // v1.5.2 quality improvements (precision fix, sharpening, V IWHT float staging, etc.)
+        // that only exist in the VEC path today. Once quality is validated on VEC, the
+        // improvements will be ported back to the MMA kernel for the speed gain.
+        //
+        // Historical: v1.4.1 started MLA on VEC (30 t/s, quality-first); v1.4.2 ported to
+        // MMA (49 t/s). We're temporarily reverting to the v1.4.1 path for quality work.
+        if (Q->ne[0] <= 576 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
             return BEST_FATTN_KERNEL_VEC;
         }
-        // GLM asymmetric: K=576, V=512 with TBQ types — MMA tensor core
-        // TBQ: dequant+IWHT → spatial f16 → MMA
-        // TBQP: K=WHT+QJL f16, V=MSE spatial f16, Q=WHT → MMA (full QJL on K·Q)
-        if (Q->ne[0] == 576 && V->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
-            if (turing_mma_available(cc) || volta_mma_available(cc)) {
-                return BEST_FATTN_KERNEL_MMA_F16;
-            }
-            return BEST_FATTN_KERNEL_VEC;
-        }
+        // (Disabled during experiment — will be re-enabled after quality port.)
+        // if (Q->ne[0] == 576 && V->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+        //     if (turing_mma_available(cc) || volta_mma_available(cc)) {
+        //         return BEST_FATTN_KERNEL_MMA_F16;
+        //     }
+        //     return BEST_FATTN_KERNEL_VEC;
+        // }
         return BEST_FATTN_KERNEL_NONE;
     }
 
