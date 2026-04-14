@@ -4,6 +4,12 @@
 
 [🇬🇧 English](README.md)
 
+### 📄 논문
+
+- 📘 [**Polar Derotation: Coupled-RoPE 언어 모델에서 3비트 KV 캐시 품질 절벽 돌파**](paper/polar_derotate_paper_ko.pdf) — TBQX3_1 (Polar Derotation + Tangent Residual) 이론 및 평가
+- 📗 [**TurboQuant 구현: 프로덕션 LLM 추론 엔진에서의 3비트 KV 캐시 압축**](paper/turboquant_impl_ko.pdf) — 원본 TBQ v1 구현 논문 (WHT + Lloyd-Max + QJL)
+- 📕 [English — Polar Derotation](paper/polar_derotate_paper.pdf) · [English — TurboQuant Impl](paper/turboquant_impl.pdf)
+
 ### 🆕 v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B)
 
 **새 K 캐시 포맷: polar 좌표 저장 + content/position 분리 + 해석적 tangent residual 보정. 수학 추론에서 f16 를 압도하면서 한국어 산문 품질 유지.**

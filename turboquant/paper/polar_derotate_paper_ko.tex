@@ -1,0 +1,612 @@
+\documentclass[10pt,twocolumn]{article}
+
+% ============================================================
+% Packages  (matches turboquant_impl_ko.tex for consistency)
+% ============================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{kotex}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{url}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\newcommand{\draftnote}[1]{\textcolor{red}{[초고: #1]}}
+
+% ============================================================
+% Title
+% ============================================================
+\title{Polar Derotation: Coupled-RoPE 언어 모델에서\\3비트 KV 캐시 품질 절벽 돌파}
+
+\author{
+AmesianX\\
+독립 연구자\\
+\texttt{amesianx@gmail.com}\\
+\url{https://powerhacker.net}\\
+\url{https://github.com/AmesianX/TurboQuant}
+}
+
+\date{2026년 4월 \\ \textit{작업 중인 초고 --- 배포용 아님}}
+
+% ============================================================
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+우리는 \textbf{TBQX3\_1}을 제시한다. 이는 coupled-RoPE 언어 모델을 위한 KV 캐시 포맷으로, 두 가지 아이디어를 결합하여 이미 학습된 모델 위에서 content/position 분리를 실제로 구현한 최초의 시스템이다: (i)~\textbf{Polar Derotation} --- 양자화 전에 알려진 RoPE 회전을 빼내고 쌍극좌표의 위치 무관 콘텐츠 표현 $(r,\varphi^{\text{content}})$을 저장하며 어텐션 읽기 시점에 위치를 대수적으로 복원하는 캐시 경계 변환; (ii)~\textbf{Tangent Residual} --- 3비트 uniform 위상 양자화기의 잔차 오차가 양자화된 위상에서의 접선 방향에 전부 놓인다는 기하학적 관찰을 이용하는 페어당 1비트 보정으로, 크기 $r\cdot\pi/16$은 해석적으로 주어지고 방향 $(-\sin\hat\varphi,\cos\hat\varphi)$은 디퀀트 경로에서 이미 계산된 코사인/사인을 재활용한다.
+
+두 기법이 결합된 스킴은 $3.625$~bpw로 동작하며, Qwen3-14B 40K 컨텍스트 temperature $0$ 환경에서 \textbf{35문항 수학 추론 벤치에서 f16 정확도를 능가한다}($37.1\%$ vs $34.3\%$). 동시에 KV 캐시는 $4.74\times$ 압축되고($6400$~MiB $\to 1350$~MiB), 디코드 처리량은 기존 3비트 TBQ와 측정 오차 범위 내에서 동일하다. 동일 워크로드에서 기존 TBQ3\_1은 f16 대비 $17\%$ 낮은 점수를 기록하며, 본 논문이 닫고자 하는 3비트 품질 절벽을 단적으로 보여준다. Polar Derotation은 Multi-head Latent Attention(MLA)~\cite{deepseekv2}이 아키텍처 재설계로 달성하는 동일한 품질 지점을 겨냥하되, 재학습 없이 가중치 포맷 변경 없이 \emph{소급 적용}된다 --- Llama, Qwen, Mistral, Gemma, Yi 등 coupled-RoPE 계열 전체가 적용 대상이다. 부수적으로 \emph{무손실 컨텍스트 시프트}도 공짜로 얻는다. 본 연구는 명시적으로 3비트 개입이며, 4비트 구성은 범위 밖이다.
+\end{abstract}
+
+% ============================================================
+\section{서론}
+\label{sec:intro}
+
+\subsection{왜 3비트인가, 왜 3비트만인가}
+\label{sec:why3bit}
+
+선행 연구~\cite{turboquant_impl2026}에서 우리는 llama.cpp 내부에 TurboQuant~\cite{turboquant2026}의 최초의 프로덕션 구현을 제시했으며, Gemma~4 26B에서 FP16 대비 6\% perplexity 저하에 $4.2\times$ KV 캐시 압축을 달성했다. 해당 구현은 요소당 \textbf{3비트}로 동작한다($K$에 대해 2비트 Lloyd-Max + 1비트 QJL 보정, $V$는 MSE만). 프로덕션 수준이긴 하나, Qwen3 같은 coupled-RoPE 모델에서는 토큰 수준 벤치마크에서 FP16 품질의 약 96\%만 유지한다.
+
+이 격차에 대한 자연스러운 반응은 4비트로 이동하는 것이다. \emph{우리는 이 경로를 해결책이 아니라고 본다.}
+
+4비트에서는 사실상 모든 최신 양자화기 --- 본 논문이 제안하는 어떠한 기법도 없는 TBQ v1 포함 --- 가 FP16급 품질에 도달한다. 4비트로 가는 데는 Polar Derotation이 필요 없고, PolarQuant도, TurboQuant도, 심지어 QJL조차 많은 경우 필요 없다. 4비트에서는 \emph{이미 힘으로 풀린 문제}이며, 해상도가 단순히 충분해서 양자화 노이즈가 모델 자신의 추론 마진 아래로 떨어진다. 4비트 영역에는 연구적 기여 여지가 없고, 더 중요하게는 \emph{엔지니어링적} 동기도 없다: 4비트 캐시는 3비트 캐시의 두 배의 저장 비용을 들이는데, 이는 애초에 압축으로 피하고 싶었던 그 비용이다.
+
+흥미로운 영역 --- 이 모든 연구 라인을 정당화하는 유일한 영역 --- 은 요소당 3비트다. 3비트 캐시는 4비트 캐시가 차지하는 풋프린트의 절반이고, 4비트 구성으로는 담을 수 없는 장문맥 워크로드를 메모리 예산 안에 들여놓으며, 엣지 및 멀티 테넌트 서빙 시나리오를 해금한다. 그러나 3비트는 바퀴가 빠지는 지점이기도 하다: coupled-RoPE 모델에서 4비트와 3비트 사이의 격차는 완만한 저하가 아니라 \textbf{품질 절벽}이다. 기존 방법들은 이 절벽에서 떨어지고, 선행 TBQ v1 구현도 떨어지며, Lloyd-Max 코드북 튜닝이나 QJL 잔차 균형 조정 그 어느 것도 우리 경험상 이를 다시 올려 세우기에 충분하지 않았다.
+
+따라서 본 논문은 오직 3비트에 집중한다. 4비트 수치는 보고하지 않는다. 4비트 개선을 주장하지 않는다. Polar Derotation 메커니즘은 \textbf{3비트 개입}이다 --- 기존 통계적 방법이 멈추는 바로 그 지점에서만 지탱력이 생기는 구조적 변화. 우리는 3비트 절벽이 3비트 해상도 자체의 \emph{본질적} 한계인지, 아니면 우리와 선행 연구가 활용하지 못한 표현상의 중복성을 반영하는지 물었다. 본 논문은 후자임을 주장한다.
+
+\paragraph{기여.}
+본 논문의 두 축은 \textbf{Polar Derotation 의 coupled-RoPE 캐시에 대한 실제 구현}과 \textbf{Tangent Residual} 이며, 이 둘이 결합되어 $3.625$~bpw에서 f16 수학 벤치를 이긴다.
+
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \textbf{coupled-RoPE 에서의 Polar Derotation 최초 end-to-end 구현}(\S\ref{sec:method}, \S\ref{sec:impl}): 캐시 경계에서 위상으로부터 $p\omega_i$를 빼고, 콘텐츠 전용 쌍극좌표 $(r,\varphi^{\text{content}})$를 저장하며, 읽기 시점에 \texttt{\_\_sincosf}로 위치를 대수적으로 복원하는 변환. 이는 MLA 의 아키텍처적 content/position 분리를 \emph{소급}으로 재현하는 것이며, 재학습도 가중치 포맷 변경도 토크나이저 변경도 요구하지 않는다. 참조 구현은 llama.cpp 의 23개 파일 수정으로 이루어지며 $\text{head\_dim}=128$ polar 경로에만 고립되어 있다.
+\item \textbf{크기 채널에 Rayleigh Lloyd-Max 적용}(\S\ref{sec:rayleigh}): 복소 가우시안 페어의 크기가 Rayleigh 분포를 따른다는 사실로부터 $\sigma$ 정규화 좌표계에서 닫힌 형식의 8-레벨 Lloyd-Max 코드북을 유도한다. 캘리브레이션 데이터 不요, 모델별 튜닝 不요. $\sigma$ 추정치도 Rayleigh 2차 모멘트로부터 닫힌 형식으로 주어진다: $\hat\sigma = \sqrt{\sum r_i^2 / 2n}$.
+\item \textbf{Tangent Residual: 해석적 1비트 위상 보정}(\S\ref{sec:tangent}): 효과적인 각도 양자화 오차를 $\pm\pi/8$에서 $\pm\pi/16$로 절반으로 줄이는 기하학적으로 정확한 보정으로, 비용은 페어당 정확히 1비트 + 읽기 시점의 FMA 2개이다. 보정 크기 $r\cdot\pi/16$은 순수 기하 상수이며, 방향 $(-\sin\hat\varphi,\cos\hat\varphi)$은 디퀀트가 이미 계산한 코사인/사인의 좌표 치환이다. 학습된 스케일도, 캘리브레이션도, 추가 삼각 함수 호출도 不요.
+\item \textbf{3.625 bpw 로 수학 벤치에서 f16 를 이김}(\S\ref{sec:eval}): Qwen3-14B 40K 컨텍스트 temperature $0$ 에서 TBQX3\_1/TBQ3\_1 은 수학 벤치 $13/35$ ($37.1\%$), f16/f16 은 $12/35$ ($34.3\%$), 기존 TBQ3\_1/TBQ3\_1 은 $10/35$ ($28.6\%$). KV 캐시 풋프린트는 $6400$~MiB 에서 $1350$~MiB 로 감소($4.74\times$), 디코드 처리량은 $21$--$22$ tokens/s (f16 $24$--$25$).
+\item \textbf{무손실 컨텍스트 시프트 공짜}(\S\ref{sec:shift}): 저장된 위상이 이미 위치 무관이므로, \texttt{build\_rope\_shift} 경로는 상수 시간 인덱스 갱신으로 축소된다. dequantize / rotate / requantize 왕복이 不요이며, 이는 장문맥 슬라이딩 윈도우 서빙에서의 기존 TBQ 결함을 닫는다.
+\item \textbf{폐기된 변종들의 연구 로드맵}(\S\ref{sec:deadends}): 구현/심각하게 고려되었다가 최종 기각된 다섯 가지 대안 접근 (TBQXP3\_1 Direct Signs $4.25$~bpw, TBQX2\_1 2비트 사분면 $2.625$~bpw, WHT$+$polar 결합, 오프라인 $\varphi$ 캘리브레이션, 셀별 적응형 FP32 fallback) 을 각각의 실패 이유와 함께 기록한다. 목적은 향후 sub-4비트 coupled-RoPE KV 캐시 연구의 설계 공간을 제한하는 것이다.
+\end{enumerate}
+
+\paragraph{본 논문이 주장하지 않는 것.}
+새로운 핵심 양자화 알고리즘을 주장하지 않는다: Lloyd-Max, WHT 전처리, QJL 잔차 보정은 적절한 곳에서 계속 적용되며, Rayleigh Lloyd-Max 는 알려진 분포에 대한 표준 Lloyd-Max 의 닫힌 형식 특수화일 뿐 새로운 최적화 기법이 아니다. 새 모델 아키텍처도 제안하지 않는다. TBQX3\_1 이 모든 벤치, 모든 모델, 모든 seed 에서 f16 을 지배한다고 주장하지도 않는다: 수학 벤치 결과는 방향성 (TBQX3\_1 이 테스트한 seed 전반에서 f16 이상) 에서 재현 가능하지만 마진은 변동이 있으며 seed 52 는 무승부를 기록한다. 기여는 구조적이다: coupled-RoPE 키 양자화를 content 와 position 이 대수적으로 분리 가능한 영역으로 옮기고, 그 영역의 잔여 위상 오차를 기하학적으로 정확한 1비트 보정으로 닫는 것.
+
+% ============================================================
+\section{배경}
+\label{sec:background}
+
+\subsection{쌍별 복소 회전으로서의 RoPE}
+\label{sec:rope-bg}
+
+Rotary Position Embedding~\cite{rope2021}은 쿼리와 키에 쌍별 2D 회전을 적용하여 절대 위치를 인코딩한다. 헤드 차원 $D$(짝수 가정)에 대해 키 벡터 $k\in\mathbb{R}^D$는 $D/2$개의 연속된 쌍 $(k_{2i},k_{2i+1})$으로 분해되고, RoPE는 각 쌍에 다음을 적용한다:
+\begin{equation}
+  \begin{pmatrix} k'_{2i}\\k'_{2i+1}\end{pmatrix}
+  =
+  \begin{pmatrix} \cos\theta_i & -\sin\theta_i\\ \sin\theta_i & \cos\theta_i\end{pmatrix}
+  \begin{pmatrix} k_{2i}\\k_{2i+1}\end{pmatrix},\quad
+  \theta_i=p\cdot\omega_i,
+  \label{eq:rope}
+\end{equation}
+여기서 $p$는 토큰 위치, $\omega_i=\text{base}^{-2i/D}$는 쌍별 주파수이다(표준 기저: $10^4$ 또는 $10^6$).
+
+핵심은 식~\eqref{eq:rope}이 복소 쌍 $k_i\!:=\!k_{2i}+\imath k_{2i+1}$에 대한 복소 곱셈 $k'_i = k_i\cdot e^{\imath\theta_i}$와 수학적으로 동일하다는 것이다. RoPE는 문자 그대로 \emph{태생적으로 극좌표 구조인} 대상에 대한 쌍별 \emph{위상 덧셈}이다. 크기 $|k_i|$는 변경하지 않고, 위상만 $p\omega_i$만큼 이동시킨다.
+
+\subsection{Coupled 대 Decoupled RoPE}
+
+두 아키텍처 계열을 구분한다:
+
+\paragraph{Coupled RoPE.}
+전체 키 벡터가 식~\eqref{eq:rope}에 의해 회전된다. 모든 쌍이 위상에 콘텐츠와 위치를 \emph{동시에} 담는다. Llama 2--4, Qwen2/2.5/3, Mistral, Gemma 1--4, Phi, Yi, Falcon 등 사실상 배포된 거의 모든 오픈 웨이트 LLM이 여기에 해당한다.
+
+\paragraph{Decoupled RoPE.}
+키가 학습 시점에 $D = D_c + D_r$로 분할된다 --- RoPE가 적용되지 않는 콘텐츠 라텐트 $D_c$와, RoPE가 적용되는 작은 rope 성분 $D_r$(일반적으로 64). DeepSeek-V2/V3 MLA~\cite{deepseekv2}와 GLM-4.5/4.6/4.7이 이 형태다. 선행 TBQ 연구에서 우리는 64차원 rope 슬라이스를 FP16 패스스루 블록으로 저장했는데, 이를 양자화하면 어텐션이 불균형하게 손상되기 때문이다(해당 영역의 norm이 라텐트 norm의 약 80배).
+
+Decoupled 설계는 정확히 위치/콘텐츠 얽힘 문제에 대한 아키텍처 수준의 해결책이다. 동작하지만, 처음부터 그렇게 학습된 모델에만 적용 가능하다.
+
+\subsection{Post-RoPE 캐시 저장 관례}
+
+거의 모든 추론 엔진 --- \texttt{transformers}, vLLM, \texttt{llama.cpp}, SGLang, TensorRT-LLM --- 은 \emph{post-RoPE} 키를 캐시에 저장한다. 이는 런타임 효율성 선택이며 아키텍처 속성이 아니다. 매 디코드 단계마다 RoPE를 다시 적용하는 것을 피하기 위한 것이다. Coupled-RoPE 모델에서 이는 양자화된 모든 원소가 콘텐츠와 위치의 혼합을 인코딩한다는 것을 의미한다.
+
+\subsection{PolarQuant과 TurboQuant}
+
+PolarQuant~\cite{polarquant2025}은 KV 캐시를 위한 재귀적 쌍극좌표 변환을 도입했다. 무작위 전처리 후 각도 주변 분포가 해석적으로 계산 가능해져서 블록당 scale/zero-point 메타데이터를 제거할 수 있다. TurboQuant~\cite{turboquant2026}은 PolarQuant을 1비트 QJL 편향 보정기로 감싼다.
+
+PolarQuant의 쌍 구조는 RoPE의 쌍 구조와 \emph{우연히} 일치한다 --- PolarQuant은 RoPE 불가지론적이며, 극 표현을 순전히 분포 정형화 목적으로 사용하고, 각도 $\varphi_i$는 여전히 위치 정보를 담고 있다. 본 논문의 Polar Derotation은 동일한 표현을 다른 목적(위치 중복성 제거)에 활용하며, PolarQuant을 대체하기보다는 \emph{합성}된다.
+
+% ============================================================
+\section{위치 중복성 관찰}
+\label{sec:observation}
+
+슬롯 $p$에 있는 coupled-RoPE 모델 캐시의 post-RoPE 복소 쌍을 $k'_i=r_ie^{\imath\varphi_i}$로 표기하자. 식~\eqref{eq:rope}을 대입하면:
+\begin{equation}
+  \varphi_i=\varphi^{\text{content}}_i+p\cdot\omega_i,\qquad
+  r_i=r^{\text{content}}_i,
+  \label{eq:decompose}
+\end{equation}
+여기서 $(r^{\text{content}}_i,\varphi^{\text{content}}_i)$는 모델의 원시 $W_K$ 출력의 pre-RoPE 극좌표이다.
+
+세 가지 기본 사실이 따른다.
+
+\paragraph{사실 1: 크기는 위치 불변이다.}
+RoPE는 $r_i$를 건드리지 않는다. 양자화기가 크기에 할당하는 모든 비트는 오직 콘텐츠만 측정한다. 카테시안 양자화기에서 이 속성은 구조적으로 \emph{보이지 않는다} --- $r_i$가 명시적 좌표로 노출되지 않기 때문이다. 그것은 $(k_{2i},k_{2i+1})$ 안에 얽혀 있고 위상 정보와 비트 예산을 공유한다.
+
+\paragraph{사실 2: 위상은 중복된 위치 비트를 담고 있다.}
+$p\cdot\omega_i$ 항은 다음에 의해 완전히 결정된다:
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=0pt]
+\item $p$: 토큰 위치 --- 캐시 슬롯 인덱스와 동일하며, 모든 커널이 추가 로드 없이 이미 알고 있다;
+\item $\omega_i$: $D/2$개 항목의 상수 테이블로, 모든 레이어, 헤드, 배치, 요청에 걸쳐 공유된다.
+\end{itemize}
+따라서 $\varphi_i=\varphi^{\text{content}}_i+p\omega_i$를 저장하는 것은 재구성에 \emph{0} 바이트가 드는 정보를 임베드하는 것이다. 양자화기는 공짜로 얻을 수 있는 신호에 정밀도를 소모하고 있다.
+
+\paragraph{사실 3: 3비트 절벽은 본질적이지 않다 --- 위치 중복성 절벽이다.}
+16비트 FP 정밀도에서는 콘텐츠와 위치가 관찰 가능한 충돌 없이 편안하게 공존한다. 4비트에서도 중첩은 통계적으로 양성이다: 남은 원소당 해상도가 두 신호를 품질 임계치를 넘지 않고 흡수할 만큼 여전히 크다. 이것이 4비트 KV 캐시가 배포된 거의 모든 양자화기에서 ``그냥 작동''하는 이유이다. 3비트에서는 양상이 급격히 바뀐다: 해상도가 이제 정보 내용 자체와 같은 차수가 되고, \emph{중복 위치에 쓰인 모든 비트는 콘텐츠에서 빼앗긴 비트}가 된다. 우리 --- 그리고 우리가 아는 모든 sub-4-bit KV 양자화기 --- 가 coupled-RoPE 모델에서 관찰한 3비트 품질 절벽은 따라서 3비트 표현의 본질적 한계가 아니다. 위치 중복성이 처음으로 품질의 결정적 제약이 되는 특정 영역이다. 절벽을 닫는 것은 4비트로 이동할 필요가 없다(그러면 압축의 목적이 사라진다). 3비트 영역에서 중복성을 제거해야 한다. Polar Derotation이 하는 일이 정확히 이것이다.
+
+% ============================================================
+\section{방법: Polar Derotation}
+\label{sec:method}
+
+\subsection{알고리즘}
+
+\paragraph{캐시 쓰기 (위치 $p$의 토큰에 대해).}
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item 어텐션 프로젝션으로부터 post-RoPE 쌍 $k'_i=(k'_{2i},k'_{2i+1})$을 수신.
+\item 극좌표 계산:
+$r_i=\sqrt{(k'_{2i})^2+(k'_{2i+1})^2}$,
+$\varphi_i=\text{atan2}(k'_{2i+1},k'_{2i})$.
+\item \textbf{Derotate}:
+$\varphi^{\text{content}}_i\leftarrow(\varphi_i-p\omega_i)\bmod 2\pi$.
+\item 기존 방식(TBQ 3비트 Lloyd-Max, PolarQuant 스타일 등) 중 하나로 $(r_i,\varphi^{\text{content}}_i)$를 양자화.
+\end{enumerate}
+
+\paragraph{어텐션 읽기 ($p_q$의 쿼리가 캐시 슬롯 $p_k$에 접근).}
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item $(\hat{r}_k,\hat{\varphi}^{\text{content}}_k)$를 역양자화.
+\item \textbf{Rerotate}:
+$\hat{\varphi}_k\leftarrow\hat{\varphi}^{\text{content}}_k+p_k\omega_i$.
+\item 카테시안으로 복원하여($\hat{k}_i=\hat{r}_k\,e^{\imath\hat{\varphi}_k}$) 기존 \texttt{vec\_dot}을 그대로 사용하거나, 극 공간에서 직접 내적 계산:
+\begin{equation}
+\langle q_i,\hat{k}_i\rangle
+=r_{q,i}\cdot\hat{r}_k\cdot\cos(\varphi_{q,i}-\hat{\varphi}_k).
+\label{eq:polar-dot}
+\end{equation}
+\end{enumerate}
+
+\subsection{위치 채널의 정확성}
+\label{sec:exact}
+
+Derotation과 rerotation은 대수적 역원이다. 부동소수점에서도 동일한 $\omega_i$(FP32 상수 테이블)와 동일한 정수 $p$(캐시 슬롯 인덱스)를 사용하므로 비트 동일 결과로 교환 가능하다. \emph{위치 채널은 새로운 오차를 도입하지 않는다.}
+
+유일한 오차 경로는 $(r_i,\varphi^{\text{content}}_i)$의 양자화이다. 동일한 총 비트 예산 하에서, 이 오차가 $(k_{2i},k_{2i+1})$에 대한 카테시안 기준선의 양자화 오차보다 엄격히 작다는 것이 다음 소절의 주장이다.
+
+\subsection{콘텐츠 분포가 더 좁은 이유}
+\label{sec:tighter}
+
+표준 인덱싱에서 큰 $i$에 해당하는 고주파 쌍의 경우, $p\omega_i$는 긴 컨텍스트에서 여러 바퀴의 완전한 회전을 쓸어간다. 전형적인 블록 내 토큰들에 걸쳐 $\varphi_i$는 $[0,2\pi)$ 상의 균등 분포 --- 최대 엔트로피 영역 --- 에 접근한다. 이는 모델의 $W_K$ 프로젝션이 무엇을 생성했든 상관없다. 이런 주변 분포에 대해 보정된 Lloyd-Max 양자화기는 균등 섹터 분할보다 더 잘할 수 없다.
+
+콘텐츠 전용 위상 $\varphi^{\text{content}}_i$는 반대로 모델 프로젝션의 학습된 구조만을 반영하며, 위치 노이즈로부터 자유롭다. 경험적으로(Phase 1 측정 대기, \S\ref{sec:eval} 참조) 이 분포는 상당히 집중되어 있을 것으로 예상된다: 동일한 8 섹터(3비트 위상)가 콘텐츠 관련 차이를 훨씬 정밀하게 해결한다. 우리는 프로덕션 coupled-RoPE 모델의 고주파 쌍에서 집중 비율이 최소 $3\times$일 것으로 추측하며, 이를 첫 번째 경험적 산출물로 삼는다.
+
+\subsection{크기 채널에 대한 Rayleigh Lloyd-Max}
+\label{sec:rayleigh}
+
+Derotation 이후 페어 $(k_x, k_y)$는 위치 무관 콘텐츠를 나타낸다. $W_K$ 프로젝션이 근사적으로 등방 가우시안 페어 활성화를 생성하는 모델에서, 크기 $r = \sqrt{k_x^2 + k_y^2}$는 해석적으로 Rayleigh 분포를 따른다:
+\begin{equation}
+p(r;\sigma) = \frac{r}{\sigma^2}\exp\!\left(-\frac{r^2}{2\sigma^2}\right),
+\end{equation}
+2차 모멘트 $E[r^2] = 2\sigma^2$. 이로부터 \emph{캘리브레이션 不요} 스케일 추정이 나온다: $n$개 페어를 갖는 임의 블록에 대해
+\begin{equation}
+\hat\sigma = \sqrt{\frac{1}{2n}\sum_{i=1}^{n} r_i^2}.
+\end{equation}
+
+더 중요한 것은, Rayleigh 분포가 $\sigma$ 정규화 좌표계에서 \textbf{특정 모델이나 데이터셋과 무관한 닫힌 형식의 8-레벨 Lloyd-Max 코드북}을 허용한다는 점이다. Rayleigh pdf 상에서 표준 Lloyd-Max 반복을 수치적으로 풀면 다음 경계/센트로이드 쌍이 나온다:
+\begin{align}
+\mathbf{b} &= (0.4280,\,0.7848,\,1.0991,\,1.4101,\,1.7268,\,2.0623,\,2.4427)\sigma,\\
+\mathbf{c} &= (0.2400,\,0.6160,\,0.9420,\,1.2547,\,1.5685,\,1.8946,\,2.2520,\,2.6650)\sigma.
+\end{align}
+저장 비용은 페어당 3비트 + $\sigma$용 \texttt{half} 하나. 블록별 히스토그램도, 학습 시점 캘리브레이션도, 모델별 튜닝도 요구되지 않는다. 동일한 상수가 모든 coupled-RoPE 모델의 모든 레이어의 모든 블록에 적용된다 --- 이 분포가 특정 데이터셋 속성이 아닌 $W_K$의 WHT 또는 가우시안 프로젝션 통계의 결과이기 때문이다. 이는 일반 $k$-평균 양자화와는 질적으로 다른 영역이며, TBQX가 $3.125$~bpw에서 품질 여유를 확보하는 두 가지 이유 중 하나이다.
+
+\subsection{Tangent Residual: 해석적 절반 셀 보정}
+\label{sec:tangent}
+
+두 번째 이유는 Rayleigh Lloyd-Max가 크기에 적용된 \emph{후} 잔차 오차가 \emph{어디에} 위치하는지에 대한 구조적 관찰이다.
+
+$[-\pi,\pi)$의 uniform 3비트 분할에서 셀 폭은 $\pi/4$이고 잔차 각도 오차는 $|\Delta\varphi| \le \pi/8 \approx 22.5^\circ$로 제한된다. 이는 그 자체로 큰 카테시안 재구성 오차를 낳는다. 페어당 오차가
+\begin{equation}
+|K_{\text{actual}} - K_{\text{polar}}| \approx r\,|\Delta\varphi|
+\end{equation}
+로 $r$에 비례하기 때문이다. 경험적으로, 이 영역이 바로 저확률 토큰 drift가 발현되는 곳이다: temperature $0$에서 희소 transliteration 토큰(예: 서구 과학자 이름의 한국어 표기)이 근접 character-set 클러스터로 flip 되는 것은 top-1 logit 마진이 $\pm\pi/8$ 각도 셀에 의해 유발되는 attention score 교란 이내이기 때문이다.
+
+해결책은, 작은 $\Delta\varphi$에 대해 잔차가 전적으로 양자화된 위상 $\hat\varphi$에서의 constant-$r$ 원에 대한 \textbf{접선} 방향에 위치한다는 사실을 활용한다. 카테시안 평면에서,
+\begin{equation}
+K_{\text{actual}} - K_{\text{polar}} \;\approx\; r\,\Delta\varphi\,\bigl(-\!\sin\hat\varphi,\;\cos\hat\varphi\bigr) + O(\Delta\varphi^2).
+\end{equation}
+두 가지 관찰이 이를 값싼 보정으로 만든다:
+
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=1pt]
+\item \textbf{크기가 해석적이다.} 반폭 $\pi/8$의 3비트 uniform 셀이 주어지면, 센트로이드로부터의 기대 절반 셀 오프셋은 $\pi/16$이다. 이는 학습된 스케일이 아닌 순수 기하 상수이다. 블록별 메타데이터가 不요하다.
+\item \textbf{방향이 공짜다.} 디퀀트 경로는 이미 양자화된 페어 복원을 위해 $(\cos\hat\varphi,\sin\hat\varphi)$를 계산한다. 접선 방향 $(-\sin\hat\varphi,\cos\hat\varphi)$는 좌표 치환 + 한 번의 부호 뒤집기이다 --- 추가 삼각 함수 호출이 없다.
+\end{itemize}
+
+따라서 Tangent Residual 보정은 정확히 \textbf{페어당 1비트}를 블록 레이아웃에 추가하며 다음 정제된 복원을 생성한다:
+\begin{equation}
+\label{eq:tangent-correction}
+K_{\text{refined}} \;=\; K_{\text{polar}} + s\cdot r\cdot\tfrac{\pi}{16}\cdot(-\!\sin\hat\varphi,\;\cos\hat\varphi),\qquad s\in\{-1,+1\},
+\end{equation}
+여기서 $s$는 3비트 각도 셀 내부의 $\Delta\varphi$ 부호로 저장된다. 전체 읽기 측 오버헤드는 FMA 두 개이다. 유효 각도 해상도는 $\pm\pi/8$에서 $\pm\pi/16$으로 두 배 증가($22.5^\circ\!\to\!11.25^\circ$)하며, 이는 단 1비트 비용에 4비트 uniform 위상 양자화기와 등가이다.
+
+경험적으로(\S\ref{sec:eval}), Tangent Residual은 Qwen3-14B에서 관찰된 저확률 토큰 drift를 제거한다: Wolfgang Pauli, Erwin Schrödinger 등 희소 이름 질의의 한국어 transliteration에서 나타나던 키릴 문자 오염이 temperature $0$에서 완전히 사라지며, 동시에 수학 추론 정확도는 유지되거나 향상된다. 본 논문의 구성에서 \emph{Rayleigh Lloyd-Max는 크기를 커버하고, Tangent Residual은 접선 방향을 따라 남은 호 길이 오차를 커버한다}. 둘은 결합되어 매우 낮은 비트 비용으로 페어당 오차 예산을 포화시킨다.
+
+결합된 스킴 --- polar derotation, $r$에 대한 Rayleigh Lloyd-Max, $\varphi^{\text{content}}$에 대한 3비트 uniform 분할, 1비트 접선 부호 --- 은 TBQ v2 참조 코드로 구현된 \textbf{TBQX3\_1} 변종이다. 블록 포맷과 경험적 수치는 \S\ref{sec:impl}와 \S\ref{sec:eval}에 있다.
+
+\subsection{이종 쌍별 비트 할당}
+\label{sec:hetero}
+
+주파수 $\omega_i$는 자릿수 차이(비율 $\approx\text{base}$, 즉 일반 설정에서 $10^4$ 또는 $10^6$)로 퍼져 있다. 저주파 쌍($p\omega_i$가 컨텍스트 윈도우에서 거의 상수)은 위치 혼합을 사실상 보지 않는다 --- 콘텐츠 분포 $(r,\varphi^{\text{content}})$가 크기 지배적이고 위상은 압축되어 있다. 고주파 쌍은 앞서 논의한 정확히 그 균등화된 위상을 보며, derotation으로부터 가장 큰 이득을 얻는다.
+
+Polar Derotation은 이 구조를 쌍당 두 개의 명시적 좌표로 노출시켜, 카테시안 공간에서는 구조적으로 불가능했던 쌍별 비트 할당을 가능케 한다. 3비트 평균 고정 하의 예시 구성:
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=0pt]
+\item 저주파 쌍: 4비트 $r$, 2비트 $\varphi^{\text{content}}$
+\item 고주파 쌍: 2비트 $r$, 4비트 $\varphi^{\text{content}}$
+\item 평균: 원소당 3비트, TBQ v1 예산과 일치
+\end{itemize}
+최적 할당은 가중치 양자화기의 채널별 스케일 보정과 유사하게 활성화로부터 오프라인 보정할 수 있다.
+
+\subsection{무손실 컨텍스트 시프트 공짜}
+\label{sec:shift}
+
+독립적 서빙 가치를 지닌 부수 효과: coupled-RoPE 모델에서 컨텍스트 시프트(슬라이딩 윈도우 KV 축출과 재인덱싱)는 개념적으로 저장된 모든 키를 새 위치로 재회전해야 한다. 양자화된 캐시의 경우 이는 시프트된 요소마다 dequantize / rotate / requantize를 의미한다. 현재 TBQ 구현은 이러한 이유로 \texttt{build\_rope\_shift}에서 early-return하여 시프트된 토큰에 대한 품질 저하를 수용한다.
+
+Polar Derotation 하에서 저장된 콘텐츠 전용 위상 $\varphi^{\text{content}}_i$는 \emph{이미} 슬롯-위치 매핑에 불변이다. 토큰을 슬롯 $p$에서 $p'$로 시프트하는 것은 인덱스 갱신으로 축소되며, 다음 읽기는 동일한 저장된 콘텐츠에서 $p\omega_i$ 대신 $p'\omega_i$를 계산하여 올바른 회전 후 재구성을 산출한다. 커널 수준 시프트 연산이 필요 없고, 품질 손실이 없다.
+
+이것은 주 변환의 부수 효과로 TBQ v1의 미해결 결함을 닫는다.
+
+% ============================================================
+\section{TBQ v2 구현 계획}
+\label{sec:impl}
+
+\subsection{블록 레이아웃 (TBQX3\_1)}
+
+참조 구현은 \texttt{block\_tbqx3\_1}이며 $D=128$(64 페어)에 대한 58바이트 레이아웃이다. \S\ref{sec:method}에서 도입된 세 채널을 담는다: polar 크기, 콘텐츠 위상, 1비트 tangent 보정 부호.
+
+\begin{verbatim}
+block_tbqx3_1      (58 bytes, 3.625 bpw)
+  d_r     half       2   // Rayleigh sigma scale
+  qr      uint8[24] 24   // 3-bit x 64 magnitudes (Lloyd-Max)
+  qphi    uint8[24] 24   // 3-bit x 64 content phases (uniform)
+  qtan    uint8[8]   8   // 1-bit x 64 tangent residual signs
+\end{verbatim}
+
+페어당 저장 내역: $r$에 3비트, $\varphi^{\text{content}}$에 3비트, 접선 부호에 1비트, 합계 페어당 7비트. 페어의 2 스칼라 원소로 평균내면 $3.5$ bpw이고, \texttt{half} 스케일 필드를 블록의 128 원소에 분할하면 총 $\mathbf{3.625}$ bpw가 된다.
+
+이 레이아웃은 원본 \texttt{block\_tbqp3\_1}에 존재하던 QJL 보정 비트를 의도적으로 생략한다. Derotation된 콘텐츠에서 QJL 스타일 랜덤 프로젝션은 pair-polar 표현과 깨끗하게 합성되지 않으며(QJL은 WHT 전처리된 벡터에서 동작하는데, WHT는 페어 구조를 파괴한다), 우리의 경험적 결과(\S\ref{sec:eval})는 Rayleigh Lloyd-Max와 Tangent Residual만으로 QJL 없이도 품질 격차가 닫힘을 보여준다.
+
+\S\ref{sec:hetero}의 이종 비트 할당을 지원하는 대체 레이아웃은 페어 그룹별 $r$/$\varphi$ 비트 재분배를 통해 동일한 바이트 봉투 안에서 구성 가능하다. 위의 기본 TBQX3\_1 레이아웃이 \S\ref{sec:eval} 전반에서 사용된 구성이다.
+
+\subsection{코드 지점}
+
+현재 TBQ v1 코드베이스~\cite{turboquant_impl2026}와의 통합은 두 파일에 국소화된다:
+
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \texttt{ggml/src/ggml-cuda/cpy-utils.cuh} --- \texttt{quantize\_f32\_tbqp3\_1\_block}을 극 변형으로 교체. 캐시 슬롯 인덱스를 커널 파라미터로 수신하여 쌍별 $p\omega_i$ 뺄셈으로 $\varphi^{\text{content}}_i$를 계산하고, 기존 Lloyd-Max 인프라로 $(r,\varphi^{\text{content}})$를 양자화한다.
+\item \texttt{ggml/src/ggml-cuda/fattn-common.cuh} --- \texttt{vec\_dot\_fattn\_vec\_KQ\_tbqp3\_1}을 극 내적 경로로 교체. 두 변형이 가능: (a)~\texttt{\_\_sincosf}로 카테시안 복원 후 기존 내적 재사용, 또는 (b)~식~\eqref{eq:polar-dot}에 따라 극 공간에서 직접 동작하며 코사인을 누산기에 융합.
+\end{itemize}
+
+모델 가중치 파일, 토크나이저, GGUF 포맷, 캐시 외 모든 경로는 손대지 않는다. RoPE 자체도 비활성화되거나 수정되지 않는다. 우리는 단지 양자화될 경계에서 post-RoPE $K$ 텐서를 가로챌 뿐이다.
+
+\subsection{지연 시간 기대치}
+
+TBQ \texttt{fattn-vec} 커널은 RTX 6000 Ada, H100, GB200급 하드웨어에서 메모리 바운드이다~\cite{turboquant_impl2026}. 쌍당 곱셈 1회($p\cdot\omega_i$), FMA 1회(위상 합), \texttt{\_\_sincosf} 1회를 추가하는 것은 전적으로 HBM 지연 시간 그림자 안에 들어가며 측정 가능한 처리량 감소를 낳지 않을 것으로 기대된다. 사실 역양자화 경로는 교체되는 카테시안 WHT 역변환 변형보다 \emph{더 저렴}해질 수 있다. 극 디코드는 쌍당 스칼라 룩업 두 번과 삼각 평가 한 번만 필요하고, 버터플라이 네트워크가 없기 때문이다.
+
+\subsection{정밀도 고려사항}
+
+긴 컨텍스트에서 인수 $p\omega_i$는 범위 축소 중 정확도가 손실되는 크기에 이를 수 있다. 표준 구제책:
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=0pt]
+\item $\varphi^{\text{content}}$를 이미 $[0,2\pi)$로 축소하여 저장.
+\item $p\omega_i\bmod 2\pi$를 Payne-Hanek 범위 축소~\cite{payne1983}로 FP32에서 사전 계산하여 컨텍스트 단계당 캐시.
+\item 극단 컨텍스트($p>10^6$)에서는 경미한 지연 시간 비용으로 \texttt{sincosf}로 폴백.
+\end{itemize}
+이들 중 어떤 것도 양자화 오차 분석에 영향을 주지 않는다. 삼각 평가 오차만 제한한다.
+
+\subsection{WHT와의 상호작용}
+
+TBQ v1은 주변 분포를 가우시안화하기 위해 Lloyd-Max 앞에 Walsh-Hadamard 전처리를 적용한다. WHT는 쌍 경계를 가로질러 섞이며 Polar Derotation이 의존하는 극 구조를 파괴한다. 따라서 TBQ v2는 다음 중 하나를 선택해야 한다:
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=0pt]
+\item \textbf{WHT 완전 제거.} Derotation 자체가 이미 콘텐츠 전용 분포를 선명하게 만드므로 추가 전처리가 불필요할 수 있다.
+\item \textbf{쌍 내부 $2\times 2$ 화이트닝.} 각 쌍 내부에 고정 회전을 WHT 대체로 적용하여 쌍 경계를 넘어 극 구조를 보존.
+\item \textbf{쌍별 독립 화이트닝.} 쌍당 작은 화이트닝 회전을 오프라인 보정.
+\end{itemize}
+이 트레이드오프는 경험적이며 Phase 2에서 결정된다.
+
+% ============================================================
+\section{선행 연구와의 관계}
+\label{sec:related}
+
+\subsection{PolarQuant과 TurboQuant}
+
+PolarQuant~\cite{polarquant2025}은 KV 캐시에서 쌍극 표현의 사용을 개척했으나, 다른 이유에서였다: 무작위 전처리 후 각도 주변 분포가 해석적 형태를 가져 블록당 scale 메타데이터를 제거할 수 있다. PolarQuant의 쌍 구조는 RoPE의 쌍 구조와 우연히 일치한다 --- RoPE 주파수 테이블 $\omega_i$나 슬롯 인덱스 $p$를 전혀 사용하지 않는다.
+
+Polar Derotation은 보완적이다: 알려진 위치 회전을 추가로 각도 좌표에서 빼내어, PolarQuant이 사용하지 않는 모델 수준 구조적 속성을 활용한다. 두 기법은 자연스럽게 합성된다: 분포 정형화를 위해 PolarQuant의 전처리를 적용한 후, 콘텐츠 격리를 위해 derotate. TurboQuant의 QJL 잔차 보정기~\cite{turboquant2026}는 변경 없이 둘러싸며, 1비트 예산이 위치/콘텐츠 혼합 대신 콘텐츠 전용 잔차에서 동작할 때 더 효과적이 될 것으로 기대된다.
+
+\subsection{Multi-head Latent Attention}
+
+DeepSeek-V2~\cite{deepseekv2}와 그 후손들(GLM-4.5/4.6/4.7)은 위치/콘텐츠 얽힘을 아키텍처 수준에서 해결한다: $K = \text{concat}(\text{latent}_{D_c},\text{rope}_{D_r})$, RoPE는 $D_r$ 슬라이스로 제한된다. Polar Derotation과 동일한 비트 효율성 개선을 낳지만, 새 아키텍처로 학습된 모델에만 해당된다.
+
+Polar Derotation은 \textbf{소급 MLA}로 볼 수 있다: 이미 학습된 coupled-RoPE 모델에 재학습 0, 가중치 수정 0으로 동일한 콘텐츠/위치 분리를 제공한다. 적용 가능한 표면적은 본질적으로 MLA 계열 외 모든 배포된 오픈 웨이트 LLM이며, MLA 계열 자체보다 수 자릿수 많은 배포 건수이다.
+
+\subsection{카테시안 KV 양자화}
+
+KIVI~\cite{kivi2024}, KVQuant~\cite{kvquant2024}, SmoothQuant-KV~\cite{smoothquant2023}는 저장된 불투명 텐서에 대해 카테시안 공간에서 동작한다. 이들은 위치 중복성을 활용할 수 없다. 중복성이 쌍 분해와 RoPE 주파수 테이블 $\omega_i$가 명시화된 후에만 구조적으로 드러나기 때문이다.
+
+% ============================================================
+\section{평가}
+\label{sec:eval}
+
+본 섹션의 모든 수치는 NVIDIA DGX Spark (GB10 SoC, 128~GB 통합 메모리), CUDA~12.8 에서 수집되었으며, 열 안정화 envelope (\S\ref{sec:deadends}) 하에서 동작했다. 모델은 Qwen3-14B (Q4\_K\_M 가중치 양자화), 컨텍스트 길이 40,960, 디코드 예산 4,096. 샘플링은 temperature $0$.
+
+\subsection{메모리 풋프린트}
+
+$\text{ctx}=40{,}960$, 40 transformer 레이어에서 llama.cpp 할당자가 보고하는 end-to-end KV 캐시 버퍼 크기:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Config} & \textbf{K buffer} & \textbf{V buffer} & \textbf{Total} & \textbf{Compression} \\
+\midrule
+f16/f16                     & 3200 MiB & 3200 MiB & 6400 MiB & $1.00\times$ \\
+\textbf{tbqx3/tbq3 (ours)}  & \textbf{725 MiB} & 625 MiB & \textbf{1350 MiB} & \textbf{$4.74\times$} \\
+tbq3/tbq3 (TBQ v1)          & 625 MiB & 625 MiB & 1250 MiB & $5.12\times$ \\
+\bottomrule
+\end{tabular}
+\caption{$\text{ctx}=40{,}960$에서의 KV 캐시 버퍼 크기. TBQX3\_1은 Tangent Residual 대가로 TBQ3\_1 대비 $+100$ MiB K측 프리미엄을 지불하며, 총합은 순수 3비트 기준선의 $8\%$ 이내, 이론 상한 $5.3\times$의 $21\%$ 이내에 머문다.}
+\label{tab:memory}
+\end{table}
+
+\subsection{디코드 처리량}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Config} & \textbf{tokens/s} & \textbf{vs f16} \\
+\midrule
+f16/f16               & 24--25 & $1.00\times$ \\
+\textbf{tbqx3/tbq3}   & \textbf{21--22} & \textbf{$0.87\times$} \\
+tbq3/tbq3             & 21--22 & $0.87\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Qwen3-14B 디코드 처리량. TBQX3\_1은 추가 Tangent Residual 보정에도 불구하고 TBQ3\_1 대비 측정 가능한 감속이 없다: 페어당 FMA 2개가 기존 HBM latency shadow 내에 들어간다. f16 대비 $13\%$ 격차는 derotation 특유가 아닌 TBQ vec 경로의 일반 비용이다.}
+\label{tab:throughput}
+\end{table}
+
+\subsection{수학 추론}
+
+수학 벤치는 3 티어 35문제 (2$\times$2 행렬곱, 3$\times$3 행렬곱, 스칼라 산술 체인) 로 구성되며 답은 정수값이다. Temperature $0$에서 부분 점수는 불가능하다: 단 하나의 중간 토큰이 잘못된 숫자로 flip 되면 문제 전체가 실패한다.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Config} & \textbf{Math (/35)} & \textbf{\%} & \textbf{vs f16} \\
+\midrule
+\textbf{tbqx3/tbq3 (ours)} & \textbf{13/35} & \textbf{37.1\%} & \textbf{$+8\%$} \\
+f16/f16                    & 12/35 & 34.3\% & --- \\
+tbq3/tbq3 (TBQ v1)         & 10/35 & 28.6\% & $-17\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Qwen3-14B 수학 정확도, seed 1234, 35문제, temperature $0$. TBQX3\_1이 f16과 기존 TBQ3\_1 둘 다를 능가한다. 기존 TBQ3\_1의 f16 대비 $-17\%$ 저하는 \S\ref{sec:why3bit}에서 기술한 ``3비트 품질 절벽''과 일치한다. TBQX3\_1은 이 절벽을 닫고 f16 위로 $+8\%$ 올라선다.}
+\label{tab:math}
+\end{table}
+
+여러 seed (42, 43, 52, 666, 1234) 에서의 추가 실행은 순서를 확인한다: TBQX3\_1은 일관되게 f16 이상이고 일관되게 기존 TBQ3\_1 이상이다. 일부 실행에서는 TBQX3\_1이 더 큰 폭으로 f16을 넘는다 (seed 42: $17/35$ vs $11/35$, $+55\%$). Seed 52는 f16과 무승부를 기록한다. 테스트된 seed 전반의 f16 대비 평균 향상은 약 $+20\%$, 기존 TBQ3\_1 대비는 약 $+35\%$이다. 이는 temperature $0$ 정확 일치 수치임을 강조하며, 더 높은 온도나 더 풍부한 벤치 세트에서의 평균 성능에 대한 주장은 추가 데이터 없이 피한다.
+
+\subsection{희소 토큰 drift (질적)}
+
+Tangent Residual의 동기는 legacy polar (tangent 보정 없는 3비트 uniform $\varphi^{\text{content}}$) 가 희소 토큰 질의에서 특징적인 출력 drift를 생성했다는 관찰이었다: temperature $0$에서 ``Wolfgang~Pauli의 한국어 음역이 무엇인가?''를 물으면 키릴 문자가 포함된 문자열 (\texttt{와оль프강 폴리}, 여기서 \texttt{оль}은 키릴 ``ol'') 을 깨끗한 한글 출력 대신 반환했다. f16/f16에서도 동일 질의는 올바른 음역 (Qwen3-14B가 이를 안정적으로 알지 못함) 을 내놓지 못했지만, 교차 문자셋 실패 대신 \emph{깨끗한} 한국어 전용 실패 (\texttt{바울리})를 냈다.
+
+Tangent Residual이 활성화된 TBQX3\_1은 동일 질의에서 깨끗한 한국어 전용 출력을 낸다: Pauli는 \texttt{와인하르트 폴리}, Schrödinger는 \texttt{에르빈 슈딩거}. 모델의 근본적인 사실 오류는 그대로이지만 --- Qwen3-14B는 여전히 올바른 음역을 모른다 --- 문자셋 오염은 제거된다. 이는 Tangent Residual이 설계 의도했던 drift 행동이며, \S\ref{sec:tangent}의 기하학적 논증을 확증한다: $\varphi$ 오차를 $\pm\pi/8$에서 $\pm\pi/16$로 절반으로 줄이면 이 질의군에 대한 attention score 교란이 top-1 flip 마진 아래로 내려간다.
+
+\subsection{Qwen3-14B 외 커버리지}
+
+TBQX3\_1은 coupled RoPE의 $\text{head\_dim}=128$에 묶여 있으며, 이는 Llama, Mistral, Qwen, Yi 계열에서 지배적인 구성이다. $\text{head\_dim}=64$ 모델 (GPT-OSS 120B) 은 무관한 double-WHT-per-head 경로~\cite{turboquant_impl2026}를 사용하고, decoupled-RoPE MLA 모델 (DeepSeek-V2, GLM-4.7) 은 derotation을 불필요하게 만드는 아키텍처적 content/position 분리를 사용한다 (\S\ref{sec:related}). 이들 구성에서 TBQX3\_1은 올바르게 기존 특수 경로로 fallthrough 하며 자신을 강제하지 않는다. Fallthrough 동작의 커버리지 테스트는 진행 중이다.
+
+% ============================================================
+\section{한계와 미해결 질문}
+\label{sec:limitations}
+
+\paragraph{주파수 의존적 이득.}
+품질 개선은 고주파 쌍에서 가장 크다. $p\omega_i$가 천천히 변하는 저주파 쌍은 이미 콘텐츠 지배적 위상을 가지고 있어 이득이 제한적이다. 주파수 대 이득 곡선의 정량화는 Phase 1 산출물이다.
+
+\paragraph{WHT 호환성.}
+\S\ref{sec:impl}에서 논의한 바와 같이, TBQ v1의 양자화 전 Walsh-Hadamard 변환은 쌍 수준에서 Polar Derotation과 호환되지 않는다. Derotation만으로 충분한지, 아니면 쌍 내부 화이트너가 필요한지는 경험적 질문으로 남아 있다.
+
+\paragraph{긴 컨텍스트 삼각 정밀도.}
+위치가 약 $10^5$를 초과하고 $\omega_i$가 높을 때, 단순한 \texttt{\_\_sincosf}는 범위 축소 중 정확도를 잃는다. 표준 구제책이 적용되지만, 잔여 오차가 양자화 오차 예산보다 훨씬 낮음을 검증해야 한다.
+
+\paragraph{QJL 재보정.}
+TBQ v1의 1비트 QJL 보정기는 카테시안 잔차에 대해 보정되어 있다. Polar Derotation 하에서 잔차 분포가 (더 깨끗한 콘텐츠 전용 형태로) 변하므로 QJL 부호 테이블을 재보정해야 한다. 효과는 긍정적일 것으로 예상되지만 검증이 필요하다.
+
+\paragraph{RoPE 외 일반화.}
+이 방법은 RoPE의 쌍별 회전 구조를 구체적으로 활용한다. ALiBi, T5 상대 위치, 절대 사인파 인코딩은 이 구조를 공유하지 않으며 Polar Derotation의 영향을 받지 않는다.
+
+\paragraph{MLA는 대상이 아니다.}
+Decoupled RoPE(MLA, GLM-4.7) 모델은 위치/콘텐츠 분리가 이미 아키텍처적이다. Polar Derotation은 거기서 추가 이득을 제공하지 않으며, 우회되어야 한다. 기존 FP16 rope 패스스루는 그대로 유지되어야 한다.
+
+% ============================================================
+\section{연구 로드맵: 막다른 길과 교훈}
+\label{sec:deadends}
+
+본 섹션은 TBQX3\_1 개발 중 구현·검증된 후 폐기된 변종들과 방향들을 기록한다. 성공한 경로는 짧지만 실패의 표면은 넓고, 각 대안이 실패한 구체적 이유가 향후 sub-4비트 coupled-RoPE KV 캐시 연구의 설계 공간을 제약하기 때문이다.
+
+\subsection{TBQXP3\_1: Direct Signs 잔차 보정 (4.25~bpw)}
+
+3비트 polar 품질 격차에 대한 첫 시도는 원본 QJL 문헌의 Direct Signs 잔차 기법을 직접 이식한 것이었다: Rayleigh Lloyd-Max $r$과 3비트 uniform $\varphi^{\text{content}}$가 디코드된 후 페어별 카테시안 잔차
+\begin{equation*}
+\mathbf{e}_i = (k_{x,i}, k_{y,i}) - r_i(\cos\hat\varphi_i,\sin\hat\varphi_i)
+\end{equation*}
+를 두 부호 비트 $(\text{sign}(e_x),\text{sign}(e_y))$와 공유 크기 스케일 $d_{\text{direct}}$ (half 저장) 로 압축. 총 비용: 페어당 추가 2비트 + 블록 스케일 2~B $= 68$~B/블록 $= 4.25$~bpw.
+
+\emph{폐기 이유.} 두 가지 독립된 이유. 첫째, 기준선 대비 1.125~bpw 오버헤드가 품질 이득에 비례하지 않는다 --- 우리는 나중에 Tangent Residual 로 3.625~bpw 에서 같은 (또는 더 나은) 품질을 얻었다. 둘째, 더 근본적으로, Direct Signs 는 \emph{잔차를 비구조적으로 취급}한다: 암묵적으로 $\mathbf{e}_i$를 일반 2D 벡터로 모델링하며 비트 예산을 반경과 접선 성분 둘 다에 분배한다. 그러나 Rayleigh Lloyd-Max 이후 잔차는 비구조적이 아니다: 반경 성분 $\Delta r$은 이미 작고 (크기 코드북이 거의 최적이기 때문에) 잔차 에너지의 거의 전부는 접선 방향에 존재한다. Direct Signs 는 잔차가 이미 사라진 방향 (반경) 에 비트의 절반을 낭비하고 있었다. Tangent Residual (\S\ref{sec:tangent}) 은 이 기하학적 관찰을 활용해 같은 보정 품질을 2비트 대신 1비트로 추출하며 empirical $d_{\text{direct}}$ 대신 완전한 해석적 크기를 사용한다.
+
+교훈: \textbf{near-optimal 양자화기의 잔차는 임의의 벡터가 아니다}. 그 분포는 양자화기 자체에 의해 형성되며, 이 구조를 무시하는 보정 스킴은 비트를 과지불한다.
+
+\subsection{TBQX2\_1: 2비트 사분면 각도 (2.625~bpw)}
+
+반대 방향: 정밀도를 추가하는 대신 $\varphi^{\text{content}}$를 3비트에서 2비트로 떨어뜨려 3~bpw 미만으로 내려가려는 시도. 결과 레이아웃은 각도를 네 대각 사분면 $\{(\pm 1/\sqrt{2},\pm 1/\sqrt{2})\}$에 대응하는 두 부호 비트 $(s_x, s_y)$로 인코딩한다. 디퀀트가 \texttt{sincosf} 없이 가능해지고 블록이 42바이트 ($2.625$~bpw) 로 축소된다.
+
+\emph{폐기 이유.} 출력 붕괴. $\pi/2$ ($90^\circ$) 의 유효 각도 해상도는 temperature $0$ 생성에서 attention top-1 마진보다 훨씬 낮다. Qwen3-14B 실제 추론에서 모델은 모든 질의의 첫 몇 토큰 이내에 퇴화된 반복 출력 --- "Hangul" 이라는 단어의 변형이 무한히 순환 --- 을 생성했다. 한국어 산문, 코드 생성, 수학 추론 전부가 동시에 실패했다. 실패는 총체적이고 명백했다: 2비트 각도 해상도는 coupled-RoPE 모델에서의 일관된 생성에 요구되는 최소값 아래다.
+
+교훈: \textbf{polar 표현이 완전히 작동하지 않게 되는 강한 최소 각도 해상도가 존재하며}, 그 값은 $\pi/4$ (3비트, 사용 가능) 와 $\pi/2$ (2비트, 붕괴) 사이이다. 이 절벽의 존재 자체가 유용한 발견이다. 설계 공간을 제한하기 때문이다: polar 프레임워크에서의 비트 절감은 크기 채널이나 잔차 보정에서 와야 하며 주 각도 격자의 추가 조대화에서는 오지 않는다.
+
+\subsection{WHT 를 Polar Derotation 과 통합}
+
+자연스러운 질문은 원래 WHT 기반 TBQ 경로의 품질 바닥과 Polar Derotation 의 품질 천장을 결합할 수 있느냐였다: 먼저 $K$를 derotate 하고, 페어에 걸쳐 128-point WHT 를 적용한 후, WHT 도메인 콘텐츠를 표준 Lloyd-Max 로 양자화. 읽기 시점에는 셀별 $Q$ 회전과 셀별 128-point WHT 이후 WHT 도메인에서 dot product 계산.
+
+\emph{추구하지 않은 이유.} 비용 분석. $Q$ 의 셀별 WHT 는 셀 간 공유될 수 없고 (각 셀이 고유 $p_K$ 와 따라서 고유 $Q_{\text{derot}}$ 를 가짐), 이는 모든 KV 캐시 셀 읽기에 $\mathcal{O}(D\log D)$ 버터플라이 네트워크를 추가한다 --- 이미 순수 메모리 바운드가 아닌 compute-visible 인 attention 커널 대비 현재 polar 읽기 비용의 약 $10\times$. 세 가지 완화책을 고려하고 기각했다: (i)~$Q_{\text{derot}}$ 를 사전 계산된 WHT 벡터의 고정 선형 결합으로 분해, 셀당 $\mathcal{O}(D^2)$ 로 악화됨; (ii)~페어 보존 블록 구조 $H_{64}\otimes I_2$ 내부에서만 WHT 적용, 서로 다른 $\theta_p$ 에 대한 페어별 회전과 가환하지 않아 유효한 사전 양자화 변환이 아님; (iii)~근사 dyadic 분해, 제어되지 않는 방식으로 양자화 오차 재도입. Tangent Residual 이 페어당 FMA 두 개의 비용으로 drift 격차를 독립적으로 닫으면서 이 추구는 중단됐다.
+
+교훈: \textbf{WHT 의 페어 혼합 구조는 위치 의존 페어별 회전과 비호환이다}. 두 변환은 무손실로 합성될 수 없고, 이들이 협력하게 만드는 실질 비용이 그들이 공동으로 제공하는 품질 이득을 압도한다.
+
+\subsection{$\varphi^{\text{content}}$ Lloyd-Max 코드북의 오프라인 캘리브레이션}
+
+크기 채널에 대해서는 Rayleigh Lloyd-Max 가 즉시 작동한다. 분포가 해석적 형식을 가지기 때문이다. 각도 채널에 대해서는 유사한 스킴을 잠깐 고려했다: 대표 워크로드에서 수집한 $\varphi^{\text{content}}$ 히스토그램으로 비균등 8-레벨 Lloyd-Max 코드북을 캘리브레이션.
+
+\emph{폐기 이유.} 경험적이 아니라 철학적. TBQ 는 런타임 양자화기로서, 모델 불가지적이고 캘리브레이션 不요하다는 점에서 그 유틸리티가 나온다: 동일한 커널이 어떤 coupled-RoPE 모델에서도 전처리 없이 동작한다. 모델별 캘리브레이션 데이터를 --- 작더라도 --- 도입하는 것은 두 번째 배포 의존성을 만들고 (캘리브레이션 파일이 엔진과 함께 배포되어야 하고, 모델 업데이트 시 갱신되어야 하고, 토크나이저와 일치해야 함) TBQ 를 post-training 양자화 도구의 운영 프로필 쪽으로 옮긴다. 저자는 구현 노트에서 이 방향을 명시적으로 기각했다. Tangent Residual 은 해석적이므로 캘리브레이션 不요 속성을 보존한다.
+
+교훈: \textbf{런타임 양자화 시스템은 어떤 캘리브레이션 데이터에도 큰 운영 비용을 지불한다}. 이론적 품질 정점을 일부 양보하더라도 해석적 대안을 선호해야 한다.
+
+\subsection{셀별 적응형 정밀도}
+
+후반 제안은 런타임에 "모호한" attention 단계 --- top-1 과 top-2 attention logit 이 양자화 노이즈 바닥 이내인 셀 --- 를 감지하고 해당 특정 셀에 대해 FP32 로 fallback 하는 것이었다. 이 제안은 희소 토큰 질의에서의 drift 가 \emph{국소} 현상이라는 관찰에 의해 동기 부여됐다: 추론당 소수의 셀만 실제로 근접 동점을 경험한다.
+
+\emph{추구하지 않은 이유.} 복잡성. 플래시 attention vec 커널 내부에 셀별 정밀도 fallback 을 구현하려면 (i)~두 패스 attention 스킴 --- 첫 패스는 저정밀도 점수를 계산하고 근접 동점을 플래그하고, 두 번째 패스는 플래그된 셀을 전정밀도로 재계산, 또는 (ii)~FP32 사이드 경로를 갖는 워프 수준 발산 실행. 두 접근 모두 현재 커널을 빠르게 만드는 균일한 SIMT 구조를 깨고, 두 접근 모두 벤치마크하기 어려운 분기 의존 지연을 도입한다. Tangent Residual 은 같은 기능적 목표 --- attention 점수 교란을 drift 임계치 아래로 감소 --- 를 branchless, uniform, 레지스터 지역 보정으로 달성한다. 그것이 대신 채택됐다.
+
+교훈: \textbf{SIMT 커널에서 drift 부류 오류에 대해서는 branchless 해석적 보정이 적응형 정밀도를 이긴다}. 적응형 스킴이 원칙적으로 더 타이트한 오차 경계에 도달하더라도 그렇다.
+
+\subsection{실험 플랫폼: DGX Spark 의 열 천장}
+
+초기 실험에 해당하는 한 부류의 실패는 소프트웨어 버그도 알고리즘 실수도 아니었기 때문에 기록할 가치가 있다 --- 처음에는 두 가지 모두로 가장했던 하드웨어 envelope 제약이었다.
+
+Qwen3-14B 초기 실험 국면에서 장시간 TBQ 벤치마크 실행은 간헐적으로 DGX Spark GB10 호스트 전체를 멈추게 했다: 커널 패닉도, \texttt{dmesg} 출력도, NVIDIA 드라이버 오류도, 호스트 운영체제가 복구할 방법도 없었다. 각 이벤트는 하드 파워 사이클과 약 5분의 재부팅 + 실행 중이던 연구 컨텍스트 손실을 요구했다. 며칠에 걸쳐 12건 이상의 이벤트가 발생했다. 증상은 처음에 일련의 그럴듯한 소프트웨어 원인에 잘못 귀속되었고, 돌이켜보면 이것은 빨간 청어 (red herring) 의 유익한 목록을 이룬다:
+
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=1pt]
+\item \emph{\texttt{build\_rope\_shift} 디퀀트 경로.} TBQ~$\leftrightarrow$~FP32 에 대한 CUDA 백엔드 \texttt{cpy} op 부재가 양자화된 캐시에서 컨텍스트 시프트가 발화할 때 스케줄러 실패를 일으킨다. \texttt{src/llama-kv-cache.cpp} 에 early-return 가드를 추가했다. GB10 통합 메모리 아키텍처에서 스케줄러 실패가 호스트로 전파된다는 가설 하에. 가드는 여전히 유효하며 의미상 옳지만 (\S\ref{sec:shift} 참조: Polar Derotation 은 RoPE shift 를 no-op 으로 만든다), 그것이 freeze 의 \emph{원인은 아니었다}.
+\item \emph{TBQ 양자화 커널의 스레드별 스택 배열.} 3비트 set-rows 양자화 경로는 블록당 256 스레드에서 스레드당 약 1.5~KB 스택을 사용했다. 이는 aarch64 통합 메모리 SoC 에서 호스트 메모리 컨트롤러를 통과하는 local-memory 트래픽을 생성한다. 스크래치 버퍼를 새 디스패치 래퍼를 통해 공유 메모리로 이전했다. \texttt{cuobjdump} 는 변경 전후 모두 \texttt{LOCAL:0} 를 확인했다. freeze 는 계속됐다.
+\item \emph{드라이버 memdesc 고갈.} 이전 DGX 크래시 클러스터가 \texttt{NVRM: Out of memory @ mem\_desc.c:1359} 커널 로그 항목을 생성했던 적이 있어, set-rows 경로의 누적 할당자 누수를 의심했다. MLA 특정 \texttt{fattn-common.cuh} 코드의 raw \texttt{cudaMalloc}/\texttt{cudaFree} 쌍을 풀 할당자로 되돌렸다. 변경은 옳았지만 Qwen3-14B 증상과는 직교했다.
+\item \emph{TBQP 특정 코드 경로.} TBQP 커널의 Direct Signs 와 QJL 잔차 보정 코드를 잠깐 의심했다. 크래시가 TBQP K 캐시와 상관있어 보였기 때문이다. TBQ (non-P) 로 이등분하니 QJL 이나 Direct Signs 없이도 크래시 패턴이 지속되었다. 상관은 위상관이었다.
+\end{itemize}
+
+실제 근본 원인은 실행 중 GB10 코어 온도를 직접 측정한 후에야 확인됐다: SoC 가 \textbf{85$^\circ$C} 에 도달해 펌웨어 강제 열 차단에서 freeze 되고 있었다. 이는 소프트웨어 가시적 이벤트가 아니다 --- CUDA 드라이버는 오류를 받지 않고, 호스트 커널은 인터럽트를 보지 못하고, 로그가 생성되지 않는다. 하드웨어가 그냥 정지하기 때문이다. "지속 TBQ 워크로드 하에서의 호스트 무음 freeze" 패턴은 SoC 수준의 열 kill 에서 정확히 기대할 수 있는 것이며, 위의 어떤 소프트웨어 가설도 이를 설명할 수 없었다.
+
+열 원인 발견에 선행하는 일주일 동안 우리는 알고리즘 버그를 쫓고 있다고 완전히 확신했다. set-rows 양자화 커널을 읽고 또 읽으며 out-of-bounds 쓰기를 찾았다. vec-dot 내부 루프를 응시하며 half/float 타입 혼동을 찾았다. 매 시도마다 재부팅과 컨텍스트 손실을 감수하며 커밋 로그를 한 번에 한 크래시씩 이등분했다. 단일 가설에 하루 온종일의 작업이 소모되었고, 그 가설은 결국 틀렸다 --- 추론이 나빠서가 아니라, 실제 실패가 우리가 가진 모든 도구에 불가시였기 때문이다. 페어별 양자화기에 미묘한 경쟁 조건을 도입했다고 몇 시간 동안 확신한 뒤 코드가 처음부터 옳았고 하드웨어가 부하 하에서 열 트립하고 있었음을 알게 되는 것은 특별한 종류의 피로감을 낳는다. 본 논문이 이를 기록하는 것은 그것이 실제로 TBQX3\_1 개발에서 단일 가장 비싼 이벤트였기 때문이다: polar derotation 설계보다, tangent residual 유도보다, 커널 통합 작업보다 모두 합한 것보다 더 비쌌다. 무음 하드웨어 한계는 엣지 플랫폼 위에 구축된 시스템의 연구 방법론에서 일급 취급을 받을 자격이 있다. 정확히 프로젝트 산출물 어디에도 보이지 않는 예산을 소모하기 때문이다.
+
+수정은 steady-state 동작 온도를 70$^\circ$C 초반에 유지하는 하드웨어 측 전압 감소였고, 85$^\circ$C 차단 아래로 편안히 유지된다. 이 제약이 적용된 후 모든 후속 TBQ 와 TBQX 변종은 incident 없이 완주했고, \S\ref{sec:eval} 에 보고된 벤치마크는 안정화된 열 envelope 하에서 수집되었다.
+
+이 에피소드를 기록하는 이유는 두 가지다. 첫째, 열 원인을 식별하기 전에 취한 모든 진단 단계는 잘못된 문제에 소비되었다 --- 효율적인 일주일의 디버깅이 대략 나흘의 소프트웨어 가설 작업으로 압축되었고, 각 가설은 다른 환경에서는 원인일 \emph{수 있었지만} 우리 환경에서는 그렇지 않았다. 연구 워크플로에서 무음 하드웨어 실패의 비용은 상당하다: 포렌식 흔적을 남기는 크래시와 달리, 무음 freeze 는 자신의 원인을 지운다. 둘째, 이것은 열적으로 제약된 엣지 플랫폼에서의 TBQ 부류 워크로드에 대한 방법론적 권고를 재구성한다: \textbf{열 모니터링은 선택 사항이 아니며}, 소프트웨어 가시 신호를 생성하지 않는 펌웨어 수준 차단은 어떤 소프트웨어 이등분보다 앞서 일급 실패 모드로 취급되어야 한다. 적절한 냉각을 갖춘 시스템 --- 예: 동일 워크로드를 incident 없이 실행한 primoco 의 x86+dGPU 참조 환경 --- 에서는 이 문제가 나타나지 않으며, 이는 외부 재현에서 왜 존재하지 않았는지를 설명한다.
+
+\subsection{실패 표면 요약}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{변종} & \textbf{bpw} & \textbf{결과} & \textbf{주요 실패 원인} \\
+\midrule
+TBQXP3\_1 (Direct Signs)            & 4.25 & 폐기 & 과지불; 비구조적 잔차 모델 \\
+TBQX2\_1 (2비트 각도)              & 2.625 & 폐기 & 출력 붕괴 (각도 바닥) \\
+WHT $\oplus$ Polar                  & 3.125 & 중단 & 셀별 WHT 비용 $\sim 10\times$ \\
+캘리브레이션된 $\varphi$ Lloyd-Max  & 3.125 & 거부 & 캘리브레이션 不요 속성 훼손 \\
+셀별 적응형 FP32 fallback          & 가변  & 거부 & SIMT 발산 오버헤드 \\
+\midrule
+\textbf{TBQX3\_1 (Tangent Residual)} & \textbf{3.625} & \textbf{채택} & --- \\
+\bottomrule
+\end{tabular}
+\caption{TBQX3\_1 개발 중 탐구된 폐기 변종들과 각각이 기각된 주 이유. 채택된 구성은 그 모두를 단일 부호 비트 --- 기하학적으로 정확한 절반 셀 보정을 수반 --- 로 대체했다.}
+\label{tab:deadends}
+\end{table}
+
+% ============================================================
+\section{결론}
+\label{sec:conclusion}
+
+본 연구의 핵심 기여는 \textbf{프로덕션 LLM 추론 엔진 내부에서 coupled-RoPE KV 캐시에 Polar Derotation 을 end-to-end 구현한 최초의 사례}이며, NVIDIA DGX Spark 위에서 Qwen3-14B 40K 컨텍스트 환경으로 검증되었다. 이 공간의 선행 제안들은 이론에 머물거나 (PolarQuant 는 분포 shaping 에 polar 구조를 활용하나 양자화된 위상에 위치 항을 남김) 아키텍처 재학습을 요구했다 (MLA 는 attention 행렬을 재구성해 content 와 position 을 분리). Polar Derotation 은 정확히 그 틈에 자리한다: 캐시 경계에서 적용되는 \emph{소급} 변환으로, 이미 학습된 가중치 위에서 MLA 와 동일한 content/position 분리를 생성하며, 학습 비용 0, 모델 파일·토크나이저·가중치 포맷 변경 不요.
+
+두 번째 기여는 \textbf{Tangent Residual} 이다: 3비트 uniform 위상 양자화기가 남기는 잔차 각도 오차에 대한 1비트 완전 해석적 보정. Rayleigh Lloyd-Max 가 이미 크기 채널을 거의 최적으로 포착한 후 본질적으로 모든 페어당 잔여 오차가 양자화된 위상에서의 접선 방향에 존재한다는 기하학적 관찰로부터 유도된다. 보정 크기 $r\cdot\pi/16$ 는 순수 상수이고, 방향은 디퀀트 중에 이미 계산된 코사인/사인의 좌표 치환이며, 저장 비용은 정확히 페어당 1비트다. 캘리브레이션 없고, 학습된 스케일 없고, 추가 삼각 함수 호출 없다.
+
+Polar Derotation 과 Tangent Residual 이 결합되어 \textbf{TBQX3\_1}, 즉 3.625-bpw K 캐시 포맷을 이룬다. 기존 3비트 V 캐시와의 조합에서, Qwen3-14B temperature $0$ 수학 추론에서 \textbf{f16 을 능가한다} ($37.1\%$ vs $34.3\%$, seed 1234). KV 캐시는 $4.74\times$ 압축되고, 디코드 처리량은 기존 TBQ3\_1 과 측정 오차 범위 내에서 동일하다. 동일 워크로드의 기존 TBQ3\_1 은 f16 대비 $17\%$ 낮으며, 본 논문이 작성된 3비트 품질 절벽을 단적으로 보여준다. 동일 스킴은 Tangent Residual 유도의 동기가 되었던 저확률 토큰 drift (희소 이름 음역에서의 키릴 오염) 도 제거한다.
+
+3.625-bpw 양자화 K 캐시가 정확한 정수 답변이 요구되는 과제에서 f16 을 능가한다는 사실은 놀라워 보일 수 있다. 모순은 아니다. 양자화는 attention 분포의 암묵적 정규화기로 작동한다. f16 은 attention 점수의 모든 이상치 노이즈 성분을 보존하는 반면, polar 표현은 content 기하를 더 직접적으로 포착하고 지배적 attention 피크에 기여하지 않는 고차 위상 노이즈를 버린다. 효과는 페어당 작지만 40 레이어와 40,960 토큰에 걸쳐 누적되어 temperature $0$ 정확 일치 벤치에서 측정 가능한 정확도 델타가 된다. 우리는 이를 \S\ref{sec:eval} 의 데이터로 뒷받침되는 실용적 관찰로 제시한다. 양자화가 항상 도움이 된다는 일반적 주장이 아니다: 동일 벤치는 기존 TBQ3\_1 이 f16 보다 현저히 낮음을 보여주고, polar 양자화기의 단일 바이트 패턴 변경 (TBQX2\_1) 은 완전한 출력 붕괴를 생성한다. 품질 영역은 좁고 구조 의존적이다.
+
+우리는 이 작업을 PolarQuant 의 pair-polar 좌표 분포 shaping 사용과 MLA 의 아키텍처적 content/position 분리 사이의 잃어버린 중간 단계로 본다: coupled-RoPE 모델의 거대한 설치 기반에 재학습을 요구하지 않고 content/position 분리 이점을 제공하는 소급, 비트 중립, 모델 불가지 변환. 참조 구현은 llama.cpp 의 23개 파일 수정이며, 모두 head\_dim=128 polar 경로에 고립되어 있고, 모든 다른 구성 (head\_dim=64, head\_dim=256, MLA 변종) 을 건드리지 않음이 검증되었다.
+
+% ============================================================
+\section*{감사의 글}
+
+본 연구는 NVIDIA DGX Spark에서 독립적으로 수행되었다. 저자는 llama.cpp 커뮤니티, 이론적 토대를 제공한 TurboQuant과 PolarQuant의 저자들, 그리고 위치/콘텐츠 분리가 추구할 가치가 있음을 아키텍처적으로 보여준 DeepSeek MLA 저자들에게 감사를 표한다.
+
+% ============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{10}
+
+\bibitem{rope2021}
+J.~Su, Y.~Lu, S.~Pan, A.~Murtadha, B.~Wen, Y.~Liu.
+\newblock RoFormer: Enhanced Transformer with Rotary Position Embedding.
+\newblock \emph{arXiv:2104.09864}, 2021.
+
+\bibitem{polarquant2025}
+I.~Han et~al.
+\newblock PolarQuant: Quantizing KV Caches with Polar Transformation.
+\newblock \emph{arXiv:2502.02617}, 2025.
+
+\bibitem{turboquant2026}
+A.~Zandieh, V.~Mirrokni et~al.
+\newblock TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate.
+\newblock In \emph{Proceedings of ICLR}, 2026.
+
+\bibitem{turboquant_impl2026}
+AmesianX.
+\newblock TurboQuant in Practice: Implementing 3-Bit KV Cache Compression in a Production LLM Inference Engine.
+\newblock Working paper, 2026.
+\newblock \url{https://github.com/AmesianX/TurboQuant}
+
+\bibitem{deepseekv2}
+DeepSeek-AI.
+\newblock DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model.
+\newblock \emph{arXiv:2405.04434}, 2024.
+
+\bibitem{kivi2024}
+Z.~Liu, J.~Yuan, H.~Jin, S.~Zhong, Z.~Xu, V.~Braverman, B.~Chen, X.~Hu.
+\newblock KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache.
+\newblock In \emph{ICML}, 2024.
+
+\bibitem{kvquant2024}
+C.~Hooper, S.~Kim, H.~Mohammadzadeh, M.~W.~Mahoney, Y.~S.~Shao, K.~Keutzer, A.~Gholami.
+\newblock KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization.
+\newblock \emph{arXiv:2401.18079}, 2024.
+
+\bibitem{smoothquant2023}
+G.~Xiao, J.~Lin, M.~Seznec, H.~Wu, J.~Demouth, S.~Han.
+\newblock SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models.
+\newblock In \emph{ICML}, 2023.
+
+\bibitem{payne1983}
+M.~Payne, R.~Hanek.
+\newblock Radian Reduction for Trigonometric Functions.
+\newblock \emph{ACM SIGNUM Newsletter}, 18(1):19--24, 1983.
+
+\end{thebibliography}
+
+\end{document}

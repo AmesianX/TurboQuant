@@ -4,6 +4,12 @@
 
 [🇰🇷 한국어](README_KO.md)
 
+### 📄 Papers
+
+- 📘 [**Polar Derotation: Breaking the 3-Bit KV Cache Quality Cliff on Coupled-RoPE Language Models**](paper/polar_derotate_paper.pdf) — theoretical foundation and evaluation of TBQX3_1 (Polar Derotation + Tangent Residual)
+- 📗 [**TurboQuant in Practice: Implementing 3-Bit KV Cache Compression in a Production LLM Inference Engine**](paper/turboquant_impl.pdf) — original TBQ v1 implementation paper (WHT + Lloyd-Max + QJL)
+- 📕 [한국어판 — Polar Derotation](paper/polar_derotate_paper_ko.pdf) · [한국어판 — TurboQuant 구현](paper/turboquant_impl_ko.pdf)
+
 ### 🆕 v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B)
 
 **New K cache format: polar-coordinate storage with content/position separation and analytical tangent residual correction. Beats f16 on math reasoning while preserving Korean prose quality.**

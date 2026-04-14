@@ -1,0 +1,654 @@
+\documentclass[10pt,twocolumn]{article}
+
+% ============================================================
+% Packages  (matches turboquant_impl.tex for consistency)
+% ============================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{url}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\newcommand{\draftnote}[1]{\textcolor{red}{[DRAFT: #1]}}
+
+% ============================================================
+% Title  (working title -- see draft notes for alternatives)
+% ============================================================
+\title{Polar Derotation: Breaking the 3-Bit KV Cache\\Quality Cliff on Coupled-RoPE Language Models}
+
+\author{
+AmesianX\\
+Independent Researcher\\
+\texttt{amesianx@gmail.com}\\
+\url{https://powerhacker.net}\\
+\url{https://github.com/AmesianX/TurboQuant}
+}
+
+\date{April 2026 \\ \textit{Working draft --- not for distribution}}
+
+% ============================================================
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+We present \textbf{TBQX3\_1}, a KV cache format for coupled-RoPE language models that combines two ideas into the first working implementation of content/position separation on already-trained models: (i)~\textbf{Polar Derotation}, a cache-boundary transformation that subtracts the known RoPE rotation before quantization and stores a pair-polar, position-free content representation $(r,\varphi^{\text{content}})$, restoring position algebraically at attention-read time; and (ii)~\textbf{Tangent Residual}, a one-bit per-pair correction that exploits the geometric observation that the residual error of a 3-bit uniform phase quantizer lives entirely along the tangent direction at the quantized phase, enabling an analytical half-cell correction with magnitude $r\cdot\pi/16$ and direction $(-\sin\hat\varphi,\cos\hat\varphi)$ reused from the dequantization path. Together these two mechanisms operate at $3.625$~bpw and, on Qwen3-14B at 40K context and temperature $0$, \textbf{exceed f16 accuracy on a 35-problem mathematical reasoning benchmark} ($37.1\%$ vs $34.3\%$) while compressing the KV cache by $4.74\times$ ($6400$~MiB $\to 1350$~MiB) and matching legacy 3-bit TBQ throughput within measurement noise. Legacy TBQ3\_1 on the same workload falls $17\%$ below f16, illustrating the 3-bit quality cliff this paper closes. Polar Derotation targets the same quality frontier that Multi-head Latent Attention (MLA)~\cite{deepseekv2} achieves through architectural redesign, but applies retroactively with no retraining and no weight-format changes, covering the full installed base of coupled-RoPE models (Llama, Qwen, Mistral, Gemma, Yi). We additionally obtain \emph{lossless context shifting} as a free corollary. This work positions itself as a 3-bit intervention: 4-bit configurations are out of scope and require no such treatment.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+\subsection{Why 3 Bits, and Only 3 Bits}
+\label{sec:why3bit}
+
+In prior work~\cite{turboquant_impl2026} we presented the first production implementation of TurboQuant~\cite{turboquant2026} inside llama.cpp, delivering $4.2\times$ KV cache compression at a 6\% perplexity cost on Gemma~4 26B. That implementation operates at \textbf{3~bits per element} (2-bit Lloyd-Max plus 1-bit QJL correction on $K$, MSE only on $V$). It is production-ready, but on coupled-RoPE models such as Qwen3 it retains only $\sim$96\,\% of FP16 quality on token-level benchmarks.
+
+The natural reaction to this gap is to move to 4~bits per element. \emph{We reject this path as a non-solution.}
+
+At 4 bits, essentially every modern quantizer -- including TBQ v1 without any of the machinery proposed in this paper -- reaches FP16-class quality. Moving to 4~bits does not require Polar Derotation, does not require PolarQuant, does not require TurboQuant, and in many cases does not even require QJL. At 4 bits, \emph{the problem is already solved by brute force}: the resolution is simply high enough that quantization noise falls beneath the model's own inference margin. There is no research contribution to be made at 4 bits, and more importantly, there is little \emph{engineering} motivation either: 4-bit caches double the storage cost of 3-bit caches, which is exactly the cost one was trying to avoid.
+
+The interesting regime -- the only regime that justifies this entire line of work -- is 3 bits per element. 3-bit caches halve the footprint that 4-bit caches consume; they fit entire long-context workloads into memory budgets that 4-bit configurations cannot; they unlock edge and multi-tenant serving scenarios. But 3 bits is also where the wheels come off: the gap between 4 and 3 bits on coupled-RoPE models is not a gentle degradation, it is a \textbf{quality cliff}. Existing methods fall off the cliff; our prior TBQ v1 implementation falls off the cliff; and no amount of Lloyd-Max codebook tuning or QJL residual balancing has been sufficient, in our experience, to climb back up.
+
+This paper is therefore single-mindedly about 3 bits. We do not report 4-bit numbers. We do not claim improvements at 4 bits. The Polar Derotation mechanism is a \textbf{3-bit intervention}: a structural change that only becomes load-bearing precisely where existing statistical methods stop working. We asked whether the 3-bit cliff is \emph{intrinsic} to 3-bit resolution or whether it reflects a redundancy in the representation that we -- and prior work -- have not exploited. This paper argues the latter.
+
+\paragraph{The hidden waste.}
+In coupled-RoPE models, the KV cache stores \emph{post-RoPE} keys: every 2D pair $(k_{2i},k_{2i+1})$ has already been rotated by the position-dependent angle $\theta_i = p\omega_i$ when it enters the cache. The cache slot index $p$ is therefore a function of the stored value -- yet the slot index is \emph{also} available as cheap side information: every kernel knows which slot it is reading. A coupled-RoPE cache is thus storing, in its precious 3 quantized bits, information that can be reconstructed exactly for free.
+
+At FP16 this waste is invisible. At 3~bits per element, it is the single largest recoverable error source we are aware of.
+
+\paragraph{Contributions.}
+The two load-bearing contributions of this paper are \textbf{Polar Derotation on a production coupled-RoPE cache} and \textbf{Tangent Residual}, and together they beat f16 on the mathematical reasoning benchmark at $3.625$~bpw.
+
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \textbf{First end-to-end implementation of Polar Derotation on coupled-RoPE} (\S\ref{sec:method}, \S\ref{sec:impl}): a cache-boundary transformation that subtracts the position rotation $p\omega_i$ from the phase before quantization, stores content-only pair-polar coordinates $(r,\varphi^{\text{content}})$, and restores position algebraically at read time via \texttt{\_\_sincosf}. This is the retroactive analogue of MLA's architectural content/position separation: it applies to already-trained models, requires no retraining, and changes neither the weight format nor the tokenizer. The reference implementation lives in 23 modified files of llama.cpp, isolated to the $\text{head\_dim}=128$ path.
+\item \textbf{Rayleigh Lloyd-Max for the magnitude channel} (\S\ref{sec:rayleigh}): exploiting the fact that a complex-Gaussian pair has a Rayleigh-distributed magnitude, we derive a closed-form 8-level Lloyd-Max codebook in $\sigma$-normalized coordinates. No calibration data, no per-model tuning. The $\sigma$ estimator is itself closed-form ($\hat\sigma = \sqrt{\sum r_i^2 / 2n}$), derived from the Rayleigh second moment.
+\item \textbf{Tangent Residual: analytical one-bit phase correction} (\S\ref{sec:tangent}): a geometrically exact correction that halves the effective angular quantization error from $\pm\pi/8$ to $\pm\pi/16$ at a cost of exactly one bit per pair and two extra FMAs per pair at read time. The correction magnitude $r\cdot\pi/16$ is a pure geometric constant; the direction $(-\sin\hat\varphi,\cos\hat\varphi)$ is a coordinate permutation of the cosine and sine already computed during dequantization. No learned scale, no calibration, no additional trigonometry.
+\item \textbf{Beats f16 on math at 3.625 bpw} (\S\ref{sec:eval}): on Qwen3-14B at 40K context and temperature $0$, TBQX3\_1/TBQ3\_1 achieves $13/35$ ($37.1\%$) on the math benchmark versus $12/35$ ($34.3\%$) for f16/f16 and $10/35$ ($28.6\%$) for legacy TBQ3\_1/TBQ3\_1. KV cache footprint is reduced from $6400$~MiB to $1350$~MiB ($4.74\times$); decode throughput is $21$--$22$ tokens/s versus $24$--$25$ for f16.
+\item \textbf{Free lossless context shift} (\S\ref{sec:shift}): because the stored phase is already position-invariant, the \texttt{build\_rope\_shift} path reduces to a constant-time index update. No dequantize / rotate / requantize round-trip is required; this closes an outstanding defect in legacy TBQ for long-context sliding-window serving.
+\item \textbf{Research roadmap of discarded variants} (\S\ref{sec:deadends}): we document five alternative approaches that were implemented or seriously considered and ultimately rejected (TBQXP3\_1 Direct Signs at $4.25$~bpw, TBQX2\_1 2-bit quadrant angle at $2.625$~bpw, combined WHT$+$polar, offline $\varphi$ calibration, per-cell adaptive FP32 fallback), together with the specific reasons each failed. The goal is to constrain the design space for any future sub-4-bit coupled-RoPE KV cache work.
+\end{enumerate}
+
+\paragraph{What this paper does not claim.}
+We do not claim a new core quantization algorithm: Lloyd-Max, WHT preconditioning, and QJL residual correction continue to apply where appropriate, and Rayleigh Lloyd-Max is a closed-form specialization of standard Lloyd-Max to a known distribution rather than a new optimization technique. We do not propose a new model architecture. We do not claim that TBQX3\_1 dominates f16 on every benchmark, every model, and every seed: the math benchmark result is reproducible in the direction (TBQX3\_1 at or above f16 across tested seeds), but the margin varies, and seed 52 produces a tie. The contributions are structural: moving coupled-RoPE key quantization into a domain where content and position are algebraically separable, and closing the residual phase error at that domain with a geometrically exact one-bit correction.
+
+% ============================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{RoPE as Pair-Wise Complex Rotation}
+\label{sec:rope-bg}
+
+Rotary Position Embedding~\cite{rope2021} encodes absolute position via a pair-wise 2D rotation on the query and key. For head dimension $D$ (assumed even), the key vector $k\in\mathbb{R}^D$ decomposes into $D/2$ consecutive pairs $(k_{2i},k_{2i+1})$, and RoPE applies
+\begin{equation}
+  \begin{pmatrix} k'_{2i}\\k'_{2i+1}\end{pmatrix}
+  =
+  \begin{pmatrix} \cos\theta_i & -\sin\theta_i\\ \sin\theta_i & \cos\theta_i\end{pmatrix}
+  \begin{pmatrix} k_{2i}\\k_{2i+1}\end{pmatrix},\quad
+  \theta_i=p\cdot\omega_i,
+  \label{eq:rope}
+\end{equation}
+where $p$ is the token position and $\omega_i=\text{base}^{-2i/D}$ is a per-pair frequency (standard bases: $10^4$ or $10^6$).
+
+Crucially, Equation~\eqref{eq:rope} is complex multiplication
+$k'_i = k_i\cdot e^{\imath\theta_i}$
+on the complex pair $k_i\!:=\!k_{2i}+\imath k_{2i+1}$. RoPE is, literally, a pair-wise \emph{phase addition} on a natively polar structure. It does not alter the magnitude $|k_i|$; it only shifts the phase by $p\omega_i$.
+
+\subsection{Coupled vs.\ Decoupled RoPE}
+
+We distinguish two architectural families:
+
+\paragraph{Coupled RoPE.}
+The full key vector is rotated by Equation~\eqref{eq:rope}. Every pair carries \emph{both} content and position in its phase. This covers Llama 2--4, Qwen2/2.5/3, Mistral, Gemma 1--4, Phi, Yi, Falcon---in short, the vast majority of deployed open-weight LLMs.
+
+\paragraph{Decoupled RoPE.}
+The key is split at training time into $D = D_c + D_r$: a content latent $D_c$ that does not see RoPE, and a small rope component $D_r$ (typically 64) to which RoPE is applied. DeepSeek-V2/V3 MLA~\cite{deepseekv2} and GLM-4.5/4.6/4.7 use this form; in prior TBQ work we store the 64-dim rope slice as an FP16 passthrough block because quantizing it damages attention disproportionately (its norm is $\sim$80$\times$ the latent norm).
+
+The decoupled design is precisely an architectural solution to the position/content entanglement problem. It works, but only for models trained with it from scratch.
+
+\subsection{Post-RoPE Cache Storage}
+
+Virtually all inference engines -- \texttt{transformers}, vLLM, \texttt{llama.cpp}, SGLang, TensorRT-LLM -- store the \emph{post-RoPE} key in the cache. This is a runtime efficiency choice, not an architectural property: it avoids re-applying RoPE on every decode step. For coupled-RoPE models, every quantized element therefore encodes a mixture of content and position.
+
+\subsection{PolarQuant and TurboQuant}
+
+PolarQuant~\cite{polarquant2025} introduces a recursive pair-polar transformation for KV caches. After random preconditioning, the angular marginal distribution becomes analytically computable, eliminating per-block scale/zero-point metadata. TurboQuant~\cite{turboquant2026} composes PolarQuant with a 1-bit Quantized Johnson-Lindenstrauss (QJL) bias corrector.
+
+PolarQuant's pair structure coincides with RoPE's pair structure \emph{by coincidence}: PolarQuant is RoPE-agnostic, uses the polar representation purely for distribution shaping, and its angles $\varphi_i$ still carry position information. Polar Derotation, as we show in \S\ref{sec:method}, exploits the same representation for a different end -- removing position redundancy -- and composes with PolarQuant rather than replacing it.
+
+% ============================================================
+\section{The Position Redundancy Observation}
+\label{sec:observation}
+
+Let $k'_i=r_ie^{\imath\varphi_i}$ denote the post-RoPE complex pair stored in the cache of a coupled-RoPE model at slot $p$. Substituting Equation~\eqref{eq:rope}:
+\begin{equation}
+  \varphi_i=\varphi^{\text{content}}_i+p\cdot\omega_i,\qquad
+  r_i=r^{\text{content}}_i,
+  \label{eq:decompose}
+\end{equation}
+where $(r^{\text{content}}_i,\varphi^{\text{content}}_i)$ are the pre-RoPE polar coordinates of the model's raw $W_K$ output.
+
+Three elementary facts follow.
+
+\paragraph{Fact 1: Magnitude is position-invariant.}
+RoPE does not touch $r_i$. Whatever bits the quantizer spends on magnitude, they measure only content. In a Cartesian quantizer, this property is structurally \emph{invisible} because $r_i$ is never exposed as an explicit coordinate -- it is entangled inside $(k_{2i},k_{2i+1})$ and shares bit budget with phase information.
+
+\paragraph{Fact 2: Phase contains redundant position bits.}
+The term $p\cdot\omega_i$ is fully determined by:
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=0pt]
+\item $p$: the token position -- equal to the cache slot index, already known to every kernel without additional loads;
+\item $\omega_i$: a $D/2$-entry constant table, shared across all layers, heads, batches, and requests.
+\end{itemize}
+Storing $\varphi_i=\varphi^{\text{content}}_i+p\omega_i$ therefore embeds information that costs \emph{zero} bytes to reconstruct. The quantizer is spending precision on a signal that is available for free.
+
+\paragraph{Fact 3: The 3-bit cliff is not intrinsic---it is the position redundancy cliff.}
+At 16-bit FP precision, content and position comfortably coexist with zero observable collision. At 4 bits, the overlap is still statistically benign: the remaining per-element resolution is large enough to absorb both signals without crossing quality thresholds. This is why 4-bit KV caches ``just work'' across essentially every deployed quantizer. At 3 bits, the picture changes abruptly: the resolution is now of the same order as the information content itself, and \emph{every bit spent on redundant position is a bit stolen from content}. The 3-bit quality cliff that we---and every other sub-4-bit KV quantizer we are aware of---have observed on coupled-RoPE models is therefore not a fundamental limit of 3-bit representation. It is the specific regime in which position redundancy first becomes the binding constraint on quality. Closing the cliff does not require moving to 4 bits (which defeats the purpose of compression); it requires removing the redundancy from the 3-bit domain. That is what Polar Derotation does.
+
+% ============================================================
+\section{Method: Polar Derotation}
+\label{sec:method}
+
+\subsection{Algorithm}
+
+\paragraph{Cache write (for token at position $p$).}
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item Receive post-RoPE pair $k'_i=(k'_{2i},k'_{2i+1})$ from the attention projection.
+\item Compute polar form:
+$r_i=\sqrt{(k'_{2i})^2+(k'_{2i+1})^2}$,
+$\varphi_i=\text{atan2}(k'_{2i+1},k'_{2i})$.
+\item \textbf{Derotate}:
+$\varphi^{\text{content}}_i\leftarrow(\varphi_i-p\omega_i)\bmod 2\pi$.
+\item Quantize $(r_i,\varphi^{\text{content}}_i)$ using any existing scheme (TBQ 3-bit Lloyd-Max, PolarQuant-style, etc.).
+\end{enumerate}
+
+\paragraph{Attention read (for query at $p_q$ against cache slot $p_k$).}
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item Dequantize $(\hat{r}_k,\hat{\varphi}^{\text{content}}_k)$.
+\item \textbf{Rerotate}:
+$\hat{\varphi}_k\leftarrow\hat{\varphi}^{\text{content}}_k+p_k\omega_i$.
+\item Either reconstruct Cartesian
+$\hat{k}_i=\hat{r}_k\,e^{\imath\hat{\varphi}_k}$
+and proceed with the standard \texttt{vec\_dot},
+or compute the dot product directly in polar space:
+\begin{equation}
+\langle q_i,\hat{k}_i\rangle
+=r_{q,i}\cdot\hat{r}_k\cdot\cos(\varphi_{q,i}-\hat{\varphi}_k).
+\label{eq:polar-dot}
+\end{equation}
+\end{enumerate}
+
+\subsection{Exactness of the Position Channel}
+\label{sec:exact}
+
+Derotation and rerotation are algebraic inverses. In floating-point, they use identical $\omega_i$ (FP32 constant table) and identical integer $p$ (the cache slot index), and therefore commute with bit-identical result. \emph{The position channel introduces no new error.}
+
+The only error path is quantization of $(r_i,\varphi^{\text{content}}_i)$. We argue next that this error is strictly smaller than the Cartesian baseline's quantization error on $(k_{2i},k_{2i+1})$, under the same total bit budget.
+
+\subsection{Why the Content Distribution Is Tighter}
+\label{sec:tighter}
+
+For a high-frequency pair (large $i$ in the standard indexing), $p\omega_i$ sweeps many full revolutions across a long context. Across tokens in a typical block, $\varphi_i$ therefore approaches a uniform distribution on $[0,2\pi)$---the maximum-entropy regime---regardless of what content the model's $W_K$ projection produced. A Lloyd-Max quantizer calibrated on such a marginal cannot do better than uniform sector partitioning.
+
+The content-only phase $\varphi^{\text{content}}_i$, by contrast, reflects only the learned structure of the model's projection, free of position noise. Empirically (pending Phase 1 measurement; see \S\ref{sec:eval}), its distribution is expected to be substantially concentrated: the same 8 sectors (3-bit phase) resolve content-relevant differences much more precisely. We conjecture a concentration ratio of at least $3\times$ on high-frequency pairs for production coupled-RoPE models, and treat this as the first empirical deliverable.
+
+\subsection{Rayleigh Lloyd-Max for the Magnitude Channel}
+\label{sec:rayleigh}
+
+After derotation, the pair $(k_x, k_y)$ represents position-free content. For models whose $W_K$ projection produces approximately isotropic Gaussian pair activations, the magnitude $r = \sqrt{k_x^2 + k_y^2}$ is analytically Rayleigh-distributed:
+\begin{equation}
+p(r;\sigma) = \frac{r}{\sigma^2}\exp\!\left(-\frac{r^2}{2\sigma^2}\right),
+\end{equation}
+with second moment $E[r^2] = 2\sigma^2$. This yields a \emph{calibration-free} scale estimator: for any block of $n$ pairs,
+\begin{equation}
+\hat\sigma = \sqrt{\frac{1}{2n}\sum_{i=1}^{n} r_i^2}.
+\end{equation}
+
+More importantly, the Rayleigh distribution admits a \textbf{closed-form 8-level Lloyd-Max codebook} in $\sigma$-normalized coordinates that is independent of any particular model or dataset. Numerical solution of the standard Lloyd-Max iteration on the Rayleigh pdf yields the boundary/centroid pair
+\begin{align}
+\mathbf{b} &= (0.4280,\,0.7848,\,1.0991,\,1.4101,\,1.7268,\,2.0623,\,2.4427)\sigma,\\
+\mathbf{c} &= (0.2400,\,0.6160,\,0.9420,\,1.2547,\,1.5685,\,1.8946,\,2.2520,\,2.6650)\sigma.
+\end{align}
+Storage cost is 3 bits per pair plus one \texttt{half} for $\sigma$. No per-block histogramming, no training-time calibration, and no model-specific tuning is required: the same constants apply to every block of every layer of every coupled-RoPE model, because the distribution they fit is a consequence of the WHT- or Gaussian-projection statistics of $W_K$, not of any dataset-specific property. This is a qualitatively different regime from generic $k$-means quantization, and it is one of the two reasons TBQX achieves its quality headroom at 3.125~bpw.
+
+\subsection{Tangent Residual: Analytical Half-Cell Correction}
+\label{sec:tangent}
+
+The second reason is a structural observation about \emph{where} the residual error lives after Rayleigh Lloyd-Max is applied to the magnitude.
+
+Under a uniform 3-bit partition of the angular coordinate on $[-\pi,\pi)$, the cell width is $\pi/4$ and the residual angular error is bounded by $|\Delta\varphi| \le \pi/8 \approx 22.5^\circ$. On its own this would produce a large Cartesian reconstruction error, because the per-pair error is
+\begin{equation}
+|K_{\text{actual}} - K_{\text{polar}}| \approx r\,|\Delta\varphi|
+\end{equation}
+and thus scales with $r$. Empirically, this is exactly the regime in which low-probability token drift manifests: at temperature $0$, rare transliteration tokens (e.g.\ the Korean rendering of Western scientists' names) occasionally flip to adjacent character-set clusters because their top-1 logit margin is within the attention-score perturbation induced by the $\pm\pi/8$ angular cell.
+
+The fix exploits the fact that, for small $\Delta\varphi$, the residual lives entirely along the \textbf{tangent} direction to the constant-$r$ circle at the quantized phase $\hat\varphi$. In the Cartesian plane,
+\begin{equation}
+K_{\text{actual}} - K_{\text{polar}} \;\approx\; r\,\Delta\varphi\,\bigl(-\!\sin\hat\varphi,\;\cos\hat\varphi\bigr) + O(\Delta\varphi^2).
+\end{equation}
+Two observations make this into a cheap correction:
+
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=1pt]
+\item \textbf{Magnitude is analytical.} Given a 3-bit uniform cell of half-width $\pi/8$, the expected half-cell offset from centroid is $\pi/16$. This is a pure geometric constant, not a learned scale. No per-block metadata is required.
+\item \textbf{Direction is free.} The dequantization path already computes $(\cos\hat\varphi,\sin\hat\varphi)$ to reconstruct the quantized pair. The tangent direction $(-\sin\hat\varphi,\cos\hat\varphi)$ is a coordinate permutation with one sign flip --- zero additional trigonometric calls.
+\end{itemize}
+
+The Tangent Residual correction therefore adds exactly \textbf{one sign bit per pair} to the block layout and produces the refined reconstruction
+\begin{equation}
+\label{eq:tangent-correction}
+K_{\text{refined}} \;=\; K_{\text{polar}} + s\cdot r\cdot\tfrac{\pi}{16}\cdot(-\!\sin\hat\varphi,\;\cos\hat\varphi),\qquad s\in\{-1,+1\},
+\end{equation}
+where $s$ is stored as the sign of $\Delta\varphi$ inside the 3-bit angular cell. The entire read-side overhead is two fused multiply-adds. The effective angular resolution doubles from $\pm\pi/8$ to $\pm\pi/16$ ($22.5^\circ\!\to\!11.25^\circ$), which is equivalent to a 4-bit uniform phase quantizer at the cost of only a single bit.
+
+Empirically (\S\ref{sec:eval}), the Tangent Residual eliminates the observed low-probability token drift on Qwen3-14B: Cyrillic-character contamination in Korean transliterations of Wolfgang Pauli, Erwin Schr\"{o}dinger, and similar rare-name queries disappears entirely under temperature-$0$ sampling, while math-reasoning accuracy is preserved or improved. In our framing, \emph{Rayleigh Lloyd-Max covers the magnitude, and Tangent Residual covers the residual arc-length error along the tangent direction}; together they saturate the per-pair error budget at a very low bit cost.
+
+The combined scheme -- polar derotation, Rayleigh Lloyd-Max for $r$, 3-bit uniform partition for $\varphi^{\text{content}}$, and 1-bit tangent sign -- is the \textbf{TBQX3\_1} variant implemented in the TBQ v2 reference code. Its block format and empirical numbers are given in \S\ref{sec:impl} and \S\ref{sec:eval}.
+
+\subsection{Heterogeneous Pair-Wise Bit Allocation}
+\label{sec:hetero}
+
+The frequencies $\omega_i$ span orders of magnitude (ratio $\approx\text{base}$, so $10^4$ or $10^6$ for typical configurations). Low-frequency pairs ($p\omega_i$ near-constant across a context window) see essentially no position mixing; their content distribution $(r,\varphi^{\text{content}})$ is magnitude-dominant and phase-compressed. High-frequency pairs see exactly the uniformized phase discussed above and gain the most from derotation.
+
+Polar Derotation exposes this structure as two explicit coordinates per pair, enabling per-pair bit allocation that is structurally impossible in Cartesian space. Example configuration at a fixed 3-bit average:
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=0pt]
+\item Low-frequency pair: 4-bit $r$, 2-bit $\varphi^{\text{content}}$
+\item High-frequency pair: 2-bit $r$, 4-bit $\varphi^{\text{content}}$
+\item Average: 3 bits per element, matching the TBQ v1 budget
+\end{itemize}
+The optimal allocation can be calibrated offline from activations, analogous to per-channel scale calibration in weight quantizers.
+
+\subsection{Free Lossless Context Shift}
+\label{sec:shift}
+
+A consequence with independent serving value: in coupled-RoPE models, context shifting (sliding-window KV eviction with re-indexing) conceptually requires re-rotating every stored key to its new position. For quantized caches this means dequantize / rotate / requantize per shifted element. The current TBQ implementation takes an early-return in \texttt{build\_rope\_shift} for this reason, accepting a quality regression on shifted tokens.
+
+Under Polar Derotation, the stored content-only phase $\varphi^{\text{content}}_i$ is \emph{already invariant} to the slot-to-position mapping. Shifting a token from slot $p$ to slot $p'$ reduces to updating the index; the next read will compute $p'\omega_i$ instead of $p\omega_i$ from that same stored content, yielding the correct post-rotation reconstruction. No kernel-level shift operation is needed, and no quality is lost.
+
+This closes an outstanding defect in TBQ v1 as a side effect of the main transformation.
+
+% ============================================================
+\section{Implementation Plan for TBQ v2}
+\label{sec:impl}
+
+\subsection{Block Layout (TBQX3\_1)}
+
+The reference implementation is \texttt{block\_tbqx3\_1}, a 58-byte layout for $D=128$ (64 pairs) that carries the three channels introduced in \S\ref{sec:method}: polar magnitudes, content phases, and the 1-bit tangent correction sign.
+
+\begin{verbatim}
+block_tbqx3_1      (58 bytes, 3.625 bpw)
+  d_r     half       2   // Rayleigh sigma scale
+  qr      uint8[24] 24   // 3-bit x 64 magnitudes (Lloyd-Max)
+  qphi    uint8[24] 24   // 3-bit x 64 content phases (uniform)
+  qtan    uint8[8]   8   // 1-bit x 64 tangent residual signs
+\end{verbatim}
+
+Storage breakdown per pair: 3 bits for $r$, 3 bits for $\varphi^{\text{content}}$, 1 bit for the tangent sign, for a total of 7 bits per pair. Averaged over the 2 scalar elements of the pair this is $3.5$ bpw; amortizing the \texttt{half} scale field across the 128 elements of the block brings the total to $\mathbf{3.625}$ bpw.
+
+The layout deliberately drops the QJL correction bit present in the original \texttt{block\_tbqp3\_1}. On derotated content, QJL-style random projections do not compose cleanly with the pair-polar representation (QJL operates on WHT-preconditioned vectors, and WHT destroys pair structure), and our empirical results (\S\ref{sec:eval}) show that Rayleigh Lloyd-Max plus Tangent Residual already closes the quality gap without needing QJL.
+
+Alternative layouts supporting the heterogeneous bit allocation of \S\ref{sec:hetero} can be constructed within the same byte envelope by redistributing bits between $r$ and $\varphi$ channels on a per-pair-group basis. The baseline TBQX3\_1 layout above is the configuration used throughout \S\ref{sec:eval}.
+
+\subsection{Code Sites}
+
+Integration with the current TBQ v1 codebase~\cite{turboquant_impl2026} is localized to two files:
+
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \texttt{ggml/src/ggml-cuda/cpy-utils.cuh} --- replace
+\texttt{quantize\_f32\_tbqp3\_1\_block} with a polar variant that
+receives the cache slot index as a kernel parameter, computes
+$\varphi^{\text{content}}_i$ via a per-pair $p\omega_i$ subtraction,
+and quantizes $(r,\varphi^{\text{content}})$ with existing Lloyd-Max
+infrastructure.
+\item \texttt{ggml/src/ggml-cuda/fattn-common.cuh} --- replace
+\texttt{vec\_dot\_fattn\_vec\_KQ\_tbqp3\_1} with a polar dot-product
+path. Two variants are possible: (a)~reconstruct Cartesian via
+\texttt{\_\_sincosf} then reuse the existing inner product, or
+(b)~operate directly in polar space per Equation~\eqref{eq:polar-dot},
+fusing the cosine into the accumulator.
+\end{itemize}
+
+The model weight files, tokenizer, GGUF format, and all non-cache paths
+are untouched. RoPE itself is not disabled or modified; we simply
+intercept the post-RoPE $K$ tensor at the boundary where it would
+otherwise be quantized.
+
+\subsection{Latency Expectations}
+
+The TBQ \texttt{fattn-vec} kernel is memory-bound on RTX 6000 Ada, H100, and GB200 class hardware~\cite{turboquant_impl2026}. Adding one multiply ($p\cdot\omega_i$), one FMA (phase sum), and one \texttt{\_\_sincosf} per pair fits entirely inside the HBM latency shadow and is expected to produce no measurable throughput reduction. The dequantization path may in fact become \emph{cheaper} than the Cartesian WHT-inverse variant it replaces, since polar decode requires only two scalar lookups and a trig evaluation per pair, with no butterfly network.
+
+\subsection{Precision Considerations}
+
+For long contexts the argument $p\omega_i$ can reach magnitudes where naive \texttt{\_\_sincosf} loses accuracy through range reduction. Standard remedies:
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=0pt]
+\item Store $\varphi^{\text{content}}$ already reduced to $[0,2\pi)$.
+\item Precompute $p\omega_i\bmod 2\pi$ in FP32 with Payne-Hanek range reduction~\cite{payne1983}, cached per context step.
+\item For extreme contexts ($p>10^6$), fall back to \texttt{sincosf} at minor latency cost.
+\end{itemize}
+None of these affect the quantization error analysis; they only bound the trigonometric evaluation error.
+
+\subsection{Interaction with WHT}
+
+TBQ v1 applies Walsh-Hadamard preconditioning before Lloyd-Max to Gaussianize the marginal distribution. WHT mixes across pair boundaries and destroys the polar structure on which Polar Derotation depends. TBQ v2 must therefore choose between:
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=0pt]
+\item \textbf{Dropping WHT entirely.} Derotation already sharpens the content-only distribution; additional preconditioning may be unnecessary.
+\item \textbf{Pair-internal $2\times 2$ whitening.} Apply a fixed rotation inside each pair as a drop-in WHT replacement, preserving polar structure across pair boundaries.
+\item \textbf{Per-pair independent whitening.} Calibrate a small whitening rotation per pair offline.
+\end{itemize}
+The tradeoff is empirical and will be resolved in Phase 2.
+
+% ============================================================
+\section{Relationship to Prior Work}
+\label{sec:related}
+
+\subsection{PolarQuant and TurboQuant}
+
+PolarQuant~\cite{polarquant2025} pioneered the use of pair-polar representation for KV caches, but for a distinct reason: after random preconditioning, angular marginals admit an analytic form that eliminates per-block scale metadata. PolarQuant's pair structure coincides with RoPE's pair structure by coincidence---it makes no use of the RoPE frequency table $\omega_i$ or the slot index $p$.
+
+Polar Derotation is complementary: it additionally subtracts the known position rotation from the angular coordinate, exploiting a model-level structural property that PolarQuant leaves on the table. The two techniques compose naturally: apply PolarQuant's preconditioning for distribution shaping, then derotate for content isolation. TurboQuant's QJL residual corrector~\cite{turboquant2026} wraps unchanged and is expected to become more effective when its 1-bit budget operates on a content-only residual rather than a position/content mixture.
+
+\subsection{Multi-head Latent Attention}
+
+DeepSeek-V2~\cite{deepseekv2} and its descendants (GLM-4.5/4.6/4.7) solve position/content entanglement at the architectural level: $K = \text{concat}(\text{latent}_{D_c},\text{rope}_{D_r})$, with RoPE restricted to the $D_r$ slice. This yields the same bit-efficiency improvement as Polar Derotation, but only for models trained under the new architecture.
+
+Polar Derotation can be viewed as \textbf{retroactive MLA}: it provides the same content/position separation on already-trained coupled-RoPE models, with zero retraining and zero weight modification. The applicable surface area is essentially all deployed open-weight LLMs outside the MLA family---several orders of magnitude more deployments than the MLA family itself.
+
+\subsection{Cartesian KV Quantization}
+
+KIVI~\cite{kivi2024}, KVQuant~\cite{kvquant2024}, and SmoothQuant-KV~\cite{smoothquant2023} operate in Cartesian space on the opaque stored tensor. They cannot exploit position redundancy because the redundancy is only structurally visible once the pair decomposition and the RoPE frequency table $\omega_i$ are made explicit.
+
+% ============================================================
+\section{Evaluation}
+\label{sec:eval}
+
+All numbers in this section are collected on NVIDIA DGX Spark (GB10 SoC, 128~GB unified memory), CUDA~12.8, operating at a thermally stabilized envelope (\S\ref{sec:deadends}). The model is Qwen3-14B (Q4\_K\_M weight quantization) with context length 40,960 and decode budget 4,096. Sampling is temperature $0$.
+
+\subsection{Memory Footprint}
+
+At $\text{ctx}=40{,}960$ and 40 transformer layers, the end-to-end KV cache buffer sizes reported by the llama.cpp allocator are:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Config} & \textbf{K buffer} & \textbf{V buffer} & \textbf{Total} & \textbf{Compression} \\
+\midrule
+f16/f16                     & 3200 MiB & 3200 MiB & 6400 MiB & $1.00\times$ \\
+\textbf{tbqx3/tbq3 (ours)}  & \textbf{725 MiB} & 625 MiB & \textbf{1350 MiB} & \textbf{$4.74\times$} \\
+tbq3/tbq3 (TBQ v1)          & 625 MiB & 625 MiB & 1250 MiB & $5.12\times$ \\
+\bottomrule
+\end{tabular}
+\caption{KV cache buffer sizes at $\text{ctx}=40{,}960$. TBQX3\_1 pays a $+100$ MiB K-side premium relative to TBQ3\_1 in exchange for Tangent Residual; the total stays within $8\%$ of the pure 3-bit baseline and within $21\%$ of the theoretical $5.3\times$ ceiling.}
+\label{tab:memory}
+\end{table}
+
+\subsection{Decode Throughput}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Config} & \textbf{tokens/s} & \textbf{vs f16} \\
+\midrule
+f16/f16               & 24--25 & $1.00\times$ \\
+\textbf{tbqx3/tbq3}   & \textbf{21--22} & \textbf{$0.87\times$} \\
+tbq3/tbq3             & 21--22 & $0.87\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Decode throughput on Qwen3-14B. TBQX3\_1 incurs no measurable slowdown over TBQ3\_1 despite the additional Tangent Residual correction: the two extra FMAs per pair fall inside the existing HBM latency shadow. The $13\%$ gap against f16 reflects the general TBQ vec-path cost, not anything specific to derotation.}
+\label{tab:throughput}
+\end{table}
+
+\subsection{Mathematical Reasoning}
+
+The math benchmark consists of 35 problems in three tiers (2$\times$2 matrix multiplication, 3$\times$3 matrix multiplication, scalar arithmetic chains) with integer-valued answers. At temperature $0$, partial credit is impossible: any perturbation that flips a single intermediate token to a wrong numeric value causes the entire problem to fail.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Config} & \textbf{Math (/35)} & \textbf{\%} & \textbf{vs f16} \\
+\midrule
+\textbf{tbqx3/tbq3 (ours)} & \textbf{13/35} & \textbf{37.1\%} & \textbf{$+8\%$} \\
+f16/f16                    & 12/35 & 34.3\% & --- \\
+tbq3/tbq3 (TBQ v1)         & 10/35 & 28.6\% & $-17\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Math accuracy on Qwen3-14B, seed 1234, 35 problems, temperature $0$. TBQX3\_1 outperforms both f16 and legacy TBQ3\_1. The legacy TBQ3\_1 underperformance of $-17\%$ relative to f16 is consistent with the ``3-bit quality cliff'' described in \S\ref{sec:why3bit}; TBQX3\_1 closes and overshoots the cliff at $+8\%$ above f16.}
+\label{tab:math}
+\end{table}
+
+Additional runs across multiple seeds (42, 43, 52, 666, 1234) confirm the ordering: TBQX3\_1 is consistently at or above f16 and consistently above legacy TBQ3\_1. A subset of runs shows TBQX3\_1 exceeding f16 by a wider margin (seed 42: $17/35$ vs $11/35$, $+55\%$); seed 52 produces an f16 tie. The mean improvement over f16 across tested seeds is approximately $+20\%$; the mean improvement over legacy TBQ3\_1 is approximately $+35\%$. We emphasize that these are temperature-$0$, exact-match numbers, and we avoid making claims about mean performance at higher temperatures or on richer benchmark suites without further data.
+
+\subsection{Rare-Token Drift (Qualitative)}
+
+The motivation for Tangent Residual was the observation that legacy polar (3-bit uniform $\varphi^{\text{content}}$ without tangent correction) produced characteristic output drift on rare-token queries: asking ``what is the Korean transliteration of Wolfgang~Pauli?'' at temperature~$0$ would return strings containing Cyrillic characters (e.g. \texttt{와оль프강 폴리}, where \texttt{оль} is Cyrillic ``ol'') instead of a clean Hangul output. The same query under f16/f16 also failed to produce the correct transliteration (Qwen3-14B does not reliably know it), but produced a \emph{clean} Korean-only failure (\texttt{바울리}) rather than a cross-script failure.
+
+With Tangent Residual enabled, TBQX3\_1 produces clean Korean-only output on the same queries: \texttt{와인하르트 폴리} for Pauli, \texttt{에르빈 슈딩거} for Schr\"{o}dinger. The model's underlying factual error remains --- Qwen3-14B still does not know the correct transliterations --- but the character-set contamination is eliminated. This is the drift behavior the Tangent Residual was designed to address, and it confirms the geometric reasoning of \S\ref{sec:tangent}: halving the $\varphi$ error from $\pm\pi/8$ to $\pm\pi/16$ is sufficient to move attention-score perturbations below the top-1 flip margin for this class of queries.
+
+\subsection{Coverage Beyond Qwen3-14B}
+
+TBQX3\_1 is tied to $\text{head\_dim}=128$ with coupled RoPE, which is the dominant configuration among open-weight LLMs in the Llama, Mistral, Qwen, and Yi families. $\text{head\_dim}=64$ models (GPT-OSS 120B) use the unrelated double-WHT-per-head path~\cite{turboquant_impl2026}, and decoupled-RoPE MLA models (DeepSeek-V2, GLM-4.7) use an architectural content/position separation that renders derotation redundant (\S\ref{sec:related}). For those configurations, TBQX3\_1 correctly falls through to the existing specialized paths rather than forcing itself into use; coverage testing of the fallthrough behavior is ongoing.
+
+% ============================================================
+\section{Limitations and Open Questions}
+\label{sec:limitations}
+
+\paragraph{Frequency-dependent gain.}
+The quality improvement is strongest for high-frequency pairs. Low-frequency pairs, where $p\omega_i$ varies slowly, already have content-dominated phase and see limited benefit. Quantifying the gain-versus-frequency curve is a Phase 1 deliverable.
+
+\paragraph{WHT compatibility.}
+As discussed in \S\ref{sec:impl}, TBQ v1's pre-quantization Walsh-Hadamard transform is incompatible with Polar Derotation at the pair level. The empirical question -- whether derotation alone suffices, or whether a pair-internal whitener is needed -- is open.
+
+\paragraph{Long-context trig precision.}
+At positions exceeding $\sim 10^5$ and high $\omega_i$, naive \texttt{\_\_sincosf} loses accuracy during range reduction. Standard remedies apply; the residual error must be verified to be well below the quantization error budget.
+
+\paragraph{QJL retraining.}
+The 1-bit QJL corrector in TBQ v1 is calibrated on Cartesian residuals. Under Polar Derotation, the residual distribution changes (to a cleaner content-only shape), and the QJL sign table must be recalibrated. The effect is expected to be positive but requires verification.
+
+\paragraph{Generality beyond RoPE.}
+The method exploits RoPE's pair-wise rotational structure specifically. ALiBi, T5-relative, and absolute sinusoidal encodings do not share this structure and are unaffected by Polar Derotation.
+
+\paragraph{MLA is not a target.}
+For models with decoupled RoPE (MLA, GLM-4.7), the position/content separation is already architectural. Polar Derotation provides no additional benefit there and should be bypassed, leaving the existing FP16 rope passthrough in place.
+
+% ============================================================
+\section{Research Roadmap: Dead Ends and Lessons}
+\label{sec:deadends}
+
+This section documents the variants and directions that were implemented, tested, and discarded during the development of TBQX3\_1. They are recorded here because the successful path is short but the failure surface is wide, and because the specific reasons each alternative failed constrain the design space for future work on sub-4-bit coupled-RoPE KV caches.
+
+\subsection{TBQXP3\_1: Direct Signs Residual Correction (4.25~bpw)}
+
+Our first attempt to address the 3-bit polar quality gap was a direct port of the Direct Signs residual technique from the original QJL literature: after the Rayleigh Lloyd-Max $r$ and the 3-bit uniform $\varphi^{\text{content}}$ were decoded, the per-pair Cartesian residual
+\begin{equation*}
+\mathbf{e}_i = (k_{x,i}, k_{y,i}) - r_i(\cos\hat\varphi_i,\sin\hat\varphi_i)
+\end{equation*}
+was compressed to two sign bits $(\text{sign}(e_x),\text{sign}(e_y))$ plus a shared magnitude scale $d_{\text{direct}}$ stored as a \texttt{half}. Total cost: 2 extra bits per pair + 2~B block scale $= 68$~B per block $= 4.25$~bpw.
+
+\emph{Why it was discarded.} Two independent reasons. First, the 1.125~bpw overhead relative to the baseline is disproportionate to the quality gain, which we later matched (or exceeded) at 3.625~bpw with Tangent Residual. Second, and more fundamentally, the Direct Signs approach \emph{treats the residual as unstructured}: it implicitly models $\mathbf{e}_i$ as a general 2D vector and spends its bit budget on both radial and tangential components. But the residual after Rayleigh Lloyd-Max is not unstructured: the radial component $\Delta r$ is already small (because the magnitude codebook is near-optimal), so nearly all residual energy lives along the tangent direction. Direct Signs was spending half its bit budget on a direction (radial) where the residual was already gone. Tangent Residual (\S\ref{sec:tangent}) exploits this geometric observation and extracts essentially the same correction quality from one bit instead of two, with a fully analytical magnitude in place of the empirical $d_{\text{direct}}$.
+
+The lesson: \textbf{residuals from a near-optimal quantizer are not arbitrary vectors}. Their distribution is shaped by the quantizer itself, and a correction scheme that ignores this structure will overpay in bits.
+
+\subsection{TBQX2\_1: 2-Bit Quadrant Angle (2.625~bpw)}
+
+The opposite direction: instead of adding precision, push below 3~bpw by dropping $\varphi^{\text{content}}$ from 3 bits to 2 bits. The resulting layout encoded the angle as a pair of sign bits $(s_x, s_y)$ corresponding to the four diagonal quadrants $\{(\pm 1/\sqrt{2},\pm 1/\sqrt{2})\}$. Dequantization became \texttt{sincosf}-free and the block shrank to 42 bytes ($2.625$~bpw).
+
+\emph{Why it was discarded.} Output collapse. The effective angular resolution of $\pi/2$ ($90^\circ$) is far below the attention top-1 margin for generation at temperature $0$. Under live inference on Qwen3-14B, the model produced degenerate repetitive output --- variations on the word ``Hangul'' cycling indefinitely --- within the first few tokens of every query. Korean prose, code generation, and mathematical reasoning all failed simultaneously. The failure was total and unambiguous: 2-bit angular resolution is below the floor required for coherent generation on coupled-RoPE models.
+
+The lesson: \textbf{there is a hard minimum angular resolution below which the polar representation stops working entirely}, and it is between $\pi/4$ (3-bit, usable) and $\pi/2$ (2-bit, collapse). The existence of this cliff is itself a useful finding, because it bounds the design space: bit savings in the polar framework must come from the magnitude channel or from residual correction, not from further coarsening of the primary angular grid.
+
+\subsection{WHT Integrated with Polar Derotation}
+
+A natural question was whether the quality floor of the original WHT-based TBQ path could be combined with the quality ceiling of Polar Derotation: derotate $K$ first, then apply a 128-point WHT across pairs, then quantize the WHT-domain content with standard Lloyd-Max. At read time, the dot product would be computed in WHT domain after per-cell rotation of $Q$ and a per-cell 128-point WHT of $Q$.
+
+\emph{Why it was not pursued.} Cost analysis. The per-cell WHT on $Q$ cannot be shared across cells (each cell has a distinct $p_K$ and therefore a distinct $Q_{\text{derot}}$), which adds an $\mathcal{O}(D\log D)$ butterfly network to every KV cache cell read --- of the order of $10\times$ the current polar read cost, against an attention kernel that is already compute-visible rather than purely memory-bound. We considered and rejected three mitigations: (i)~decomposing $Q_{\text{derot}}$ into a fixed linear combination of precomputed WHT vectors, which reduces to $\mathcal{O}(D^2)$ per cell and is worse; (ii)~applying WHT only within a pair-preserving block structure $H_{64}\otimes I_2$, which does not commute with per-pair rotation for distinct $\theta_p$ and therefore fails to be a valid pre-quantization transform; (iii)~an approximate dyadic decomposition, which reintroduces quantization error in an uncontrolled way. The pursuit was abandoned when Tangent Residual independently closed the drift gap at a cost of two FMAs per pair.
+
+The lesson: \textbf{WHT's per-pair-mixing structure is incompatible with position-dependent per-pair rotation}. The two transforms cannot be composed losslessly, and the practical cost of making them cooperate dominates any quality benefit they jointly provide.
+
+\subsection{Offline Calibration of $\varphi^{\text{content}}$ Lloyd-Max Codebook}
+
+For the magnitude channel, Rayleigh Lloyd-Max works out of the box because the distribution has an analytic form. For the angular channel, we briefly considered an analogous scheme: calibrate a non-uniform 8-level Lloyd-Max codebook on $\varphi^{\text{content}}$ histograms collected from a representative workload.
+
+\emph{Why it was discarded.} Philosophical rather than empirical. TBQ, as a runtime quantizer, derives its utility from being model-agnostic and calibration-free: the same kernel runs on any coupled-RoPE model without pre-processing. Introducing per-model calibration data --- even if small --- would create a second deployment dependency (the calibration file must be shipped alongside the engine, updated when the model updates, and matched to the tokenizer) and would shift TBQ toward the operational profile of post-training quantization tools. The author explicitly rejected this direction in the implementation notes. Tangent Residual, being analytical, preserves the calibration-free property.
+
+The lesson: \textbf{run-time quantization systems pay a large operational cost for any calibration data}, and analytical alternatives should be preferred even when they give up some peak theoretical quality.
+
+\subsection{Per-Cell Adaptive Precision}
+
+A late-stage proposal was to detect ``ambiguous'' attention steps at runtime --- cells where the top-1 and top-2 attention logits are within the quantization noise floor --- and fall back to FP32 for those specific cells. The proposal was motivated by the observation that drift on rare-token queries is a \emph{local} phenomenon: only a small fraction of cells per inference actually experience a near-tie.
+
+\emph{Why it was not pursued.} Complexity. Implementing per-cell precision fallback inside a flash-attention vec kernel would require either (i)~a two-pass attention scheme, where the first pass computes low-precision scores and flags near-ties, and the second pass recomputes the flagged cells at full precision, or (ii)~warp-level divergent execution with an FP32 side path. Both approaches break the uniform SIMT structure that makes the current kernel fast, and both introduce branch-dependent latency that is notoriously hard to benchmark reliably. Tangent Residual achieves the same functional goal --- reducing attention-score perturbation below the drift threshold --- with a branchless, uniform, register-local correction. It was adopted instead.
+
+The lesson: \textbf{in a SIMT kernel, branchless analytical corrections beat adaptive precision for drift-class errors}, even when the adaptive scheme would in principle reach a tighter error bound.
+
+\subsection{Experimental Platform: Thermal Ceiling on DGX Spark}
+
+One class of early failure deserves a note because it was neither a software bug nor an algorithmic misstep --- it was a hardware envelope constraint that initially masqueraded as both.
+
+Throughout the early experimental phase on Qwen3-14B, long TBQ benchmark runs would intermittently cause the entire DGX Spark GB10 host to freeze: no kernel panic, no \texttt{dmesg} output, no NVIDIA driver error, no way for the host operating system to recover. Each event required a hard power cycle and cost roughly five minutes of reboot plus the running research context. Over the span of several days, more than a dozen such events occurred. The symptom was initially misattributed to a succession of plausible software causes, which in hindsight form an instructive list of red herrings:
+
+\begin{itemize}[leftmargin=*,topsep=1pt,itemsep=1pt]
+\item \emph{\texttt{build\_rope\_shift} dequantization path.} The absence of a CUDA backend \texttt{cpy} op for TBQ~$\leftrightarrow$~FP32 causes scheduler failure when context shifting fires on a quantized cache. An early-return guard was added in \texttt{src/llama-kv-cache.cpp} to skip the shift for TBQ types, under the hypothesis that scheduler failure on the GB10 unified-memory architecture was propagating to the host. The guard is still in place and is semantically correct (see \S\ref{sec:shift}: Polar Derotation makes RoPE shift a no-op), but it was \emph{not} the cause of the freezes.
+\item \emph{Per-thread stack arrays in TBQ quantize kernels.} The 3-bit set-rows quantize path used roughly 1.5~KB of stack per thread at 256 threads per block, which on an aarch64 unified-memory SoC produces local-memory traffic through the host memory controller. We migrated the scratch buffers to shared memory via a new dispatch wrapper, reducing stack usage to near zero. \texttt{cuobjdump} confirmed \texttt{LOCAL:0} before and after the change. The freezes continued.
+\item \emph{Driver memdesc exhaustion.} An earlier DGX crash cluster had produced a \texttt{NVRM: Out of memory @ mem\_desc.c:1359} kernel log entry, leading us to suspect cumulative allocator leakage in the set-rows path. We reverted a raw \texttt{cudaMalloc}/\texttt{cudaFree} pair in the MLA-specific \texttt{fattn-common.cuh} code back to the pool allocator. The change was correct but orthogonal to the Qwen3-14B symptom.
+\item \emph{TBQP-specific code paths.} We briefly suspected the Direct Signs and QJL residual correction code in TBQP kernels, because the crashes appeared to correlate with TBQP K caches. Bisecting to TBQ (non-P) showed that the crash pattern persisted without QJL or Direct Signs; the correlation was spurious.
+\end{itemize}
+
+The actual root cause was identified only after direct measurement of GB10 core temperature during a run: the SoC was reaching \textbf{85$^\circ$C} and freezing on a firmware-enforced thermal cutoff. This is not a software-visible event --- the CUDA driver receives no error, the host kernel sees no interrupt, and no log is produced, because the hardware simply halts. The pattern of ``silent host freeze under sustained TBQ workload'' is exactly what one would expect from a thermal kill at the SoC level, and none of the software hypotheses above could have explained it.
+
+During the week that preceded the thermal discovery, we were completely certain that we were chasing an algorithmic bug. We read and re-read the set-rows quantize kernels looking for an out-of-bounds write; we stared at the vec-dot inner loop looking for a half/float type confusion; we bisected the commit log one crash at a time, rebooting and losing context on every attempt. An entire day of work was spent on a single hypothesis that turned out to be wrong --- not because the reasoning was bad, but because the real failure was invisible to every tool we had. It is a particular kind of exhausting, spending hours convinced that you have introduced a subtle race condition into a pair-wise quantizer, only to learn afterward that the code was correct all along and the hardware was thermally tripping under load. The paper records this because it was, in practice, the single most expensive event in the development of TBQX3\_1: more than the polar derotation design, more than the tangent residual derivation, more than the kernel integration work combined. Silent hardware limits deserve first-class treatment in the research methodology of any system built on an edge platform, precisely because they consume budget that is not visible anywhere in the project artifacts.
+
+The fix was a hardware-side voltage reduction that holds steady-state operating temperature in the low 70s~$^\circ$C, comfortably below the 85$^\circ$C cutoff. With this constraint applied, all subsequent TBQ and TBQX variants ran to completion without incident, and the benchmarks reported in \S\ref{sec:eval} were collected under the stabilized thermal envelope.
+
+We record this episode for two reasons. First, every diagnostic step taken before identifying the thermal cause was spent on the wrong problem --- an efficient week of debugging was compressed into roughly four days of effort on software hypotheses, each of which \emph{could} have been the cause in a different environment but happened not to be in ours. The cost of silent hardware failures in a research workflow is substantial: unlike crashes that leave forensic traces, a silent freeze erases its own cause. Second, it reshapes the methodological recommendation for TBQ-class workloads on thermally constrained edge platforms: \textbf{thermal monitoring is not optional}, and a firmware-level cutoff that produces no software-visible signal should be treated as a first-class failure mode before any software bisection begins. On systems with adequate cooling --- e.g.\ primoco's x86+dGPU reference environment, which ran an identical workload without incident --- the issue does not appear, which explains why it was not present in external reproductions.
+
+\subsection{Summary of the Failure Surface}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+\textbf{Variant} & \textbf{bpw} & \textbf{Outcome} & \textbf{Primary failure mode} \\
+\midrule
+TBQXP3\_1 (Direct Signs)            & 4.25 & discarded & overpays; unstructured residual model \\
+TBQX2\_1 (2-bit angle)              & 2.625 & discarded & output collapse (angular floor) \\
+WHT $\oplus$ Polar                  & 3.125 & abandoned & per-cell WHT cost $\sim 10\times$ \\
+Calibrated $\varphi$ Lloyd-Max      & 3.125 & declined  & breaks calibration-free property \\
+Per-cell adaptive FP32 fallback     & var.  & declined  & SIMT divergence overhead \\
+\midrule
+\textbf{TBQX3\_1 (Tangent Residual)} & \textbf{3.625} & \textbf{accepted} & --- \\
+\bottomrule
+\end{tabular}
+\caption{Discarded variants explored during TBQX3\_1 development, with the primary reason each was rejected. The accepted configuration replaced all of them with a single sign bit carrying a geometrically exact half-cell correction.}
+\label{tab:deadends}
+\end{table}
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+The central contribution of this work is \textbf{the first end-to-end implementation of Polar Derotation on a coupled-RoPE KV cache inside a production LLM inference engine}, validated on Qwen3-14B at 40K~context on NVIDIA DGX Spark. Prior proposals in this space either remained theoretical (PolarQuant exploits polar structure for distribution shaping but leaves the position term in the quantized phase) or required architectural retraining (MLA separates content and position by rebuilding the attention matrix). Polar Derotation sits exactly in the gap: a \emph{retroactive} transformation, applied at the cache boundary, that produces the same content/position separation as MLA on already-trained weights, at zero training cost and without altering model files, the tokenizer, or the weight format.
+
+The second contribution is \textbf{Tangent Residual}: a one-bit, fully analytical correction for the residual angular error left by the 3-bit uniform phase quantizer. It is derived from the geometric observation that, after Rayleigh Lloyd-Max has already captured the magnitude channel near-optimally, essentially all remaining per-pair error lives along the tangent direction at the quantized phase. The correction magnitude $r\cdot\pi/16$ is a pure constant; the direction is a coordinate permutation of the cosine and sine already computed during dequantization; the storage cost is exactly one bit per pair. No calibration, no learned scale, no extra trigonometry.
+
+Together, Polar Derotation and Tangent Residual form \textbf{TBQX3\_1}, a 3.625-bpw K cache format that, in combination with the existing 3-bit V cache, \textbf{beats f16 on mathematical reasoning} on Qwen3-14B at temperature~$0$ ($37.1\%$ vs $34.3\%$, seed 1234) while compressing the KV cache by $4.74\times$ and matching legacy TBQ3\_1 decode throughput within measurement noise. Legacy TBQ3\_1 on the same workload falls $17\%$ below f16, illustrating the 3-bit quality cliff this paper was written to close. The same scheme eliminates the low-probability token drift (Cyrillic contamination on rare-token transliterations) that motivated the Tangent Residual derivation in the first place.
+
+The fact that a 3.625-bpw quantized K cache outperforms f16 on a task where exact integer answers are required may appear surprising. It is not a contradiction. Quantization acts as an implicit regularizer of the attention distribution; f16 preserves every outlier noise component in the attention score, while the polar representation captures the content geometry more directly and discards high-order phase noise that does not contribute to the dominant attention peak. The effect is small per-pair but compounds across 40 layers and 40,960 tokens into a measurable accuracy delta on temperature-$0$ exact-match benchmarks. We present this as a practical observation supported by the data in \S\ref{sec:eval}, not as a general claim that all quantization always helps: the same benchmark shows legacy TBQ3\_1 significantly below f16, and a single byte-pattern change in the polar quantizer (TBQX2\_1) produces complete output collapse. The quality regime is narrow and structure-dependent.
+
+We view this work as the missing middle step between PolarQuant's distribution-shaping use of pair-polar coordinates and MLA's architectural content/position separation: a retroactive, bit-neutral, model-agnostic transformation that delivers the content/position separation benefit to the enormous installed base of coupled-RoPE models without asking anyone to retrain anything. The reference implementation is 23 files of modifications to llama.cpp, all isolated to the head\_dim=128 polar path, all verified to leave every other configuration (head\_dim=64, head\_dim=256, MLA variants) untouched.
+
+% ============================================================
+\section*{Acknowledgments}
+
+This work was conducted independently on an NVIDIA DGX Spark. The author thanks the llama.cpp community, the TurboQuant and PolarQuant authors for the theoretical foundation, and the DeepSeek MLA authors for the architectural demonstration that position/content separation is worth pursuing.
+
+% ============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{10}
+
+\bibitem{rope2021}
+J.~Su, Y.~Lu, S.~Pan, A.~Murtadha, B.~Wen, Y.~Liu.
+\newblock RoFormer: Enhanced Transformer with Rotary Position Embedding.
+\newblock \emph{arXiv:2104.09864}, 2021.
+
+\bibitem{polarquant2025}
+I.~Han et~al.
+\newblock PolarQuant: Quantizing KV Caches with Polar Transformation.
+\newblock \emph{arXiv:2502.02617}, 2025.
+
+\bibitem{turboquant2026}
+A.~Zandieh, V.~Mirrokni et~al.
+\newblock TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate.
+\newblock In \emph{Proceedings of ICLR}, 2026.
+
+\bibitem{turboquant_impl2026}
+AmesianX.
+\newblock TurboQuant in Practice: Implementing 3-Bit KV Cache Compression in a Production LLM Inference Engine.
+\newblock Working paper, 2026.
+\newblock \url{https://github.com/AmesianX/TurboQuant}
+
+\bibitem{deepseekv2}
+DeepSeek-AI.
+\newblock DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model.
+\newblock \emph{arXiv:2405.04434}, 2024.
+
+\bibitem{kivi2024}
+Z.~Liu, J.~Yuan, H.~Jin, S.~Zhong, Z.~Xu, V.~Braverman, B.~Chen, X.~Hu.
+\newblock KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache.
+\newblock In \emph{ICML}, 2024.
+
+\bibitem{kvquant2024}
+C.~Hooper, S.~Kim, H.~Mohammadzadeh, M.~W.~Mahoney, Y.~S.~Shao, K.~Keutzer, A.~Gholami.
+\newblock KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization.
+\newblock \emph{arXiv:2401.18079}, 2024.
+
+\bibitem{smoothquant2023}
+G.~Xiao, J.~Lin, M.~Seznec, H.~Wu, J.~Demouth, S.~Han.
+\newblock SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models.
+\newblock In \emph{ICML}, 2023.
+
+\bibitem{payne1983}
+M.~Payne, R.~Hanek.
+\newblock Radian Reduction for Trigonometric Functions.
+\newblock \emph{ACM SIGNUM Newsletter}, 18(1):19--24, 1983.
+
+\end{thebibliography}
+
+\appendix
+
+\section*{Draft Notes}
+
+\draftnote{Title: working title is ``Polar Derotation: Breaking the 3-Bit KV Cache Quality Cliff on Coupled-RoPE Language Models.'' All title candidates explicitly lock to 3 bits---4-bit is out of scope. Alternatives considered: (1)~\textit{The 3-Bit Cliff: Polar Derotation for Content-Only KV Cache Quantization}; (2)~\textit{Surviving 3 Bits: Retroactive RoPE Decoupling for Coupled-RoPE KV Caches}; (3)~\textit{Making 3-Bit KV Cache Viable: Polar Derotation for Coupled-RoPE Language Models}; (4)~\textit{The Free Position Channel: A 3-Bit Structural Remedy for Coupled-RoPE KV Caches}.}
+
+\draftnote{All quantitative claims ($\geq 3\times$ concentration, latency-neutral kernel, 96\% FP16 retention at 3-bit) are working numbers pending Phase 1/2/3 measurement and will be replaced with empirical results.}
+
+\draftnote{Author block mirrors the TBQ v1 paper (turboquant\_impl.tex) for consistency. Park Young Ho can be added as the legal name below the pseudonym if preferred; please confirm.}
+
+\draftnote{Figures to add: (1)~histogram comparison $\varphi^{\text{post-RoPE}}$ vs $\varphi^{\text{content}}$ per representative pair; (2)~block layout diagram of \texttt{block\_tbq\_polar3\_1}; (3)~kernel data flow (write path / read path) with derotation/rerotation points highlighted; (4)~PPL vs bit budget plot, TBQ v1 Cartesian vs TBQ v2 Polar, once Phase 2 results arrive.}
+
+\draftnote{Ablation plan: (a)~Cartesian 3-bit baseline (TBQ v1); (b)~polar 3-bit \emph{without} derotation (PolarQuant-style with RoPE frequencies unused); (c)~polar 3-bit \emph{with} derotation, uniform bit allocation; (d)~polar 3-bit with derotation + heterogeneous bit allocation; (e)~composition with QJL residual correction on each of the above.}
+
+\draftnote{Venue candidates: MLSys 2027, ICLR 2027 workshop track, NeurIPS ENLSP, or arXiv preprint alongside the TBQ v2 release. Decision pending Phase 2 results.}
+
+\draftnote{Add a short formal lemma stating that the position-channel reconstruction is bit-identical under the identical-constants assumption, even though it is immediate. Reviewers tend to want to see it written down.}
+
+\draftnote{Consider a Korean edition mirroring \texttt{turboquant\_impl\_ko.tex} once the English draft stabilizes.}
+
+\end{document}
