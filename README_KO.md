@@ -64,6 +64,8 @@
 --cache-type-k tbqx3 --cache-type-v tbq3
 ```
 
+> ⚠️ **알려진 한계 — VEC 커널만 구현됨.** TBQX3_1 은 현재 `fattn-vec` 경로에만 구현되어 있음. 그 결과 Qwen3-14B 디코드 처리량이 f16 의 약 0.87× 수준에 머무름. `fattn-mma` (Tensor Core) 커널로 이식하면 full 속도가 회복되지만 **아직 구현 전** — 다음 릴리즈의 최대 미결 과제.
+
 ---
 
 ### v1.5.3 — Double WHT Per-Head for head_dim=64 (GPT-OSS 120B)

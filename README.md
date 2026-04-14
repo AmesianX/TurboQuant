@@ -64,6 +64,8 @@
 --cache-type-k tbqx3 --cache-type-v tbq3
 ```
 
+> ⚠️ **Known limitation — VEC kernel only.** TBQX3_1 is currently implemented on the `fattn-vec` path only. Decode throughput on Qwen3-14B is ~0.87× f16 as a result. Porting to the `fattn-mma` (Tensor Core) kernel would restore full speed but is **not yet implemented** — it is the main open item for a future release.
+
 ---
 
 ### v1.5.3 — Double WHT Per-Head for head_dim=64 (GPT-OSS 120B)
