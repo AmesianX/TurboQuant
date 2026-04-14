@@ -213,11 +213,16 @@ p(r;\sigma) = \frac{r}{\sigma^2}\exp\!\left(-\frac{r^2}{2\sigma^2}\right),
 \hat\sigma = \sqrt{\frac{1}{2n}\sum_{i=1}^{n} r_i^2}.
 \end{equation}
 
-더 중요한 것은, Rayleigh 분포가 $\sigma$ 정규화 좌표계에서 \textbf{특정 모델이나 데이터셋과 무관한 닫힌 형식의 8-레벨 Lloyd-Max 코드북}을 허용한다는 점이다. Rayleigh pdf 상에서 표준 Lloyd-Max 반복을 수치적으로 풀면 다음 경계/센트로이드 쌍이 나온다:
-\begin{align}
-\mathbf{b} &= (0.4280,\,0.7848,\,1.0991,\,1.4101,\,1.7268,\,2.0623,\,2.4427)\sigma,\\
-\mathbf{c} &= (0.2400,\,0.6160,\,0.9420,\,1.2547,\,1.5685,\,1.8946,\,2.2520,\,2.6650)\sigma.
-\end{align}
+더 중요한 것은, Rayleigh 분포가 $\sigma$ 정규화 좌표계에서 \textbf{특정 모델이나 데이터셋과 무관한 닫힌 형식의 8-레벨 Lloyd-Max 코드북}을 허용한다는 점이다. Rayleigh pdf 상에서 표준 Lloyd-Max 반복을 수치적으로 풀면 다음 경계 벡터 $\mathbf{b}$ 와 센트로이드 벡터 $\mathbf{c}$ 가 나온다:
+\begin{equation}
+\small
+\begin{aligned}
+\mathbf{b}/\sigma &= \bigl(0.4280,\,0.7848,\,1.0991,\,1.4101,\\
+                  &\qquad 1.7268,\,2.0623,\,2.4427\bigr),\\[2pt]
+\mathbf{c}/\sigma &= \bigl(0.2400,\,0.6160,\,0.9420,\,1.2547,\\
+                  &\qquad 1.5685,\,1.8946,\,2.2520,\,2.6650\bigr).
+\end{aligned}
+\end{equation}
 저장 비용은 페어당 3비트 + $\sigma$용 \texttt{half} 하나. 블록별 히스토그램도, 학습 시점 캘리브레이션도, 모델별 튜닝도 요구되지 않는다. 동일한 상수가 모든 coupled-RoPE 모델의 모든 레이어의 모든 블록에 적용된다 --- 이 분포가 특정 데이터셋 속성이 아닌 $W_K$의 WHT 또는 가우시안 프로젝션 통계의 결과이기 때문이다. 이는 일반 $k$-평균 양자화와는 질적으로 다른 영역이며, TBQX가 $3.125$~bpw에서 품질 여유를 확보하는 두 가지 이유 중 하나이다.
 
 \subsection{Tangent Residual: 해석적 절반 셀 보정}
@@ -245,9 +250,12 @@ K_{\text{actual}} - K_{\text{polar}} \;\approx\; r\,\Delta\varphi\,\bigl(-\!\sin
 따라서 Tangent Residual 보정은 정확히 \textbf{페어당 1비트}를 블록 레이아웃에 추가하며 다음 정제된 복원을 생성한다:
 \begin{equation}
 \label{eq:tangent-correction}
-K_{\text{refined}} \;=\; K_{\text{polar}} + s\cdot r\cdot\tfrac{\pi}{16}\cdot(-\!\sin\hat\varphi,\;\cos\hat\varphi),\qquad s\in\{-1,+1\},
+\begin{aligned}
+K_{\text{refined}} \;=\;& K_{\text{polar}} \\
+ +\;& s\cdot r\cdot\tfrac{\pi}{16}\cdot(-\!\sin\hat\varphi,\,\cos\hat\varphi),
+\end{aligned}
 \end{equation}
-여기서 $s$는 3비트 각도 셀 내부의 $\Delta\varphi$ 부호로 저장된다. 전체 읽기 측 오버헤드는 FMA 두 개이다. 유효 각도 해상도는 $\pm\pi/8$에서 $\pm\pi/16$으로 두 배 증가($22.5^\circ\!\to\!11.25^\circ$)하며, 이는 단 1비트 비용에 4비트 uniform 위상 양자화기와 등가이다.
+여기서 $s\in\{-1,+1\}$이며, 3비트 각도 셀 내부의 $\Delta\varphi$ 부호로 저장된다. 전체 읽기 측 오버헤드는 FMA 두 개이다. 유효 각도 해상도는 $\pm\pi/8$에서 $\pm\pi/16$으로 두 배 증가($22.5^\circ\!\to\!11.25^\circ$)하며, 이는 단 1비트 비용에 4비트 uniform 위상 양자화기와 등가이다.
 
 경험적으로(\S\ref{sec:eval}), Tangent Residual은 Qwen3-14B에서 관찰된 저확률 토큰 drift를 제거한다: Wolfgang Pauli, Erwin Schrödinger 등 희소 이름 질의의 한국어 transliteration에서 나타나던 키릴 문자 오염이 temperature $0$에서 완전히 사라지며, 동시에 수학 추론 정확도는 유지되거나 향상된다. 본 논문의 구성에서 \emph{Rayleigh Lloyd-Max는 크기를 커버하고, Tangent Residual은 접선 방향을 따라 남은 호 길이 오차를 커버한다}. 둘은 결합되어 매우 낮은 비트 비용으로 페어당 오차 예산을 포화시킨다.
 
@@ -283,13 +291,14 @@ Polar Derotation 하에서 저장된 콘텐츠 전용 위상 $\varphi^{\text{con
 
 참조 구현은 \texttt{block\_tbqx3\_1}이며 $D=128$(64 페어)에 대한 58바이트 레이아웃이다. \S\ref{sec:method}에서 도입된 세 채널을 담는다: polar 크기, 콘텐츠 위상, 1비트 tangent 보정 부호.
 
+{\footnotesize
 \begin{verbatim}
-block_tbqx3_1      (58 bytes, 3.625 bpw)
-  d_r     half       2   // Rayleigh sigma scale
-  qr      uint8[24] 24   // 3-bit x 64 magnitudes (Lloyd-Max)
-  qphi    uint8[24] 24   // 3-bit x 64 content phases (uniform)
-  qtan    uint8[8]   8   // 1-bit x 64 tangent residual signs
-\end{verbatim}
+block_tbqx3_1  (58 B, 3.625 bpw)
+  d_r    half       2   // Rayleigh sigma
+  qr     uint8[24] 24   // 3-bit r x 64
+  qphi   uint8[24] 24   // 3-bit phi x 64
+  qtan   uint8[8]   8   // 1-bit sign x 64
+\end{verbatim}}
 
 페어당 저장 내역: $r$에 3비트, $\varphi^{\text{content}}$에 3비트, 접선 부호에 1비트, 합계 페어당 7비트. 페어의 2 스칼라 원소로 평균내면 $3.5$ bpw이고, \texttt{half} 스케일 필드를 블록의 128 원소에 분할하면 총 $\mathbf{3.625}$ bpw가 된다.
 
