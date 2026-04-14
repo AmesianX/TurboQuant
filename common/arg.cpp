@@ -402,6 +402,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TBQ4_2,
     GGML_TYPE_TBQP3_2,
     GGML_TYPE_TBQP4_2,
+    GGML_TYPE_TBQX3_1,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -412,6 +413,8 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
         {"tbq4",  GGML_TYPE_TBQ4_0},
         {"tbqp3", GGML_TYPE_TBQP3_0},
         {"tbqp4", GGML_TYPE_TBQP4_0},
+        // TBQX (Polar Derotate) — only D=128 variant exists for now.
+        {"tbqx3",  GGML_TYPE_TBQX3_1},
     };
     auto it = tbq_shortcuts.find(s);
     if (it != tbq_shortcuts.end()) {

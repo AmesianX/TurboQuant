@@ -4,7 +4,63 @@
 
 [🇰🇷 한국어](README_KO.md)
 
-### 🆕 v1.5.3 — Double WHT Per-Head for head_dim=64 (GPT-OSS 120B)
+### 🆕 v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B)
+
+**New K cache format: polar-coordinate storage with content/position separation and analytical tangent residual correction. Beats f16 on math reasoning while preserving Korean prose quality.**
+
+**Environment:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · Model: Qwen3-14B Q4_K_M · ctx=40960 · temp=0
+
+**Memory footprint (ctx=40960, 40 layers):**
+
+| Config | K buffer | V buffer | Total KV | Compression |
+|--------|----------|----------|----------|-------------|
+| f16/f16 | 3200 MiB | 3200 MiB | 6400 MiB | 1.0x |
+| **tbqx3/tbq3** | **725 MiB** | 625 MiB | **1350 MiB** | **4.74x** |
+| tbq3/tbq3 | 625 MiB | 625 MiB | 1250 MiB | 5.12x |
+
+**Speed (decode, same prompt):**
+
+| Config | t/s | vs f16 |
+|--------|-----|--------|
+| f16/f16 | 24–25 | 1.00x |
+| **tbqx3/tbq3** | **21–22** | **0.87x** |
+| tbq3/tbq3 | 21–22 | 0.87x |
+
+**Math Accuracy (35 problems, seed=1234, temp=0):**
+
+| Config | Math (/35) | % | vs f16 |
+|--------|------------|---|--------|
+| **tbqx3/tbq3** | **13/35** | **37.1%** | **+8%** |
+| f16/f16 | 12/35 | 34.3% | — |
+| tbq3/tbq3 | 10/35 | 28.6% | −17% |
+
+> **tbqx3/tbq3 beats f16 on math while compressing 4.74x** and matching tbq3/tbq3 speed. Legacy tbq3/tbq3 trails f16 by 17%.
+
+**TBQX3_1 block format (3.625 bpw, head_dim=128):**
+
+| Field | Size | Purpose |
+|-------|------|---------|
+| `d_r` | 2 B | Rayleigh σ (half) |
+| `qr[24]` | 24 B | 3-bit r indices (Rayleigh Lloyd-Max, 64 pairs) |
+| `qphi[24]` | 24 B | 3-bit φ_content indices (uniform, 64 pairs) |
+| `qtan[8]` | 8 B | 1-bit tangent sign per pair |
+| **Total** | **58 B** | **3.625 bpw** |
+
+**Key ideas:**
+
+1. **Polar derotate (content/position separation)**: K is stored as `(r, φ_content) = (r, φ_post − pos·freq_i)` per RoPE pair. Content is position-invariant; re-rotation by `pos·freq_i` at read time restores post-RoPE K. Attention now sees content geometry directly instead of content·position entanglement.
+2. **Rayleigh Lloyd-Max on r**: the magnitude `r = √(x² + y²)` of a complex Gaussian pair is Rayleigh-distributed. Lloyd-Max 8-level codebook derived analytically from Rayleigh quantile boundaries (no calibration required, works across models).
+3. **Tangent Residual (the drift fix)**: the 3-bit uniform φ quantization has bounded error ±π/8. The resulting K perturbation lies almost entirely along the tangent direction `(-sin φ, cos φ)`. One extra bit encodes the sign of `Δφ`, and the magnitude `r · π/16` is analytical (half-cell). No learned scale, reuses already-computed sin/cos — just 2 extra FMAs per pair at read time. Cuts φ error in half (22.5° → 11.25°), eliminates low-probability token drift (Cyrillic contamination on rare-token transliterations).
+4. **No WHT in content path**: polar structure preserves angular information directly; applying WHT across pairs would destroy the RoPE pair structure. TBQX3_1 is the first TBQ variant to skip WHT entirely.
+
+**Recommended config for Qwen3-14B and other head_dim=128 RoPE models:**
+```
+--cache-type-k tbqx3 --cache-type-v tbq3
+```
+
+---
+
+### v1.5.3 — Double WHT Per-Head for head_dim=64 (GPT-OSS 120B)
 
 **Cross-head WHT abandoned. Replaced with double WHT per-head (S1→WHT64→S2→WHT64) for D=64 models. QJL 1-bit correction re-enabled — critical for multi-turn stability.**
 

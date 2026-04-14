@@ -291,6 +291,8 @@ llama_kv_cache::llama_kv_cache(
 
     // TBQ types require WHT rotation regardless of variable GQA
     // (WHT operates per-head, not per-GQA-group, so variable n_head_kv is fine)
+    // TBQX (Polar Derotate) does NOT use WHT — polar (r, φ) decomposition
+    // already gives the structure it needs, so it stays out of this list.
     const bool is_tbq_k = type_k == GGML_TYPE_TBQ3_0  || type_k == GGML_TYPE_TBQ4_0
                        || type_k == GGML_TYPE_TBQP3_0 || type_k == GGML_TYPE_TBQP4_0
                        || type_k == GGML_TYPE_TBQ3_1  || type_k == GGML_TYPE_TBQ4_1
@@ -1775,6 +1777,14 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                                 ? LLAMA_ROPE_TYPE_NEOX
                                 : hparams.rope_type;
     ggml_tensor * tmp;
+
+    // TurboQuant: TBQ cache types have no F32 ↔ TBQ backend op; scheduler
+    // failure on GB10 unified memory manifests as silent host SoC freeze.
+    // Skip RoPE shift for TBQ caches — independent queries unaffected; single
+    // response rarely wraps context. See memory project_qwen3_14b_crash.md.
+    if (cur->type >= GGML_TYPE_TBQ3_0 && cur->type <= GGML_TYPE_TBQP4_4) {
+        return cur;
+    }
 
     if (ggml_is_quantized(cur->type)) {
         // dequantize to f32 -> RoPE -> quantize back

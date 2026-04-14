@@ -166,6 +166,8 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-tbqp4_1-tbq3_1.cu
             template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu
             template-instances/fattn-vec-instance-q8_0-tbq4_1.cu
+            template-instances/fattn-vec-instance-tbqx3_1-tbq3_1.cu
+            template-instances/fattn-vec-instance-tbqx3_1-f16.cu
 
             # ---- D=256 and D=512 (_0): Qwen3.5, Qwen3-Next, Gemma 4 ----
             # Same _0 instance files serve both D=256 and D=512 dispatch cases.
