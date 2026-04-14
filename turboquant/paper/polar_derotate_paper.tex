@@ -222,11 +222,16 @@ with second moment $E[r^2] = 2\sigma^2$. This yields a \emph{calibration-free} s
 \hat\sigma = \sqrt{\frac{1}{2n}\sum_{i=1}^{n} r_i^2}.
 \end{equation}
 
-More importantly, the Rayleigh distribution admits a \textbf{closed-form 8-level Lloyd-Max codebook} in $\sigma$-normalized coordinates that is independent of any particular model or dataset. Numerical solution of the standard Lloyd-Max iteration on the Rayleigh pdf yields the boundary/centroid pair
-\begin{align}
-\mathbf{b} &= (0.4280,\,0.7848,\,1.0991,\,1.4101,\,1.7268,\,2.0623,\,2.4427)\sigma,\\
-\mathbf{c} &= (0.2400,\,0.6160,\,0.9420,\,1.2547,\,1.5685,\,1.8946,\,2.2520,\,2.6650)\sigma.
-\end{align}
+More importantly, the Rayleigh distribution admits a \textbf{closed-form 8-level Lloyd-Max codebook} in $\sigma$-normalized coordinates that is independent of any particular model or dataset. Numerical solution of the standard Lloyd-Max iteration on the Rayleigh pdf yields the boundary vector $\mathbf{b}$ and centroid vector $\mathbf{c}$:
+\begin{equation}
+\small
+\begin{aligned}
+\mathbf{b}/\sigma &= \bigl(0.4280,\,0.7848,\,1.0991,\,1.4101,\\
+                  &\qquad 1.7268,\,2.0623,\,2.4427\bigr),\\[2pt]
+\mathbf{c}/\sigma &= \bigl(0.2400,\,0.6160,\,0.9420,\,1.2547,\\
+                  &\qquad 1.5685,\,1.8946,\,2.2520,\,2.6650\bigr).
+\end{aligned}
+\end{equation}
 Storage cost is 3 bits per pair plus one \texttt{half} for $\sigma$. No per-block histogramming, no training-time calibration, and no model-specific tuning is required: the same constants apply to every block of every layer of every coupled-RoPE model, because the distribution they fit is a consequence of the WHT- or Gaussian-projection statistics of $W_K$, not of any dataset-specific property. This is a qualitatively different regime from generic $k$-means quantization, and it is one of the two reasons TBQX achieves its quality headroom at 3.125~bpw.
 
 \subsection{Tangent Residual: Analytical Half-Cell Correction}
@@ -254,9 +259,12 @@ Two observations make this into a cheap correction:
 The Tangent Residual correction therefore adds exactly \textbf{one sign bit per pair} to the block layout and produces the refined reconstruction
 \begin{equation}
 \label{eq:tangent-correction}
-K_{\text{refined}} \;=\; K_{\text{polar}} + s\cdot r\cdot\tfrac{\pi}{16}\cdot(-\!\sin\hat\varphi,\;\cos\hat\varphi),\qquad s\in\{-1,+1\},
+\begin{aligned}
+K_{\text{refined}} \;=\;& K_{\text{polar}} \\
+ +\;& s\cdot r\cdot\tfrac{\pi}{16}\cdot(-\!\sin\hat\varphi,\,\cos\hat\varphi),
+\end{aligned}
 \end{equation}
-where $s$ is stored as the sign of $\Delta\varphi$ inside the 3-bit angular cell. The entire read-side overhead is two fused multiply-adds. The effective angular resolution doubles from $\pm\pi/8$ to $\pm\pi/16$ ($22.5^\circ\!\to\!11.25^\circ$), which is equivalent to a 4-bit uniform phase quantizer at the cost of only a single bit.
+with $s\in\{-1,+1\}$, where $s$ is stored as the sign of $\Delta\varphi$ inside the 3-bit angular cell. The entire read-side overhead is two fused multiply-adds. The effective angular resolution doubles from $\pm\pi/8$ to $\pm\pi/16$ ($22.5^\circ\!\to\!11.25^\circ$), which is equivalent to a 4-bit uniform phase quantizer at the cost of only a single bit.
 
 Empirically (\S\ref{sec:eval}), the Tangent Residual eliminates the observed low-probability token drift on Qwen3-14B: Cyrillic-character contamination in Korean transliterations of Wolfgang Pauli, Erwin Schr\"{o}dinger, and similar rare-name queries disappears entirely under temperature-$0$ sampling, while math-reasoning accuracy is preserved or improved. In our framing, \emph{Rayleigh Lloyd-Max covers the magnitude, and Tangent Residual covers the residual arc-length error along the tangent direction}; together they saturate the per-pair error budget at a very low bit cost.
 
@@ -292,13 +300,14 @@ This closes an outstanding defect in TBQ v1 as a side effect of the main transfo
 
 The reference implementation is \texttt{block\_tbqx3\_1}, a 58-byte layout for $D=128$ (64 pairs) that carries the three channels introduced in \S\ref{sec:method}: polar magnitudes, content phases, and the 1-bit tangent correction sign.
 
+{\footnotesize
 \begin{verbatim}
-block_tbqx3_1      (58 bytes, 3.625 bpw)
-  d_r     half       2   // Rayleigh sigma scale
-  qr      uint8[24] 24   // 3-bit x 64 magnitudes (Lloyd-Max)
-  qphi    uint8[24] 24   // 3-bit x 64 content phases (uniform)
-  qtan    uint8[8]   8   // 1-bit x 64 tangent residual signs
-\end{verbatim}
+block_tbqx3_1  (58 B, 3.625 bpw)
+  d_r    half       2   // Rayleigh sigma
+  qr     uint8[24] 24   // 3-bit r x 64
+  qphi   uint8[24] 24   // 3-bit phi x 64
+  qtan   uint8[8]   8   // 1-bit sign x 64
+\end{verbatim}}
 
 Storage breakdown per pair: 3 bits for $r$, 3 bits for $\varphi^{\text{content}}$, 1 bit for the tangent sign, for a total of 7 bits per pair. Averaged over the 2 scalar elements of the pair this is $3.5$ bpw; amortizing the \texttt{half} scale field across the 128 elements of the block brings the total to $\mathbf{3.625}$ bpw.
 
