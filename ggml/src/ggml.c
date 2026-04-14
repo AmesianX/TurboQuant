@@ -1044,6 +1044,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(block_tbqp4_4),
         .is_quantized             = true,
     },
+    [GGML_TYPE_TBQX3_1] = {
+        .type_name                = "tbqx3_1",
+        .blck_size                = TBQ_K128,
+        .type_size                = sizeof(block_tbqx3_1),
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -5510,6 +5516,22 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+// TurboQuant: decoupled rope slice for MLA (_4) — bound to src[5].
+void ggml_flash_attn_ext_add_k_rope(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_rope) {
+    if (!k_rope) {
+        a->src[5] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(k_rope->type == GGML_TYPE_F16);
+
+    a->src[5] = k_rope;
 }
 
 // ggml_flash_attn_back

@@ -127,61 +127,61 @@ def _fmt(rows):
     return "[" + ",".join("[" + ",".join(str(x) for x in r) + "]" for r in rows) + "]"
 
 
-# ── Test data ─────────────────────────────────────────────────────────────────
+# ── Test data (seeded generators) ────────────────────────────────────────────
 
-# ── Easy: 2x2 matrix (10 problems) ───────────────────────────────────────────
-MATRIX_2X2 = [
-    ("E01", [[3, 1], [4, 2]],   [[5, 7], [6, 8]]),
-    ("E02", [[1, 2], [3, 4]],   [[5, 6], [7, 8]]),
-    ("E03", [[2, 0], [1, 3]],   [[4, 1], [2, 5]]),
-    ("E04", [[5, 3], [2, 7]],   [[1, 4], [6, 0]]),
-    ("E05", [[0, 1], [1, 0]],   [[3, 4], [5, 6]]),
-    ("E06", [[2, 3], [1, 4]],   [[1, 0], [2, 1]]),
-    ("E07", [[6, 1], [3, 2]],   [[2, 5], [4, 3]]),
-    ("E08", [[1, 5], [2, 3]],   [[4, 2], [1, 6]]),
-    ("E09", [[7, 2], [0, 3]],   [[1, 1], [3, 4]]),
-    ("E10", [[4, 4], [2, 1]],   [[1, 3], [2, 0]]),
-]
-
-# ── Medium: 3x3 matrix (10 problems) ────────────────────────────────────────
-MATRIX_3X3 = [
-    ("M01", [[1, 0, 2], [3, 1, 0], [0, 2, 1]], [[1, 2, 3], [4, 5, 6], [7, 8, 9]]),
-    ("M02", [[2, 1, 0], [0, 3, 1], [1, 0, 2]], [[1, 0, 1], [2, 1, 0], [0, 1, 2]]),
-    ("M03", [[1, 1, 1], [2, 2, 2], [3, 3, 3]], [[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
-    ("M04", [[3, 0, 1], [0, 2, 4], [1, 1, 0]], [[2, 1, 0], [0, 3, 1], [4, 0, 2]]),
-    ("M05", [[1, 2, 3], [4, 5, 6], [7, 8, 9]], [[9, 8, 7], [6, 5, 4], [3, 2, 1]]),
-    ("M06", [[0, 1, 2], [1, 0, 1], [2, 1, 0]], [[1, 1, 1], [2, 2, 2], [3, 3, 3]]),
-    ("M07", [[5, 0, 0], [0, 3, 0], [0, 0, 2]], [[1, 2, 3], [4, 5, 6], [7, 8, 9]]),
-    ("M08", [[1, 3, 2], [0, 1, 4], [2, 0, 1]], [[1, 0, 2], [3, 1, 0], [0, 2, 1]]),
-    ("M09", [[2, 1, 3], [1, 4, 0], [3, 2, 1]], [[0, 1, 2], [1, 0, 3], [2, 3, 0]]),
-    ("M10", [[1, 0, 0], [0, 1, 0], [0, 0, 1]], [[5, 3, 7], [2, 8, 1], [4, 6, 9]]),
-]
-
-# ── Hard: scalar arithmetic chains (15 problems, increasing complexity) ──────
-SCALAR = [
-    # Easy scalars
-    ("S01", "(17 * 23) + 14",                str((17 * 23) + 14)),         # 405
-    ("S02", "3^4 + 2^5",                     str(3**4 + 2**5)),            # 113
-    ("S03", "(144 / 12) * (15 - 8) + 3",     str(int((144 / 12) * (15 - 8) + 3))),  # 87
-    ("S04", "7*8 + 6*9 + 5*10",              str(7*8 + 6*9 + 5*10)),      # 160
-    ("S05", "1000 - 13 * 37",                str(1000 - 13*37)),           # 519
-    # Medium scalars
-    ("S06", "25 * 16 - 3 * 47",              str(25*16 - 3*47)),           # 259
-    ("S07", "(256 + 128) / 8 + 17",          str(int((256+128)/8 + 17))),  # 65
-    ("S08", "11^2 + 13^2",                   str(11**2 + 13**2)),          # 290
-    ("S09", "99 * 101",                      str(99*101)),                 # 9999
-    ("S10", "(37 + 43) * (29 - 17)",         str((37+43)*(29-17))),        # 960
-    # Hard scalars
-    ("S11", "2^10 - 3^5 + 7^3",             str(2**10 - 3**5 + 7**3)),    # 1024-243+343=1124
-    ("S12", "123 * 45 + 678 - 9 * 87",      str(123*45 + 678 - 9*87)),    # 5535+678-783=5430
-    ("S13", "(2^8 + 3^4) * 2 - 100",        str((2**8 + 3**4)*2 - 100)),  # (256+81)*2-100=574
-    ("S14", "17 * 19 * 3 - 11 * 11 * 7",    str(17*19*3 - 11*11*7)),      # 969-847=122
-    ("S15", "(500 - 137) * 3 + 2^7",        str((500-137)*3 + 2**7)),     # 363*3+128=1217
-]
+def _gen_matrix(rng, n, lo, hi):
+    return [[rng.randint(lo, hi) for _ in range(n)] for _ in range(n)]
 
 
-def build_tests(filler_levels, skip_3x3=False, skip_scalar=False):
+def gen_matrix_2x2(seed):
+    rng = random.Random(seed ^ 0xA5A5_2222)
+    out = []
+    for i in range(10):
+        A = _gen_matrix(rng, 2, 0, 9)
+        B = _gen_matrix(rng, 2, 0, 9)
+        out.append((f"E{i+1:02d}", A, B))
+    return out
+
+
+def gen_matrix_3x3(seed):
+    rng = random.Random(seed ^ 0xA5A5_3333)
+    out = []
+    for i in range(10):
+        A = _gen_matrix(rng, 3, 0, 9)
+        B = _gen_matrix(rng, 3, 0, 9)
+        out.append((f"M{i+1:02d}", A, B))
+    return out
+
+
+def gen_scalar(seed):
+    rng = random.Random(seed ^ 0xA5A5_5555)
+    out = []
+    # 5 easy: a*b + c
+    for i in range(5):
+        a = rng.randint(11, 29); b = rng.randint(11, 29); c = rng.randint(5, 99)
+        expr = f"({a} * {b}) + {c}"
+        out.append((f"S{i+1:02d}", expr, str(a*b + c)))
+    # 5 medium: a*b - c*d
+    for i in range(5, 10):
+        a = rng.randint(12, 40); b = rng.randint(12, 40)
+        c = rng.randint(3, 20); d = rng.randint(20, 60)
+        expr = f"{a} * {b} - {c} * {d}"
+        out.append((f"S{i+1:02d}", expr, str(a*b - c*d)))
+    # 5 hard: a^p - b^q + c^r
+    for i in range(10, 15):
+        a = rng.randint(2, 9); p = rng.randint(3, 5)
+        b = rng.randint(2, 9); q = rng.randint(3, 5)
+        c = rng.randint(2, 9); r = rng.randint(3, 5)
+        expr = f"{a}^{p} - {b}^{q} + {c}^{r}"
+        out.append((f"S{i+1:02d}", expr, str(a**p - b**q + c**r)))
+    return out
+
+
+def build_tests(filler_levels, skip_3x3=False, skip_scalar=False, seed=0):
     tests = []
+    MATRIX_2X2 = gen_matrix_2x2(seed)
+    MATRIX_3X3 = gen_matrix_3x3(seed)
+    SCALAR = gen_scalar(seed)
 
     for label, A, B in MATRIX_2X2:
         C = _mm(A, B)
@@ -267,7 +267,7 @@ def build_tests(filler_levels, skip_3x3=False, skip_scalar=False):
 
 async def send_prompt(session: aiohttp.ClientSession, url: str, model: str,
                       prompt: str, temperature: float = 0.0,
-                      num_predict: int = 2048) -> tuple:
+                      num_predict: int = 2048, api_key: str = "") -> tuple:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -275,9 +275,12 @@ async def send_prompt(session: aiohttp.ClientSession, url: str, model: str,
         "temperature": temperature,
         "stream": False,
     }
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     try:
         async with session.post(
-            f"{url}/v1/chat/completions", json=payload,
+            f"{url}/v1/chat/completions", json=payload, headers=headers,
             timeout=aiohttp.ClientTimeout(total=300)
         ) as resp:
             if resp.status != 200:
@@ -298,9 +301,9 @@ async def send_prompt(session: aiohttp.ClientSession, url: str, model: str,
 # ── Collect ───────────────────────────────────────────────────────────────────
 
 async def collect(args):
-    random.seed(0)
+    random.seed(args.seed)
     filler_levels = [int(x) for x in args.filler.split(",") if x and int(x) > 0]
-    tests = build_tests(filler_levels, skip_3x3=args.skip_3x3, skip_scalar=args.skip_scalar)
+    tests = build_tests(filler_levels, skip_3x3=args.skip_3x3, skip_scalar=args.skip_scalar, seed=args.seed)
 
     print(f"TurboQuant Math Accuracy Test (llama-server)")
     print(f"  URL:   {args.url}")
@@ -312,13 +315,12 @@ async def collect(args):
     cats = {}
     run_start = time.time()
 
-    headers = {"Authorization": "Bearer test1234!@X"}
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession() as session:
         for test in tests:
             t0 = time.time()
             response, timing = await send_prompt(session, args.url, "gemma4",
                                                  test["prompt"], args.temperature,
-                                                 args.num_predict)
+                                                 args.num_predict, args.api_key)
             latency_s = time.time() - t0
             passed, detail = check_answer(test, response)
 
@@ -401,6 +403,8 @@ def main():
     c.add_argument("--skip-3x3", action="store_true")
     c.add_argument("--skip-scalar", action="store_true")
     c.add_argument("--num-predict", type=int, default=2048)
+    c.add_argument("--api-key", default="")
+    c.add_argument("--seed", type=int, default=0)
     c.add_argument("--output", "-o")
     c.add_argument("--verbose", "-v", action="store_true")
 

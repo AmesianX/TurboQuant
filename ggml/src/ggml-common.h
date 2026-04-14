@@ -348,6 +348,21 @@ typedef struct {
 } block_tbqp4_1;
 static_assert(sizeof(block_tbqp4_1) == 2*sizeof(ggml_half) + TBQ_K128*3/8 + TBQ_K128/8, "wrong tbqp4_1 block size/padding");
 
+// TurboQuant Polar Derotate 3-bit + Tangent Residual, 128-block: ~3.625 bpw
+// Per pair (i, i+D/2):
+//   r           — Rayleigh Lloyd-Max 3-bit (24 bytes)
+//   φ_content   — uniform 3-bit over [-π,π) (24 bytes)
+//   sign(Δφ)    — 1-bit tangent residual sign (8 bytes)
+// At read time: K = K_polar + r·(π/16)·sign·(-sin φ, cos φ)  [analytical half-cell]
+typedef struct {
+    ggml_half d_r;
+    uint8_t qr  [TBQ_K128*3/16]; // 3-bit packed r indices
+    uint8_t qphi[TBQ_K128*3/16]; // 3-bit packed φ indices
+    uint8_t qtan[TBQ_K128/16];   // 1-bit tangent sign per pair (8 bytes for 64 pairs)
+} block_tbqx3_1;
+static_assert(sizeof(block_tbqx3_1) == sizeof(ggml_half) + 2*(TBQ_K128*3/16) + TBQ_K128/16, "wrong tbqx3_1 block size/padding");
+
+
 // TurboQuant head_dim=64 variants (blck_size=64)
 #define TBQ_K64 64
 

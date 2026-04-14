@@ -449,7 +449,8 @@ extern "C" {
         GGML_TYPE_TBQ4_4  = 59, // TurboQuant 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
         GGML_TYPE_TBQP3_4 = 60, // TurboQuant_prod 3-bit, blck_size=576 (head_dim=576, split 256+256+64)
         GGML_TYPE_TBQP4_4 = 61, // TurboQuant_prod 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
-        GGML_TYPE_COUNT   = 62,
+        GGML_TYPE_TBQX3_1  = 62, // TurboQuant Polar Derotate 3-bit + Tangent Residual (head_dim=128)
+        GGML_TYPE_COUNT    = 64,
     };
 
     // precision
@@ -2424,6 +2425,13 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // TurboQuant: attach decoupled rope slice tensor for MLA (_4 types, GLM/DeepSeek).
+    // K tensor stores latent only; k_rope stores the f16 rope[64] portion separately.
+    // Binds to src[5]. Optional — only used when K->type is TBQ `_4` family.
+    GGML_API void ggml_flash_attn_ext_add_k_rope(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_rope);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

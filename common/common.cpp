@@ -1411,7 +1411,8 @@ common_init_result::common_init_result(common_params & params) :
 
             // Also catch _1/_2/_4 types that don't match head_dim (user specified directly)
             auto is_wrong_suffix = [&](ggml_type t) -> bool {
-                bool is_1 = (t == GGML_TYPE_TBQ3_1 || t == GGML_TYPE_TBQ4_1 || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1);
+                bool is_1 = (t == GGML_TYPE_TBQ3_1 || t == GGML_TYPE_TBQ4_1 || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
+                            || t == GGML_TYPE_TBQX3_1);
                 bool is_2 = (t == GGML_TYPE_TBQ3_2 || t == GGML_TYPE_TBQ4_2 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2);
                 bool is_4 = (t == GGML_TYPE_TBQ3_4 || t == GGML_TYPE_TBQ4_4 || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4);
                 if (is_1 && head_dim != 128) return true;

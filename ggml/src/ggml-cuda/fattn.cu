@@ -306,6 +306,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ3_1)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ4_1)      // recommended 4-bit
     FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,    GGML_TYPE_TBQ4_1)      // primoco recommended
+    // TurboQuant Polar Derotate + Tangent Residual. K = TBQX3_1, V = TBQ3_1 / F16.
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_F16)
 
     // ---- D=256 (_0) — Qwen3.5, Qwen3-Next, etc. ----
     FATTN_VEC_CASE(256, GGML_TYPE_F16,     GGML_TYPE_TBQ3_0)
@@ -821,7 +824,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         || K->type == GGML_TYPE_TBQ3_3 || K->type == GGML_TYPE_TBQ4_3
                         || K->type == GGML_TYPE_TBQP3_3 || K->type == GGML_TYPE_TBQP4_3
                         || K->type == GGML_TYPE_TBQ3_4 || K->type == GGML_TYPE_TBQ4_4
-                        || K->type == GGML_TYPE_TBQP3_4 || K->type == GGML_TYPE_TBQP4_4;
+                        || K->type == GGML_TYPE_TBQP3_4 || K->type == GGML_TYPE_TBQP4_4
+                        || K->type == GGML_TYPE_TBQX3_1;
         const bool tbq_v = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0
                         || V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQ4_1
                         || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2
@@ -870,6 +874,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_TBQ4_4:
         case GGML_TYPE_TBQP3_4:
         case GGML_TYPE_TBQP4_4:
+        case GGML_TYPE_TBQX3_1:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -895,7 +900,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      || K->type == GGML_TYPE_TBQ4_3 || K->type == GGML_TYPE_TBQ3_3
      || K->type == GGML_TYPE_TBQP4_3 || K->type == GGML_TYPE_TBQP3_3
      || K->type == GGML_TYPE_TBQ4_4 || K->type == GGML_TYPE_TBQ3_4
-     || K->type == GGML_TYPE_TBQP4_4 || K->type == GGML_TYPE_TBQP3_4;
+     || K->type == GGML_TYPE_TBQP4_4 || K->type == GGML_TYPE_TBQP3_4
+     || K->type == GGML_TYPE_TBQX3_1;
     const bool tbq_v_type = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_TBQ3_0
      || V->type == GGML_TYPE_TBQ4_1 || V->type == GGML_TYPE_TBQ3_1
      || V->type == GGML_TYPE_TBQ4_2 || V->type == GGML_TYPE_TBQ3_2
@@ -933,6 +939,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
+                // TurboQuant: TBQ types force VEC kernel regardless of Q size.
+                // MMA_F16 path dequantizes the full K cache to f16 on every call
+                // (fattn-common.cuh need_f16_K branch). On DGX Spark GB10 (aarch64
+                // unified memory), repeated dequant of growing K causes silent host
+                // SoC freeze around K≈2048. VEC kernel reads TBQ blocks natively.
+                // See memory project_qwen3_14b_crash.md.
+                const bool tbq_K_or_V =
+                    (K->type >= GGML_TYPE_TBQ3_0 && K->type <= GGML_TYPE_TBQP4_4) ||
+                    (V->type >= GGML_TYPE_TBQ3_0 && V->type <= GGML_TYPE_TBQP4_4);
+                if (tbq_K_or_V) {
+                    return BEST_FATTN_KERNEL_VEC;
+                }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;

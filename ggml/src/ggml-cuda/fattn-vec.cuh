@@ -41,7 +41,8 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
         const char * __restrict__ raw_K_data, const int32_t raw_K_stride,
-        const char * __restrict__ Q_wht2_data, const int32_t Q_wht2_stride) {
+        const char * __restrict__ Q_wht2_data, const int32_t Q_wht2_stride,
+        const char * __restrict__ k_rope_data, const int32_t k_rope_stride) {
 #ifdef FLASH_ATTN_AVAILABLE
 
     // Skip unused kernel variants for faster compilation:
@@ -54,7 +55,8 @@ static __global__ void flash_attn_ext_vec(
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride);
+                  nb31, nb32, nb33, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride,
+                  k_rope_data, k_rope_stride);
         NO_DEVICE_CODE;
         return;
     }
@@ -97,7 +99,8 @@ static __global__ void flash_attn_ext_vec(
         && type_K != GGML_TYPE_TBQ4_3 && type_K != GGML_TYPE_TBQ3_3
         && type_K != GGML_TYPE_TBQP3_3 && type_K != GGML_TYPE_TBQP4_3
         && type_K != GGML_TYPE_TBQ4_4 && type_K != GGML_TYPE_TBQ3_4
-        && type_K != GGML_TYPE_TBQP3_4 && type_K != GGML_TYPE_TBQP4_4;
+        && type_K != GGML_TYPE_TBQP3_4 && type_K != GGML_TYPE_TBQP4_4
+        && type_K != GGML_TYPE_TBQX3_1;
     // _3 types: double WHT per-head (not cross-head). Cross-head abandoned — Q-K domain mismatch at D=64.
     constexpr bool is_cross_head_K = false;
     constexpr bool is_cross_head_V = type_V == GGML_TYPE_TBQ3_3 || type_V == GGML_TYPE_TBQ4_3;
@@ -496,6 +499,26 @@ static __global__ void flash_attn_ext_vec(
                 }
             }
         }
+    } else if constexpr (type_K == GGML_TYPE_TBQX3_1) {
+        // TBQX/TBQXP (Polar Derotate): no WHT, Q is loaded raw in pair layout —
+        // slot p of thread tid = (Q[p], Q[p + n_pairs]).
+        // vec_dot_fattn_vec_KQ_tbqx[p]3_1 expects this layout.
+        constexpr int n_pairs = D / 2;
+        for (int j = 0; j < ncols; ++j) {
+            const float * Q_f = (const float *) (Q + j*nb01);
+            for (int p0 = 0; p0 < n_pairs; p0 += nthreads_KQ) {
+                const int p = p0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                if (p < n_pairs) {
+                    const float qx = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[p]            * scale;
+                    const float qy = (ncols > 1 && ic0 + j >= int(ne01.z)) ? 0.0f : Q_f[p + n_pairs]  * scale;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                    Q_reg[j][p0/nthreads_KQ] = make_half2(__float2half(qx), __float2half(qy));
+#else
+                    Q_reg[j][p0/nthreads_KQ] = make_float2(qx, qy);
+#endif
+                }
+            }
+        }
     } else if constexpr (type_K == GGML_TYPE_TBQ4_1 || type_K == GGML_TYPE_TBQ3_1
                       || type_K == GGML_TYPE_TBQP4_1 || type_K == GGML_TYPE_TBQP3_1) {
         // TurboQuant 128-block: D=128, nthreads=128, 1:1 thread-element mapping
@@ -529,10 +552,12 @@ static __global__ void flash_attn_ext_vec(
                 Q_wht[tid] = f0;
                 __syncthreads();
                 { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 32]; f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); }
+                __syncthreads(); // ensure all warps finished reading before stage 6 write
                 // Stage 6 (stride 64): shared memory
                 Q_wht[tid] = f0;
                 __syncthreads();
                 { float u0 = Q_wht[tid], v0 = Q_wht[tid ^ 64]; f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); }
+                __syncthreads(); // ensure all warps finished reading before final write
                 Q_wht[tid] = f0;
                 __syncthreads();
             }
@@ -839,6 +864,21 @@ static __global__ void flash_attn_ext_vec(
     // Cross-head WHT: kv_head_idx within group of 8 for H_8 sign computation
     [[maybe_unused]] const int kv_head_idx = (is_cross_head_K || is_cross_head_V) ? ((head / gqa_ratio) % 8) : 0;
 
+    // TBQX (Polar Derotate) freq table: precompute base^(-2p/D) once per kernel.
+    // Small (D/2 floats, max 256B) and broadcast-read by every cell — much cheaper
+    // than recomputing expf in every vec_dot call.
+    constexpr bool tbqx_active = (type_K == GGML_TYPE_TBQX3_1);
+    __shared__ float s_tbqx_freq[tbqx_active ? (D/2) : 1];
+    if constexpr (tbqx_active) {
+        constexpr float TBQX_FREQ_BASE = 1.0e6f;  // Qwen3 — TODO plumb from model
+        const float log_base = logf(TBQX_FREQ_BASE);
+        const int tid_lin = threadIdx.y * WARP_SIZE + threadIdx.x;
+        for (int p = tid_lin; p < D/2; p += nthreads) {
+            s_tbqx_freq[p] = expf(-2.0f * (float)p * log_base / (float)D);
+        }
+        __syncthreads();
+    }
+
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
@@ -863,6 +903,8 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum;
+                const auto * Q_src = Q_reg[j];
+
                 if constexpr (is_cross_head_K) {
                     // Cross-head scoring: combine 8 groups with H_8 signs
                     // H_512 = H_8 ⊗ H_64 → score = (1/8)Σ_g H_8[h][g] · vec_dot(K_g, Q_wht)
@@ -870,14 +912,22 @@ static __global__ void flash_attn_ext_vec(
                     #pragma unroll
                     for (int g = 0; g < 8; g++) {
                         const char * K_g = K + (int64_t)(g - kv_head_idx) * nb12 + (int64_t)i_KQ * nb11;
-                        float partial = vec_dot_KQ(K_g, Q_reg[j], Q_i32[j], Q_ds[j]);
+                        float partial = vec_dot_KQ(K_g, Q_src, Q_i32[j], Q_ds[j]);
                         const int h8_sign = (__popc(kv_head_idx & g) & 1) ? -1 : 1;
                         sum += h8_sign * partial;
                     }
                     sum = warp_reduce_sum<nthreads_KQ>(sum);
                     sum *= 0.125f; // 1/8
+                } else if constexpr (type_K == GGML_TYPE_TBQX3_1) {
+                    // TBQX (Polar Derotate): bypass the function-pointer dispatch
+                    // and call the pos-aware kernel directly so cell_pos and the
+                    // shmem-cached freq table are in scope.
+                    const int cell_pos = k_VKQ_0 + i_KQ;
+                    sum = vec_dot_fattn_vec_KQ_tbqx3_1_pos<D, nthreads_KQ>(
+                            K + i_KQ*nb11, Q_src, cell_pos, s_tbqx_freq);
+                    sum = warp_reduce_sum<nthreads_KQ>(sum);
                 } else {
-                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_src, Q_i32[j], Q_ds[j]);
                     sum = warp_reduce_sum<nthreads_KQ>(sum);
                 }
 
@@ -1335,11 +1385,12 @@ static __global__ void flash_attn_ext_vec(
                     buf[tid] = f0;
                     __syncthreads();
                     { float u0 = buf[tid], v0 = buf[tid ^ 32]; f0 = (tid & 32) ? (v0 - u0) : (u0 + v0); }
+                    __syncthreads(); // ensure all warps finished reading before stage 6 write
                     // Stage 6 (stride 64)
                     buf[tid] = f0;
                     __syncthreads();
                     { float u0 = buf[tid], v0 = buf[tid ^ 64]; f0 = (tid & 64) ? (v0 - u0) : (u0 + v0); }
-                    __syncthreads();
+                    __syncthreads(); // ensure all warps finished reading before final sign-undo write
                     float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
                     buf[tid] = f0 * sign0 / (float)D_V;
                 }
@@ -1488,7 +1539,8 @@ static __global__ void flash_attn_ext_vec(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride);
+              nb31, nb32, nb33, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride,
+              k_rope_data, k_rope_stride);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }
@@ -1630,6 +1682,10 @@ EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQ3_1)
 EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQ4_1)
 EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQP3_1)
 EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQP4_1)
+
+// TBQX (Polar Derotate) extern declarations — V is reused TBQ3_1.
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_TBQ3_1);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_F16);
 
 // TurboQuant 64-block (_2) extern declarations: D=64 only
 #define EXTERN_DECL_FATTN_VEC_TBQ2(type_K)                            \

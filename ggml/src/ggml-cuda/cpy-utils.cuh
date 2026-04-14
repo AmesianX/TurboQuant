@@ -763,7 +763,10 @@ static __device__ void quantize_f32_tbqp4_0_block(const float * __restrict__ x, 
 // ============================================================
 
 // TBQ3_1: 128-element WHT + 3-bit Lloyd-Max
-static __device__ void quantize_f32_tbq3_1_block(const float * __restrict__ x, block_tbq3_1 * __restrict__ y) {
+// Shared-memory variant: scratch buffer (TBQ_K128 floats) provided by caller.
+// Eliminates per-thread stack array → DRAM-backed local memory, which on
+// DGX Spark GB10 (aarch64 unified memory) caused host SoC freeze under load.
+static __device__ void quantize_f32_tbq3_1_block(const float * __restrict__ x, block_tbq3_1 * __restrict__ y, float * __restrict__ tmp) {
     static constexpr uint8_t tbq_signs[16] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
         0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
@@ -772,7 +775,6 @@ static __device__ void quantize_f32_tbq3_1_block(const float * __restrict__ x, b
         -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
     };
 
-    float tmp[TBQ_K128];
     float sum_sq = 0.0f;
     for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
     float norm = sqrtf(sum_sq);
@@ -811,8 +813,123 @@ static __device__ void quantize_f32_tbq3_1_block(const float * __restrict__ x, b
     }
 }
 
+// Rayleigh Lloyd-Max 3-bit codebook (σ=1).
+// Boundaries (sorted) — values in [0, ∞) divided into 8 bins.
+// Centroids — quantized representative for each bin (used at dequant).
+// Stored magnitudes are normalized by per-block σ before bin lookup, so the
+// same codebook works for any block scale.
+__device__ static constexpr float TBQX_R_BOUND[7] = {
+    0.4280f, 0.7848f, 1.0991f, 1.4101f, 1.7268f, 2.0623f, 2.4427f
+};
+__device__ static constexpr float TBQX_R_CENT[8] = {
+    0.2400f, 0.6160f, 0.9420f, 1.2547f, 1.5685f, 1.8946f, 2.2520f, 2.6650f
+};
+
+// TBQX3_1: Polar Derotate 3-bit (head_dim=128).
+// Per pair (i, i+D/2):
+//   r = sqrt(kx^2+ky^2)             (position-invariant)
+//   φ_post = atan2(ky, kx)
+//   φ_content = (φ_post - pos·freq_i) wrapped to [-π, π)
+// Stored: r quantized to 8 Rayleigh Lloyd-Max levels (per-block σ scale),
+// φ_content quantized to 8 uniform levels in [-π, π).
+//
+// pos = absolute K cell index in the KV cache.
+// freq_base = 1e6 hardcoded (Qwen3) — TODO plumb from model.
+static __device__ void quantize_f32_tbqx3_1_block_pos(
+        const float * __restrict__ x,
+        block_tbqx3_1 * __restrict__ y,
+        float * __restrict__ tmp,
+        int pos) {
+    GGML_UNUSED(tmp);
+
+    constexpr int n_pairs = TBQ_K128 / 2;  // 64
+    constexpr float TWO_PI     = 6.28318530717958647692f;
+    constexpr float PI         = 3.14159265358979323846f;
+    constexpr float INV_TWO_PI = 1.0f / TWO_PI;
+    constexpr float TBQX_FREQ_BASE = 1.0e6f;
+    const float log_base = logf(TBQX_FREQ_BASE);
+
+    // σ from sum-of-squares (Rayleigh).
+    float sum_r2 = 0.0f;
+    for (int p = 0; p < n_pairs; p++) {
+        const float kx = x[p];
+        const float ky = x[p + n_pairs];
+        sum_r2 += kx*kx + ky*ky;
+    }
+    const float sigma = sqrtf(sum_r2 / (float)(2 * n_pairs));
+    y->d_r = __float2half(sigma);
+
+    for (int j = 0; j < TBQ_K128*3/16; j++) { y->qr[j] = 0; y->qphi[j] = 0; }
+    for (int j = 0; j < TBQ_K128/16;   j++) { y->qtan[j] = 0; }
+
+    if (sigma < 1e-10f) return;
+
+    const float inv_sigma = 1.0f / sigma;
+
+    int bit_pos_r   = 0;
+    int bit_pos_phi = 0;
+    for (int p = 0; p < n_pairs; p++) {
+        const float kx = x[p];
+        const float ky = x[p + n_pairs];
+        const float r  = sqrtf(kx*kx + ky*ky);
+        const float phi_post = atan2f(ky, kx);
+
+        const float freq_i = expf(-2.0f * (float)p * log_base / (float)TBQ_K128);
+        float theta = (float)pos * freq_i;
+        theta -= TWO_PI * floorf(theta * INV_TWO_PI + 0.5f);
+        float phi_content = phi_post - theta;
+        phi_content -= TWO_PI * floorf(phi_content * INV_TWO_PI + 0.5f);
+
+        // r Lloyd-Max
+        const float r_norm = r * inv_sigma;
+        int r_idx = 7;
+        for (int b = 0; b < 7; b++) {
+            if (r_norm < TBQX_R_BOUND[b]) { r_idx = b; break; }
+        }
+
+        // φ uniform 3-bit
+        float phi_norm = (phi_content + PI) * INV_TWO_PI;
+        int phi_idx = (int)floorf(phi_norm * 8.0f);
+        if (phi_idx > 7) phi_idx = 7;
+        if (phi_idx < 0) phi_idx = 0;
+
+        // Tangent residual: sign of (φ_content − φ_center) within the 3-bit cell.
+        // φ_center = ((phi_idx + 0.5)/8) · 2π − π. Δφ ∈ [−π/8, π/8).
+        const float phi_center = ((phi_idx + 0.5f) * (1.0f / 8.0f)) * TWO_PI - PI;
+        const float d_phi = phi_content - phi_center;
+        const int sign_dphi = (d_phi >= 0.0f) ? 1 : 0;
+
+        // Pack r (3 bits)
+        {
+            int byte_idx = bit_pos_r / 8;
+            int bit_off  = bit_pos_r % 8;
+            y->qr[byte_idx] |= (uint8_t)((r_idx & 0x7) << bit_off);
+            if (bit_off > 5) y->qr[byte_idx + 1] |= (uint8_t)((r_idx & 0x7) >> (8 - bit_off));
+            bit_pos_r += 3;
+        }
+        // Pack φ (3 bits)
+        {
+            int byte_idx = bit_pos_phi / 8;
+            int bit_off  = bit_pos_phi % 8;
+            y->qphi[byte_idx] |= (uint8_t)((phi_idx & 0x7) << bit_off);
+            if (bit_off > 5) y->qphi[byte_idx + 1] |= (uint8_t)((phi_idx & 0x7) >> (8 - bit_off));
+            bit_pos_phi += 3;
+        }
+        // Pack 1-bit tangent sign at bit p.
+        y->qtan[p >> 3] |= (uint8_t)(sign_dphi << (p & 7));
+    }
+}
+
+// Wrapper with old signature for set_rows_cuda_quant_sm template — pos
+// defaults to 0 (no derotate). Real path goes through the dedicated
+// set_rows_polar kernel that calls _pos with the cache slot index.
+static __device__ void quantize_f32_tbqx3_1_block(const float * __restrict__ x, block_tbqx3_1 * __restrict__ y, float * __restrict__ tmp) {
+    quantize_f32_tbqx3_1_block_pos(x, y, tmp, 0);
+}
+
 // TBQ4_1: 128-element WHT + 4-bit Lloyd-Max
-static __device__ void quantize_f32_tbq4_1_block(const float * __restrict__ x, block_tbq4_1 * __restrict__ y) {
+// scratch[TBQ_K128] provided by caller (shared memory).
+static __device__ void quantize_f32_tbq4_1_block(const float * __restrict__ x, block_tbq4_1 * __restrict__ y, float * __restrict__ tmp) {
     static constexpr uint8_t tbq_signs[16] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
         0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
@@ -823,7 +940,6 @@ static __device__ void quantize_f32_tbq4_1_block(const float * __restrict__ x, b
          0.2583f, 0.5225f, 0.7996f, 1.0993f, 1.4371f, 1.8435f, 2.4008f,
     };
 
-    float tmp[TBQ_K128];
     float sum_sq = 0.0f;
     for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
     float norm = sqrtf(sum_sq);
@@ -858,15 +974,14 @@ static __device__ void quantize_f32_tbq4_1_block(const float * __restrict__ x, b
 }
 
 // TBQP3_1: 128-element 2-bit Lloyd-Max + 1-bit QJL
-static __device__ void quantize_f32_tbqp3_1_block(const float * __restrict__ x, block_tbqp3_1 * __restrict__ y) {
+// scratch[TBQ_K128] provided by caller (shared memory). recon/res eliminated inline.
+static __device__ void quantize_f32_tbqp3_1_block(const float * __restrict__ x, block_tbqp3_1 * __restrict__ y, float * __restrict__ tmp) {
     static constexpr uint8_t tbq_signs[16] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
         0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
     };
     static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
     static constexpr float b2[3] = { -0.9816f, 0.0f, 0.9816f };
-
-    float tmp[TBQ_K128], recon[TBQ_K128];
 
     float sum_sq = 0.0f;
     for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
@@ -890,36 +1005,30 @@ static __device__ void quantize_f32_tbqp3_1_block(const float * __restrict__ x, 
                 tmp[i+j] = u+v; tmp[i+j+len] = u-v;
             }
 
-    // 2-bit Lloyd-Max quantization
+    // 2-bit Lloyd-Max + residual (Direct Sign) in single pass — no recon/res arrays.
+    for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
+    float res_abs_sum = 0.0f;
     for (int j = 0; j < TBQ_K128/4; j++) {
         uint8_t packed = 0;
         for (int k = 0; k < 4; k++) {
+            const int e = j*4 + k;
             uint8_t idx = 3;
-            for (int b = 0; b < 3; b++) { if (tmp[j*4+k] < b2[b]) { idx = b; break; } }
+            for (int b = 0; b < 3; b++) { if (tmp[e] < b2[b]) { idx = b; break; } }
             packed |= (idx & 0x3) << (k*2);
-            recon[j*4+k] = c2[idx];
+            // Compute residual on-the-fly (no recon[] array)
+            const float r = tmp[e] - c2[idx];
+            res_abs_sum += fabsf(r);
+            if (r >= 0.0f) y->qjl[e/8] |= (1 << (e%8));
         }
         y->qs[j] = packed;
     }
-
-    // Residual + Direct Sign (no SRHT — lower variance than QJL for d≤128)
-    float res[TBQ_K128], res_abs_sum = 0.0f;
-    for (int j = 0; j < TBQ_K128; j++) {
-        res[j] = tmp[j] - recon[j];
-        res_abs_sum += fabsf(res[j]);
-    }
-    float gamma = res_abs_sum / TBQ_K128; // mean(|residual|)
+    const float gamma = res_abs_sum / TBQ_K128; // mean(|residual|)
     y->d_qjl = __float2half(gamma * norm);
-
-    // Store sign(residual) directly — no random rotation needed
-    for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
-    for (int j = 0; j < TBQ_K128; j++) {
-        if (res[j] >= 0.0f) y->qjl[j/8] |= (1 << (j%8));
-    }
 }
 
 // TBQP4_1: 128-element 3-bit Lloyd-Max + 1-bit QJL
-static __device__ void quantize_f32_tbqp4_1_block(const float * __restrict__ x, block_tbqp4_1 * __restrict__ y) {
+// scratch[TBQ_K128] provided by caller (shared memory). recon/res eliminated inline.
+static __device__ void quantize_f32_tbqp4_1_block(const float * __restrict__ x, block_tbqp4_1 * __restrict__ y, float * __restrict__ tmp) {
     static constexpr uint8_t tbq_signs[16] = {
         0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
         0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
@@ -931,7 +1040,6 @@ static __device__ void quantize_f32_tbqp4_1_block(const float * __restrict__ x, 
         -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
     };
 
-    float tmp[TBQ_K128], recon[TBQ_K128];
     float sum_sq = 0.0f;
     for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
     float norm = sqrtf(sum_sq);
@@ -954,28 +1062,25 @@ static __device__ void quantize_f32_tbqp4_1_block(const float * __restrict__ x, 
                 tmp[i+j] = u+v; tmp[i+j+len] = u-v;
             }
 
-    // 3-bit Lloyd-Max + packing
+    // 3-bit Lloyd-Max + residual (Direct Sign) in single pass — no recon/res arrays.
     int bit_pos = 0;
     for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
+    for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
+    float res_abs_sum = 0.0f;
     for (int j = 0; j < TBQ_K128; j++) {
         uint8_t idx = 7;
         for (int b = 0; b < 7; b++) { if (tmp[j] < b3[b]) { idx = b; break; } }
         int byte_idx = bit_pos / 8, bit_off = bit_pos % 8;
         y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
         if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
-        recon[j] = c3[idx];
         bit_pos += 3;
+        // Inline residual + sign
+        const float r = tmp[j] - c3[idx];
+        res_abs_sum += fabsf(r);
+        if (r >= 0.0f) y->qjl[j/8] |= (1 << (j%8));
     }
-
-    // Residual + Direct Sign (no SRHT — lower variance than QJL for d≤128)
-    float res[TBQ_K128], res_abs_sum = 0.0f;
-    for (int j = 0; j < TBQ_K128; j++) { res[j] = tmp[j] - recon[j]; res_abs_sum += fabsf(res[j]); }
-    float gamma = res_abs_sum / TBQ_K128;
+    const float gamma = res_abs_sum / TBQ_K128;
     y->d_qjl = __float2half(gamma * norm);
-    for (int j = 0; j < TBQ_K128/8; j++) y->qjl[j] = 0;
-    for (int j = 0; j < TBQ_K128; j++) {
-        if (res[j] >= 0.0f) y->qjl[j/8] |= (1 << (j%8));
-    }
 }
 
 // ============================================================

@@ -4,7 +4,63 @@
 
 [🇬🇧 English](README.md)
 
-### 🆕 v1.5.3 — Double WHT Per-Head for head_dim=64 (GPT-OSS 120B)
+### 🆕 v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B)
+
+**새 K 캐시 포맷: polar 좌표 저장 + content/position 분리 + 해석적 tangent residual 보정. 수학 추론에서 f16 를 압도하면서 한국어 산문 품질 유지.**
+
+**환경:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · 모델: Qwen3-14B Q4_K_M · ctx=40960 · temp=0
+
+**메모리 사용량 (ctx=40960, 40 layers):**
+
+| 설정 | K 버퍼 | V 버퍼 | 총 KV | 압축률 |
+|------|--------|--------|-------|--------|
+| f16/f16 | 3200 MiB | 3200 MiB | 6400 MiB | 1.0x |
+| **tbqx3/tbq3** | **725 MiB** | 625 MiB | **1350 MiB** | **4.74x** |
+| tbq3/tbq3 | 625 MiB | 625 MiB | 1250 MiB | 5.12x |
+
+**속도 (decode, 동일 프롬프트):**
+
+| 설정 | t/s | vs f16 |
+|------|-----|--------|
+| f16/f16 | 24–25 | 1.00x |
+| **tbqx3/tbq3** | **21–22** | **0.87x** |
+| tbq3/tbq3 | 21–22 | 0.87x |
+
+**수학 정확도 (35문제, seed=1234, temp=0):**
+
+| 설정 | Math (/35) | % | vs f16 |
+|------|------------|---|--------|
+| **tbqx3/tbq3** | **13/35** | **37.1%** | **+8%** |
+| f16/f16 | 12/35 | 34.3% | — |
+| tbq3/tbq3 | 10/35 | 28.6% | −17% |
+
+> **tbqx3/tbq3 는 4.74배 압축하면서 수학에서 f16 를 이김**. 기존 tbq3/tbq3 는 f16 대비 17% 열세.
+
+**TBQX3_1 블록 포맷 (3.625 bpw, head_dim=128):**
+
+| 필드 | 크기 | 용도 |
+|------|------|------|
+| `d_r` | 2 B | Rayleigh σ (half) |
+| `qr[24]` | 24 B | 3비트 r 인덱스 (Rayleigh Lloyd-Max, 64 페어) |
+| `qphi[24]` | 24 B | 3비트 φ_content 인덱스 (uniform, 64 페어) |
+| `qtan[8]` | 8 B | 페어당 1비트 접선 부호 |
+| **총** | **58 B** | **3.625 bpw** |
+
+**핵심 아이디어:**
+
+1. **Polar derotate (content/position 분리)**: K 를 `(r, φ_content) = (r, φ_post − pos·freq_i)` 로 페어당 저장. content 는 position-invariant. 읽기 시점에 `pos·freq_i` 로 re-rotation. Attention 이 content 기하를 직접 봄 (content·position 얽힘 없이).
+2. **r 에 Rayleigh Lloyd-Max 적용**: 복소 가우시안 페어의 크기 `r = √(x² + y²)` 는 Rayleigh 분포. Rayleigh quantile 경계로부터 8-레벨 Lloyd-Max 코드북 해석적으로 도출 (캘리브레이션 불필요, 모델 독립적).
+3. **Tangent Residual (drift 픽스)**: 3비트 uniform φ 양자화 오차 ±π/8. 이로 인한 K perturbation 의 거의 전부가 접선 방향 `(-sin φ, cos φ)` 에 위치. 1비트로 `Δφ` 부호 인코딩, 크기 `r · π/16` 은 해석적 (half-cell). 학습 無, 이미 계산된 sin/cos 재활용 — 페어당 FMA 2개 추가로 끝. φ 오차 절반 (22.5° → 11.25°), 희소 토큰 drift (키릴 문자 오염) 제거.
+4. **Content 경로에 WHT 없음**: polar 구조 자체가 각도 정보를 보존. 페어 간 WHT 는 RoPE 페어 구조를 파괴. TBQX3_1 은 WHT 를 완전히 생략한 최초의 TBQ 변종.
+
+**Qwen3-14B 및 기타 head_dim=128 RoPE 모델 권장 설정:**
+```
+--cache-type-k tbqx3 --cache-type-v tbq3
+```
+
+---
+
+### v1.5.3 — Double WHT Per-Head for head_dim=64 (GPT-OSS 120B)
 
 **Cross-head WHT 폐기. Double WHT per-head (S1→WHT64→S2→WHT64)로 교체. QJL 1비트 보정 재활성화 — 멀티턴 안정성에 필수.**
 
