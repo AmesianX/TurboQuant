@@ -1,12 +1,17 @@
 \documentclass[10pt,twocolumn]{article}
 
 % ============================================================
-% Packages  (matches turboquant_impl_ko.tex for consistency)
+% Packages — xelatex native (Unicode + professional typography)
 % ============================================================
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{kotex}
 \usepackage[margin=0.75in]{geometry}
+\usepackage{kotex}
+\usepackage{fontspec}
+\setmainfont{TeX Gyre Termes}
+\setsansfont{TeX Gyre Heros}
+\setmonofont{TeX Gyre Cursor}
+\setmainhangulfont{Noto Serif CJK KR}[Scale=0.95]
+\setsanshangulfont{Noto Sans CJK KR}[Scale=0.95]
+\usepackage{microtype}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{graphicx}
 \usepackage{booktabs}
@@ -357,7 +362,7 @@ KIVI~\cite{kivi2024}, KVQuant~\cite{kvquant2024}, SmoothQuant-KV~\cite{smoothqua
 
 $\text{ctx}=40{,}960$, 40 transformer 레이어에서 llama.cpp 할당자가 보고하는 end-to-end KV 캐시 버퍼 크기:
 
-\begin{table}[h]
+\begin{table*}[t]
 \centering
 \small
 \begin{tabular}{@{}lrrrr@{}}
@@ -371,11 +376,11 @@ tbq3/tbq3 (TBQ v1)          & 625 MiB & 625 MiB & 1250 MiB & $5.12\times$ \\
 \end{tabular}
 \caption{$\text{ctx}=40{,}960$에서의 KV 캐시 버퍼 크기. TBQX3\_1은 Tangent Residual 대가로 TBQ3\_1 대비 $+100$ MiB K측 프리미엄을 지불하며, 총합은 순수 3비트 기준선의 $8\%$ 이내, 이론 상한 $5.3\times$의 $21\%$ 이내에 머문다.}
 \label{tab:memory}
-\end{table}
+\end{table*}
 
 \subsection{디코드 처리량}
 
-\begin{table}[h]
+\begin{table*}[t]
 \centering
 \small
 \begin{tabular}{@{}lrr@{}}
@@ -389,13 +394,13 @@ tbq3/tbq3             & 21--22 & $0.87\times$ \\
 \end{tabular}
 \caption{Qwen3-14B 디코드 처리량. TBQX3\_1은 추가 Tangent Residual 보정에도 불구하고 TBQ3\_1 대비 측정 가능한 감속이 없다: 페어당 FMA 2개가 기존 HBM latency shadow 내에 들어간다. f16 대비 $13\%$ 격차는 derotation 특유가 아닌 TBQ vec 경로의 일반 비용이다.}
 \label{tab:throughput}
-\end{table}
+\end{table*}
 
 \subsection{수학 추론}
 
 수학 벤치는 3 티어 35문제 (2$\times$2 행렬곱, 3$\times$3 행렬곱, 스칼라 산술 체인) 로 구성되며 답은 정수값이다. Temperature $0$에서 부분 점수는 불가능하다: 단 하나의 중간 토큰이 잘못된 숫자로 flip 되면 문제 전체가 실패한다.
 
-\begin{table}[h]
+\begin{table*}[t]
 \centering
 \small
 \begin{tabular}{@{}lrrr@{}}
@@ -409,7 +414,7 @@ tbq3/tbq3 (TBQ v1)         & 10/35 & 28.6\% & $-17\%$ \\
 \end{tabular}
 \caption{Qwen3-14B 수학 정확도, seed 1234, 35문제, temperature $0$. TBQX3\_1이 f16과 기존 TBQ3\_1 둘 다를 능가한다. 기존 TBQ3\_1의 f16 대비 $-17\%$ 저하는 \S\ref{sec:why3bit}에서 기술한 ``3비트 품질 절벽''과 일치한다. TBQX3\_1은 이 절벽을 닫고 f16 위로 $+8\%$ 올라선다.}
 \label{tab:math}
-\end{table}
+\end{table*}
 
 여러 seed (42, 43, 52, 666, 1234) 에서의 추가 실행은 순서를 확인한다: TBQX3\_1은 일관되게 f16 이상이고 일관되게 기존 TBQ3\_1 이상이다. 일부 실행에서는 TBQX3\_1이 더 큰 폭으로 f16을 넘는다 (seed 42: $17/35$ vs $11/35$, $+55\%$). Seed 52는 f16과 무승부를 기록한다. 테스트된 seed 전반의 f16 대비 평균 향상은 약 $+20\%$, 기존 TBQ3\_1 대비는 약 $+35\%$이다. 이는 temperature $0$ 정확 일치 수치임을 강조하며, 더 높은 온도나 더 풍부한 벤치 세트에서의 평균 성능에 대한 주장은 추가 데이터 없이 피한다.
 
@@ -518,7 +523,7 @@ Qwen3-14B 초기 실험 국면에서 장시간 TBQ 벤치마크 실행은 간헐
 
 \subsection{실패 표면 요약}
 
-\begin{table}[h]
+\begin{table*}[t]
 \centering
 \small
 \begin{tabular}{@{}llll@{}}
@@ -536,7 +541,7 @@ WHT $\oplus$ Polar                  & 3.125 & 중단 & 셀별 WHT 비용 $\sim 1
 \end{tabular}
 \caption{TBQX3\_1 개발 중 탐구된 폐기 변종들과 각각이 기각된 주 이유. 채택된 구성은 그 모두를 단일 부호 비트 --- 기하학적으로 정확한 절반 셀 보정을 수반 --- 로 대체했다.}
 \label{tab:deadends}
-\end{table}
+\end{table*}
 
 % ============================================================
 \section{결론}
