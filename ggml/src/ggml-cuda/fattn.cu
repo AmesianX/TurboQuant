@@ -629,6 +629,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_Q8_0)
+    // TurboQuant Polar Derotate + Tangent Residual (v1.6.0): D=128 only, K=TBQX3_1, V=TBQ3_1 / F16
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_F16)
     // TurboQuant 64-block (_2): D=64 only
     FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_F16)
     FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_F16)
