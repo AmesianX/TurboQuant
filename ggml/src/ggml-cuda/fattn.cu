@@ -477,6 +477,14 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_Q8_0)
 
+    // TurboQuant Polar Derotate + Tangent Residual (v1.6.0). K = TBQX3_1, V = TBQ3_1 / F16.
+    // These entries also exist under GGML_CUDA_FA_TBQ_TUNING but were missing from the
+    // GGML_CUDA_FA_ALL_QUANTS branch, causing fattn.cu:732 to abort for head_dim=128
+    // + tbqx3 in the default CMake configuration. (Fix reported by cutlerbenjamin1-cmd
+    // on issue #19, confirmed against v1.6.0 tag.)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_F16)
+
     // Asymmetric: standard K + TBQ V (ALL_QUANTS path)
     FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ3_0)
     FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ4_0)
