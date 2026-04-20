@@ -492,7 +492,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 type_k == GGML_TYPE_TBQ3_4  || type_k == GGML_TYPE_TBQ4_4  ||
                 type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4 ||
                 type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4  ||
-                type_v == GGML_TYPE_TBQP3_4 || type_v == GGML_TYPE_TBQP4_4) {
+                type_v == GGML_TYPE_TBQP3_4 || type_v == GGML_TYPE_TBQP4_4 ||
+                type_k == GGML_TYPE_AMX3_1  || type_k == GGML_TYPE_AMXV3_1 ||
+                type_v == GGML_TYPE_AMX3_1  || type_v == GGML_TYPE_AMXV3_1) {
                 return false;
             }
             return true;

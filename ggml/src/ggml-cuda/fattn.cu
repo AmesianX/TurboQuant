@@ -306,9 +306,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ3_1)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQ4_1)      // recommended 4-bit
     FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,    GGML_TYPE_TBQ4_1)      // primoco recommended
-    // TurboQuant Polar Derotate + Tangent Residual. K = TBQX3_1, V = TBQ3_1 / F16.
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_TBQ3_1)
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_F16)
+    // AMX: 128-WHT + polar (r, φ) + cosine-optimal. K = AMX3_1, V = AMXV3_1 / TBQ3_1 / F16.
+    FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_AMXV3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_F16)
+    // Baseline for tq-bench comparison (q4_0 K+V on head_dim=128).
+    FATTN_VEC_CASE(128, GGML_TYPE_Q4_0,    GGML_TYPE_Q4_0)
 
     // ---- D=256 (_0) — Qwen3.5, Qwen3-Next, etc. ----
     FATTN_VEC_CASE(256, GGML_TYPE_F16,     GGML_TYPE_TBQ3_0)
@@ -477,13 +480,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(64, GGML_TYPE_TBQP4_2, GGML_TYPE_Q8_0)
 
-    // TurboQuant Polar Derotate + Tangent Residual (v1.6.0). K = TBQX3_1, V = TBQ3_1 / F16.
-    // These entries also exist under GGML_CUDA_FA_TBQ_TUNING but were missing from the
-    // GGML_CUDA_FA_ALL_QUANTS branch, causing fattn.cu:732 to abort for head_dim=128
-    // + tbqx3 in the default CMake configuration. (Fix reported by cutlerbenjamin1-cmd
-    // on issue #19, confirmed against v1.6.0 tag.)
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_TBQ3_1)
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_F16)
+    // AMX: 128-WHT + polar (r, φ) + cosine-optimal. K = AMX3_1, V = AMXV3_1 / TBQ3_1 / F16.
+    FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_AMXV3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_F16)
 
     // Asymmetric: standard K + TBQ V (ALL_QUANTS path)
     FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TBQ3_0)
@@ -629,9 +629,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP3_1, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_Q8_0)
-    // TurboQuant Polar Derotate + Tangent Residual (v1.6.0): D=128 only, K=TBQX3_1, V=TBQ3_1 / F16
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_TBQ3_1)
-    FATTN_VEC_CASE(128, GGML_TYPE_TBQX3_1, GGML_TYPE_F16)
+    // AMX: 128-WHT + polar (r, φ) + cosine-optimal. K = AMX3_1, V = AMXV3_1 / TBQ3_1 / F16.
+    FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_AMXV3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_F16)
     // TurboQuant 64-block (_2): D=64 only
     FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_F16)
     FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_F16)
@@ -836,9 +837,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         || K->type == GGML_TYPE_TBQP3_3 || K->type == GGML_TYPE_TBQP4_3
                         || K->type == GGML_TYPE_TBQ3_4 || K->type == GGML_TYPE_TBQ4_4
                         || K->type == GGML_TYPE_TBQP3_4 || K->type == GGML_TYPE_TBQP4_4
-                        || K->type == GGML_TYPE_TBQX3_1;
+                        || K->type == GGML_TYPE_AMX3_1;
         const bool tbq_v = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0
                         || V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQ4_1
+                        || V->type == GGML_TYPE_AMXV3_1
                         || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2
                         || V->type == GGML_TYPE_TBQ3_3 || V->type == GGML_TYPE_TBQ4_3
                         || V->type == GGML_TYPE_TBQ3_4 || V->type == GGML_TYPE_TBQ4_4;
@@ -885,7 +887,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_TBQ4_4:
         case GGML_TYPE_TBQP3_4:
         case GGML_TYPE_TBQP4_4:
-        case GGML_TYPE_TBQX3_1:
+        case GGML_TYPE_AMX3_1:
+        case GGML_TYPE_AMXV3_1:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -912,8 +915,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      || K->type == GGML_TYPE_TBQP4_3 || K->type == GGML_TYPE_TBQP3_3
      || K->type == GGML_TYPE_TBQ4_4 || K->type == GGML_TYPE_TBQ3_4
      || K->type == GGML_TYPE_TBQP4_4 || K->type == GGML_TYPE_TBQP3_4
-     || K->type == GGML_TYPE_TBQX3_1;
+     || K->type == GGML_TYPE_AMX3_1;
     const bool tbq_v_type = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_TBQ3_0
+                         || V->type == GGML_TYPE_AMXV3_1
      || V->type == GGML_TYPE_TBQ4_1 || V->type == GGML_TYPE_TBQ3_1
      || V->type == GGML_TYPE_TBQ4_2 || V->type == GGML_TYPE_TBQ3_2
      || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3

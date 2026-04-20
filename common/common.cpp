@@ -1412,7 +1412,7 @@ common_init_result::common_init_result(common_params & params) :
             // Also catch _1/_2/_4 types that don't match head_dim (user specified directly)
             auto is_wrong_suffix = [&](ggml_type t) -> bool {
                 bool is_1 = (t == GGML_TYPE_TBQ3_1 || t == GGML_TYPE_TBQ4_1 || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
-                            || t == GGML_TYPE_TBQX3_1);
+                            || t == GGML_TYPE_AMX3_1 || t == GGML_TYPE_AMXV3_1);
                 bool is_2 = (t == GGML_TYPE_TBQ3_2 || t == GGML_TYPE_TBQ4_2 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2);
                 bool is_4 = (t == GGML_TYPE_TBQ3_4 || t == GGML_TYPE_TBQ4_4 || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4);
                 if (is_1 && head_dim != 128) return true;
@@ -1581,6 +1581,19 @@ common_init_result_ptr common_init_from_params(common_params & params) {
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
         params.ctx_shift = false;
+    }
+
+    if (!params.triattention_stats_path.empty() && params.triattention_budget > 0) {
+        struct llama_tria_stats * tstats = llama_tria_load(params.triattention_stats_path.c_str());
+        if (tstats) {
+            llama_tria_attach(lctx, tstats,
+                    params.triattention_budget,
+                    params.triattention_interval,
+                    params.triattention_keep_first);
+        } else {
+            LOG_WRN("%s: failed to load TriAttention stats '%s' — scoring disabled\n",
+                    __func__, params.triattention_stats_path.c_str());
+        }
     }
 
     if (!params.control_vectors.empty()) {

@@ -1,6 +1,29 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 
+// AMX3 cosine-optimal λ: 0.7 for reasoning (default), 2.5 for embedding.
+// Auto-detect via AMX3_LAMBDA env var, or --embedding flag.
+__device__ float g_amx3_lambda = 0.7f;
+static bool g_amx3_lambda_initialized = false;
+
+void ggml_cuda_set_amx3_lambda(float lambda) {
+    CUDA_CHECK(cudaMemcpyToSymbol(g_amx3_lambda, &lambda, sizeof(float)));
+    g_amx3_lambda_initialized = true;
+}
+
+static void amx3_lambda_auto_init() {
+    if (g_amx3_lambda_initialized) return;
+    g_amx3_lambda_initialized = true;
+    const char * env = getenv("AMX3_LAMBDA");
+    if (env) {
+        float v = strtof(env, nullptr);
+        if (v > 0.0f) {
+            CUDA_CHECK(cudaMemcpyToSymbol(g_amx3_lambda, &v, sizeof(float)));
+            fprintf(stderr, "AMX3: λ=%.2f (from AMX3_LAMBDA env)\n", v);
+        }
+    }
+}
+
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
 // Generic quantized set_rows kernel template
@@ -309,8 +332,8 @@ static void set_rows_cuda_quant_sm(
 }
 
 // =============================================================================
-// Polar (TBQX/TBQXP) variant: quantize function takes pos (= dst_row in cache).
-// Templated on the destination block type (block_tbqx3_1) for the polar path.
+// Polar (TBQX/TBQXP/AMX3) variant: quantize function takes pos (= dst_row in cache).
+// Polar path templated (legacy, unused after AMX simplified to scalar Lloyd-Max).
 // =============================================================================
 template <typename idx_t, typename block_type,
           void (*quantize_func)(const float *, block_type *, float *, int)>
@@ -1102,11 +1125,23 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
-    } else if (dst->type == GGML_TYPE_TBQX3_1) {
-        // Polar variant: pos (= dst_row) is passed to the quantize function
-        // so it can derotate phi by pos·freq_i.
-        set_rows_cuda_quant_sm_polar<idx_t, block_tbqx3_1, quantize_f32_tbqx3_1_block_pos>(
-            src0_d, src1_d, (block_tbqx3_1*)dst->data,
+    } else if (dst->type == GGML_TYPE_AMX3_1) {
+        // AMX K-side: Polar Derotate + cosine-optimal quant + TriAttention fusion target.
+        // Uses polar kernel with per-cell slot position for derotation.
+        amx3_lambda_auto_init(); // one-time: read AMX3_LAMBDA env var
+        set_rows_cuda_quant_sm_polar<idx_t, block_amx3_1, quantize_f32_amx3_1_block_pos>(
+            src0_d, src1_d, (block_amx3_1*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_AMXV3_1) {
+        // AMX V-side: tbq3_1 동치 (WHT + 3-bit Gaussian Lloyd-Max, no MSE search).
+        set_rows_cuda_quant_sm<idx_t, block_amxv3_1, TBQ_K128, quantize_f32_amxv3_1_block>(
+            src0_d, src1_d, (block_amxv3_1*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
             nb01, nb02, nb03,

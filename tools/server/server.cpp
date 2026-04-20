@@ -82,6 +82,17 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // AMX: auto-set λ=2.5 for embedding mode (cosine-optimal quantization).
+    // λ=0.7 (default) optimizes for reasoning; λ=2.5 optimizes for encoder/retrieval fidelity.
+    if (params.embedding && !getenv("AMX3_LAMBDA")) {
+#ifdef _WIN32
+        _putenv_s("AMX3_LAMBDA", "2.5");
+#else
+        setenv("AMX3_LAMBDA", "2.5", 0);
+#endif
+        LOG_INF("%s: embedding mode detected, setting AMX3_LAMBDA=2.5 for encoder-optimal quantization\n", __func__);
+    }
+
     // validate batch size for embeddings
     // embeddings require all tokens to be processed in a single ubatch
     // see https://github.com/ggml-org/llama.cpp/issues/12836

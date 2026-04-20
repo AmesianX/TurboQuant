@@ -152,6 +152,10 @@ public:
 
     bool get_has_shift() const;
 
+    // TriAttention: per-layer scoring + Top-B + physical eviction on AMX3_1 K cache.
+    // Returns true if scoring ran.  keep_first = attention sink size (first-N always kept).
+    bool tria_score_maybe(struct llama_tria_stats * stats, int budget, int keep_first) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

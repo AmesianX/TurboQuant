@@ -511,6 +511,24 @@ extern "C" {
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
 
+    // TriAttention (AMX3_1 pre-RoPE polar scoring).  Opaque stats handle.
+    struct llama_tria_stats;
+
+    // Load calibration stats (TRIA v2 binary).  Returns NULL on error.
+    LLAMA_API struct llama_tria_stats * llama_tria_load(const char * path);
+    LLAMA_API void llama_tria_free(struct llama_tria_stats * stats);
+
+    // Attach loaded stats + scoring budget/interval to a context.
+    // budget     = Top-B slots per layer (0 disables scoring)
+    // interval   = trigger every N tokens
+    // keep_first = attention-sink size (first-N slots always kept; typical: 4)
+    LLAMA_API void llama_tria_attach(
+            struct llama_context       * ctx,
+            struct llama_tria_stats    * stats,
+            int32_t                      budget,
+            int32_t                      interval,
+            int32_t                      keep_first);
+
     enum llama_params_fit_status {
         LLAMA_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
         LLAMA_PARAMS_FIT_STATUS_FAILURE = 1, // could not find allocations that are projected to fit

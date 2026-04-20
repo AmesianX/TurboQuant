@@ -449,7 +449,8 @@ extern "C" {
         GGML_TYPE_TBQ4_4  = 59, // TurboQuant 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
         GGML_TYPE_TBQP3_4 = 60, // TurboQuant_prod 3-bit, blck_size=576 (head_dim=576, split 256+256+64)
         GGML_TYPE_TBQP4_4 = 61, // TurboQuant_prod 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
-        GGML_TYPE_TBQX3_1  = 62, // TurboQuant Polar Derotate 3-bit + Tangent Residual (head_dim=128)
+        GGML_TYPE_AMX3_1   = 62, // AMX K-side 3r+4φ polar, 128-WHT + cosine-optimal (head_dim=128)
+        GGML_TYPE_AMXV3_1  = 63, // AMX V-side 3-bit (tbq3_1 동치; optimization 후추가)
         GGML_TYPE_COUNT    = 64,
     };
 

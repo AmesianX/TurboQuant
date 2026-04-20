@@ -234,6 +234,8 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    void tria_set(struct llama_tria_stats * stats, int32_t budget, int32_t interval, int32_t keep_first);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -264,6 +266,13 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+
+    // TriAttention runtime state (opaque handle + config)
+    struct llama_tria_stats * tria_stats      = nullptr;
+    int32_t                   tria_budget     = 0;
+    int32_t                   tria_interval   = 128;
+    int32_t                   tria_keep_first = 4;   // attention sink size
+    int64_t                   tria_counter    = 0;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

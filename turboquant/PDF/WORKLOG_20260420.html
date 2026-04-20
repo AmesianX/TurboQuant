@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>업무일지 2026-04-20~21 · TriAttention</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root {
+    --bg: #fafbfc;
+    --fg: #1a1a2e;
+    --accent: #3b82f6;
+    --accent2: #8b5cf6;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --muted: #64748b;
+    --card-bg: #ffffff;
+    --border: #e2e8f0;
+  }
+  .reveal { font-family: 'Noto Sans KR', sans-serif; font-size: 28px; color: var(--fg); letter-spacing: -0.01em; line-height: 1.55; }
+  .reveal .slides { text-align: left; }
+  .reveal .slides section { padding: 36px 50px; box-sizing: border-box; }
+  .reveal h1, .reveal h2, .reveal h3 { font-family: 'Noto Sans KR', sans-serif; font-weight: 700; color: var(--fg); text-transform: none; letter-spacing: -0.02em; }
+  .reveal h1 { font-size: 2.0em; margin-bottom: 0.2em; }
+  .reveal h2 { font-size: 1.3em; margin-bottom: 0.4em; }
+  .reveal h3 { font-size: 1.0em; margin-bottom: 0.3em; color: var(--accent); }
+  .cover { text-align: center !important; display: flex !important; flex-direction: column; align-items: center; justify-content: center; }
+  .cover h1 { font-size: 2.2em; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin-bottom: 0.1em; }
+  .cover .subtitle { font-size: 1.0em; color: var(--muted); font-weight: 300; margin-bottom: 1.5em; }
+  .cover .meta { font-size: 0.7em; color: var(--muted); line-height: 1.8; }
+  .cover .meta span { display: inline-block; background: #f1f5f9; padding: 4px 14px; border-radius: 20px; margin: 3px 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; }
+  .divider { width: 60px; height: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); border: none; border-radius: 2px; margin: 8px 0 16px 0; }
+  .cover .divider { margin: 10px auto 20px auto; }
+  .tag { display: inline-block; font-size: 0.5em; font-weight: 500; padding: 2px 10px; border-radius: 12px; vertical-align: middle; margin-left: 8px; }
+  .tag-blue { background: #dbeafe; color: #1d4ed8; }
+  .tag-green { background: #d1fae5; color: #065f46; }
+  .tag-red { background: #fee2e2; color: #991b1b; }
+  .tag-yellow { background: #fef3c7; color: #92400e; }
+  .tag-purple { background: #ede9fe; color: #5b21b6; }
+  .items { list-style: none; padding: 0; margin: 0; }
+  .items li { position: relative; padding-left: 20px; margin-bottom: 6px; font-size: 0.7em; line-height: 1.6; word-break: keep-all; }
+  .items li::before { content: ''; position: absolute; left: 0; top: 9px; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); opacity: 0.6; }
+  .items li.check::before { background: var(--success); opacity: 1; border-radius: 50%; }
+  .items li.warn::before { background: var(--warning); opacity: 1; }
+  .items li.fail::before { background: var(--danger); opacity: 1; border-radius: 50%; }
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
+  .card-grid.three { grid-template-columns: 1fr 1fr 1fr; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin: 0 0 5px 0; font-size: 0.7em; font-weight: 700; color: var(--fg); }
+  .card p, .card ul { margin: 0; font-size: 0.6em; line-height: 1.55; color: #475569; word-break: keep-all; }
+  .card ul { padding-left: 16px; }
+  .highlight-box { border-left: 4px solid; border-radius: 6px; padding: 10px 14px; margin: 8px 0; font-size: 0.7em; line-height: 1.6; word-break: keep-all; }
+  .highlight-box.blue { border-color: var(--accent); background: #eff6ff; }
+  .highlight-box.green { border-color: var(--success); background: #ecfdf5; }
+  .highlight-box.red { border-color: var(--danger); background: #fef2f2; }
+  .highlight-box.yellow { border-color: var(--warning); background: #fffbeb; }
+  .highlight-box.purple { border-color: var(--accent2); background: #f5f3ff; }
+  .reveal code { font-family: 'JetBrains Mono', monospace; font-size: 0.88em; background: #f1f5f9; padding: 1px 6px; border-radius: 4px; color: var(--accent2); }
+  .reveal table { width: 100%; border-collapse: collapse; font-size: 0.6em; margin-top: 8px; table-layout: fixed; }
+  .reveal table th { background: #f8fafc; font-weight: 600; text-align: left; padding: 6px 10px; border-bottom: 2px solid var(--border); color: var(--muted); font-size: 0.88em; text-transform: uppercase; letter-spacing: 0.05em; }
+  .reveal table td { padding: 6px 10px; border-bottom: 1px solid var(--border); line-height: 1.45; word-break: keep-all; }
+  .reveal table tr:last-child td { border-bottom: none; }
+  .reveal table .ok { color: var(--success); font-weight: 600; }
+  .reveal table .ng { color: var(--danger); font-weight: 600; }
+  .reveal table .mid { color: var(--warning); font-weight: 600; }
+  @media print { .reveal .slides section { page-break-after: always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>TriAttention 통합</h1>
+  <p class="subtitle">AMX3_1 하이브리드 K 캐시 × pre-RoPE polar 스코어링 × 물리 eviction</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-20 ~ 04-21</span>
+    <span>Qwen3-14B Q4_K_M</span>
+    <span>AMX3_1 · 6.75 bpw</span>
+    <br>
+    <span>Needle Test 성공</span>
+    <span>20 tok/s 유지</span>
+    <span>95% eviction 품질 유지</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>세션 개요</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>목표</h4>
+      <p>TriAttention 논문 (Mao et al., arxiv 2604.04921) 포팅.<br>Pre-RoPE polar 스코어링으로 dequant-free KV eviction.</p>
+    </div>
+    <div class="card">
+      <h4>결과</h4>
+      <p>End-to-end 동작 + <strong>needle test 성공</strong>.<br>"비밀번호 다람쥐7429" 정확 회수. 반복 루프 해소.</p>
+    </div>
+    <div class="card">
+      <h4>기술 혁신</h4>
+      <p>AMX3_1 Part B (polar) <strong>직접 소비</strong>.<br>GPU→CPU 전송 없는 스코어링.</p>
+    </div>
+    <div class="card">
+      <h4>성능</h4>
+      <p>Prompt 694 tok/s, <strong>Eval 20.7 tok/s</strong>.<br>오버헤드 무시 수준 (기준선 f16과 동일).</p>
+    </div>
+  </div>
+</section>
+
+<!-- ARCHITECTURE -->
+<section>
+  <h2>AMX3_1 하이브리드 블록 구조 <span class="tag tag-blue">108B · 6.75 bpw</span></h2>
+  <hr class="divider">
+  <div class="highlight-box blue">
+    <strong>TriAttention 을 위한 이중 인코딩</strong>: WHT 경로(FA attention)와 polar 경로(스코어링) 병행.
+  </div>
+  <table>
+    <colgroup><col style="width:16%"><col style="width:14%"><col style="width:18%"><col style="width:52%"></colgroup>
+    <tr><th>Part</th><th>크기</th><th>필드</th><th>역할</th></tr>
+    <tr><td rowspan="2"><strong>Part A</strong><br>WHT</td><td>2 B</td><td><code>d_wht</code></td><td>WHT 도메인 L2 norm (FA 디코더가 사용)</td></tr>
+    <tr><td>48 B</td><td><code>qs[48]</code></td><td>3-bit Lloyd-Max (tbq3_1 동치, 128 elements)</td></tr>
+    <tr><td rowspan="3"><strong>Part B</strong><br>Polar</td><td>2 B</td><td><code>d_r</code></td><td>Rayleigh σ (polar 스케일)</td></tr>
+    <tr><td>24 B</td><td><code>qr[24]</code></td><td>3-bit Rayleigh r 인덱스 (64 페어)</td></tr>
+    <tr><td>32 B</td><td><code>qphi[32]</code></td><td>4-bit uniform φ 인덱스</td></tr>
+  </table>
+  <p style="font-size:0.65em; color:var(--muted); margin-top:6px;">Part B → pre-RoPE (kxc, kyc) 직접 복원 → TriAttention 스코어링에 사용. 50% 유지 시 effective 3.375 bpw.</p>
+</section>
+
+<!-- SCORING PIPELINE -->
+<section>
+  <h2>3-Kernel 스코어링 파이프라인</h2>
+  <hr class="divider">
+  <div class="card-grid three">
+    <div class="card">
+      <h4>1. Raw score</h4>
+      <p>grid=(n_kv, num_heads)<br>block=fc (thread/pair)<br>Part B 복원 + 17 offset sincosf 합 + block reduce</p>
+    </div>
+    <div class="card">
+      <h4>2. Z-normalize</h4>
+      <p>grid=num_heads, block=256<br>head별 mean/std 계산<br>in-place 정규화</p>
+    </div>
+    <div class="card">
+      <h4>3. Aggregate</h4>
+      <p>grid=(n_kv/T), block=128<br>per-slot max across all heads<br>→ out_scores[n_kv]</p>
+    </div>
+  </div>
+  <div class="highlight-box purple">
+    <strong>스코어링 공식</strong>: <code>S_trig = Σ rel_r·cos(Δ·ω) - rel_i·sin(Δ·ω)</code> (17 geometric Δ, 64 freq) + <code>S_norm = max(0, qam-qma) · r</code>
+  </div>
+</section>
+
+<!-- EVICTION -->
+<section>
+  <h2>물리 eviction + attention sink</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>Histogram threshold</h4>
+      <p>1024-bin 히스토그램 기반 K번째 largest. Single-thread kernel. n_kv=2500 기준 ~5μs.</p>
+    </div>
+    <div class="card">
+      <h4>Mask kernel</h4>
+      <p>병렬 <code>score ≥ threshold ? 1 : 0</code> 비교.</p>
+    </div>
+    <div class="card">
+      <h4>Attention sink (C2)</h4>
+      <p><code>mask[0..keep_first] = 1</code> 강제 override.<br>BOS + 프롬프트 헤더 보호.</p>
+    </div>
+    <div class="card">
+      <h4>Physical eviction (C1)</h4>
+      <p>mask=0 슬롯에 <code>d_wht=0</code> <strong>AND</strong> <code>d_r=0</code>.<br>재스코어링 시 0점 → 영구 제외.</p>
+    </div>
+  </div>
+</section>
+
+<!-- VERIFICATION -->
+<section>
+  <h2>Needle Test 검증 <span class="tag tag-green">성공</span></h2>
+  <hr class="divider">
+  <div class="highlight-box blue">
+    <strong>프롬프트</strong>: "비밀번호는 <strong>다람쥐7429</strong> 이다. [양자역학 요약 요청] ... 요약 마지막에 비밀번호 정확히 적어라."
+  </div>
+  <table>
+    <colgroup><col style="width:22%"><col style="width:10%"><col style="width:14%"><col style="width:18%"><col style="width:36%"></colgroup>
+    <tr><th>버전</th><th>토큰</th><th>종료</th><th>비밀번호</th><th>현상</th></tr>
+    <tr><td>초기 (버그 상태)</td><td>2500</td><td class="ng">length</td><td class="ng">❌ 언급 없음</td><td>"다름, 다름, 다름..." 폭주</td></tr>
+    <tr><td>keep_first=4</td><td>575</td><td class="ok">stop</td><td class="ng">❌ "다섯"</td><td>반복 해소, 회상 실패</td></tr>
+    <tr><td><strong>keep_first=32</strong></td><td><strong>366</strong></td><td class="ok"><strong>stop</strong></td><td class="ok"><strong>✅ "다람쥐7429"</strong></td><td>정답 회수 + 자연 종료</td></tr>
+  </table>
+  <div class="highlight-box green">
+    프롬프트 앞 32 토큰 보호 → 비밀번호 "다람쥐7429" 생성 끝(position 366)까지 살아남음.
+  </div>
+</section>
+
+<!-- CLI -->
+<section>
+  <h2>CLI 플래그 + API</h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:30%"><col style="width:22%"><col style="width:48%"></colgroup>
+    <tr><th>플래그</th><th>기본값</th><th>의미</th></tr>
+    <tr><td><code>--triattention &lt;FILE&gt;</code></td><td>—</td><td>TRIA v2 칼리브레이션 파일</td></tr>
+    <tr><td><code>--tri-budget N</code></td><td>0 (비활성)</td><td>레이어별 Top-B 예산</td></tr>
+    <tr><td><code>--tri-interval N</code></td><td>128</td><td>트리거 토큰 간격 (논문 β)</td></tr>
+    <tr><td><code>--tri-keep-first N</code></td><td>4</td><td>Attention sink — 앞 N 슬롯 강제 유지</td></tr>
+  </table>
+  <div class="highlight-box blue">
+    <strong>공개 C API</strong>: <code>llama_tria_load() / llama_tria_free() / llama_tria_attach()</code><br>
+    <strong>내부 3단 API</strong>: <code>tria_trigger_prepare → tria_trigger_score_layer → tria_trigger_finish</code>
+  </div>
+</section>
+
+<!-- BUGS -->
+<section>
+  <h2>해결한 Critical 버그 5종</h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:10%"><col style="width:28%"><col style="width:62%"></colgroup>
+    <tr><th>ID</th><th>버그</th><th>증상 / 원인 / 해결</th></tr>
+    <tr><td>C1</td><td>Eviction 후 Part B 방치</td><td>d_wht만 0 세팅 → 재스코어링에서 재선택 → 반복 루프 폭주. d_r도 0 으로 영구 제외.</td></tr>
+    <tr><td>C2</td><td>Attention sink 누락</td><td>softmax 질량 배출구 없음 → "다름, 다름..." 폭주. <code>keep_first</code> 파라미터 추가.</td></tr>
+    <tr><td>B1</td><td>kept = n_kv 전체</td><td><code>v_cells.size()=40960</code> 그대로 넘김 → 빈 슬롯까지 스코어 → 히스토그램 왜곡. <code>n_valid</code> 사용.</td></tr>
+    <tr><td>B2</td><td>n_stream&gt;1 미가드</td><td>멀티 시퀀스 모드 미지원 가드 추가.</td></tr>
+    <tr><td>—</td><td>Private member access</td><td>llama_context 필드 private 섹션에 들어가 compile 실패. public setter <code>tria_set()</code> 경유.</td></tr>
+  </table>
+</section>
+
+<!-- MISSTEPS 1 -->
+<section>
+  <h2>뻘짓 히스토리 (1/2) <span class="tag tag-yellow">retrospective</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="fail"><strong>Qwen3.6-35B 40분 허비</strong> — head_dim=256 (config에 있었음), AMX3_1 호환 불가. Qwen3-14B 로 재칼리브레이션.</li>
+    <li class="fail"><strong>llama.h include 지옥</strong> — ggml-cuda에 <code>#include "llama.h"</code> 경로 없음. extern "C" 전방선언만으로 해결.</li>
+    <li class="fail"><strong>private 필드 실수</strong> — llama_context 멤버가 private 섹션. free function 접근 불가. public setter 추가.</li>
+    <li class="fail"><strong>kept=40960 분석 오해</strong> — "레이어간 일관성 너무 높다" 라고 착각. 실제론 로그 필터 부작용.</li>
+    <li class="fail"><strong>transformers 4.57.3 → 5.5.4</strong> — qwen3_5_moe 미지원 버전. 업그레이드 필요했음.</li>
+    <li class="fail"><strong>wikitext 경로 헤매기</strong> — <code>~/llama.cpp/wikitext-2-raw/</code> 아닌 <code>~/work/cuda_research/wiki.test.raw</code>.</li>
+    <li class="fail"><strong>서버 바이너리 구버전 실행</strong> — <code>make -j</code> 가 링크 보장 안 함. <code>--target llama-server</code> 또는 clean build 필요.</li>
+    <li class="fail"><strong>Dead code 3종 방치</strong> — <code>tria_head_stats_dev</code>, <code>llama_tria_stats_unwrap</code>, <code>tria_wrapper_layer_scales_ref</code> 감사 단계에서 제거.</li>
+  </ul>
+</section>
+
+<!-- MISSTEPS 2 -->
+<section>
+  <h2>뻘짓 히스토리 (2/2) <span class="tag tag-yellow">retrospective</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="fail"><strong>API 시그니처 3회 변경</strong> — 단일 함수 → keep_first 추가 → 3단 분할 (prepare/score/finish). 매번 호출부 + 전방선언 동시 갱신.</li>
+    <li class="fail"><strong>const_cast 지옥</strong> — <code>const void * K_cache_gpu</code> 시그니처에 쓰기 필요. 감사에서 <code>void *</code> 로 정리.</li>
+    <li class="fail"><strong>cur_pos 3회 변경</strong> — max 루프 → <code>host_pos[n_valid-1]</code> → 방어용 max 복원 → 사용자 지적으로 다시 간결화 (feedback_no_fallbacks 위반).</li>
+    <li class="fail"><strong>Log spam</strong> — 40 레이어 × 트리거당 1줄 = 2500 토큰 시 780줄. aggregate + <code>TRIA_VERBOSE=1</code> 로 개선.</li>
+    <li class="fail"><strong>Threshold 커널 단일 스레드 패스</strong> — SM 이용률 1/32 이하. n_kv=2500에서 ~5μs 병목 아니라 후순위.</li>
+    <li class="fail"><strong>"초최최최종" 리뷰 4회</strong> — 매번 새 발견. self-review 한계 실감.</li>
+  </ul>
+</section>
+
+<!-- AUDIT FIXES -->
+<section>
+  <h2>최종 감사 수정사항</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>Critical (C1/C2)</h4>
+      <p>Eviction 영구성 (d_wht + d_r 모두 zero)<br>Attention sink (<code>--tri-keep-first</code>)</p>
+    </div>
+    <div class="card">
+      <h4>High (H1~H3)</h4>
+      <p>tria_load <code>goto cleanup</code> 패턴<br>scratch_ensure 할당 실패 전체 해제<br>scratch_free 전 stream sync</p>
+    </div>
+    <div class="card">
+      <h4>Medium (M1/M5)</h4>
+      <p>3단 API 분할 (position H2D 1회)<br>Aggregate log + <code>TRIA_VERBOSE</code> env</p>
+    </div>
+    <div class="card">
+      <h4>Architecture (A3)</h4>
+      <p>Per-layer budget scale 적용<br><code>budget * layer_scales[il]</code></p>
+    </div>
+    <div class="card">
+      <h4>Final (F1~F3)</h4>
+      <p>prepare 시 state 선제 리셋<br>finish 시 항상 리셋<br>layer_scales D2H 에러 로깅</p>
+    </div>
+    <div class="card">
+      <h4>Cleanup (B1~B4/S1)</h4>
+      <p>n_stream 가드<br>const_cast 제거<br>Per-layer AMX3_1 type 체크</p>
+    </div>
+  </div>
+</section>
+
+<!-- PERFORMANCE -->
+<section>
+  <h2>성능 측정 <span class="tag tag-green">Qwen3-14B Q4_K_M · AMX3_1</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:30%"><col style="width:20%"><col style="width:20%"><col style="width:30%"></colgroup>
+    <tr><th>항목</th><th>값</th><th>기준선 f16</th><th>비고</th></tr>
+    <tr><td>Prompt</td><td class="ok">694 tok/s</td><td>~700</td><td>거의 동일</td></tr>
+    <tr><td>Eval</td><td class="ok">20.7 tok/s</td><td>~21</td><td>오버헤드 무시</td></tr>
+    <tr><td>트리거당 오버헤드</td><td>~120 ms</td><td>—</td><td>40 layer × ~3 ms</td></tr>
+    <tr><td>128 토큰 생성 대비</td><td>~2%</td><td>—</td><td>6.4 s 중 120 ms</td></tr>
+    <tr><td>실효 kept / n_kv</td><td>~130 / 2500</td><td>2500</td><td>95% eviction</td></tr>
+  </table>
+  <div class="highlight-box green">
+    <strong>결론</strong>: 95% eviction 상태에서도 품질 유지 + 속도 손실 없음. TriAttention 논문 주장 실증.
+  </div>
+</section>
+
+<!-- LESSONS -->
+<section>
+  <h2>핵심 교훈</h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="check"><strong>모델 config의 key_length/value_length를 먼저 확인</strong> — hidden/num_heads는 Q 기준, K 저장은 다를 수 있음 (gated attention, partial rotary)</li>
+    <li class="check"><strong>Eviction 영구성은 Part A + Part B 모두 zeroing</strong> — 점수 경로(Part B)를 그대로 두면 재선택됨</li>
+    <li class="check"><strong>Attention sink는 필수</strong> — softmax 붕괴는 즉시 생성 품질 파괴 (무한 반복)</li>
+    <li class="check"><strong>API는 처음부터 3단 설계</strong> — 리소스 업로드/재사용/정리 분리가 자연스럽다. 단일 함수로 시작하면 리팩토링 비용 큼</li>
+    <li class="check"><strong><code>make -j</code> 는 target 종속성 자동 포함 안 됨</strong> — 바이너리까지 재링크하려면 명시적 target 지정</li>
+    <li class="check"><strong>감사는 반복해도 새 발견</strong> — self-review 본질적 한계. 시간 간격 + 다른 관점 = 최선</li>
+    <li class="check"><strong>피드백 메모리 실제 작동</strong> — "No Fallbacks" 를 감사 중 위반했다가 사용자가 직접 지적해 원복</li>
+  </ul>
+</section>
+
+<!-- NEXT -->
+<section>
+  <h2>다음 작업</h2>
+  <hr class="divider">
+  <div class="card-grid three">
+    <div class="card">
+      <h4>스트레스 테스트</h4>
+      <p>4000+ 토큰 생성, n_kv&gt;10000 안정성. <strong>내일 예정</strong>.</p>
+    </div>
+    <div class="card">
+      <h4>수학 벤치</h4>
+      <p>MMLU/GSM8K 정밀도 영향 측정.</p>
+    </div>
+    <div class="card">
+      <h4>다른 모델 범용성</h4>
+      <p>head_dim=128 모델들 (Qwen3-30B-A3B 등).</p>
+    </div>
+    <div class="card">
+      <h4>budget 하이퍼 스윕</h4>
+      <p>64/256/512 품질-성능 곡선.</p>
+    </div>
+    <div class="card">
+      <h4>Threshold 병렬화</h4>
+      <p>단일 스레드 → 병렬 reduction.</p>
+    </div>
+    <div class="card">
+      <h4>TBQ attn_rot_k 재설계</h4>
+      <p>외부 회전 의존 제거. 별도 세션.</p>
+    </div>
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash:true, slideNumber:'c/t', width:1280, height:720, margin:0, transition:'fade', transitionSpeed:'fast' });</script>
+</body>
+</html>

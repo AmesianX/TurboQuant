@@ -337,6 +337,13 @@ class SettingsStore {
 			if (normalizedCurrent === normalizedDefault) {
 				this.userOverrides.delete(key);
 			}
+
+			// TurboQuant: write server-provided defaults (from CLI --temp/--top-p/etc)
+			// into config so they are actually sent in requests and visible in the UI,
+			// instead of relying on placeholder-only display + server-side fallback.
+			if (!this.userOverrides.has(key) && propsValue !== undefined) {
+				setConfigValue(this.config, key, propsValue);
+			}
 		}
 
 		// webui settings need actual values in config (no placeholder mechanism),

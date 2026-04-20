@@ -1,1 +1,4 @@
 .github/workflows/*.yml merge=ours
+README.md merge=ours
+README_KO.md merge=ours
+turboquant/** merge=ours

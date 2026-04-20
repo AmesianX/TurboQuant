@@ -95,6 +95,23 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
+    // AMX only supports head_dim=128 (coupled-RoPE: Qwen3, LLaMA, Mistral, etc.)
+    if ((type_k == GGML_TYPE_AMX3_1 || type_k == GGML_TYPE_AMXV3_1) && hparams.n_embd_head_k() != 128) {
+        throw std::runtime_error(
+            "amx3 only supports head_dim=128 (got " + std::to_string(hparams.n_embd_head_k()) + ").");
+    }
+    if ((type_v == GGML_TYPE_AMX3_1 || type_v == GGML_TYPE_AMXV3_1) && hparams.n_embd_head_v() != 128) {
+        throw std::runtime_error(
+            "amx3 only supports head_dim=128 for V (got " + std::to_string(hparams.n_embd_head_v()) + ").");
+    }
+    // AMX3_1 is K-only. AMXV3_1 is V-only.
+    if (type_v == GGML_TYPE_AMX3_1) {
+        throw std::runtime_error("amx3_1 is K-only. Use amxv3_1 (CLI: -ctv amx3) for V cache.");
+    }
+    if (type_k == GGML_TYPE_AMXV3_1) {
+        throw std::runtime_error("amxv3_1 is V-only. Use amx3_1 (CLI: -ctk amx3) for K cache.");
+    }
+
     // Note: TurboQuant head_dim auto-mapping (_0 → _1/_2) is done in llama_init_from_model()
     // before this constructor is called. No duplicate mapping needed here.
 
@@ -289,34 +306,30 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
     }
 
-    // TBQ types require WHT rotation regardless of variable GQA
-    // (WHT operates per-head, not per-GQA-group, so variable n_head_kv is fine)
-    // TBQX (Polar Derotate) does NOT use WHT — polar (r, φ) decomposition
-    // already gives the structure it needs, so it stays out of this list.
-    const bool is_tbq_k = type_k == GGML_TYPE_TBQ3_0  || type_k == GGML_TYPE_TBQ4_0
-                       || type_k == GGML_TYPE_TBQP3_0 || type_k == GGML_TYPE_TBQP4_0
-                       || type_k == GGML_TYPE_TBQ3_1  || type_k == GGML_TYPE_TBQ4_1
-                       || type_k == GGML_TYPE_TBQP3_1 || type_k == GGML_TYPE_TBQP4_1
-                       || type_k == GGML_TYPE_TBQ3_2  || type_k == GGML_TYPE_TBQ4_2
-                       || type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2
-                       || type_k == GGML_TYPE_TBQ3_4  || type_k == GGML_TYPE_TBQ4_4
-                       || type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4;
-    // is_tbq_v removed: V rotation disabled (IWHT decode has no inverse rotation)
-
-    // TBQP (QJL) types: disable attn_rot for K — QJL already provides its own random projection,
-    // triple rotation (attn_rot + WHT + QJL) is redundant. Benchmarked: OFF avg 37.0 > ON avg 35.4.
-    // TBQ (non-QJL) types: keep attn_rot — double rotation (attn_rot + WHT) helps decorrelation.
+    // All TBQ/TBQP/AMX encoders carry their own internal WHT (tbq_signs pattern +
+    // butterfly) inside set-rows / cpy-utils and mirror it in fattn-vec.  External
+    // attn_rot_k would therefore be a redundant second rotation — both operations
+    // cancel via Parseval between Q and K, but the extra pass costs compute and
+    // accumulates rounding error.  So: external rotation OFF for every TBQ* type.
+    const bool is_tbq_k  = type_k == GGML_TYPE_TBQ3_0  || type_k == GGML_TYPE_TBQ4_0
+                        || type_k == GGML_TYPE_TBQ3_1  || type_k == GGML_TYPE_TBQ4_1
+                        || type_k == GGML_TYPE_TBQ3_2  || type_k == GGML_TYPE_TBQ4_2
+                        || type_k == GGML_TYPE_TBQ3_3  || type_k == GGML_TYPE_TBQ4_3
+                        || type_k == GGML_TYPE_TBQ3_4  || type_k == GGML_TYPE_TBQ4_4;
     const bool is_tbqp_k = type_k == GGML_TYPE_TBQP3_0 || type_k == GGML_TYPE_TBQP4_0
                         || type_k == GGML_TYPE_TBQP3_1 || type_k == GGML_TYPE_TBQP4_1
                         || type_k == GGML_TYPE_TBQP3_2 || type_k == GGML_TYPE_TBQP4_2
+                        || type_k == GGML_TYPE_TBQP3_3 || type_k == GGML_TYPE_TBQP4_3
                         || type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4;
+    const bool is_amx_k  = type_k == GGML_TYPE_AMX3_1;
+    const bool is_internal_wht_k = is_tbq_k || is_tbqp_k || is_amx_k;
 
     attn_rot_k =
         !attn_rot_disable &&
-        !is_tbqp_k &&
+        !is_internal_wht_k &&
         n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
-        (is_tbq_k || !hparams.is_n_embd_k_gqa_variable()) &&
+        !hparams.is_n_embd_k_gqa_variable() &&
         hparams.n_embd_head_k() % 64 == 0;
 
     // V rotation disabled: IWHT decode path does not undo attn_rot,
@@ -1144,6 +1157,61 @@ bool llama_kv_cache::get_has_shift() const {
 
 ggml_type llama_kv_cache::type_k() const {
     return layers[0].k->type;
+}
+
+// Forward-declared in ggml-cuda/triattention.cuh — not pulled in here to avoid CUDA deps.
+struct llama_tria_stats;
+extern "C" float tria_layer_scale(struct llama_tria_stats * stats, int model_layer_idx);
+extern "C" void  tria_trigger_prepare(struct llama_tria_stats * stats, int n_kv, const int * host_key_pos);
+extern "C" void  tria_trigger_score_layer(struct llama_tria_stats * stats, int model_layer_idx,
+                                          void * K_cache_gpu, int n_kv, int cur_pos,
+                                          int budget, int keep_first);
+extern "C" void  tria_trigger_finish(struct llama_tria_stats * stats);
+
+bool llama_kv_cache::tria_score_maybe(struct llama_tria_stats * stats, int budget, int keep_first) const {
+    if (!stats || budget <= 0) return false;
+    if (layers.empty()) return false;
+    if (layers[0].k->type != GGML_TYPE_AMX3_1) return false;
+    if (n_stream != 1) return false;  // multi-stream not supported
+
+    const auto & cells = v_cells[0];
+    const uint32_t size = cells.size();
+
+    // Contiguous valid prefix [0, n_valid).
+    uint32_t n_valid = 0;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells.is_empty(i)) break;
+        n_valid++;
+    }
+    if (n_valid == 0) return false;
+
+    std::vector<int> host_pos(n_valid);
+    for (uint32_t i = 0; i < n_valid; ++i) {
+        host_pos[i] = (int)cells.pos_get(i);
+    }
+    const int cur_pos = host_pos[n_valid - 1];  // monotone insertion
+    if (cur_pos < 0) return false;
+
+    tria_trigger_prepare(stats, (int)n_valid, host_pos.data());
+
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto & layer = layers[il];
+        if (!layer.k) continue;
+        if (layer.k->type != GGML_TYPE_AMX3_1) continue;  // skip non-AMX3_1 layers
+        void * K_ptr = layer.k->data;
+        if (!K_ptr) continue;
+
+        const float scale = tria_layer_scale(stats, (int)layer.il);
+        int layer_budget = (int)(budget * scale);
+        if (layer_budget < 1) layer_budget = 1;
+
+        tria_trigger_score_layer(
+            stats, (int)layer.il, K_ptr,
+            (int)n_valid, cur_pos, layer_budget, keep_first);
+    }
+
+    tria_trigger_finish(stats);
+    return true;
 }
 
 ggml_type llama_kv_cache::type_v() const {

@@ -9,6 +9,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "llama-kv-cache.h"
 #include "llama.h"
 
 #include <cinttypes>
@@ -1878,6 +1879,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    if (tria_stats && tria_budget > 0) {
+        tria_counter += batch_inp.n_tokens;
+        if (tria_counter >= tria_interval) {
+            tria_counter = 0;
+            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            if (kv) {
+                synchronize();
+                kv->tria_score_maybe(tria_stats, tria_budget, tria_keep_first);
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -3058,6 +3071,26 @@ llama_context * llama_new_context_with_model(
 
 void llama_free(llama_context * ctx) {
     delete ctx;
+}
+
+void llama_context::tria_set(struct llama_tria_stats * stats, int32_t budget, int32_t interval, int32_t keep_first) {
+    tria_stats      = stats;
+    tria_budget     = budget;
+    tria_interval   = (interval > 0) ? interval : 128;
+    tria_keep_first = (keep_first >= 0) ? keep_first : 0;
+    tria_counter    = 0;
+    LLAMA_LOG_INFO("%s: TriAttention attached (budget=%d interval=%d keep_first=%d stats=%p)\n",
+            __func__, budget, tria_interval, tria_keep_first, (void *)stats);
+}
+
+void llama_tria_attach(
+        struct llama_context    * ctx,
+        struct llama_tria_stats * stats,
+        int32_t                   budget,
+        int32_t                   interval,
+        int32_t                   keep_first) {
+    if (!ctx) return;
+    ctx->tria_set(stats, budget, interval, keep_first);
 }
 
 uint32_t llama_n_ctx(const llama_context * ctx) {

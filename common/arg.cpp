@@ -403,22 +403,33 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TBQ4_2,
     GGML_TYPE_TBQP3_2,
     GGML_TYPE_TBQP4_2,
-    GGML_TYPE_TBQX3_1,
+    GGML_TYPE_AMX3_1,
+    GGML_TYPE_AMXV3_1,
 };
 
-static ggml_type kv_cache_type_from_str(const std::string & s) {
+static ggml_type kv_cache_type_from_str(const std::string & s, bool is_v = false) {
     // TurboQuant shorthand: "tbq3" → tbq3_0 (resolved to correct _N by head_dim later)
-    // Users don't need to know about _0/_1/_2 suffixes
-    static const std::unordered_map<std::string, ggml_type> tbq_shortcuts = {
+    // Users don't need to know about _0/_1/_2 suffixes.
+    // "amx3" maps to different enums depending on K vs V context:
+    //   -ctk amx3 → AMX3_1  (K: 128-WHT + polar + cosine-optimal)
+    //   -ctv amx3 → AMXV3_1 (V: WHT + 3-bit Lloyd-Max, optimization 후추가 예정)
+    static const std::unordered_map<std::string, ggml_type> tbq_shortcuts_k = {
         {"tbq3",  GGML_TYPE_TBQ3_0},
         {"tbq4",  GGML_TYPE_TBQ4_0},
         {"tbqp3", GGML_TYPE_TBQP3_0},
         {"tbqp4", GGML_TYPE_TBQP4_0},
-        // TBQX (Polar Derotate) — only D=128 variant exists for now.
-        {"tbqx3",  GGML_TYPE_TBQX3_1},
+        {"amx3",  GGML_TYPE_AMX3_1},
     };
-    auto it = tbq_shortcuts.find(s);
-    if (it != tbq_shortcuts.end()) {
+    static const std::unordered_map<std::string, ggml_type> tbq_shortcuts_v = {
+        {"tbq3",  GGML_TYPE_TBQ3_0},
+        {"tbq4",  GGML_TYPE_TBQ4_0},
+        {"tbqp3", GGML_TYPE_TBQP3_0},
+        {"tbqp4", GGML_TYPE_TBQP4_0},
+        {"amx3",  GGML_TYPE_AMXV3_1},
+    };
+    const auto & shortcuts = is_v ? tbq_shortcuts_v : tbq_shortcuts_k;
+    auto it = shortcuts.find(s);
+    if (it != shortcuts.end()) {
         return it->second;
     }
     for (const auto & type : kv_cache_types) {
@@ -435,6 +446,7 @@ static std::string get_all_kv_cache_types() {
     static const std::unordered_map<ggml_type, std::string> tbq_display = {
         {GGML_TYPE_TBQ3_0,  "tbq3"},   {GGML_TYPE_TBQ4_0,  "tbq4"},
         {GGML_TYPE_TBQP3_0, "tbqp3"},  {GGML_TYPE_TBQP4_0, "tbqp4"},
+        {GGML_TYPE_AMX3_1,  "amx3"},   {GGML_TYPE_AMXV3_1, "amx3"},
     };
     std::set<std::string> seen_tbq;
     std::ostringstream msg;
@@ -449,7 +461,8 @@ static std::string get_all_kv_cache_types() {
         } else {
             // Skip internal TBQ subtypes (_1, _2, _3, _4) from display
             std::string raw = ggml_type_name(type);
-            if (raw.find("tbq") != std::string::npos || raw.find("tbqp") != std::string::npos) continue;
+            if (raw.find("tbq") != std::string::npos || raw.find("tbqp") != std::string::npos
+                || raw.find("amx") != std::string::npos) continue;
             name = raw;
         }
         if (!first) msg << ", ";
@@ -2065,9 +2078,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            params.cache_type_k = kv_cache_type_from_str(value, /*is_v=*/false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
+    add_opt(common_arg(
+        {"--triattention"}, "FILE",
+        "TriAttention calibration stats file (TRIA v2). Enables Top-B KV eviction on AMX3_1 K cache.",
+        [](common_params & params, const std::string & value) {
+            params.triattention_stats_path = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tri-budget"}, "N",
+        string_format("TriAttention per-KV-head Top-B budget (default: %d, 0 = disabled)", params.triattention_budget),
+        [](common_params & params, int value) {
+            params.triattention_budget = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tri-interval"}, "N",
+        string_format("TriAttention scoring trigger interval in tokens (default: %d)", params.triattention_interval),
+        [](common_params & params, int value) {
+            params.triattention_interval = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tri-keep-first"}, "N",
+        string_format("TriAttention attention-sink size — first N slots always kept (default: %d)", params.triattention_keep_first),
+        [](common_params & params, int value) {
+            params.triattention_keep_first = value;
+        }
+    ));
     add_opt(common_arg(
         {"-ctv", "--cache-type-v"}, "TYPE",
         string_format(
@@ -2078,7 +2119,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_v = kv_cache_type_from_str(value);
+            params.cache_type_v = kv_cache_type_from_str(value, /*is_v=*/true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
@@ -3613,7 +3654,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.speculative.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.cache_type_k = kv_cache_type_from_str(value);
+            params.speculative.cache_type_k = kv_cache_type_from_str(value, /*is_v=*/false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K_DRAFT"));
     add_opt(common_arg(
@@ -3626,7 +3667,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.speculative.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.cache_type_v = kv_cache_type_from_str(value);
+            params.speculative.cache_type_v = kv_cache_type_from_str(value, /*is_v=*/true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_DRAFT"));
 

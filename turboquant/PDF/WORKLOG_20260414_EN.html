@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Worklog 2026-04-14~15 · v1.6.0</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root {
+    --bg: #fafbfc;
+    --fg: #1a1a2e;
+    --accent: #3b82f6;
+    --accent2: #8b5cf6;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --muted: #64748b;
+    --card-bg: #ffffff;
+    --border: #e2e8f0;
+  }
+  .reveal { font-family: 'Inter', sans-serif; font-size: 28px; color: var(--fg); letter-spacing: -0.01em; line-height: 1.55; }
+  .reveal .slides { text-align: left; }
+  .reveal .slides section { padding: 36px 50px; box-sizing: border-box; }
+  .reveal h1, .reveal h2, .reveal h3 { font-family: 'Inter', sans-serif; font-weight: 700; color: var(--fg); text-transform: none; letter-spacing: -0.02em; }
+  .reveal h1 { font-size: 2.0em; margin-bottom: 0.2em; }
+  .reveal h2 { font-size: 1.3em; margin-bottom: 0.4em; }
+  .reveal h3 { font-size: 1.0em; margin-bottom: 0.3em; color: var(--accent); }
+  .cover { text-align: center !important; display: flex !important; flex-direction: column; align-items: center; justify-content: center; }
+  .cover h1 { font-size: 2.2em; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin-bottom: 0.1em; }
+  .cover .subtitle { font-size: 1.0em; color: var(--muted); font-weight: 300; margin-bottom: 1.5em; }
+  .cover .meta { font-size: 0.7em; color: var(--muted); line-height: 1.8; }
+  .cover .meta span { display: inline-block; background: #f1f5f9; padding: 4px 14px; border-radius: 20px; margin: 3px 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; }
+  .divider { width: 60px; height: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); border: none; border-radius: 2px; margin: 8px 0 16px 0; }
+  .cover .divider { margin: 10px auto 20px auto; }
+  .tag { display: inline-block; font-size: 0.5em; font-weight: 500; padding: 2px 10px; border-radius: 12px; vertical-align: middle; margin-left: 8px; }
+  .tag-blue { background: #dbeafe; color: #1d4ed8; }
+  .tag-green { background: #d1fae5; color: #065f46; }
+  .tag-red { background: #fee2e2; color: #991b1b; }
+  .tag-yellow { background: #fef3c7; color: #92400e; }
+  .tag-purple { background: #ede9fe; color: #5b21b6; }
+  .items { list-style: none; padding: 0; margin: 0; }
+  .items li { position: relative; padding-left: 20px; margin-bottom: 8px; font-size: 0.72em; line-height: 1.65; }
+  .items li::before { content: ''; position: absolute; left: 0; top: 10px; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); opacity: 0.6; }
+  .items li.check::before { background: var(--success); opacity: 1; border-radius: 50%; }
+  .items li.warn::before { background: var(--warning); opacity: 1; }
+  .items li.fail::before { background: var(--danger); opacity: 1; border-radius: 50%; }
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 10px; }
+  .card-grid.three { grid-template-columns: 1fr 1fr 1fr; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin: 0 0 6px 0; font-size: 0.72em; font-weight: 700; color: var(--fg); }
+  .card p, .card ul { margin: 0; font-size: 0.62em; line-height: 1.6; color: #475569; }
+  .card ul { padding-left: 16px; }
+  .highlight-box { border-left: 4px solid; border-radius: 6px; padding: 10px 16px; margin: 10px 0; font-size: 0.72em; line-height: 1.6; }
+  .highlight-box.blue { border-color: var(--accent); background: #eff6ff; }
+  .highlight-box.green { border-color: var(--success); background: #ecfdf5; }
+  .highlight-box.red { border-color: var(--danger); background: #fef2f2; }
+  .highlight-box.yellow { border-color: var(--warning); background: #fffbeb; }
+  .highlight-box.purple { border-color: var(--accent2); background: #f5f3ff; }
+  .reveal code { font-family: 'JetBrains Mono', monospace; font-size: 0.88em; background: #f1f5f9; padding: 1px 6px; border-radius: 4px; color: var(--accent2); }
+  .reveal table { width: 100%; border-collapse: collapse; font-size: 0.62em; margin-top: 8px; table-layout: fixed; }
+  .reveal table th { background: #f8fafc; font-weight: 600; text-align: left; padding: 7px 10px; border-bottom: 2px solid var(--border); color: var(--muted); font-size: 0.88em; text-transform: uppercase; letter-spacing: 0.05em; }
+  .reveal table td { padding: 7px 10px; border-bottom: 1px solid var(--border); line-height: 1.5; }
+  .reveal table tr:last-child td { border-bottom: none; }
+  .reveal table .ok { color: var(--success); font-weight: 600; }
+  .reveal table .ng { color: var(--danger); font-weight: 600; }
+  .reveal table .mid { color: var(--warning); font-weight: 600; }
+  @media print { .reveal .slides section { page-break-after: always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<section class="cover">
+  <h1>TurboQuant v1.6.0</h1>
+  <p class="subtitle">Polar Derotate + Tangent Residual Breakthrough</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-14 ~ 04-15</span>
+    <span>Qwen3-14B</span>
+    <span>TBQX3_1 · 3.625 bpw</span>
+    <br>
+    <span>Math +20% vs f16</span>
+    <span>4.74x compression</span>
+    <span>v1.6.0 release</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<section>
+  <h2>Session Overview</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>Goal</h4>
+      <p>End-to-end coupled-RoPE K-cache polar derotate.<br>Match f16 quality at 3 bpw.</p>
+    </div>
+    <div class="card">
+      <h4>Outcome</h4>
+      <p>TBQX3_1 <strong>3.625 bpw · 4.74x compression</strong>.<br>Qwen3-14B math bench <strong>beats f16</strong> (37.1% vs 34.3%).</p>
+    </div>
+    <div class="card">
+      <h4>Math breakthrough</h4>
+      <p><strong>Tangent Residual</strong> — "residual lives on tangent" insight.<br>4.25 bpw Direct Signs → 3.625 bpw.</p>
+    </div>
+    <div class="card">
+      <h4>Hardware mystery</h4>
+      <p>DGX Spark silent freeze root cause: <strong>85°C thermal cutoff</strong>.<br>All software hypotheses were red herrings.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>TBQX3_1 Block Structure <span class="tag tag-green">3.625 bpw</span></h2>
+  <hr class="divider">
+  <div class="highlight-box blue">
+    <strong>Store in pre-RoPE (polar) domain + restore via re-rotation.</strong> Decouple RoPE coupling before quantization.
+  </div>
+  <table>
+    <colgroup><col style="width:22%"><col style="width:18%"><col style="width:60%"></colgroup>
+    <tr><th>Field</th><th>Size</th><th>Role</th></tr>
+    <tr><td><code>d_r</code></td><td>2 B</td><td>Rayleigh σ estimate (per-block scale)</td></tr>
+    <tr><td><code>qr[24]</code></td><td>24 B</td><td>3-bit Rayleigh Lloyd-Max r indices (64 pairs)</td></tr>
+    <tr><td><code>qphi[24]</code></td><td>24 B</td><td>4-bit uniform φ indices (angular π/8 resolution)</td></tr>
+    <tr><td><code>qtan[8]</code></td><td>8 B</td><td><strong>1-bit tangent residual</strong> (NEW) · φ error ±π/16</td></tr>
+  </table>
+  <p style="font-size:0.68em; color:var(--muted); margin-top:8px;">13 files modified: ggml.h, ggml-common.h, cpy-utils.cuh, fattn-common.cuh, fattn-vec.cuh, set-rows.cu, fattn.cu, ggml-cuda.cu, ggml.c, arg.cpp, common.cpp, CMakeLists, new template instances</p>
+</section>
+
+<section>
+  <h2>🔑 Tangent Residual Math Breakthrough</h2>
+  <hr class="divider">
+  <div class="highlight-box purple">
+    <strong>Observation:</strong> After Rayleigh Lloyd-Max, residual error lies almost entirely along the tangent direction <code>(-sin φ̂, cos φ̂)</code>
+  </div>
+  <div class="card-grid">
+    <div class="card">
+      <h4>Analytic magnitude</h4>
+      <p><code>r · π/16</code> — half-width of a 3-bit cell.<br>No per-block metadata required.</p>
+    </div>
+    <div class="card">
+      <h4>Direction is free</h4>
+      <p>Obtained by coordinate swap of <code>cos/sin</code> already computed during dequant.</p>
+    </div>
+    <div class="card">
+      <h4>Cost</h4>
+      <p><strong>1 bit per pair</strong> (qtan[8]) + 2 FMA ops on read.</p>
+    </div>
+    <div class="card">
+      <h4>Effect</h4>
+      <p>φ error ±π/8 → <strong>±π/16</strong> (22.5° → 11.25°).</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>3 Discarded Variants <span class="tag tag-red">removed</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:22%"><col style="width:14%"><col style="width:64%"></colgroup>
+    <tr><th>Variant</th><th>bpw</th><th>Reason for removal</th></tr>
+    <tr><td><strong>TBQXP3_1</strong></td><td>4.25</td><td>Direct Signs residual. <strong>Tangent Residual achieves same quality with 1 bit</strong>. Overpaid — removed.</td></tr>
+    <tr><td><strong>TBQX2_1</strong></td><td>2.625</td><td>2-bit quadrant angle. π/2 resolution below attention top-1 margin. Qwen3-14B output collapsed to "Hangul" repetition. Removed.</td></tr>
+    <tr><td><strong>WHT + Polar</strong></td><td>—</td><td>Per-cell Q WHT costs <strong>10× more</strong>. Tangent Residual fixes the same drift cheaper. Abandoned.</td></tr>
+  </table>
+  <div class="highlight-box yellow">
+    <strong>Polar vs WHT cannot combine</strong>: polar preserves angular structure (math reasoning), WHT disperses outliers (prose). Different optimization domains.
+  </div>
+</section>
+
+<section>
+  <h2>Math Bench Results <span class="tag tag-blue">Qwen3-14B · seed 1234</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:24%"><col style="width:26%"><col style="width:14%"><col style="width:20%"><col style="width:16%"></colgroup>
+    <tr><th>Config</th><th>KV buffer</th><th>t/s</th><th>Math /35</th><th>Compression</th></tr>
+    <tr><td>f16 / f16</td><td>6400 MiB</td><td>24–25</td><td class="mid">12 (34.3%)</td><td>1.00x</td></tr>
+    <tr><td><strong>tbqx3 / tbq3</strong></td><td><strong>1350 MiB</strong></td><td>21–22</td><td class="ok"><strong>13 (37.1%)</strong></td><td><strong>4.74x</strong></td></tr>
+    <tr><td>tbq3 / tbq3</td><td>1250 MiB</td><td>21–22</td><td class="ng">10 (28.6%)</td><td>5.12x</td></tr>
+  </table>
+  <div class="highlight-box green">
+    <strong>Multi-seed average:</strong> tbqx3 <strong>vs f16 ≈ +20%</strong>, vs tbq3 ≈ +35%. seed 52 was a tie.<br>
+    <strong>Cyrillic drift cured:</strong> Pauli/Schrödinger transliteration queries no longer mix Cyrillic — pure Korean output.
+  </div>
+</section>
+
+<section>
+  <h2>Pauli Transliteration Test <span class="tag tag-purple">qualitative</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="check"><strong>f16 / f16:</strong> "바울리" — model limit (Korean only)</li>
+    <li class="fail"><strong>tbqx3 / tbq3 (bare):</strong> "와оль프강 폴리" — <strong>Cyrillic drift</strong></li>
+    <li class="check"><strong>tbqx3 / tbq3 + tangent:</strong> "와인하르트 폴리" — drift gone, still model limit</li>
+  </ul>
+  <div class="highlight-box yellow">
+    <strong>Conclusion:</strong> Pauli test is ultimately bounded by model capability, so it's unsuitable as a quantization quality metric. Subsequent focus shifted to math bench.
+  </div>
+</section>
+
+<section>
+  <h2>DGX Spark Silent Freeze Resolved <span class="tag tag-red">hardware</span></h2>
+  <hr class="divider">
+  <div class="highlight-box red">
+    Previous hypotheses <strong>all red herrings</strong>: build_rope_shift / set_rows local memory / memdesc exhaustion
+  </div>
+  <div class="card-grid">
+    <div class="card">
+      <h4>Actual cause</h4>
+      <p><strong>GB10 SoC 85°C firmware cutoff.</strong><br>A silent freeze invisible to software.</p>
+    </div>
+    <div class="card">
+      <h4>Fix</h4>
+      <p>Hardware voltage reduction → steady-state <strong>low 70°C</strong>.</p>
+    </div>
+  </div>
+  <div class="highlight-box blue">
+    <strong>Lesson:</strong> Silent hardware failure is a first-class failure mode. <strong>Check temperature before software bisection</strong>.
+  </div>
+</section>
+
+<section>
+  <h2>Paper Update <span class="tag tag-blue">EN + KO</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="check"><strong>Rayleigh Lloyd-Max subsection</strong> new — analytic derivation + σ estimation</li>
+    <li class="check"><strong>Tangent Residual subsection</strong> new — math derivation + figure</li>
+    <li class="check"><strong>Evaluation:</strong> Phase 1-4 plan → measured-result tables × 3</li>
+    <li class="check"><strong>Research Roadmap: Dead Ends section</strong> — TBQXP3_1 / TBQX2_1 / WHT+polar / calibration / thermal</li>
+    <li class="warn"><strong>Typography:</strong> pdflatex → <code>xelatex + fontspec(TeX Gyre Termes) + microtype + xeCJK/kotex</code></li>
+    <li class="check"><strong>Korean rewrite</strong> — removed English-direct-translation feel, natural Korean prose</li>
+    <li class="check">PDF <strong>12 pages (EN), 10 pages (KO)</strong>, linked from 4 READMEs</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Issue #19 Response <span class="tag tag-yellow">existential challenge</span></h2>
+  <hr class="divider">
+  <div class="highlight-box red">
+    <strong>cutlerbenjamin1-cmd attack:</strong> "All TBQ variants lose to q4_0 on self-cosine / Spearman / top-5, and are 30–70% slower"
+  </div>
+  <div class="card-grid">
+    <div class="card">
+      <h4>Response stance</h4>
+      <ul>
+        <li>Acknowledge q4_0 competition head-on</li>
+        <li>Admit evaluation coverage gap</li>
+        <li>Request harness sharing</li>
+        <li>Request v1.6.0 TBQX3_1 re-measurement</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Technical correction</h4>
+      <ul>
+        <li>QJL diagnosis fixed (tbq_signs hardcoded, tbq4_1 no QJL)</li>
+        <li>v1.5.2 half2→float fix retained</li>
+        <li>head_dim 128 only verified, 256/512 unvalidated</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Release CI Workflow Fix <span class="tag tag-green">resolved</span></h2>
+  <hr class="divider">
+  <div class="highlight-box red">
+    <strong>Symptom:</strong> libggml-cuda.so undefined reference to <code>cuMemMap</code>, <code>cuMemCreate</code>, <code>cuDeviceGet</code>...<br>
+    <strong>Root cause:</strong> libcuda stub lives outside standard path in nvidia/cuda devel image (<code>/usr/local/cuda/lib64/stubs/</code>)
+  </div>
+  <ul class="items">
+    <li class="fail"><strong>1st attempt (failed):</strong> <code>CMAKE_EXE_LINKER_FLAGS="-L/stubs -Wl,-rpath-link,/stubs"</code> — rpath-link is meaningless without DT_NEEDED</li>
+    <li class="check"><strong>2nd attempt (worked):</strong> Docker script adds <code>ln -sf /stubs/libcuda.so /usr/lib/libcuda.so.1</code> — CMake find_library + ld auto-discover</li>
+  </ul>
+  <div class="highlight-box green">
+    <strong>Result:</strong> Run #24422871815 — <strong>all Windows 6 + Linux 5 + aarch64 successful</strong>, v1.6.0 release uploaded <strong>12 binaries</strong>.
+  </div>
+</section>
+
+<section>
+  <h2>Commit Summary <span class="tag tag-blue">9 commits</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:24%"><col style="width:76%"></colgroup>
+    <tr><th>Hash</th><th>Description</th></tr>
+    <tr><td><code>c7ba61d46</code></td><td>feat(tbqx3): tangent residual correction + remove failed variants</td></tr>
+    <tr><td><code>1e84ec35a</code></td><td>docs(paper): Polar Derotate paper EN/KO + README links</td></tr>
+    <tr><td><code>2e3c26c73</code></td><td>docs(paper): fix PDF typography (fontspec + microtype + table*)</td></tr>
+    <tr><td><code>46b93143a</code></td><td>docs(paper): fix column overflow (Rayleigh, verbatim, tangent eq)</td></tr>
+    <tr><td><code>2fb6c5cd6</code></td><td>chore(paper): remove tracked intermediates, add .gitignore</td></tr>
+    <tr><td><code>b7aaf0086</code></td><td>docs(readme): note TBQX3_1 is VEC-only, MMA port pending</td></tr>
+    <tr><td><code>9c54860fe</code></td><td>docs(paper-ko): soften stiff Korean prose</td></tr>
+    <tr><td><code>97a199fd0</code></td><td>ci(linux): symlink libcuda stub (final fix)</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>Key Lessons <span class="tag tag-purple">retrospective</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="check"><strong>Math breakthroughs are simple</strong> — Tangent Residual was a one-sentence insight ("residual lives on the tangent"). 4.25 bpw → 3.625 bpw from one line of math</li>
+    <li class="check"><strong>Failed research has documentation value</strong> — 5 dead ends + thermal episode narrowed the design space</li>
+    <li class="check"><strong>Silent hardware failure is first-class</strong> — check temperature before software bisection</li>
+    <li class="check"><strong>Polar vs tbq are different optimization domains</strong> — polar = angular (math), tbq-WHT = outlier (prose). Cannot combine (per-cell WHT is 10× cost)</li>
+    <li class="check"><strong>Paper prose needs to be rewritten, not translated</strong> — direct English-to-Korean translation fails; write from scratch in natural Korean</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Next Work</h2>
+  <hr class="divider">
+  <div class="card-grid three">
+    <div class="card">
+      <h4>TBQX3_1 MMA port</h4>
+      <p>Currently vec only 0.87× f16. MMA port restores full speed. <strong>Top priority</strong>.</p>
+    </div>
+    <div class="card">
+      <h4>q4_0 direct bench</h4>
+      <p>Issue #19 challenge. Validate project's raison d'être.</p>
+    </div>
+    <div class="card">
+      <h4>head_dim determinism</h4>
+      <p>256/512 unvalidated. Audit V_DOT2 undef + set_rows σ reduction.</p>
+    </div>
+    <div class="card">
+      <h4>CI determinism regression</h4>
+      <p>Add automated regression test (Issue #19 suggestion).</p>
+    </div>
+    <div class="card">
+      <h4>PPL error bar re-measure</h4>
+      <p>Run again with proper error bars.</p>
+    </div>
+    <div class="card">
+      <h4>Upstream rebase</h4>
+      <p>24 commits behind. FA-side changes may conflict.</p>
+    </div>
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash:true, slideNumber:'c/t', width:1280, height:720, margin:0, transition:'fade', transitionSpeed:'fast' });</script>
+</body>
+</html>

@@ -1044,10 +1044,16 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(block_tbqp4_4),
         .is_quantized             = true,
     },
-    [GGML_TYPE_TBQX3_1] = {
-        .type_name                = "tbqx3_1",
+    [GGML_TYPE_AMX3_1] = {
+        .type_name                = "amx3_1",
         .blck_size                = TBQ_K128,
-        .type_size                = sizeof(block_tbqx3_1),
+        .type_size                = sizeof(block_amx3_1),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_AMXV3_1] = {
+        .type_name                = "amxv3_1",
+        .blck_size                = TBQ_K128,
+        .type_size                = sizeof(block_amxv3_1),
         .is_quantized             = true,
     },
 };

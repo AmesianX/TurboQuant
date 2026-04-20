@@ -972,6 +972,42 @@ static __device__ __forceinline__ void dequantize_V_tbq3_1(const void * __restri
     }
 }
 
+// AMXV3_1 dequantize: tbq3_1 동치 (WHT + 3-bit Gaussian Lloyd-Max).
+// Read-side 는 block_amxv3_1 과 block_tbq3_1 이 동일 레이아웃이라 tbq3_1 과 동일 로직.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_amxv3_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_amxv3_1 * x = (const block_amxv3_1 *) vx;
+    static constexpr float c3[8] = {
+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
+    };
+
+    const int64_t ib = i0 / TBQ_K128;
+    const int elem = i0 % TBQ_K128;
+    const float norm = __half2float(x[ib].d);
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int e = elem + l;
+        const int bp = e * 3;
+        const int by = bp >> 3;
+        int start_byte = by & ~1;
+        if (start_byte > (int)(TBQ_K128*3/8) - 4) start_byte = (int)(TBQ_K128*3/8) - 4;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &x[ib].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp - (start_byte << 3);
+        const float cent = c3[(qs_word_u >> bit_in_word) & 0x7] * norm;
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l] = cent;
+        }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l] = __float2half(cent);
+        }
+#endif
+    }
+}
+
 // TBQP3_1: fused MSE + Direct Sign score (128-block)
 // Direct Sign: sign(residual) stored directly, no SRHT — uses Q_v (MSE query) instead of Q_ds
 // Memory pattern: 4-byte aligned int loads via ggml_cuda_memcpy_1 (matches q4_0/q5_0 pattern)
@@ -1198,81 +1234,38 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_1(
     return norm * sum;
 }
 
-// TBQX3_1: Polar Derotate 3-bit attention score (head_dim=128).
-// Block stores per-pair (r, φ_content) where φ_content = φ_post − pos·freq_i.
-// r uses Rayleigh Lloyd-Max codebook with per-block σ scale.
-// At read time: φ_full = φ_content + cell_pos·freq_i, reconstruct (kx,ky)
-// via __sincosf, and dot with raw Q (Q_v is post-rope Q in pair layout where
-// slot k holds (Q[k], Q[k + n_pairs])).
-//
-// freq_table is a shmem-resident fp32 array pre-computed once per kernel
-// at the outer fattn-vec kernel start (s_tbqx_freq). pos·freq_i is computed
-// in fp32 — for cell_pos ≤ ~2^23 (8M tokens) precision is exact integer.
+// AMX3_1 FA path (Part A only): WHT-quantized K → tbq3_1 동치 fused Q·K.
+// Part B (polar) 는 TriAttention scoring kernel 이 별도로 읽음.
 template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqx3_1_pos(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v,
-    int cell_pos, const float * __restrict__ freq_table) {
-    const block_tbqx3_1 * K_tbq = (const block_tbqx3_1 *) K_c;
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_amx3_1(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_amx3_1 * K_amx = (const block_amx3_1 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
 
-    constexpr int n_pairs = D / 2;  // 64
-    constexpr float TWO_PI     = 6.28318530717958647692f;
-    constexpr float PI         = 3.14159265358979323846f;
-    constexpr float INV_TWO_PI = 1.0f / TWO_PI;
-
-    // Mirror of TBQX_R_CENT in cpy-utils.cuh — Rayleigh Lloyd-Max 8-level.
-    static constexpr float r_cent[8] = {
-        0.2400f, 0.6160f, 0.9420f, 1.2547f, 1.5685f, 1.8946f, 2.2520f, 2.6650f
+    static constexpr float c3[8] = {
+        -2.1520f, -1.3440f, -0.7560f, -0.2451f,
+         0.2451f,  0.7560f,  1.3440f,  2.1520f,
     };
 
-    const float sigma = __half2float(K_tbq[0].d_r);
+    const float norm = __half2float(K_amx[0].d_wht);
     float sum = 0.0f;
 
     #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < n_pairs; k_KQ_0 += nthreads) {
-        const int p = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = k * 2;
 
-        // Unpack 3-bit r and phi indices for pair p.
-        const int bp = p * 3;
-        const int byte_idx = bp >> 3;
-        int start_byte = byte_idx & ~1;
-        if (start_byte > (int)(TBQ_K128*3/16) - 4) start_byte = (int)(TBQ_K128*3/16) - 4; // qr is 24 bytes
-        int qr_word;
-        ggml_cuda_memcpy_1<sizeof(int), 2>(&qr_word, &K_tbq[0].qr[start_byte]);
-        int qphi_word;
-        ggml_cuda_memcpy_1<sizeof(int), 2>(&qphi_word, &K_tbq[0].qphi[start_byte]);
-        const int bit_in_word = bp - (start_byte << 3);
-        const int r_idx   = ((uint32_t) qr_word   >> bit_in_word) & 0x7;
-        const int phi_idx = ((uint32_t) qphi_word >> bit_in_word) & 0x7;
-
-        // Dequant: r = sigma * Lloyd-Max centroid.
-        // phi_content mid-point of 8 uniform bins on [-π, π).
-        const float r           = sigma * r_cent[r_idx];
-        const float phi_content = ((phi_idx + 0.5f) * (1.0f / 8.0f)) * TWO_PI - PI;
-
-        // Re-rotate by pos·freq_i — fp32 only, freq_i broadcast-read from shmem.
-        const float freq_i = freq_table[p];
-        float theta = (float)cell_pos * freq_i;
-        // Wrap into [-π, π) — manual modular reduction (cheap, no fp64).
-        theta -= TWO_PI * floorf(theta * INV_TWO_PI + 0.5f);
-        float phi_full = phi_content + theta;
-        // Phi_content already in [-π,π); after add theta is in [-π,π); sum in
-        // [-2π, 2π). One more wrap step.
-        phi_full -= TWO_PI * floorf(phi_full * INV_TWO_PI + 0.5f);
-
-        float sin_p, cos_p;
-        __sincosf(phi_full, &sin_p, &cos_p);  // fast intrinsic
-        float kx = r * cos_p;
-        float ky = r * sin_p;
-
-        // Tangent residual: analytical half-cell correction in the φ tangent direction.
-        //   K_ref = K_polar + r·(π/16)·sign_dφ·(-sin φ_full, cos φ_full)
-        // Reuses cos_p/sin_p — no extra sincos. sign bit stored at qtan bit p.
-        constexpr float TANG_MAG = 0.19634954084936207f; // π/16
-        const int tan_bit = (K_tbq[0].qtan[p >> 3] >> (p & 7)) & 1;
-        const float tan_sign = tan_bit ? 1.0f : -1.0f;
-        const float tan_scale = r * TANG_MAG * tan_sign;
-        kx += tan_scale * (-sin_p);
-        ky += tan_scale * ( cos_p);
+        const int bp0 = elem * 3;
+        const int byte_idx0 = bp0 >> 3;
+        int start_byte = byte_idx0 & ~1;
+        if (start_byte > (int)(TBQ_K128*3/8) - 4) start_byte = (int)(TBQ_K128*3/8) - 4;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K_amx[0].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp0 - (start_byte << 3);
+        const float cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+        const float cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
@@ -1280,23 +1273,10 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqx3_1_pos(
         const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
 #endif
 
-        // Q_v layout for TBQX3_1: slot p = (Q_post[p], Q_post[p + n_pairs])
-        sum += q.x * kx + q.y * ky;
+        sum += q.x * cent0 + q.y * cent1;
     }
 
-    return sum;
-}
-
-// Stub matching the standard vec_dot_KQ_t signature so get_vec_dot_KQ
-// dispatch still compiles. The actual TBQX3_1 path bypasses this.
-template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqx3_1(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-    GGML_UNUSED(K_c);
-    GGML_UNUSED(Q_v);
-    GGML_UNUSED(Q_q8);
-    GGML_UNUSED(Q_ds_v);
-    return 0.0f;
+    return norm * sum;
 }
 
 // ============================================================
@@ -1929,8 +1909,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_tbq4_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQ3_1) {
         return vec_dot_fattn_vec_KQ_tbq3_1<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_TBQX3_1) {
-        return vec_dot_fattn_vec_KQ_tbqx3_1<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_AMX3_1) {
+        return vec_dot_fattn_vec_KQ_amx3_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP3_1) {
         return vec_dot_fattn_vec_KQ_tbqp3_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP4_1) {
@@ -2001,6 +1981,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_tbq4_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ3_1) {
         return dequantize_V_tbq3_1<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_AMXV3_1) {
+        return dequantize_V_amxv3_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ4_2) {
         return dequantize_V_tbq4_2<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ3_2) {

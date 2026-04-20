@@ -348,19 +348,29 @@ typedef struct {
 } block_tbqp4_1;
 static_assert(sizeof(block_tbqp4_1) == 2*sizeof(ggml_half) + TBQ_K128*3/8 + TBQ_K128/8, "wrong tbqp4_1 block size/padding");
 
-// TurboQuant Polar Derotate 3-bit + Tangent Residual, 128-block: ~3.625 bpw
-// Per pair (i, i+D/2):
-//   r           — Rayleigh Lloyd-Max 3-bit (24 bytes)
-//   φ_content   — uniform 3-bit over [-π,π) (24 bytes)
-//   sign(Δφ)    — 1-bit tangent residual sign (8 bytes)
-// At read time: K = K_polar + r·(π/16)·sign·(-sin φ, cos φ)  [analytical half-cell]
+// AMX K-side 128-block: Hybrid (WHT FA-path + Polar Derotate TriAttention-path) 108B = 6.75 bpw.
+// Part A (FA attention) — tbq3_1 동치: post-RoPE K → WHT → 3-bit Lloyd-Max
+//   d_wht (2B) + qs[48] 3-bit scalar (48B) = 50B
+// Part B (TriAttention scoring) — pre-RoPE polar: derotate → (r, φ_content) → 3r + 4φ
+//   d_r (2B) + qr[24] 3-bit Rayleigh (24B) + qphi[32] 4-bit uniform (32B) = 58B
+// TriAttention 50% retention 시 effective 3.375 bpw.
 typedef struct {
-    ggml_half d_r;
-    uint8_t qr  [TBQ_K128*3/16]; // 3-bit packed r indices
-    uint8_t qphi[TBQ_K128*3/16]; // 3-bit packed φ indices
-    uint8_t qtan[TBQ_K128/16];   // 1-bit tangent sign per pair (8 bytes for 64 pairs)
-} block_tbqx3_1;
-static_assert(sizeof(block_tbqx3_1) == sizeof(ggml_half) + 2*(TBQ_K128*3/16) + TBQ_K128/16, "wrong tbqx3_1 block size/padding");
+    // Part A — TurboQuant WHT (FA path, tbq3_1 동치)
+    ggml_half d_wht;                  // L2 norm after WHT (2B)
+    uint8_t   qs  [TBQ_K128*3/8];     // 3-bit WHT + Lloyd-Max (48B)
+    // Part B — Polar Derotate (TriAttention scoring, pre-RoPE)
+    ggml_half d_r;                    // Rayleigh σ (2B)
+    uint8_t   qr  [TBQ_K128*3/16];    // 3-bit r indices, 64 pairs (24B)
+    uint8_t   qphi[TBQ_K128/4];       // 4-bit φ indices, 64 pairs (32B)
+} block_amx3_1;
+static_assert(sizeof(block_amx3_1) == 2*sizeof(ggml_half) + TBQ_K128*3/8 + TBQ_K128*3/16 + TBQ_K128/4, "wrong amx3_1 block size/padding");
+
+// AMX V-side 128-block: TurboQuant (WHT + 3-bit Lloyd-Max), tbq3_1 동치, ~3.125 bpw.
+typedef struct {
+    ggml_half d;                // L2 norm of original vector
+    uint8_t qs[TBQ_K128*3/8];   // 3-bit packed indices (48 bytes for 128 elements)
+} block_amxv3_1;
+static_assert(sizeof(block_amxv3_1) == sizeof(ggml_half) + TBQ_K128*3/8, "wrong amxv3_1 block size/padding");
 
 
 // TurboQuant head_dim=64 variants (blck_size=64)

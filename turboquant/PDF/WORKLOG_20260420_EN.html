@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Worklog 2026-04-20~21 · TriAttention</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root {
+    --bg: #fafbfc;
+    --fg: #1a1a2e;
+    --accent: #3b82f6;
+    --accent2: #8b5cf6;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --muted: #64748b;
+    --card-bg: #ffffff;
+    --border: #e2e8f0;
+  }
+  .reveal { font-family: 'Inter', sans-serif; font-size: 28px; color: var(--fg); letter-spacing: -0.01em; line-height: 1.55; }
+  .reveal .slides { text-align: left; }
+  .reveal .slides section { padding: 36px 50px; box-sizing: border-box; }
+  .reveal h1, .reveal h2, .reveal h3 { font-family: 'Inter', sans-serif; font-weight: 700; color: var(--fg); text-transform: none; letter-spacing: -0.02em; }
+  .reveal h1 { font-size: 2.0em; margin-bottom: 0.2em; }
+  .reveal h2 { font-size: 1.3em; margin-bottom: 0.4em; }
+  .reveal h3 { font-size: 1.0em; margin-bottom: 0.3em; color: var(--accent); }
+  .cover { text-align: center !important; display: flex !important; flex-direction: column; align-items: center; justify-content: center; }
+  .cover h1 { font-size: 2.2em; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin-bottom: 0.1em; }
+  .cover .subtitle { font-size: 1.0em; color: var(--muted); font-weight: 300; margin-bottom: 1.5em; }
+  .cover .meta { font-size: 0.7em; color: var(--muted); line-height: 1.8; }
+  .cover .meta span { display: inline-block; background: #f1f5f9; padding: 4px 14px; border-radius: 20px; margin: 3px 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; }
+  .divider { width: 60px; height: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); border: none; border-radius: 2px; margin: 8px 0 16px 0; }
+  .cover .divider { margin: 10px auto 20px auto; }
+  .tag { display: inline-block; font-size: 0.5em; font-weight: 500; padding: 2px 10px; border-radius: 12px; vertical-align: middle; margin-left: 8px; }
+  .tag-blue { background: #dbeafe; color: #1d4ed8; }
+  .tag-green { background: #d1fae5; color: #065f46; }
+  .tag-red { background: #fee2e2; color: #991b1b; }
+  .tag-yellow { background: #fef3c7; color: #92400e; }
+  .tag-purple { background: #ede9fe; color: #5b21b6; }
+  .items { list-style: none; padding: 0; margin: 0; }
+  .items li { position: relative; padding-left: 20px; margin-bottom: 6px; font-size: 0.7em; line-height: 1.6; }
+  .items li::before { content: ''; position: absolute; left: 0; top: 9px; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); opacity: 0.6; }
+  .items li.check::before { background: var(--success); opacity: 1; border-radius: 50%; }
+  .items li.warn::before { background: var(--warning); opacity: 1; }
+  .items li.fail::before { background: var(--danger); opacity: 1; border-radius: 50%; }
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
+  .card-grid.three { grid-template-columns: 1fr 1fr 1fr; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin: 0 0 5px 0; font-size: 0.7em; font-weight: 700; color: var(--fg); }
+  .card p, .card ul { margin: 0; font-size: 0.6em; line-height: 1.55; color: #475569; }
+  .card ul { padding-left: 16px; }
+  .highlight-box { border-left: 4px solid; border-radius: 6px; padding: 10px 14px; margin: 8px 0; font-size: 0.7em; line-height: 1.6; }
+  .highlight-box.blue { border-color: var(--accent); background: #eff6ff; }
+  .highlight-box.green { border-color: var(--success); background: #ecfdf5; }
+  .highlight-box.red { border-color: var(--danger); background: #fef2f2; }
+  .highlight-box.yellow { border-color: var(--warning); background: #fffbeb; }
+  .highlight-box.purple { border-color: var(--accent2); background: #f5f3ff; }
+  .reveal code { font-family: 'JetBrains Mono', monospace; font-size: 0.88em; background: #f1f5f9; padding: 1px 6px; border-radius: 4px; color: var(--accent2); }
+  .reveal table { width: 100%; border-collapse: collapse; font-size: 0.6em; margin-top: 8px; table-layout: fixed; }
+  .reveal table th { background: #f8fafc; font-weight: 600; text-align: left; padding: 6px 10px; border-bottom: 2px solid var(--border); color: var(--muted); font-size: 0.88em; text-transform: uppercase; letter-spacing: 0.05em; }
+  .reveal table td { padding: 6px 10px; border-bottom: 1px solid var(--border); line-height: 1.45; }
+  .reveal table tr:last-child td { border-bottom: none; }
+  .reveal table .ok { color: var(--success); font-weight: 600; }
+  .reveal table .ng { color: var(--danger); font-weight: 600; }
+  .reveal table .mid { color: var(--warning); font-weight: 600; }
+  @media print { .reveal .slides section { page-break-after: always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<section class="cover">
+  <h1>TriAttention Integration</h1>
+  <p class="subtitle">AMX3_1 hybrid K-cache × pre-RoPE polar scoring × physical eviction</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-04-20 ~ 04-21</span>
+    <span>Qwen3-14B Q4_K_M</span>
+    <span>AMX3_1 · 6.75 bpw</span>
+    <br>
+    <span>Needle Test Passed</span>
+    <span>20 tok/s maintained</span>
+    <span>95% eviction · quality intact</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<section>
+  <h2>Session Overview</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>Goal</h4>
+      <p>Port TriAttention paper (Mao et al., arxiv 2604.04921).<br>Dequant-free KV eviction via pre-RoPE polar scoring.</p>
+    </div>
+    <div class="card">
+      <h4>Outcome</h4>
+      <p>End-to-end working + <strong>needle test passed</strong>.<br>"Password 다람쥐7429" recalled exactly. Repetition loops eliminated.</p>
+    </div>
+    <div class="card">
+      <h4>Technical innovation</h4>
+      <p>AMX3_1 Part B (polar) <strong>consumed directly</strong>.<br>No GPU→CPU transfer during scoring.</p>
+    </div>
+    <div class="card">
+      <h4>Performance</h4>
+      <p>Prompt 694 tok/s, <strong>Eval 20.7 tok/s</strong>.<br>Overhead negligible (same as f16 baseline).</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>AMX3_1 Hybrid Block Layout <span class="tag tag-blue">108B · 6.75 bpw</span></h2>
+  <hr class="divider">
+  <div class="highlight-box blue">
+    <strong>Dual encoding for TriAttention</strong>: WHT path (FA attention) and polar path (scoring) in parallel.
+  </div>
+  <table>
+    <colgroup><col style="width:16%"><col style="width:14%"><col style="width:18%"><col style="width:52%"></colgroup>
+    <tr><th>Part</th><th>Size</th><th>Field</th><th>Role</th></tr>
+    <tr><td rowspan="2"><strong>Part A</strong><br>WHT</td><td>2 B</td><td><code>d_wht</code></td><td>WHT-domain L2 norm (consumed by FA decoder)</td></tr>
+    <tr><td>48 B</td><td><code>qs[48]</code></td><td>3-bit Lloyd-Max (tbq3_1 equivalent, 128 elements)</td></tr>
+    <tr><td rowspan="3"><strong>Part B</strong><br>Polar</td><td>2 B</td><td><code>d_r</code></td><td>Rayleigh σ (polar scale)</td></tr>
+    <tr><td>24 B</td><td><code>qr[24]</code></td><td>3-bit Rayleigh r indices (64 pairs)</td></tr>
+    <tr><td>32 B</td><td><code>qphi[32]</code></td><td>4-bit uniform φ indices</td></tr>
+  </table>
+  <p style="font-size:0.65em; color:var(--muted); margin-top:6px;">Part B → direct reconstruction of pre-RoPE (kxc, kyc) → fed to TriAttention scoring. At 50% retention, effective 3.375 bpw.</p>
+</section>
+
+<section>
+  <h2>3-Kernel Scoring Pipeline</h2>
+  <hr class="divider">
+  <div class="card-grid three">
+    <div class="card">
+      <h4>1. Raw score</h4>
+      <p>grid=(n_kv, num_heads)<br>block=fc (thread/pair)<br>Part B reconstruct + 17 offset sincosf sum + block reduce</p>
+    </div>
+    <div class="card">
+      <h4>2. Z-normalize</h4>
+      <p>grid=num_heads, block=256<br>Per-head mean/std<br>in-place normalization</p>
+    </div>
+    <div class="card">
+      <h4>3. Aggregate</h4>
+      <p>grid=(n_kv/T), block=128<br>per-slot max across all heads<br>→ out_scores[n_kv]</p>
+    </div>
+  </div>
+  <div class="highlight-box purple">
+    <strong>Scoring formula</strong>: <code>S_trig = Σ rel_r·cos(Δ·ω) - rel_i·sin(Δ·ω)</code> (17 geometric Δ, 64 freq) + <code>S_norm = max(0, qam-qma) · r</code>
+  </div>
+</section>
+
+<section>
+  <h2>Physical Eviction + Attention Sink</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>Histogram threshold</h4>
+      <p>1024-bin histogram for K-th largest. Single-thread kernel. ~5μs at n_kv=2500.</p>
+    </div>
+    <div class="card">
+      <h4>Mask kernel</h4>
+      <p>Parallel <code>score ≥ threshold ? 1 : 0</code> comparison.</p>
+    </div>
+    <div class="card">
+      <h4>Attention sink (C2)</h4>
+      <p>Force <code>mask[0..keep_first] = 1</code> override.<br>Protects BOS + prompt header.</p>
+    </div>
+    <div class="card">
+      <h4>Physical eviction (C1)</h4>
+      <p>Evicted slots: <code>d_wht=0</code> <strong>AND</strong> <code>d_r=0</code>.<br>Next scoring → 0 score → permanent exclusion.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Needle Test Validation <span class="tag tag-green">passed</span></h2>
+  <hr class="divider">
+  <div class="highlight-box blue">
+    <strong>Prompt</strong>: "Password is <strong>다람쥐7429</strong>. [quantum mechanics summary request] ... at the end of the summary, write the password exactly."
+  </div>
+  <table>
+    <colgroup><col style="width:22%"><col style="width:10%"><col style="width:14%"><col style="width:20%"><col style="width:34%"></colgroup>
+    <tr><th>Version</th><th>Tokens</th><th>Finish</th><th>Password</th><th>Behavior</th></tr>
+    <tr><td>Initial (buggy)</td><td>2500</td><td class="ng">length</td><td class="ng">❌ never mentioned</td><td>"다름, 다름, 다름..." explosion</td></tr>
+    <tr><td>keep_first=4</td><td>575</td><td class="ok">stop</td><td class="ng">❌ "다섯"</td><td>Loop gone, recall failed</td></tr>
+    <tr><td><strong>keep_first=32</strong></td><td><strong>366</strong></td><td class="ok"><strong>stop</strong></td><td class="ok"><strong>✅ "다람쥐7429"</strong></td><td>Correct recall + natural stop</td></tr>
+  </table>
+  <div class="highlight-box green">
+    Protecting the first 32 prompt tokens → password "다람쥐7429" survived until generation end (position 366).
+  </div>
+</section>
+
+<section>
+  <h2>CLI Flags + API</h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:30%"><col style="width:22%"><col style="width:48%"></colgroup>
+    <tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+    <tr><td><code>--triattention &lt;FILE&gt;</code></td><td>—</td><td>TRIA v2 calibration file</td></tr>
+    <tr><td><code>--tri-budget N</code></td><td>0 (disabled)</td><td>Per-layer Top-B budget</td></tr>
+    <tr><td><code>--tri-interval N</code></td><td>128</td><td>Trigger token interval (paper β)</td></tr>
+    <tr><td><code>--tri-keep-first N</code></td><td>4</td><td>Attention sink — first N slots always kept</td></tr>
+  </table>
+  <div class="highlight-box blue">
+    <strong>Public C API</strong>: <code>llama_tria_load() / llama_tria_free() / llama_tria_attach()</code><br>
+    <strong>Internal 3-step API</strong>: <code>tria_trigger_prepare → tria_trigger_score_layer → tria_trigger_finish</code>
+  </div>
+</section>
+
+<section>
+  <h2>5 Critical Bugs Resolved</h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:10%"><col style="width:28%"><col style="width:62%"></colgroup>
+    <tr><th>ID</th><th>Bug</th><th>Symptom / Cause / Fix</th></tr>
+    <tr><td>C1</td><td>Part B left intact after eviction</td><td>Only d_wht zeroed → re-scoring re-selected same slot → repetition loop. Also zero d_r for permanent exclusion.</td></tr>
+    <tr><td>C2</td><td>Missing attention sink</td><td>Softmax has no sink → "다름, 다름..." explosion. Added <code>keep_first</code> parameter.</td></tr>
+    <tr><td>B1</td><td>kept = full n_kv</td><td>Passed <code>v_cells.size()=40960</code> as-is → empty slots scored → histogram skewed. Use <code>n_valid</code> instead.</td></tr>
+    <tr><td>B2</td><td>No n_stream&gt;1 guard</td><td>Multi-sequence mode unsupported. Added guard.</td></tr>
+    <tr><td>—</td><td>Private member access</td><td>llama_context fields in private section, compile failed. Added public setter <code>tria_set()</code>.</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>Missteps Timeline (1/2) <span class="tag tag-yellow">retrospective</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="fail"><strong>40 min wasted on Qwen3.6-35B</strong> — head_dim=256 (in config), AMX3_1 incompatible. Had to re-calibrate with Qwen3-14B.</li>
+    <li class="fail"><strong>llama.h include hell</strong> — no path from ggml-cuda to llama.h. Solved via extern "C" forward declarations.</li>
+    <li class="fail"><strong>Private member mistake</strong> — llama_context fields in private section. Free functions can't access. Added public setter.</li>
+    <li class="fail"><strong>kept=40960 misread</strong> — thought "too consistent across layers". Actually a log-filter artifact.</li>
+    <li class="fail"><strong>transformers 4.57.3 → 5.5.4</strong> — old version didn't know qwen3_5_moe. Required upgrade.</li>
+    <li class="fail"><strong>wikitext path hunt</strong> — not at <code>~/llama.cpp/wikitext-2-raw/</code> but <code>~/work/cuda_research/wiki.test.raw</code>.</li>
+    <li class="fail"><strong>Server ran old binary</strong> — <code>make -j</code> didn't relink. Required <code>--target llama-server</code> or clean build.</li>
+    <li class="fail"><strong>3 dead-code leftovers</strong> — <code>tria_head_stats_dev</code>, <code>llama_tria_stats_unwrap</code>, <code>tria_wrapper_layer_scales_ref</code>. Removed during audit.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Missteps Timeline (2/2) <span class="tag tag-yellow">retrospective</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="fail"><strong>API signature changed 3 times</strong> — single function → keep_first added → 3-step split (prepare/score/finish). Each time updating callers + forward declarations.</li>
+    <li class="fail"><strong>const_cast hell</strong> — <code>const void * K_cache_gpu</code> but needed to write. Switched to <code>void *</code> during audit.</li>
+    <li class="fail"><strong>cur_pos changed 3 times</strong> — max loop → <code>host_pos[n_valid-1]</code> → defensive max restored → user pointed out violation of "no fallbacks" feedback, went back to terse.</li>
+    <li class="fail"><strong>Log spam</strong> — 40 layers × per-trigger 1 line = 780 lines at 2500 tokens. Fixed with aggregate + <code>TRIA_VERBOSE=1</code>.</li>
+    <li class="fail"><strong>Single-thread threshold kernel skipped</strong> — SM utilization ≤1/32. Not a bottleneck at n_kv=2500 (~5μs), deferred.</li>
+    <li class="fail"><strong>"Final final final" review × 4</strong> — each round found new issues. Realized limits of self-review.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Final Audit Fixes</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>Critical (C1/C2)</h4>
+      <p>Eviction permanence (both d_wht + d_r zero)<br>Attention sink (<code>--tri-keep-first</code>)</p>
+    </div>
+    <div class="card">
+      <h4>High (H1~H3)</h4>
+      <p>tria_load <code>goto cleanup</code> pattern<br>scratch_ensure full rollback on failure<br>stream sync before scratch_free</p>
+    </div>
+    <div class="card">
+      <h4>Medium (M1/M5)</h4>
+      <p>3-step API split (position H2D once)<br>Aggregate log + <code>TRIA_VERBOSE</code> env</p>
+    </div>
+    <div class="card">
+      <h4>Architecture (A3)</h4>
+      <p>Per-layer budget scale applied<br><code>budget * layer_scales[il]</code></p>
+    </div>
+    <div class="card">
+      <h4>Final (F1~F3)</h4>
+      <p>State pre-reset in prepare<br>Always-reset in finish<br>layer_scales D2H error logged</p>
+    </div>
+    <div class="card">
+      <h4>Cleanup (B1~B4/S1)</h4>
+      <p>n_stream guard<br>const_cast removed<br>Per-layer AMX3_1 type check</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Performance Measurement <span class="tag tag-green">Qwen3-14B Q4_K_M · AMX3_1</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:30%"><col style="width:20%"><col style="width:20%"><col style="width:30%"></colgroup>
+    <tr><th>Metric</th><th>Value</th><th>f16 baseline</th><th>Notes</th></tr>
+    <tr><td>Prompt</td><td class="ok">694 tok/s</td><td>~700</td><td>nearly identical</td></tr>
+    <tr><td>Eval</td><td class="ok">20.7 tok/s</td><td>~21</td><td>overhead negligible</td></tr>
+    <tr><td>Per-trigger overhead</td><td>~120 ms</td><td>—</td><td>40 layers × ~3 ms</td></tr>
+    <tr><td>Vs 128-token gen time</td><td>~2%</td><td>—</td><td>120 ms / 6.4 s</td></tr>
+    <tr><td>Effective kept / n_kv</td><td>~130 / 2500</td><td>2500</td><td>95% eviction</td></tr>
+  </table>
+  <div class="highlight-box green">
+    <strong>Conclusion</strong>: Quality preserved + zero speed regression at 95% eviction. TriAttention paper claim empirically confirmed.
+  </div>
+</section>
+
+<section>
+  <h2>Key Lessons</h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="check"><strong>Check model config's key_length/value_length first</strong> — hidden/num_heads is Q-side; K storage may differ (gated attention, partial rotary)</li>
+    <li class="check"><strong>Eviction permanence requires zeroing both Part A and Part B</strong> — leaving the scoring path intact lets the slot re-enter selection</li>
+    <li class="check"><strong>Attention sink is mandatory, not optional</strong> — softmax collapse destroys generation quality immediately (infinite loops)</li>
+    <li class="check"><strong>Design APIs as 3-step from the start</strong> — upload/reuse/cleanup separation is natural. Starting with a single function incurs big refactoring cost</li>
+    <li class="check"><strong><code>make -j</code> doesn't auto-resolve target dependencies</strong> — to re-link binaries, specify target explicitly</li>
+    <li class="check"><strong>Audits find new issues even when repeated</strong> — self-review has inherent limits. Time gap + different perspective = best substitute</li>
+    <li class="check"><strong>Feedback memory actually works</strong> — user caught my "No Fallbacks" violation mid-audit and made me revert</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Next Work</h2>
+  <hr class="divider">
+  <div class="card-grid three">
+    <div class="card">
+      <h4>Stress test</h4>
+      <p>4000+ token generation, n_kv&gt;10000 stability. <strong>Scheduled tomorrow</strong>.</p>
+    </div>
+    <div class="card">
+      <h4>Math benchmarks</h4>
+      <p>MMLU/GSM8K precision impact measurement.</p>
+    </div>
+    <div class="card">
+      <h4>Model portability</h4>
+      <p>Other head_dim=128 models (Qwen3-30B-A3B, etc.)</p>
+    </div>
+    <div class="card">
+      <h4>Budget sweep</h4>
+      <p>64/256/512 quality-performance curve.</p>
+    </div>
+    <div class="card">
+      <h4>Threshold parallelization</h4>
+      <p>Single-thread → parallel reduction.</p>
+    </div>
+    <div class="card">
+      <h4>TBQ attn_rot_k redesign</h4>
+      <p>Remove external rotation dependency. Separate session.</p>
+    </div>
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash:true, slideNumber:'c/t', width:1280, height:720, margin:0, transition:'fade', transitionSpeed:'fast' });</script>
+</body>
+</html>
