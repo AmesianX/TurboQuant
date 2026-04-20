@@ -659,17 +659,22 @@ jobs:
   # =============================== Release ============================
 
   release:
-    if: ${{ ( github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') ) || github.event.inputs.create_release == 'true' }}
+    # Partial-success upload: run as long as ≥1 build job succeeded.
+    # Without `always()` the job is skipped the moment any `needs:` fails;
+    # with `always() && contains(needs.*.result, 'success')` we still skip
+    # the upload only when *every* GPU/OS combo failed.
+    if: |
+      always() &&
+      contains(needs.*.result, 'success') &&
+      ( ( github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') ) || github.event.inputs.create_release == 'true' )
 
     permissions:
         contents: write
 
     runs-on: ubuntu-latest
 
-    # Each job is independent; release only waits for them.
-    # `needs:` does NOT require success — with `if: always() && contains(...)`
-    # we could make release run even if some builds fail. For now we still
-    # require all to succeed; flip this if partial releases are desired.
+    # Each job is independent; release waits for them but does NOT require
+    # all to succeed (see the `if:` above).
     needs:
       - windows-cuda-v100
       - windows-cuda-a100

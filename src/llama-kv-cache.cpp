@@ -1160,13 +1160,19 @@ ggml_type llama_kv_cache::type_k() const {
 }
 
 // Forward-declared in ggml-cuda/triattention.cuh — not pulled in here to avoid CUDA deps.
+// GGML_BACKEND_API matches the declaration in triattention.cuh: on Windows shared
+// builds it expands to __declspec(dllimport) so the linker resolves these against
+// the ggml-cuda DLL. Without it Windows libllama fails with LNK2019 (v1.7.0 bug).
+#include "ggml-backend.h"
 struct llama_tria_stats;
-extern "C" float tria_layer_scale(struct llama_tria_stats * stats, int model_layer_idx);
-extern "C" void  tria_trigger_prepare(struct llama_tria_stats * stats, int n_kv, const int * host_key_pos);
-extern "C" void  tria_trigger_score_layer(struct llama_tria_stats * stats, int model_layer_idx,
-                                          void * K_cache_gpu, int n_kv, int cur_pos,
-                                          int budget, int keep_first);
-extern "C" void  tria_trigger_finish(struct llama_tria_stats * stats);
+extern "C" {
+GGML_BACKEND_API float tria_layer_scale(struct llama_tria_stats * stats, int model_layer_idx);
+GGML_BACKEND_API void  tria_trigger_prepare(struct llama_tria_stats * stats, int n_kv, const int * host_key_pos);
+GGML_BACKEND_API void  tria_trigger_score_layer(struct llama_tria_stats * stats, int model_layer_idx,
+                                                void * K_cache_gpu, int n_kv, int cur_pos,
+                                                int budget, int keep_first);
+GGML_BACKEND_API void  tria_trigger_finish(struct llama_tria_stats * stats);
+}
 
 bool llama_kv_cache::tria_score_maybe(struct llama_tria_stats * stats, int budget, int keep_first) const {
     if (!stats || budget <= 0) return false;

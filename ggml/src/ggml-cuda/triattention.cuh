@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "ggml-backend.h"
 
 #include <cstdint>
 
@@ -55,13 +56,20 @@ void tria_topb_mask(
     cudaStream_t  stream);
 
 // Host-facing trigger API (called from llama-kv-cache.cpp; no CUDA types in sig).
+// GGML_BACKEND_API → __declspec(dllexport/import) on Windows shared builds, plain
+// extern elsewhere. Without it, libllama can't resolve these symbols at link time
+// when the CUDA backend is built as a separate DLL (Windows builds failed in v1.7.0).
 struct llama_tria_stats;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Read per-model-layer budget scale (host copy).  Returns 1.0 if out of range.
-extern "C" float tria_layer_scale(struct llama_tria_stats * stats, int model_layer_idx);
+GGML_BACKEND_API float tria_layer_scale(struct llama_tria_stats * stats, int model_layer_idx);
 
 // Prepare one trigger: upload positions once, reset aggregate counters.
-extern "C" void tria_trigger_prepare(
+GGML_BACKEND_API void tria_trigger_prepare(
     struct llama_tria_stats * stats,
     int                       n_kv,
     const int *               host_key_pos);
@@ -69,7 +77,7 @@ extern "C" void tria_trigger_prepare(
 // Score + mask + attention-sink override + physical eviction for one layer.
 // budget: per-layer Top-B.  keep_first: always-keep slot count (attention sink).
 // K_cache_gpu is modified in place (d_wht, d_r zeroed for evicted slots).
-extern "C" void tria_trigger_score_layer(
+GGML_BACKEND_API void tria_trigger_score_layer(
     struct llama_tria_stats * stats,
     int                       model_layer_idx,
     void *                    K_cache_gpu,
@@ -79,4 +87,8 @@ extern "C" void tria_trigger_score_layer(
     int                       keep_first);
 
 // Finish trigger: flush aggregate log, sync stream.
-extern "C" void tria_trigger_finish(struct llama_tria_stats * stats);
+GGML_BACKEND_API void tria_trigger_finish(struct llama_tria_stats * stats);
+
+#ifdef __cplusplus
+}
+#endif
