@@ -9,7 +9,108 @@
 - 📗 [**TurboQuant 구현: 프로덕션 LLM 추론 엔진에서의 3비트 KV 캐시 압축**](paper/turboquant_impl_ko.pdf) — 원본 TBQ v1 구현 논문 (WHT + Lloyd-Max + QJL)
 - 📕 [English — TurboQuant Impl](paper/turboquant_impl.pdf)
 
-### 🆕 v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B)
+### 🆕 v1.7.0 — TriAttention 통합 + attn_rot_k 중복 회전 제거
+
+**AMX3_1 하이브리드 K 캐시에 TriAttention 토큰 가지치기 — dequant-free pre-RoPE polar 스코어링 + 물리 eviction. 전 TBQ/TBQP/AMX 인코더의 외부 attn_rot_k 의존 제거 (중복 Hadamard 제거).**
+
+> ⚠️ **Breaking change — TBQX3_1 폐기.** v1.6.0의 polar-only 3.625 bpw 포맷 (TBQX3_1 / `tbqx3`)은 **v1.7.0에서 삭제**됩니다. 그 polar `(r, φ)` 아이디어는 이제 AMX3_1의 Part B로 흡수되었고, Part A는 WHT로 FA attention을 담당합니다 — 즉 v1.6.0에서 품질 향상에 기여했던 "polar" 경로는 그대로 살아있지만, 독립 K 캐시 포맷으로서의 TBQX3_1은 사라집니다. `--cache-type-k tbqx3` 사용하던 스크립트는 `--cache-type-k amx3`로 교체해주세요.
+
+**환경:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · Qwen3-14B Q4_K_M · ctx=40960 · temp=0.
+
+#### 압축률 스토리 (2.37배로 보이지만 실제로는 더)
+
+| 축 | Before | After | 이득 |
+|------|--------|-------|------|
+| **원시 블록 크기** (128 원소) | f16 → 256 B | AMX3_1 → 108 B | **2.37×** |
+| **슬롯당 살아있는 토큰** (budget=128, 50% retention) | 2500 전부 생존 | ~128 alive, 2372 evicted | **~2×** |
+| **실효 토큰 압축률** | 1× | — | **~4.74×** (동급 attention 품질 기준) |
+
+AMX3_1 단독으로도 이미 2.37× 패킹 이득입니다. TriAttention은 **별도의 두 번째 축** — "레이어별로 매 attention 스텝에 실제로 기여하는 슬롯은 ~128개뿐"이라고 보는 거라, 나머지 ~95%의 할당된 KV 캐시는 추론 시점에는 죽은 무게로 취급 가능. 두 축을 곱하면 f16 ctx=N 품질 목표가 대략 `N/4.7` 메모리에 들어감. 물리 할당량은 `-c` 값 그대로 — 줄어드는 건 매 스텝 attention이 건드려야 하는 양입니다.
+
+#### TriAttention — 새 CLI 플래그 (`-ctk amx3` K 캐시 필요)
+
+| 플래그 | 기본값 | 의미 |
+|------|---------|---------|
+| `--triattention FILE` | — | TRIA v2 칼리브레이션 파일 (`calibrate_ref.py` 출력) |
+| `--tri-budget N` | 0 (off) | 레이어별 Top-B 유지 슬롯 수 |
+| `--tri-interval N` | 128 | N 토큰마다 스코어링 트리거 (논문 β) |
+| `--tri-keep-first N` | 4 | Attention sink — 앞 N 슬롯 무조건 유지 (프롬프트 헤더 보호용 32 추천) |
+
+#### AMX3_1 하이브리드 K 블록 (108 B, 6.75 bpw raw)
+
+| Part | 크기 | 용도 |
+|------|------|---------|
+| Part A (WHT) | 50 B (`d_wht` + `qs[48]`) | FA 디코드 — tbq3_1 동치 |
+| Part B (polar) | 58 B (`d_r` + `qr[24]` + `qphi[32]`) | TriAttention 스코어링 — pre-RoPE `(r, φ)` |
+
+Part B는 스코어링 커널이 GPU에서 직접 소비 — dequant-and-copy 없음, CPU 왕복 없음.
+
+#### Needle-in-haystack 회수 (Qwen3-14B · budget=128 · interval=128)
+
+프롬프트: "비밀번호는 **다람쥐7429** 이다. [1000자 요약 요청] … 마지막에 비밀번호 정확히 적어라."
+
+| 설정 | 생성 토큰 | 종료 | 비밀번호 회수 | 관찰 동작 |
+|--------|------------------|--------|-----------------|-------------------|
+| TriAttention 수정 전 | 2500 | length | ❌ 언급 없음 | "다름, 다름, 다름…" 무한 반복 |
+| keep_first=4 | 575 | stop | ❌ "다섯" 로 환각 | 첫 음절 부분 환각 |
+| **keep_first=32** | **366** | **stop** | **✅ "다람쥐7429"** | 정답 회수 + 자연 종료 |
+
+#### head_dim별 한국어 + 스코어링 커널 검증
+
+네 경우 모두 시작 로그에 `attn_rot_k = 0 / attn_rot_v = 0` 확인 (외부 Hadamard 완전 비활성; 내부 WHT가 회전 담당):
+
+| head_dim | 모델 (gguf) | 해석된 KV 타입 | 한국어 8행 시 | 스코어링 파이프라인 |
+|---|---|---|---|---|
+| 64 | gpt-oss-20b-MXFP4 | `tbqp3_3` (double WHT) | ✅ 자연스러움 | 해당 없음 (TriAttention은 head_dim=128 전용) |
+| **128** | **Qwen3-14B Q4_K_M** | **`tbq3_1` / `amx3_1`** | **✅ + needle 성공** | ✅ 3-kernel + eviction + sink 검증 |
+| 256 | Qwen3.5-9B Q8_0 | `tbq3_0` | ✅ 자연스러움 | 해당 없음 |
+| 576 (MLA) | GLM-4.7-Flash | `tbq3_4` (512-WHT + rope 64 passthrough) | ✅ 자연스러움 | 해당 없음 |
+
+#### 성능 (Qwen3-14B Q4_K_M, AMX3_1 하이브리드)
+
+| 지표 | 값 | f16 기준선 대비 |
+|--------|-------|-----------------|
+| Prompt 처리량 | 694 tok/s | ~700 (≈동등) |
+| Decode 처리량 | **20.7 tok/s** | ~21 (≈동등) |
+| 트리거당 오버헤드 | ~120 ms (40 레이어 × 3 ms) | 128-토큰 decode window의 ≈2% |
+| 실효 kept / n_kv | ~130 / 2500 (95% evicted) | — |
+
+> 매 트리거마다 슬롯의 95%를 물리적으로 0 처리하는 상태에서도 품질 유지 — TriAttention 논문 주장을 로컬에서 재현.
+
+#### 핵심 설계 결정 (TriAttention이 여기서 실제로 동작하는 이유)
+
+1. **Dequant-free 스코어링.** Part B가 스코어링 공식이 필요로 하는 pre-RoPE `(kxc, kyc)` 페어로 직접 복원됨. 그림자 fp16 K 버퍼 없음, D2H 복사 없음 — 3-kernel 파이프라인 (raw · z-norm · aggregate)이 양자화 블록을 제자리에서 읽음.
+2. **영구성 있는 물리 eviction.** Evict된 슬롯은 `d_wht` (Part A → FA attention → 0)와 `d_r` (Part B → 다음 스코어링 → 0) **둘 다** zero. d_wht만 zero하면 "유령" 슬롯이 다음 트리거 Top-B에 재선택되어 budget을 조용히 까먹음; 둘 다 zero해야 eviction이 영구적.
+3. **Attention sink는 필수, 선택 아님.** `--tri-keep-first 0`으로 돌리면 decode가 ~300 토큰 내에 "다름, 다름…" 토큰 반복 루프로 붕괴. Sink는 StreamingLLM 스타일 해결책: softmax가 잔여 확률 질량을 버릴 곳이 있도록 앞 N 슬롯을 강제 유지. `4`는 chat template 커버, `32`는 주입된 지시사항 포함 프롬프트 헤더 전체를 커버.
+4. **외부 attn_rot_k는 중복 회전이었음.** 모든 TBQ/TBQP/AMX 인코더는 이미 내부 `tbq_signs` 부호 뒤집기 + butterfly WHT를 실행; fattn-vec도 Q 쪽에 동일한 WHT 적용. llama-kv-cache가 인코더 전에 적용하던 Hadamard matmul은 중복 두 번째 회전 — Parseval에 의해 Q와 K 사이에서 상쇄되므로 출력은 변하지 않지만, 매 토큰마다 추가 matmul 1회 + 약간의 반올림 손실을 지불. v1.7.0에서 내부-WHT 타입 23종 전부를 `attn_rot_k`에서 제외; head_dim = 64 / 128 / 256 / 576에서 한국어 산문 품질 유지 확인.
+
+#### 권장 설정
+
+Qwen3-14B (head_dim=128, AMX3_1 지원):
+```
+--cache-type-k amx3 --cache-type-v amxv3 \
+--triattention calib/qwen3_14b.bin --tri-budget 128 --tri-keep-first 32
+```
+
+다른 head_dim (64/256/576) — TriAttention 미지원, attn_rot_k 정리는 자동 적용:
+```
+--cache-type-k tbq3 --cache-type-v tbq3     # head_dim에 따라 _2/_0/_4 자동 해석
+```
+
+> ⚠️ **범위 — AMX3_1은 head_dim=128 필요.** Qwen3.6-35B (K=256 비대칭), GLM MLA 576, gpt-oss 계열은 아키텍처별 AMX 변종이 나오기 전까지 **TriAttention 후보 아님**. `attn_rot_k` 정리는 head_dim 무관하게 전역 적용.
+
+#### 크레딧
+
+- **TriAttention 알고리즘** — Mao et al., *"Tri-attention: Tail-token saliency via trigonometric scoring on pre-RoPE keys"*, [arxiv 2604.04921](https://arxiv.org/abs/2604.04921) (2026).
+- **Python 레퍼런스 포트** — [`domvox/triattention-ggml`](https://github.com/domvox/triattention-ggml). TRIA v2 바이너리 칼리브레이션 포맷, 스코어링 수식, 헤드별 통계 추출을 이 레퍼런스에서 이식. CUDA 포트, AMX3_1 하이브리드 K 캐시 통합, llama-kv-cache / llama-context / fattn-vec 쪽 물리 eviction + attention-sink 배선은 이번 릴리즈에서 신규.
+
+#### 약간의 비하인드
+
+v1.6.0 초기 작업 때 저희는 "polar derotation"을 독자적으로 스케치했습니다 — K를 `(r, φ_content)`로 저장하고 위치를 대수적으로 벗겨내는 방식, 나름대로 우리만의 작은 아이디어라 생각했죠. 배포도 했고 논문도 썼고, 이론적 프레이밍이 완전히 맞지 않는다는 걸 깨닫고 논문은 철회했습니다 (`eab1d2ad1` — RoPE 하에서 pair 구조 + content-only WHT + 정확한 Q·K 보존이 동시에 성립할 수 없음). 그러다 TriAttention 논문을 읽다가 발견했죠 — 우리가 고안한 그 polar 분해가 이미 누군가의 score 공식 안에 들어있었다는 것을. 용도는 완전히 달랐습니다: 저장이 아니라 토큰 중요도 측정. 겹침이 알고 보니 선물이었습니다 — AMX3_1 하이브리드 블록이 TriAttention 스코어링 수식에 거의 그대로 맞아 떨어졌거든요, 왜냐하면 Part B가 **바로** 그 논문이 원하던 pre-RoPE polar 페어였으니까요. 독립 재발견은 겸손해지는 일이지만, 덕분에 이 통합 작업이 원래 들 시간보다 훨씬 짧아졌습니다.
+
+---
+
+### v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B) — 폐기됨, v1.7.0 참조
 
 **새 K 캐시 포맷: polar 좌표 저장 + content/position 분리 + 해석적 tangent residual 보정. 수학 추론에서 f16 를 압도하면서 한국어 산문 품질 유지.**
 

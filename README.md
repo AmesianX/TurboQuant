@@ -9,7 +9,108 @@
 - 📗 [**TurboQuant in Practice: Implementing 3-Bit KV Cache Compression in a Production LLM Inference Engine**](turboquant/paper/turboquant_impl.pdf) — original TBQ v1 implementation paper (WHT + Lloyd-Max + QJL)
 - 📕 [한국어판 — TurboQuant 구현](turboquant/paper/turboquant_impl_ko.pdf)
 
-### 🆕 v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B)
+### 🆕 v1.7.0 — TriAttention Integration + attn_rot_k Duplicate Rotation Cleanup
+
+**TriAttention token pruning on AMX3_1 hybrid K cache — dequant-free pre-RoPE polar scoring + physical eviction. All TBQ/TBQP/AMX encoders freed from external attn_rot_k dependency (redundant Hadamard now gone).**
+
+> ⚠️ **Breaking change — TBQX3_1 removed.** The v1.6.0 polar-only 3.625 bpw format (TBQX3_1 / `tbqx3`) is **deleted in v1.7.0**. Its polar `(r, φ)` idea now lives inside AMX3_1's Part B, paired with a WHT Part A that handles FA attention — so the "polar" path you used in v1.6.0 for scoring quality still exists, but the standalone polar-as-K-cache shape is gone. Scripts calling `--cache-type-k tbqx3` must switch to `--cache-type-k amx3`.
+
+**Environment:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · Qwen3-14B Q4_K_M · ctx=40960 · temp=0.
+
+#### The compression story (looks like 2.37×, actually more)
+
+| Axis | Before | After | Gain |
+|------|--------|-------|------|
+| **Raw block size** (128 elements) | f16 → 256 B | AMX3_1 → 108 B | **2.37×** |
+| **Live tokens per slot** (budget=128, 50% retention) | all 2500 alive | ~128 alive, 2372 evicted | **~2×** |
+| **Effective token-level compression** | 1× | — | **~4.74×** at sustained attention-equivalent quality |
+
+AMX3_1 alone is already a 2.37× packing win. TriAttention is a **separate second axis** — it says "only ~128 slots per layer actually contribute to each attention step," so the remaining ~95% of the allocated KV cache can be treated as dead weight at inference time. Compound the two axes and an f16 ctx=N quality target fits in roughly `N/4.7` memory. The physical allocation still matches your `-c` flag — what shrinks is how much of it attention has to touch each step.
+
+#### TriAttention — new CLI flags (requires `-ctk amx3` K cache)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--triattention FILE` | — | TRIA v2 calibration file (from `calibrate_ref.py`) |
+| `--tri-budget N` | 0 (off) | Per-layer Top-B slots kept after each trigger |
+| `--tri-interval N` | 128 | Trigger every N decoded tokens (paper β) |
+| `--tri-keep-first N` | 4 | Attention sink — first N slots always kept (set 32 to protect prompt header) |
+
+#### AMX3_1 hybrid K block (108 B, 6.75 bpw raw)
+
+| Part | Size | Purpose |
+|------|------|---------|
+| Part A (WHT) | 50 B (`d_wht` + `qs[48]`) | FA decode — tbq3_1 equivalent |
+| Part B (polar) | 58 B (`d_r` + `qr[24]` + `qphi[32]`) | TriAttention scoring — pre-RoPE `(r, φ)` |
+
+Part B is consumed directly on the GPU by the scoring kernel — no dequant-and-copy, no CPU round-trip.
+
+#### Needle-in-haystack recall (Qwen3-14B · budget=128 · interval=128)
+
+Prompt: "비밀번호는 **다람쥐7429** 이다. [1000자 요약 요청] … 마지막에 비밀번호 정확히 적어라."
+
+| Config | Tokens generated | Finish | Password recall | Observed behavior |
+|--------|------------------|--------|-----------------|-------------------|
+| Before TriAttention fix | 2500 | length | ❌ never mentioned | "다름, 다름, 다름…" infinite loop |
+| keep_first=4 | 575 | stop | ❌ recalled as "다섯" | partial first-syllable hallucination |
+| **keep_first=32** | **366** | **stop** | **✅ "다람쥐7429"** | natural self-stop with correct recall |
+
+#### Korean + scoring-kernel verification across head_dim
+
+All four cases reported `attn_rot_k = 0 / attn_rot_v = 0` at startup (external Hadamard fully disabled; internal WHT carries the rotation):
+
+| head_dim | Model (gguf) | Resolved KV type | Korean 8-line poem | Scoring pipeline |
+|---|---|---|---|---|
+| 64 | gpt-oss-20b-MXFP4 | `tbqp3_3` (double WHT) | ✅ natural | n/a (TriAttention is head_dim=128 only) |
+| **128** | **Qwen3-14B Q4_K_M** | **`tbq3_1` / `amx3_1`** | **✅ + needle pass** | ✅ 3-kernel + eviction + sink verified |
+| 256 | Qwen3.5-9B Q8_0 | `tbq3_0` | ✅ natural | n/a |
+| 576 (MLA) | GLM-4.7-Flash | `tbq3_4` (512-WHT + rope 64 passthrough) | ✅ natural | n/a |
+
+#### Performance (Qwen3-14B Q4_K_M, AMX3_1 hybrid)
+
+| Metric | Value | vs f16 baseline |
+|--------|-------|-----------------|
+| Prompt throughput | 694 tok/s | ~700 (≈parity) |
+| Decode throughput | **20.7 tok/s** | ~21 (≈parity) |
+| Per-trigger overhead | ~120 ms (40 layers × 3 ms) | ≈2% of 128-token decode window |
+| Effective kept slots / n_kv | ~130 / 2500 (95% evicted) | — |
+
+> Quality is preserved **while** 95% of slots are physically zeroed out each trigger — this is the TriAttention claim reproduced locally.
+
+#### Key design decisions (why TriAttention actually works here)
+
+1. **Dequant-free scoring.** Part B decodes straight into the pre-RoPE `(kxc, kyc)` pair the scoring formula needs. There is no shadow fp16 K buffer, no D2H copy — the 3-kernel pipeline (raw · z-norm · aggregate) reads quantized blocks in place.
+2. **Physical eviction with permanence.** Evicted slots zero **both** `d_wht` (so Part A → FA attention produces 0) **and** `d_r` (so Part B → next scoring pass produces 0). Zeroing only d_wht lets "ghost" slots win Top-B next trigger and silently consume budget; zeroing both makes eviction terminal.
+3. **Attention sink is mandatory, not optional.** With `--tri-keep-first 0` the decode collapses into a "다름, 다름, …" token-repetition loop within ~300 tokens. The sink is a StreamingLLM-style fix: always keep the first N slots so softmax has somewhere to dump residual mass. `4` covers the chat template; `32` covers a full prompt header including injected instructions.
+4. **External attn_rot_k was a duplicate rotation.** Every TBQ/TBQP/AMX encoder already runs an internal `tbq_signs` sign-flip + butterfly WHT; fattn-vec runs the identical WHT on the Q side. The Hadamard matmul that llama-kv-cache previously applied before the encoder was a redundant second rotation — it cancels via Parseval between Q and K, so output was unchanged, but every token paid for one extra matmul and a bit of rounding loss. v1.7.0 excludes all 23 internally-WHT types from `attn_rot_k`; verified on head_dim = 64 / 128 / 256 / 576 with Korean prose intact.
+
+#### Recommended config
+
+Qwen3-14B (head_dim=128, has AMX3_1 support):
+```
+--cache-type-k amx3 --cache-type-v amxv3 \
+--triattention calib/qwen3_14b.bin --tri-budget 128 --tri-keep-first 32
+```
+
+Any other head_dim (64/256/576) — TriAttention not wired, but attn_rot_k cleanup still applies automatically:
+```
+--cache-type-k tbq3 --cache-type-v tbq3     # auto-resolves to _2/_0/_4 by head_dim
+```
+
+> ⚠️ **Scope — AMX3_1 requires head_dim=128.** Qwen3.6-35B (K=256 asymmetric), GLM MLA 576, and gpt-oss family are **not** candidates for TriAttention until per-architecture AMX variants are built. `attn_rot_k` cleanup applies universally regardless of head_dim.
+
+#### Credits
+
+- **TriAttention algorithm** — Mao et al., *"Tri-attention: Tail-token saliency via trigonometric scoring on pre-RoPE keys"*, [arxiv 2604.04921](https://arxiv.org/abs/2604.04921) (2026).
+- **Python reference port** — [`domvox/triattention-ggml`](https://github.com/domvox/triattention-ggml). The TRIA v2 binary calibration format, the scoring math, and the per-head statistics extraction were adapted from that reference. The CUDA port, the AMX3_1 hybrid K cache integration, and the physical eviction + attention-sink wiring in llama-kv-cache / llama-context / fattn-vec are new in this release.
+
+#### A small behind-the-scenes note
+
+Back in early v1.6.0 work we sketched out "polar derotation" from scratch — storing K as `(r, φ_content)` with position peeled off algebraically — thinking it was our own little idea. It shipped, we wrote a paper, we pulled the paper when the theoretical framing didn't fully hold (see `eab1d2ad1` — pair structure + content-only WHT + exact Q·K preservation cannot all coexist under RoPE). Then while reading through TriAttention we realized the same polar decomposition was already sitting inside someone else's score formula, used for a different purpose entirely — token importance, not storage. The overlap turned out to be a gift: the AMX3_1 hybrid block slotted into TriAttention's scoring math almost unchanged, because Part B *was* the pre-RoPE polar pair the paper wanted. Independent rediscovery is humbling, but it made this integration much shorter than it had any right to be.
+
+---
+
+### v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B) — deprecated, see v1.7.0
 
 **New K cache format: polar-coordinate storage with content/position separation and analytical tangent residual correction. Beats f16 on math reasoning while preserving Korean prose quality.**
 

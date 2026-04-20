@@ -332,7 +332,7 @@ static void set_rows_cuda_quant_sm(
 }
 
 // =============================================================================
-// Polar (TBQX/TBQXP/AMX3) variant: quantize function takes pos (= dst_row in cache).
+// Polar (AMX3_1) variant: quantize function takes pos (= dst_row in cache).
 // Polar path templated (legacy, unused after AMX simplified to scalar Lloyd-Max).
 // =============================================================================
 template <typename idx_t, typename block_type,
