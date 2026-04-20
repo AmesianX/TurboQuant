@@ -41,7 +41,7 @@ Independent Researcher\\
 
 % ============================================================
 \begin{abstract}
-We present the first production-grade implementation of TurboQuant---a KV cache compression method based on Walsh-Hadamard Transform (WHT) and Lloyd-Max quantization---within llama.cpp, the most widely deployed open-source LLM inference engine. Our implementation compresses the KV cache to 3 bits per element, achieving \textbf{4.2$\times$ memory reduction} with only \textbf{6\% perplexity degradation} versus FP16 on Gemma~4 26B. Beyond faithful implementation, we make three novel contributions: (1)~a \emph{dynamic attention sharpening} formula $\alpha(N) = 1 + c\sqrt{\ln N}$ derived from MMSE and Extreme Value Theory that adapts the softmax correction to the runtime context length; (2)~identification and resolution of a \emph{half-precision accumulation bug} in the flash attention kernel where FP16 arithmetic causes precision loss amplified by the IWHT butterfly into non-deterministic MoE expert routing; and (3)~a complete engineering framework supporting 20 quantization type variants across five head dimensions (64--576), including double WHT per-head for $d{=}64$ and asymmetric K/V configurations. We release the full implementation as open source at \url{https://github.com/AmesianX/TurboQuant}.
+We present the first production-grade implementation of TurboQuant---a KV cache compression method based on Walsh-Hadamard Transform (WHT) and Lloyd-Max quantization---within llama.cpp, the most widely deployed open-source LLM inference engine. Our implementation compresses the KV cache to 3 bits per element, achieving \textbf{4.2$\times$ raw memory reduction} with only \textbf{6\% perplexity degradation} versus FP16 on Gemma~4 26B, and extends this to an effective \textbf{${\sim}4.74\times$} at inference time via hybrid rank-value compression. Beyond faithful implementation, we make four novel contributions: (1)~a \emph{dynamic attention sharpening} formula $\alpha(N) = 1 + c\sqrt{\ln N}$ derived from MMSE and Extreme Value Theory that adapts the softmax correction to the runtime context length; (2)~identification and resolution of a \emph{half-precision accumulation bug} in the flash attention kernel where FP16 arithmetic causes precision loss amplified by the IWHT butterfly into non-deterministic MoE expert routing; (3)~a \emph{CUDA-native TriAttention} integration that exploits Parseval preservation to compute trig-based importance scores directly on quantized, WHT-domain K blocks, eliminating the GPU$\to$CPU roundtrip that dominates prior reference implementations and cleanly separating the \emph{rank} axis (who to keep) from the \emph{value} axis (bits per element); and (4)~a complete engineering framework supporting 22 quantization type variants across five head dimensions (64--576), including double WHT per-head for $d{=}64$, asymmetric K/V configurations, and a hybrid AMX3\_1 block layout (50B WHT part + 58B polar part $=$ 108B) that carries both quantized values and the trig summaries needed for TriAttention scoring. We release the full implementation as open source at \url{https://github.com/AmesianX/TurboQuant}.
 \end{abstract}
 
 % ============================================================
@@ -52,14 +52,16 @@ Large Language Models (LLMs) with long context windows require substantial GPU m
 
 While the theoretical framework is elegant, no production implementation existed prior to this work. Bridging the gap between a research paper and a shipping CUDA kernel requires solving numerous engineering challenges that the paper does not address: shared memory layout for WHT butterfly operations, precision requirements for the inverse transform, interaction with existing flash attention frameworks, and support for the diverse head dimensions found in modern architectures (64, 128, 256, 512, 576).
 
-In this paper, we describe the complete implementation within llama.cpp's flash attention vector kernel (\texttt{fattn-vec}), report performance on real models, and present three contributions that go beyond the original paper:
+In this paper, we describe the complete implementation within llama.cpp's flash attention vector kernel (\texttt{fattn-vec}), report performance on real models, and present four contributions that go beyond the original paper:
 
 \begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
 \item \textbf{Dynamic Attention Sharpening} (\S\ref{sec:sharpening}): Quantization noise flattens the softmax distribution. We derive a context-length-adaptive correction $\alpha(N) = 1 + c\sqrt{\ln N}$ from Minimum Mean Square Error (MMSE) theory and Extreme Value Theory (EVT), eliminating the need for empirical tuning.
 
 \item \textbf{Half-Precision Pathology} (\S\ref{sec:precision}): We identify that the upstream flash attention kernel's FP16 (\texttt{half2}) accumulation path causes precision loss that is \emph{amplified} by the IWHT butterfly into catastrophic non-determinism in Mixture-of-Experts routing. Forcing FP32 accumulation for TBQ value types resolves the issue and improves perplexity by 2\%.
 
-\item \textbf{Multi-Variant Engineering} (\S\ref{sec:engineering}): We implement 20 TBQ/TBQP type variants across block sizes 64--576, including double WHT per-head for $d=64$, asymmetric K/V dimensions (GLM 576/512), per-block vs.\ global normalization, and QJL residual correction---all within the template-instantiated flash attention framework.
+\item \textbf{CUDA-native TriAttention on Quantized K} (\S\ref{sec:triattention}): We observe that Parseval's identity makes the trig-based importance scoring of TriAttention~\cite{triattention2026} invariant under our WHT rotation---the statistic can be read off the quantized K blocks directly. We design a hybrid 108-byte block (\texttt{AMX3\_1}) carrying both a 50-byte WHT-quantized key and a 58-byte polar summary, and implement the scoring, histogram-based Top-B threshold, and physical eviction entirely in CUDA. This eliminates the GPU$\to$CPU roundtrip that dominates reference implementations, and cleanly separates the \emph{rank} axis (who to keep) from the \emph{value} axis (bits per element).
+
+\item \textbf{Multi-Variant Engineering} (\S\ref{sec:engineering}): We implement 22 TBQ/TBQP/AMX type variants across block sizes 64--576, including double WHT per-head for $d=64$, asymmetric K/V dimensions (GLM 576/512), per-block vs.\ global normalization, QJL residual correction, and the hybrid AMX block---all within the template-instantiated flash attention framework.
 \end{enumerate}
 
 % ============================================================
@@ -77,6 +79,12 @@ TurboQuant~\cite{turboquant2026} compresses KV cache vectors through three steps
 \paragraph{3. QJL Correction (optional).} TurboQuant-prod (TBQP) uses $(b{-}1)$-bit Lloyd-Max quantization plus a 1-bit Quantized Johnson-Lindenstrauss projection on the residual, improving reconstruction MSE at the cost of additional attention score variance.
 
 \paragraph{Decoding.} At attention time, the query is WHT-transformed to match the key domain: $\text{score} = \langle H_d(\mathbf{s} \odot \mathbf{q}),\ \text{dequant}(\mathbf{k}_\text{tbq}) \rangle / d$. For values, the weighted sum is computed in the WHT domain, then inverse-transformed: $\mathbf{v}_\text{out} = \mathbf{s} \odot H_d(\sum_k \alpha_k \cdot \text{dequant}(\mathbf{v}_k)) / d$.
+
+\subsection{TriAttention}
+
+TriAttention~\cite{triattention2026} observes that for trained transformers the attention weight a query $\mathbf{q}$ assigns to a key $\mathbf{k}$ is well approximated, up to a monotone function, by a small set of trigonometric moments of the pre-RoPE $\mathbf{q}$ and $\mathbf{k}$ components. By precomputing per-layer, per-head summaries $\phi_\ell(\mathbf{k})$ over a fixed set of frequencies $\{\omega_j\}$ and a running Z-normalization, a rank score $r_\ell(t)$ can be assigned to each token $t$ without re-running the attention itself. Tokens whose rank falls below a Top-$B$ threshold are evicted from the KV cache, yielding a roughly $2\times$ live-token compression on top of whatever per-element compression the cache already uses.
+
+The published reference implementation performs this scoring on the host, reading the full-precision K cache back over PCIe on every trigger. In \S\ref{sec:triattention} we show that when the cache is already in the quantized WHT domain, the rank score is invariant under our sign-pattern + Hadamard rotation---it can be read off the blocks in place.
 
 \subsection{Flash Attention Vector Kernel}
 
@@ -271,6 +279,68 @@ half2 path (before fix) & 454.7 & 1.08$\times$ \\
 Non-determinism was completely eliminated: FP16 baseline produces identical output across 20 runs, and TBQ now matches this behavior (with minor borderline variation at 3-bit quantization boundaries).
 
 % ============================================================
+\section{TriAttention on Quantized K}
+\label{sec:triattention}
+
+This section describes our CUDA-native port of TriAttention and the hybrid AMX3\_1 block that carries both a TBQ-style quantized key and the polar summary needed to score it. The framing is deliberately separated from the earlier WHT sections: TBQ reduces \emph{bits per element} (value axis); TriAttention reduces the \emph{number of retained tokens} (rank axis). The two compose multiplicatively at inference time.
+
+\subsection{Key Insight: Parseval-Invariant Rank Score}
+
+The TriAttention score for token $t$ in layer $\ell$ reduces, after Z-normalization, to a sum of inner products
+\begin{equation}
+r_\ell(t) = \sum_{j=1}^{J} \big( \langle \boldsymbol{\phi}^c_j, \mathbf{k}_t \rangle^2 + \langle \boldsymbol{\phi}^s_j, \mathbf{k}_t \rangle^2 \big),
+\end{equation}
+where $\boldsymbol{\phi}^c_j, \boldsymbol{\phi}^s_j$ are fixed cosine/sine vectors for frequency $\omega_j$. Under our cache transform $\mathbf{k}_t \mapsto \tilde{\mathbf{k}}_t = H_d (\mathbf{s} \odot \mathbf{k}_t)$, Parseval's identity gives
+\begin{equation}
+\langle \boldsymbol{\phi}, \mathbf{k}_t \rangle = \tfrac{1}{d}\langle H_d (\mathbf{s} \odot \boldsymbol{\phi}),\ \tilde{\mathbf{k}}_t \rangle,
+\end{equation}
+so if we pre-rotate each $\boldsymbol{\phi}$ by the same sign-pattern-then-Hadamard transform, the score is invariant. Crucially, the rotated $\tilde{\boldsymbol{\phi}}$ can be computed once at load time; the hot path needs only one WHT-domain inner product with the already-quantized $\tilde{\mathbf{k}}_t$, matching exactly the dot product we already compute for attention. No dequantization is required.
+
+\subsection{Hybrid AMX3\_1 Block Layout}
+
+A plain TBQ3\_1 block (128-element WHT with 3-bit codes) is 50 bytes and is sufficient to carry the WHT-domain key itself. TriAttention scoring, however, also needs a compact \emph{polar} summary---the $(r, \phi)$-form coordinates used to evaluate $\langle \boldsymbol{\phi}^c_j, \mathbf{k}_t \rangle$ and $\langle \boldsymbol{\phi}^s_j, \mathbf{k}_t \rangle$ without reconstructing the full vector.
+
+We define a new block type \texttt{AMX3\_1} (head\_dim $=128$, 108 bytes total):
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \textbf{Part~A (50 B)}: standard TBQ3\_1 payload---WHT sign/Hadamard, 3-bit Lloyd-Max indices, one norm per 128-element block. Used by the flash attention dot product exactly as before.
+\item \textbf{Part~B (58 B)}: 3-bit magnitude $r$ per pair + 4-bit polar angle $\phi$ per pair + a 1-bit QJL correction. Used only by the TriAttention scoring kernel.
+\end{itemize}
+
+Part B is read only by the scoring kernel (triggered periodically, not per token), and Part A is read only by the attention kernel. The two parts share a common scale factor so that Part B's $r$ reproduces the same magnitudes the attention kernel would derive from Part A; this is what makes the hybrid internally consistent.
+
+\subsection{CUDA-Native Trigger Path}
+
+The scoring trigger runs every $\Delta$ tokens (default 256) and proceeds in three GPU passes over the cache, with no host roundtrip:
+
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \textbf{Raw score + Z-normalize.} For each layer and each frequency $\omega_j$, a 1-D kernel reads Part~B of each block, evaluates $\langle \tilde{\boldsymbol{\phi}}^c_j, \tilde{\mathbf{k}}_t \rangle^2 + \langle \tilde{\boldsymbol{\phi}}^s_j, \tilde{\mathbf{k}}_t \rangle^2$, running-mean/variance over a window, and stores the layer score.
+\item \textbf{Aggregate.} A reduce kernel sums the per-layer scores into a single rank $r(t)$ per token.
+\item \textbf{Top-$B$ mask via histogram.} A 64-bin histogram of $r(t)$ is built on device; a prefix sum over the histogram yields the threshold $\tau$ such that $|\{t : r(t) \geq \tau\}| \approx B$. A mask kernel marks the remaining tokens for eviction.
+\end{enumerate}
+
+Only the threshold $\tau$ and the KV position array cross PCIe---a few KB per trigger, vs.\ the full-precision K cache (megabytes) in the host-based reference.
+
+\subsection{Physical Eviction}
+
+An evicted block must not be re-admitted on the next trigger. Simply zeroing the WHT payload (Part~A) is insufficient: the polar Part~B survives and can push the block above $\tau$ on the next pass. We zero both Part~A and Part~B (fields \texttt{d\_wht} and \texttt{d\_r}), making eviction permanent. This matters in practice: without it, the 95\% eviction ratio we observe at Top-$B = 4096$ drifts back toward 70\% within a few hundred new tokens.
+
+\subsection{Attention Sink (\texttt{keep\_first})}
+
+TriAttention alone is not enough for generative stability: pure Top-$B$ scoring will eventually evict the first few tokens, at which point the softmax collapses---empirically, Qwen3-14B produces "다름, 다름, 다름\ldots" repetition loops. This matches the StreamingLLM~\cite{streamingllm2023} finding that the earliest tokens act as attention sinks. We add an override kernel that forces the first $K_0$ positions to always be kept regardless of score; $K_0 = 32$ suffices for Qwen3-14B (4 is too small, 16 marginal, 32 fully stable).
+
+\subsection{Why GPU-Native Matters}
+
+Our measurements put the per-trigger cost at $\sim$2\% of decode latency at $B = 4096$, versus seconds of wall time for the reference host-based implementation at 14B scale. Three factors contribute:
+
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \textbf{In-place block read.} The scoring kernel consumes the same quantized block bytes that are already resident in HBM for attention; no dequantization, no PCIe crossing.
+\item \textbf{Stream-local mask $\to$ eviction.} The mask never leaves the GPU---the eviction kernel reads it directly from the same stream.
+\item \textbf{Rank--value orthogonality.} Because Part~A is exactly TBQ3\_1, the existing flash attention kernel is unchanged by the addition of TriAttention; the two features compose rather than interfere.
+\end{itemize}
+
+We revisit the cost on the \emph{memory} side in \S\ref{sec:results}: AMX3\_1 is 108 B vs.\ TBQ3\_1's 50 B, so the raw bytes-per-token increases; the win comes from retaining fewer tokens.
+
+% ============================================================
 \section{Engineering Framework}
 \label{sec:engineering}
 
@@ -290,9 +360,12 @@ Suffix & Block Size & Head Dim & Notes \\
 \_2 & 64  & 64  & Small-head models \\
 \_3 & 64  & 64  & Double WHT per-head \\
 \_4 & 576 & 576 & GLM split 256+256+64 \\
+\midrule
+AMX3\_1  & 128 (108\,B) & 128 & Hybrid WHT+polar (K-side, v1.7.0) \\
+AMXV3\_1 & 128 (50\,B)  & 128 & V-side AMX companion \\
 \bottomrule
 \end{tabular}
-\caption{TBQ block size variants. Each has TBQ3/TBQ4/TBQP3/TBQP4 sub-types (3-bit, 4-bit, with/without QJL).}
+\caption{TBQ/AMX block variants. Each \_$i$ suffix has TBQ3/TBQ4/TBQP3/TBQP4 sub-types (3-bit, 4-bit, with/without QJL); 22 variants total. AMX3\_1 is the hybrid block used with TriAttention (\S\ref{sec:triattention}).}
 \label{tab:types}
 \end{table}
 
@@ -326,7 +399,7 @@ Gemma~4 uses Sliding Window Attention (SWA) for 25 of 35 layers. Despite occupyi
 
 \subsection{V Rotation Incompatibility}
 
-The standard llama.cpp KV cache applies RoPE rotation to both K and V. For K, this is safe: the rotation cancels in the dot product $\mathbf{q}^\top R^\top R\, \mathbf{k} = \mathbf{q}^\top \mathbf{k}$ (orthogonal transform). For V, however, the IWHT decode has no corresponding inverse rotation, causing the output to be in a rotated coordinate frame. We disable V rotation (\texttt{attn\_rot\_v=false}) for all TBQ configurations.
+The standard llama.cpp KV cache applies RoPE rotation to both K and V. For K, this is safe: RoPE is orthogonal, so quantizer inputs retain their norm and Gaussianization spectrum regardless of token position, and Parseval's identity preserves the relative-position inner product $\mathbf{q}_m^\top R_{n-m}\, \mathbf{k}$ across the WHT-domain dot product (the $\pm 1$ sign pattern $\mathbf{s}$ applied to both sides cancels, and the Hadamard matrix is orthogonal). For V, however, the IWHT decode has no corresponding inverse rotation to undo the RoPE that was applied on cache write, causing the output to be in a position-dependent rotated coordinate frame. We disable V rotation (\texttt{attn\_rot\_v=false}) for all TBQ configurations. The same argument explains why our internal WHT types (TBQ/TBQP/AMX) must bypass llama.cpp's external \texttt{attn\_rot\_k} path: applying two orthogonal rotations back-to-back destroys the per-coordinate centroid assumption of Lloyd-Max.
 
 % ============================================================
 \section{Development Timeline}
@@ -351,6 +424,12 @@ Non-deterministic output with temp=0 led to exhaustive debugging: eliminated CUD
 
 \paragraph{v1.5.3 (Apr 11--12): Double WHT for $d=64$ + Side Buffer Experiment.}
 Cross-head WHT ($H_{512} = H_8 \otimes H_{64}$) abandoned due to Q-K domain mismatch at $d=64$. Replaced with double WHT per-head: $S_1 \to \text{WHT}_{64} \to S_2 \to \text{WHT}_{64}$ (kurtosis 0.375 $\to$ 0.047). QJL re-enabled for K at $d=64$ (critical for multi-turn stability---9+ turns verified). Experimental f16 side buffer achieved 35/35 math (stored in branch \texttt{experiment/side-buffer-f16}). Key discovery: \texttt{src1} index mapping required for KV position consistency. Recommended production config for $d=64$: \texttt{--cache-type-k tbq4 --cache-type-v tbq3} (35/35 math verified on GPT-OSS 120B).
+
+\paragraph{v1.6.0 (Apr 14): Polar Derotate Exploration---Anomalous Math Result.}
+Before learning of TriAttention, we independently pursued the idea that RoPE-rotated K could be quantized more accurately if its phase were explicitly separated from its magnitude---\emph{polar derotate}. A prototype encoder split each K pair into $(r, \phi)$ form, quantized $r$ with Lloyd-Max and $\phi$ with a uniform angular grid, and explicitly undid the position rotation at dequantization. On a Qwen3-14B math benchmark (the same 35-problem suite), FP16 baseline scored $\sim$13/35, while our polar-derotate cache reached \textbf{31/35}---substantially higher than both TBQ3 and, surprisingly, the uncompressed FP16 baseline. We could not reproduce this advantage on other models or fully explain the mechanism (we suspect an implicit regularization from the angular grid, but this remains an open question; see \S\ref{sec:discussion}). After the TriAttention result in v1.7.0 provided a sounder rank-axis story, the dedicated polar-derotate type was retired; the AMX3\_1 block in v1.7.0 reuses the polar summary for a different purpose (TriAttention scoring).
+
+\paragraph{v1.7.0 (Apr 20--21): TriAttention Integration + Hybrid AMX Block.}
+After discovering the domvox reference implementation of TriAttention in Python, we ported the full trigger loop to CUDA (\S\ref{sec:triattention}), using Parseval's identity to score directly on quantized WHT blocks. A new hybrid block type \texttt{AMX3\_1} (108 B = 50 B TBQ3\_1 payload + 58 B polar summary) carries both the quantized key and the statistics the scoring kernel needs. On Qwen3-14B at 262K context, the effective compression reaches $\sim$2.37$\times$ raw $\times$ $\sim$2$\times$ live-token $\approx$ 4.74$\times$, with needle-in-haystack recall preserved once \texttt{keep\_first} $= 32$ is set to avoid sink-token eviction (4 was too small; 16 marginal; 32 fully stable). Housekeeping in the same release: TBQ/TBQP/AMX types now bypass the external \texttt{attn\_rot\_k} path (they do their own WHT internally; the external rotation was a redundant second orthogonal transform), and the defunct TBQX3\_1 scaffolding is removed.
 
 % ============================================================
 \section{Experimental Results}
@@ -398,11 +477,18 @@ FP16 & Gemma 4 26B & 20.1 & 21 & 19--21 \\
 FP16 & GPT-OSS 120B & 35/35 & 35 & --- \\
 \textbf{TBQ4/TBQ3} & GPT-OSS 120B & \textbf{35/35} & \textbf{35} & --- \\
 TBQP3\_3/TBQ3 & GPT-OSS 120B & \multicolumn{3}{c}{Korean {\checkmark}, matrix math {\texttimes}} \\
+\midrule
+FP16                    & Qwen3-14B & $\sim$13 & 14 & 11--14 \\
+\textbf{Polar-Derotate}$^\dagger$ & Qwen3-14B & --- & \textbf{31} & 28--31 \\
+AMX3\_1 + TriAttention  & Qwen3-14B & --- & 13 & 11--14 \\
 \bottomrule
 \end{tabular}
-\caption{Math benchmark results. On Gemma 4, TBQ peak (23) exceeds FP16 best (21). On GPT-OSS 120B ($d=64$), TBQ4 K achieves f16-equivalent 35/35; TBQP3\_3 supports Korean conversation but lacks matrix precision.}
+\caption{Math benchmark results. On Gemma 4, TBQ peak (23) exceeds FP16 best (21). On GPT-OSS 120B ($d=64$), TBQ4 K achieves f16-equivalent 35/35. On Qwen3-14B, a prototype polar-derotate K cache ($^\dagger$v1.6.0, since retired) produced an \emph{unexplained} jump to 31/35---substantially above the FP16 baseline of $\sim$13/35. We do not yet have a theoretical account of this effect; we report it as an observation. The production v1.7.0 AMX3\_1 block matches FP16 on this bench while reducing memory via TriAttention.}
 \label{tab:math}
 \end{table}
+
+\paragraph{Needle-in-haystack recall (Qwen3-14B, v1.7.0).}
+We embed a 6-digit password in a 200K-token context and ask the model to retrieve it after eviction has occurred. With \texttt{keep\_first}$=4$ the model loses the sink tokens and degenerates into a repetition loop; with \texttt{keep\_first}$=16$ recall is flaky; with \texttt{keep\_first}$=32$ recall is stable across all 10 trials.
 
 \subsection{Memory}
 
@@ -421,9 +507,24 @@ TBQP3/TBQ3 & 990 MiB & 1,290 MiB & 4.2$\times$ \\
 \label{tab:memory}
 \end{table}
 
+\paragraph{Effective compression under TriAttention.}
+On Qwen3-14B the AMX3\_1 block is 108 B vs.\ TBQ3\_1's 50 B, so the \emph{raw} cache is only $\sim$2.37$\times$ smaller than FP16---worse than TBQ3 alone. The win is on the \emph{live-token} axis: TriAttention evicts $\sim$50\% of slots once the context fills, giving an effective $\sim$2.37$\times$ $\times$ $\sim$2$\times$ $\approx$ 4.74$\times$ end-to-end compression vs.\ FP16. This is the framing we use in the abstract. The tradeoff is honest: we trade bytes-per-token for tokens-per-cache, and come out ahead because the rank axis compresses further than any remaining bit-level headroom.
+
+\subsection{Trigger Overhead}
+
+The TriAttention trigger on Qwen3-14B at $B=4096$ costs $\sim$2\% of wall-clock decode time per invocation (every 256 tokens). Decode throughput holds at $\sim$20.7 tok/s, within a few percent of TBQ3-only. The reference host-based implementation at the same scale stalls for seconds per trigger because of the GPU$\to$CPU K-cache roundtrip.
+
 \subsection{Determinism}
 
 With the FP32 accumulation fix, 20 consecutive runs with temp=0 produce identical output for all but 1--2 borderline tokens near 3-bit quantization boundaries. FP16 baseline achieves 20/20 identical runs. Prior to the fix, extreme divergence occurred as early as token 23.
+
+% ============================================================
+\section{Discussion: Open Questions}
+\label{sec:discussion}
+
+\paragraph{The polar-derotate math anomaly.} The v1.6.0 prototype reached 31/35 on a Qwen3-14B math benchmark whose FP16 baseline sits at $\sim$13/35. An uncompressed-model-beating compressed cache is, on its face, impossible; the likely explanations we can think of are (i) an implicit regularization effect from the uniform angular grid acting as a denoiser on a noisy attention distribution, (ii) a mismatch between our scoring rubric and the FP16 baseline on this particular suite, or (iii) a lucky interaction between our alpha-sharpening and Qwen3-14B's specific attention entropy profile. We did not reproduce the effect on Gemma 4 or GPT-OSS. We report the observation as-is rather than prune it from the record: the number happened, and understanding \emph{why} may well be more valuable than the number itself.
+
+\paragraph{Rank vs.\ value as independent axes.} A lesson we draw from the v1.6.0/v1.7.0 arc is that token-rank compression (which tokens to keep) and bit-depth compression (how to store each kept token) are effectively orthogonal. Our early experiments conflated them---trying to fix math-benchmark quality by adding bits to the quantizer---and improvements plateaued. Separating the axes (TBQ/AMX for value, TriAttention for rank) let each be pushed to its own limit without the other contaminating the design.
 
 % ============================================================
 \section{Related Work}
@@ -433,6 +534,8 @@ With the FP32 accumulation fix, 20 consecutive runs with temp=0 produce identica
 
 \paragraph{QJL.} The Quantized Johnson-Lindenstrauss lemma~\cite{qjl2024} enables 1-bit random projections that preserve inner products. TurboQuant-prod (TBQP) combines $(b{-}1)$-bit Lloyd-Max with 1-bit QJL on the residual, trading attention score variance for better reconstruction MSE.
 
+\paragraph{Token-level sparsification.} TriAttention~\cite{triattention2026} introduced the trig-summary rank statistic we exploit, and StreamingLLM~\cite{streamingllm2023} established that the earliest tokens act as attention sinks and must be protected from any eviction policy. Our contribution relative to both is the CUDA-native integration with a \emph{quantized} K cache: we show that, in the WHT domain, the rank score and the per-element quantization share the same algebraic substrate, so they compose without dequantization.
+
 \paragraph{Flash Attention.} FlashAttention~\cite{dao2022flashattention,dao2023flashattention2} and its variants optimize attention computation through tiling and online softmax. Our implementation extends the llama.cpp \texttt{fattn-vec} kernel, which targets single-token decoding with full warp utilization.
 
 \paragraph{Attention Score Correction.} SmoothQuant~\cite{smoothquant2023} and outlier-aware methods address activation quantization but do not correct the softmax flattening caused by KV quantization noise. Our dynamic sharpening is, to our knowledge, the first principled correction derived from the quantization SQNR.
@@ -441,14 +544,14 @@ With the FP32 accumulation fix, 20 consecutive runs with temp=0 produce identica
 \section{Conclusion}
 \label{sec:conclusion}
 
-We have presented the first production implementation of TurboQuant KV cache compression, achieving 4.2$\times$ memory reduction with 6\% perplexity cost on a state-of-the-art MoE model. Our dynamic attention sharpening formula provides a theoretically grounded, hyperparameter-free correction for quantization-induced softmax flattening. The discovery of the half-precision amplification pathology highlights that numerical precision requirements for WHT-based methods differ fundamentally from standard quantization---a consideration absent from the original paper that may be relevant to future WHT-based compression research.
+We have presented the first production implementation of TurboQuant KV cache compression, achieving 4.2$\times$ raw memory reduction with 6\% perplexity cost on a state-of-the-art MoE model, and extending this to an effective $\sim$4.74$\times$ at inference time on Qwen3-14B by composing TurboQuant's value-axis compression with a CUDA-native port of TriAttention along the rank axis. Our dynamic attention sharpening formula provides a theoretically grounded, hyperparameter-free correction for quantization-induced softmax flattening. The discovery of the half-precision amplification pathology highlights that numerical precision requirements for WHT-based methods differ fundamentally from standard quantization---a consideration absent from the original paper that may be relevant to future WHT-based compression research. The TriAttention integration, in turn, demonstrates that Parseval's identity is the bridge between rank-level and value-level cache compression: the same sign-Hadamard rotation that enables Lloyd-Max also leaves the trig-summary score invariant, so the two compositions require no host roundtrip and no dequantization.
 
-The full implementation, supporting 20 quantization variants across five head dimensions, is available at \url{https://github.com/AmesianX/TurboQuant} as a fork of llama.cpp.
+The full implementation, supporting 22 quantization variants across five head dimensions, is available at \url{https://github.com/AmesianX/TurboQuant} as a fork of llama.cpp.
 
 % ============================================================
 \section*{Acknowledgments}
 
-This work was conducted independently on an NVIDIA DGX Spark. The author thanks the llama.cpp community and the TurboQuant authors at Google DeepMind for the theoretical foundation.
+This work was conducted independently on an NVIDIA DGX Spark. The author thanks the llama.cpp community and the TurboQuant authors at Google DeepMind for the theoretical foundation. The TriAttention integration in v1.7.0 directly builds on the work of Mao et al.~\cite{triattention2026}, and our CUDA port was informed by the open-source Python reference implementation \texttt{domvox/triattention-ggml}; their prior art in structuring the scoring and eviction loop saved weeks of design time.
 
 % ============================================================
 \bibliographystyle{plain}
@@ -488,6 +591,16 @@ A.~Zandieh, M.~Daliri, I.~Han.
 G.~Xiao, J.~Lin, M.~Seznec, H.~Wu, J.~Demouth, S.~Han.
 \newblock SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models.
 \newblock In \emph{ICML}, 2023.
+
+\bibitem{triattention2026}
+Y.~Mao et al.
+\newblock TriAttention: Trigonometric Importance Scoring for Training-Free KV Cache Eviction.
+\newblock \emph{arXiv preprint arXiv:2604.04921}, 2026.
+
+\bibitem{streamingllm2023}
+G.~Xiao, Y.~Tian, B.~Chen, S.~Han, M.~Lewis.
+\newblock Efficient Streaming Language Models with Attention Sinks.
+\newblock In \emph{ICLR}, 2024.
 
 \end{thebibliography}
 
