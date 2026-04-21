@@ -3093,6 +3093,26 @@ void llama_tria_attach(
     ctx->tria_set(stats, budget, interval, keep_first);
 }
 
+// ---------------------------------------------------------------------------
+// TriAttention load/free — thin shims that forward to ggml-cuda so the public
+// symbols live in libllama (matches the LLAMA_API declaration in llama.h).
+// Windows DLL linkage was broken before v1.7.1 because the definitions sat in
+// ggml-cuda.dll while llama.h promised they came from llama.dll.
+// ---------------------------------------------------------------------------
+#include "ggml-backend.h"
+extern "C" {
+GGML_BACKEND_API struct llama_tria_stats * _llama_tria_backend_load(const char * path);
+GGML_BACKEND_API void                      _llama_tria_backend_free(struct llama_tria_stats * stats);
+}
+
+struct llama_tria_stats * llama_tria_load(const char * path) {
+    return _llama_tria_backend_load(path);
+}
+
+void llama_tria_free(struct llama_tria_stats * stats) {
+    _llama_tria_backend_free(stats);
+}
+
 uint32_t llama_n_ctx(const llama_context * ctx) {
     return ctx->n_ctx();
 }

@@ -65,6 +65,12 @@ struct llama_tria_stats;
 extern "C" {
 #endif
 
+// Backend-side load / free (wrapped by libllama's llama_tria_load / llama_tria_free).
+// These are the actual symbols exported from ggml-cuda.  The public names that
+// user code calls are defined in src/llama-context.cpp and forward here.
+GGML_BACKEND_API struct llama_tria_stats * _llama_tria_backend_load(const char * path);
+GGML_BACKEND_API void                      _llama_tria_backend_free(struct llama_tria_stats * stats);
+
 // Read per-model-layer budget scale (host copy).  Returns 1.0 if out of range.
 GGML_BACKEND_API float tria_layer_scale(struct llama_tria_stats * stats, int model_layer_idx);
 

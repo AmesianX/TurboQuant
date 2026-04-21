@@ -579,10 +579,20 @@ fail:
 }
 
 // ---------------------------------------------------------------------------
-// Public llama.h API shims
+// Backend-side entry points for the llama.h API shims.
+//
+// llama_tria_load / llama_tria_free are declared LLAMA_API in llama.h, so
+// Windows consumers expect them to be exported from llama.dll.  The real
+// implementation, however, needs CUDA — it lives here in ggml-cuda.dll.
+// To keep the library boundary clean we expose backend-prefixed entry
+// points via GGML_BACKEND_API (→ __declspec(dllexport) on Windows shared
+// builds) and let a thin wrapper in src/llama-context.cpp re-export them
+// under the official llama_tria_* names.  Before v1.7.1 the shim below
+// used the llama_ names directly, which caused Windows llama-common.dll
+// to fail linking with LNK2019 __imp_llama_tria_load.
 // ---------------------------------------------------------------------------
 
-extern "C" struct llama_tria_stats * llama_tria_load(const char * path) {
+extern "C" struct llama_tria_stats * _llama_tria_backend_load(const char * path) {
     auto * s = tria_load(path);
     if (!s) return nullptr;
     auto * w = new llama_tria_stats();
@@ -597,7 +607,7 @@ extern "C" struct llama_tria_stats * llama_tria_load(const char * path) {
     return w;
 }
 
-extern "C" void llama_tria_free(struct llama_tria_stats * stats) {
+extern "C" void _llama_tria_backend_free(struct llama_tria_stats * stats) {
     if (!stats) return;
     tria_scratch_free(stats);
     tria_free(stats->impl);
