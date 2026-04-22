@@ -1,0 +1,36 @@
+diff --git a/.github/actions/get-tag-name/action.yml b/.github/actions/get-tag-name/action.yml
+index 7ace23b2a..3ace8c7d5 100644
+--- a/.github/actions/get-tag-name/action.yml
++++ b/.github/actions/get-tag-name/action.yml
+@@ -1,22 +1,19 @@
+-name: "Determine tag name"
+-description: "Determine the tag name to use for a release"
++name: "Determine TurboQuant version"
++description: "Return the latest v*.*.* tag (e.g. v1.5.3) used for artifact naming"
+ outputs:
+   name:
+-    description: "The name of the tag"
++    description: "The version string (e.g. v1.5.3)"
+     value: ${{ steps.tag.outputs.name }}
+ 
+ runs:
+   using: "composite"
+   steps:
+-    - name: Determine tag name
++    - name: Determine version
+       id: tag
+       shell: bash
+       run: |
+-        BUILD_NUMBER="$(git rev-list --count HEAD)"
+-        SHORT_HASH="$(git rev-parse --short=7 HEAD)"
+-        if [[ "${{ env.BRANCH_NAME }}" == "master" ]]; then
+-          echo "name=b${BUILD_NUMBER}" >> $GITHUB_OUTPUT
+-        else
+-          SAFE_NAME=$(echo "${{ env.BRANCH_NAME }}" | tr '/' '-')
+-          echo "name=${SAFE_NAME}-b${BUILD_NUMBER}-${SHORT_HASH}" >> $GITHUB_OUTPUT
+-        fi
++        # Use the most recent v*.*.* tag as the version used in artifact filenames.
++        # This matches the existing release scheme (v1.5.3, v1.5.2, ...) where releases
++        # are created manually and this workflow only attaches binaries to them.
++        TBQ_VERSION="$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo 'v0.0.0')"
++        echo "name=${TBQ_VERSION}" >> $GITHUB_OUTPUT

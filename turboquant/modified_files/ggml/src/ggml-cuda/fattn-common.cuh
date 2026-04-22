@@ -43,7 +43,9 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ raw_K_data,
         const int32_t raw_K_stride,
         const char * __restrict__ Q_wht2_data,
-        const int32_t Q_wht2_stride);
+        const int32_t Q_wht2_stride,
+        const char * __restrict__ k_rope_data,      // TurboQuant: MLA _4 rope slice (f16). nullptr unless src[5] set.
+        const int32_t k_rope_stride);               // bytes per K cell row in k_rope tensor
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -583,6 +585,7 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 
 // TurboQuant V dequantization: centroid lookup in WHT domain (no IWHT here)
 // IWHT is applied ONCE to the final attention output (after softmax*V sum)
+// block_tbq4_0: d at offset 0, qs[128] at offset 2 → 2-byte aligned.
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_tbq4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_tbq4_0 * x = (const block_tbq4_0 *) vx;
@@ -597,8 +600,12 @@ static __device__ __forceinline__ void dequantize_V_tbq4_0(const void * __restri
 
 #pragma unroll
     for (int l = 0; l < ne; l += 2) {
-        const int byte_idx = (elem + l) / 2;
-        const uint8_t packed = x[ib].qs[byte_idx];
+        const int byte_idx = (elem + l) >> 1;
+        int start_byte = byte_idx & ~1;
+        if (start_byte > (int)(QK_K/2) - 4) start_byte = (int)(QK_K/2) - 4; // qs is 128 bytes
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &x[ib].qs[start_byte]);
+        const int packed = (qs_word >> ((byte_idx - start_byte) * 8)) & 0xFF;
         const float c0 = c4[packed & 0xF] * norm;
         const float c1 = c4[packed >> 4] * norm;
         if constexpr (std::is_same_v<T, float>) {
@@ -614,6 +621,7 @@ static __device__ __forceinline__ void dequantize_V_tbq4_0(const void * __restri
     }
 }
 
+// block_tbq3_0: d at offset 0, qs[96] at offset 2 → 2-byte aligned.
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_tbq3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_tbq3_0 * x = (const block_tbq3_0 *) vx;
@@ -629,10 +637,14 @@ static __device__ __forceinline__ void dequantize_V_tbq3_0(const void * __restri
     for (int l = 0; l < ne; ++l) {
         const int e = elem + l;
         const int bp = e * 3;
-        const int by = bp / 8, bo = bp % 8;
-        uint32_t v = (uint32_t)x[ib].qs[by] >> bo;
-        if (bo > 5 && by + 1 < QK_K*3/8) v |= (uint32_t)x[ib].qs[by+1] << (8-bo);
-        const float cent = c3[v & 0x7] * norm;
+        const int by = bp >> 3;
+        int start_byte = by & ~1;
+        if (start_byte > (int)(QK_K*3/8) - 4) start_byte = (int)(QK_K*3/8) - 4;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &x[ib].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp - (start_byte << 3);
+        const float cent = c3[(qs_word_u >> bit_in_word) & 0x7] * norm;
         if constexpr (std::is_same_v<T, float>) {
             ((float *) dst)[l] = cent;
         }
@@ -649,6 +661,7 @@ static __device__ __forceinline__ void dequantize_V_tbq3_0(const void * __restri
 // Q_ds_v = WHT(signs2*q)*sqrt(pi/2)/D (QJL query, in Q_ds -- independent random projection)
 // score = sum(cent[idx]*Q_mse[j])*norm + sum(qjl_sign[j]*Q_qjl[j])*d_qjl
 template <int D, int nthreads>
+// TBQP3_0: block_tbqp3_0 has d at offset 0, d_qjl at 2, qs[64] at 4, qjl[32] at 68. All 4-aligned.
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
@@ -664,33 +677,43 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_0(
         const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = k * 2;
         const int ib = elem / QK_K;
+        const int elem_in_blk = elem - ib*QK_K;
 
-        // Read both norms once
+        // Read both norms once (direct half struct field load)
         const float norm = __half2float(K[ib].d);
         const float d_qjl = __half2float(K[ib].d_qjl);
 
-        // 2-bit centroid lookup
-        const int byte_idx0 = (elem % QK_K) / 4;
-        const int byte_idx1 = ((elem+1) % QK_K) / 4;
-        const float cent0 = c2[(K[ib].qs[byte_idx0] >> (((elem % QK_K) % 4) * 2)) & 0x3];
-        const float cent1 = c2[(K[ib].qs[byte_idx1] >> ((((elem+1) % QK_K) % 4) * 2)) & 0x3];
+        // qs: 2-bit indices (4 elements per byte). Elem and elem+1 in same byte.
+        // 4-byte int load via memcpy_1 (qs at struct offset 4, 4-aligned).
+        const int qs_byte = elem_in_blk >> 2;
+        const int qs_aligned = qs_byte & ~3;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 4>(&qs_word, &K[ib].qs[qs_aligned]);
+        const int qs_byte_val = (qs_word >> ((qs_byte & 3) * 8)) & 0xFF;
+        const int bit_off = (elem_in_blk & 3) * 2;
+        const float cent0 = c2[(qs_byte_val >> bit_off)       & 0x3];
+        const float cent1 = c2[(qs_byte_val >> (bit_off + 2)) & 0x3];
 
-        // QJL: sign-flip instead of multiply (branchless via XOR on float sign bit)
+        // qjl: 1-bit signs. 4-byte int load (qjl at offset 68, 4-aligned).
+        const int qjl_byte = elem_in_blk >> 3;
+        const int qjl_aligned = qjl_byte & ~3;
+        int qjl_word;
+        ggml_cuda_memcpy_1<sizeof(int), 4>(&qjl_word, &K[ib].qjl[qjl_aligned]);
+        const int qjl_byte_val = (qjl_word >> ((qjl_byte & 3) * 8)) & 0xFF;
+        const int sign_bit = elem_in_blk & 7;
+        const int qjl0 = (qjl_byte_val >> sign_bit)       & 1;
+        const int qjl1 = (qjl_byte_val >> (sign_bit + 1)) & 1;
+
         const float2 q_qjl = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-        const int qjl0 = (K[ib].qjl[(elem%QK_K)/8] >> ((elem%QK_K)%8)) & 1;
-        const int qjl1 = (K[ib].qjl[((elem+1)%QK_K)/8] >> (((elem+1)%QK_K)%8)) & 1;
-        // sign-flip: if qjl==0 negate, if qjl==1 keep -> equivalent to *(2*qjl-1)
         const float qc0 = qjl0 ? q_qjl.x : -q_qjl.x;
         const float qc1 = qjl1 ? q_qjl.y : -q_qjl.y;
 
-        // MSE query
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q_mse = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
 #else
         const float2 q_mse = ((const float2 *) Q_v)[k_KQ_0/nthreads];
 #endif
 
-        // Combined: MSE + QJL in single accumulation
         sum += norm * (q_mse.x * cent0 + q_mse.y * cent1)
              + d_qjl * (qc0 + qc1);
     }
@@ -698,6 +721,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_0(
     return sum;
 }
 
+// TBQP4_0: block_tbqp4_0 has d at 0, d_qjl at 2, qs[96] at 4, qjl[32] at 100. All 4-aligned.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -716,29 +740,35 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_0(
         const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = k * 2;
         const int ib = elem / QK_K;
+        const int elem_in_blk = elem - ib*QK_K;
 
         const float norm = __half2float(K[ib].d);
         const float d_qjl = __half2float(K[ib].d_qjl);
 
-        // 3-bit centroid unpack
-        float cent0, cent1;
-        {
-            int bp = (elem%QK_K)*3, by = bp/8, bo = bp%8;
-            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
-            if (bo > 5 && by+1 < QK_K*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
-            cent0 = c3[v & 0x7];
-        }
-        {
-            int bp = ((elem+1)%QK_K)*3, by = bp/8, bo = bp%8;
-            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
-            if (bo > 5 && by+1 < QK_K*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
-            cent1 = c3[v & 0x7];
-        }
+        // qs: 3-bit indices. 2-byte aligned 4-byte load (alignment=2 since we use byte_idx & ~1 base).
+        // bit_in_word ≤ 15 (general) or ≤ 26 (clamped tail). qs is 96 bytes; clamp to 92.
+        const int bp0 = elem_in_blk * 3;
+        const int byte_idx0 = bp0 >> 3;
+        int start_byte = byte_idx0 & ~1;
+        if (start_byte > (int)(QK_K*3/8) - 4) start_byte = (int)(QK_K*3/8) - 4;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K[ib].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp0 - (start_byte << 3);
+        const float cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+        const float cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
 
-        // QJL: sign-flip (no float multiply)
+        // qjl: 1-bit signs. 4-byte int load (qjl at offset 100, 4-aligned).
+        const int qjl_byte = elem_in_blk >> 3;
+        const int qjl_aligned = qjl_byte & ~3;
+        int qjl_word;
+        ggml_cuda_memcpy_1<sizeof(int), 4>(&qjl_word, &K[ib].qjl[qjl_aligned]);
+        const int qjl_byte_val = (qjl_word >> ((qjl_byte & 3) * 8)) & 0xFF;
+        const int sign_bit = elem_in_blk & 7;
+        const int qjl0 = (qjl_byte_val >> sign_bit)       & 1;
+        const int qjl1 = (qjl_byte_val >> (sign_bit + 1)) & 1;
+
         const float2 q_qjl = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-        const int qjl0 = (K[ib].qjl[(elem%QK_K)/8] >> ((elem%QK_K)%8)) & 1;
-        const int qjl1 = (K[ib].qjl[((elem+1)%QK_K)/8] >> (((elem+1)%QK_K)%8)) & 1;
         const float qc0 = qjl0 ? q_qjl.x : -q_qjl.x;
         const float qc1 = qjl1 ? q_qjl.y : -q_qjl.y;
 
@@ -755,7 +785,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_0(
     return sum;
 }
 
-// TurboQuant KV: fused attention score (TBQ_mse variant, no QJL)
+// TBQ4_0: block_tbq4_0 has d at offset 0, qs[128] at offset 2 → 2-byte aligned.
 // score = sum_j( centroid[K_idx[j]] * Q_wht[j] ) * norm
 // Note: scale/D already applied to Q_wht during query preprocessing
 template <int D, int nthreads>
@@ -781,9 +811,15 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
         #pragma unroll
         for (int k_KQ_0 = 0; k_KQ_0 < 128; k_KQ_0 += nthreads) {
             const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-            const int byte_idx = k; // 128 bytes per block (256 elements * 4 bits / 8)
 
-            const uint8_t packed = K_tbq[blk].qs[byte_idx];
+            // qs: 4-bit packed, 2 elements per byte. 128 bytes per block.
+            // 2-byte aligned 4-byte int load. Clamp to keep window in 128-byte qs.
+            const int qs_byte = k;
+            int start_byte = qs_byte & ~1;
+            if (start_byte > 124) start_byte = 124;
+            int qs_word;
+            ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K_tbq[blk].qs[start_byte]);
+            const int packed = (qs_word >> ((qs_byte - start_byte) * 8)) & 0xFF;
             const float cent_lo = c4[packed & 0xF];
             const float cent_hi = c4[packed >> 4];
 
@@ -803,6 +839,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
 }
 
 // TBQ3_0: 3-bit fused attention score
+// block_tbq3_0 has d at offset 0, qs[96] at offset 2 → 2-byte aligned.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -828,21 +865,18 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
             const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
             const int elem = k * 2;
 
-            float cent0, cent1;
-            {
-                const int bp0 = elem * 3;
-                const int by0 = bp0 / 8, bo0 = bp0 % 8;
-                uint32_t v0 = (uint32_t)K_tbq[blk].qs[by0] >> bo0;
-                if (bo0 > 5) v0 |= (uint32_t)K_tbq[blk].qs[by0+1] << (8-bo0);
-                cent0 = c3[v0 & 0x7];
-            }
-            {
-                const int bp1 = (elem + 1) * 3;
-                const int by1 = bp1 / 8, bo1 = bp1 % 8;
-                uint32_t v1 = (uint32_t)K_tbq[blk].qs[by1] >> bo1;
-                if (bo1 > 5) v1 |= (uint32_t)K_tbq[blk].qs[by1+1] << (8-bo1);
-                cent1 = c3[v1 & 0x7];
-            }
+            // qs: 3-bit packed indices. 2-byte aligned 4-byte int load via memcpy_1.
+            // qs is 96 bytes per block; clamp window start to 92.
+            const int bp0 = elem * 3;
+            const int byte_idx0 = bp0 >> 3;
+            int start_byte = byte_idx0 & ~1;
+            if (start_byte > (int)(QK_K*3/8) - 4) start_byte = (int)(QK_K*3/8) - 4;
+            int qs_word;
+            ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K_tbq[blk].qs[start_byte]);
+            const uint32_t qs_word_u = (uint32_t) qs_word;
+            const int bit_in_word = bp0 - (start_byte << 3);
+            const float cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+            const float cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
 
             const int q_idx = blk * (128/nthreads) + k_KQ_0/nthreads;
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -875,10 +909,16 @@ static __device__ __forceinline__ void dequantize_V_tbq4_1(const void * __restri
     const int elem = i0 % TBQ_K128;
     const float norm = __half2float(x[ib].d);
 
+    // Memory pattern fix: use ggml_cuda_memcpy_1 for byte array reads (block_tbq4_1::qs at offset 2).
+    // qs is 64 bytes (4-bit packed, 2 elements/byte). Clamp 4-byte window start to 60.
 #pragma unroll
     for (int l = 0; l < ne; l += 2) {
-        const int byte_idx = (elem + l) / 2;
-        const uint8_t packed = x[ib].qs[byte_idx];
+        const int byte_idx = (elem + l) >> 1;
+        int start_byte = byte_idx & ~1;
+        if (start_byte > (int)(TBQ_K128/2) - 4) start_byte = (int)(TBQ_K128/2) - 4; // qs is 64 bytes
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &x[ib].qs[start_byte]);
+        const int packed = (qs_word >> ((byte_idx - start_byte) * 8)) & 0xFF;
         const float c0 = c4[packed & 0xF] * norm;
         const float c1 = c4[packed >> 4] * norm;
         if constexpr (std::is_same_v<T, float>) {
@@ -905,14 +945,58 @@ static __device__ __forceinline__ void dequantize_V_tbq3_1(const void * __restri
     const int elem = i0 % TBQ_K128;
     const float norm = __half2float(x[ib].d);
 
+    // Memory pattern fix: avoid raw byte indexing (causes GB10 freeze under sustained load).
+    // Use ggml_cuda_memcpy_1 with 2-byte alignment (block_tbq3_1::qs is at struct offset 2).
+    // 4-byte int load with 2-byte alignment → 2 short loads → coalesced across warp.
+    // qs is 48 bytes, so clamp start to 44 to keep the 4-byte window in bounds.
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         const int e = elem + l;
         const int bp = e * 3;
-        const int by = bp / 8, bo = bp % 8;
-        uint32_t v = (uint32_t)x[ib].qs[by] >> bo;
-        if (bo > 5 && by + 1 < TBQ_K128*3/8) v |= (uint32_t)x[ib].qs[by+1] << (8-bo);
-        const float cent = c3[v & 0x7] * norm;
+        const int by = bp >> 3;
+        int start_byte = by & ~1;
+        if (start_byte > (int)(TBQ_K128*3/8) - 4) start_byte = (int)(TBQ_K128*3/8) - 4; // qs is 48 bytes
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &x[ib].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp - (start_byte << 3); // ≤ 26 (clamped tail) or ≤ 15 (general)
+        const float cent = c3[(qs_word_u >> bit_in_word) & 0x7] * norm;
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l] = cent;
+        }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l] = __float2half(cent);
+        }
+#endif
+    }
+}
+
+// AMXV3_1 dequantize: tbq3_1 동치 (WHT + 3-bit Gaussian Lloyd-Max).
+// Read-side 는 block_amxv3_1 과 block_tbq3_1 이 동일 레이아웃이라 tbq3_1 과 동일 로직.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_amxv3_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_amxv3_1 * x = (const block_amxv3_1 *) vx;
+    static constexpr float c3[8] = {
+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
+    };
+
+    const int64_t ib = i0 / TBQ_K128;
+    const int elem = i0 % TBQ_K128;
+    const float norm = __half2float(x[ib].d);
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int e = elem + l;
+        const int bp = e * 3;
+        const int by = bp >> 3;
+        int start_byte = by & ~1;
+        if (start_byte > (int)(TBQ_K128*3/8) - 4) start_byte = (int)(TBQ_K128*3/8) - 4;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &x[ib].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp - (start_byte << 3);
+        const float cent = c3[(qs_word_u >> bit_in_word) & 0x7] * norm;
         if constexpr (std::is_same_v<T, float>) {
             ((float *) dst)[l] = cent;
         }
@@ -926,6 +1010,8 @@ static __device__ __forceinline__ void dequantize_V_tbq3_1(const void * __restri
 
 // TBQP3_1: fused MSE + Direct Sign score (128-block)
 // Direct Sign: sign(residual) stored directly, no SRHT — uses Q_v (MSE query) instead of Q_ds
+// Memory pattern: 4-byte aligned int loads via ggml_cuda_memcpy_1 (matches q4_0/q5_0 pattern)
+// to avoid uncoalesced byte loads that accumulate driver state on GB10 unified memory.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_1(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -936,25 +1022,40 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_1(
 
     static constexpr float c2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
 
+    // D=128: single block per token (ib==0). Hoist d/d_qjl as one 4-byte aligned int load.
+    int dd_word;
+    ggml_cuda_memcpy_1<sizeof(int), 4>(&dd_word, &K[0].d);
+    const half2 dd_h2 = *reinterpret_cast<const half2 *>(&dd_word);
+    const float2 dd = __half22float2(dd_h2);
+    const float norm     = dd.x;
+    const float d_direct = dd.y; // mean(|residual|) * ||k||
+
     float sum = 0.0f;
 
     #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
         const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = k * 2;
-        const int ib = elem / TBQ_K128;
 
-        const float norm = __half2float(K[ib].d);
-        const float d_direct = __half2float(K[ib].d_qjl); // mean(|residual|) * ||k||
+        // qs: 2-bit indices, 4 elements per byte. Load 4 bytes (16 elements) as int.
+        const int qs_byte = elem >> 2;          // byte index containing elem and elem+1 (elem even)
+        const int qs_aligned = qs_byte & ~3;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 4>(&qs_word, &K[0].qs[qs_aligned]);
+        const int qs_byte_val = (qs_word >> ((qs_byte & 3) * 8)) & 0xFF;
+        const int bit_off = (elem & 3) * 2;     // 0 or 4
+        const float cent0 = c2[(qs_byte_val >> bit_off)       & 0x3];
+        const float cent1 = c2[(qs_byte_val >> (bit_off + 2)) & 0x3];
 
-        const int byte_idx0 = (elem % TBQ_K128) / 4;
-        const int byte_idx1 = ((elem+1) % TBQ_K128) / 4;
-        const float cent0 = c2[(K[ib].qs[byte_idx0] >> (((elem % TBQ_K128) % 4) * 2)) & 0x3];
-        const float cent1 = c2[(K[ib].qs[byte_idx1] >> ((((elem+1) % TBQ_K128) % 4) * 2)) & 0x3];
-
-        // Direct Sign: use same Q_v (WHT'd query) for both MSE and sign correction
-        const int sign0 = (K[ib].qjl[(elem%TBQ_K128)/8] >> ((elem%TBQ_K128)%8)) & 1;
-        const int sign1 = (K[ib].qjl[((elem+1)%TBQ_K128)/8] >> (((elem+1)%TBQ_K128)%8)) & 1;
+        // qjl: 1-bit signs, 8 elements per byte. Load 4 bytes (32 elements) as int.
+        const int qjl_byte = elem >> 3;
+        const int qjl_aligned = qjl_byte & ~3;
+        int qjl_word;
+        ggml_cuda_memcpy_1<sizeof(int), 4>(&qjl_word, &K[0].qjl[qjl_aligned]);
+        const int qjl_byte_val = (qjl_word >> ((qjl_byte & 3) * 8)) & 0xFF;
+        const int sign_bit = elem & 7;           // 0,2,4,6 (elem always even)
+        const int sign0 = (qjl_byte_val >> sign_bit)       & 1;
+        const int sign1 = (qjl_byte_val >> (sign_bit + 1)) & 1;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
@@ -985,33 +1086,45 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_1(
         -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
     };
 
+    // D=128: single block per token. Hoist d/d_qjl as one 4-byte aligned int load.
+    // (block_tbqp4_1 has d at offset 0 and qs at offset 4 — 4-byte aligned.)
+    int dd_word;
+    ggml_cuda_memcpy_1<sizeof(int), 4>(&dd_word, &K[0].d);
+    const half2 dd_h2 = *reinterpret_cast<const half2 *>(&dd_word);
+    const float2 dd = __half22float2(dd_h2);
+    const float norm     = dd.x;
+    const float d_direct = dd.y;
+
     float sum = 0.0f;
 
     #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
         const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = k * 2;
-        const int ib = elem / TBQ_K128;
 
-        const float norm = __half2float(K[ib].d);
-        const float d_direct = __half2float(K[ib].d_qjl);
+        // qs: 3-bit indices, packed across byte boundaries. Pair (elem,elem+1) needs 6 bits at bp0..bp0+5.
+        // Use 2-byte aligned 4-byte load (start_byte even). bit_in_word ≤ 15 in normal case,
+        // ≤ 26 in clamped tail case — both fit within 32-bit window (cent1 high bit ≤ 31).
+        const int bp0 = elem * 3;
+        const int byte_idx0 = bp0 >> 3;
+        int start_byte = byte_idx0 & ~1;
+        if (start_byte > (int)(TBQ_K128*3/8) - 4) start_byte = (int)(TBQ_K128*3/8) - 4; // qs is 48 bytes
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K[0].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp0 - (start_byte << 3);
+        const float cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+        const float cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
 
-        float cent0, cent1;
-        {
-            int bp = (elem%TBQ_K128)*3, by = bp/8, bo = bp%8;
-            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
-            if (bo > 5 && by+1 < TBQ_K128*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
-            cent0 = c3[v & 0x7];
-        }
-        {
-            int bp = ((elem+1)%TBQ_K128)*3, by = bp/8, bo = bp%8;
-            uint32_t v = (uint32_t)K[ib].qs[by] >> bo;
-            if (bo > 5 && by+1 < TBQ_K128*3/8) v |= (uint32_t)K[ib].qs[by+1] << (8-bo);
-            cent1 = c3[v & 0x7];
-        }
-
-        const int sign0 = (K[ib].qjl[(elem%TBQ_K128)/8] >> ((elem%TBQ_K128)%8)) & 1;
-        const int sign1 = (K[ib].qjl[((elem+1)%TBQ_K128)/8] >> (((elem+1)%TBQ_K128)%8)) & 1;
+        // qjl: 1-bit signs, qjl is 16 bytes, offset 52 in struct (4-byte aligned).
+        const int qjl_byte = elem >> 3;
+        const int qjl_aligned = qjl_byte & ~3;
+        int qjl_word;
+        ggml_cuda_memcpy_1<sizeof(int), 4>(&qjl_word, &K[0].qjl[qjl_aligned]);
+        const int qjl_byte_val = (qjl_word >> ((qjl_byte & 3) * 8)) & 0xFF;
+        const int sign_bit = elem & 7;
+        const int sign0 = (qjl_byte_val >> sign_bit)       & 1;
+        const int sign1 = (qjl_byte_val >> (sign_bit + 1)) & 1;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
@@ -1029,6 +1142,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_1(
 }
 
 // TBQ4_1: 4-bit fused attention score (128-block)
+// Memory pattern: block_tbq4_1 has d at offset 0, qs at offset 2 → 2-byte aligned.
+// Use ggml_cuda_memcpy_1 with alignment=2 (matches q4_0/q5_0 pattern).
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_1(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1041,15 +1156,22 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_1(
          0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
     };
 
-    const float norm = __half2float(K_tbq[0].d);
+    const float norm = __half2float(K_tbq[0].d); // direct half struct field load (compiler-friendly)
     float sum = 0.0f;
 
     #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
         const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int byte_idx = k;
 
-        const uint8_t packed = K_tbq[0].qs[byte_idx];
+        // qs: 4-bit packed, 2 elements per byte. Each thread reads 1 byte (qs_byte=k).
+        // Load 4 bytes (4 thread-bytes) starting from 2-byte aligned base.
+        // qs is 64 bytes; clamp window start to 60 to keep load in bounds.
+        const int qs_byte = k;
+        int start_byte = qs_byte & ~1;
+        if (start_byte > (int)(TBQ_K128/2) - 4) start_byte = (int)(TBQ_K128/2) - 4;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K_tbq[0].qs[start_byte]);
+        const int packed = (qs_word >> ((qs_byte - start_byte) * 8)) & 0xFF;
         const float cent_lo = c4[packed & 0xF];
         const float cent_hi = c4[packed >> 4];
 
@@ -1066,6 +1188,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_1(
 }
 
 // TBQ3_1: 3-bit fused attention score (128-block)
+// Memory pattern: block_tbq3_1 has d at offset 0, qs at offset 2 → 2-byte aligned.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_1(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1078,7 +1201,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_1(
          0.2451f,  0.7560f,  1.3440f,  2.1520f,
     };
 
-    const float norm = __half2float(K_tbq[0].d);
+    const float norm = __half2float(K_tbq[0].d); // direct half load
     float sum = 0.0f;
 
     #pragma unroll
@@ -1086,21 +1209,63 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_1(
         const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = k * 2;
 
-        float cent0, cent1;
-        {
-            const int bp0 = elem * 3;
-            const int by0 = bp0 / 8, bo0 = bp0 % 8;
-            uint32_t v0 = (uint32_t)K_tbq[0].qs[by0] >> bo0;
-            if (bo0 > 5) v0 |= (uint32_t)K_tbq[0].qs[by0+1] << (8-bo0);
-            cent0 = c3[v0 & 0x7];
-        }
-        {
-            const int bp1 = (elem + 1) * 3;
-            const int by1 = bp1 / 8, bo1 = bp1 % 8;
-            uint32_t v1 = (uint32_t)K_tbq[0].qs[by1] >> bo1;
-            if (bo1 > 5) v1 |= (uint32_t)K_tbq[0].qs[by1+1] << (8-bo1);
-            cent1 = c3[v1 & 0x7];
-        }
+        // qs: 3-bit indices. Pair (elem, elem+1) needs 6 bits at bp0..bp0+5 (elem even).
+        // 2-byte aligned 4-byte int load → bit_in_word ≤ 15 (general) or ≤ 26 (clamped tail). Both fit in 32-bit.
+        const int bp0 = elem * 3;
+        const int byte_idx0 = bp0 >> 3;
+        int start_byte = byte_idx0 & ~1;
+        if (start_byte > (int)(TBQ_K128*3/8) - 4) start_byte = (int)(TBQ_K128*3/8) - 4; // qs is 48 bytes
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K_tbq[0].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp0 - (start_byte << 3);
+        const float cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+        const float cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
+#else
+        const float2 q = ((const float2 *) Q_v)[k_KQ_0/nthreads];
+#endif
+
+        sum += q.x * cent0 + q.y * cent1;
+    }
+
+    return norm * sum;
+}
+
+// AMX3_1 FA path (Part A only): WHT-quantized K → tbq3_1 동치 fused Q·K.
+// Part B (polar) 는 TriAttention scoring kernel 이 별도로 읽음.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_amx3_1(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_amx3_1 * K_amx = (const block_amx3_1 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    static constexpr float c3[8] = {
+        -2.1520f, -1.3440f, -0.7560f, -0.2451f,
+         0.2451f,  0.7560f,  1.3440f,  2.1520f,
+    };
+
+    const float norm = __half2float(K_amx[0].d_wht);
+    float sum = 0.0f;
+
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = k * 2;
+
+        const int bp0 = elem * 3;
+        const int byte_idx0 = bp0 >> 3;
+        int start_byte = byte_idx0 & ~1;
+        if (start_byte > (int)(TBQ_K128*3/8) - 4) start_byte = (int)(TBQ_K128*3/8) - 4;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K_amx[0].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp0 - (start_byte << 3);
+        const float cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+        const float cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads]);
@@ -1118,13 +1283,20 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_1(
 // TurboQuant 64-block (_2) variants for head_dim=64
 // ============================================================
 
+// block_tbq4_2: d at 0, qs[32] at offset 2 (2-byte aligned).
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_tbq4_2(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_tbq4_2 * x = (const block_tbq4_2 *) vx;
     static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
     const int64_t ib = i0 / TBQ_K64; const int elem = i0 % TBQ_K64; const float norm = __half2float(x[ib].d);
 #pragma unroll
-    for (int l = 0; l < ne; l += 2) { const uint8_t packed = x[ib].qs[(elem+l)/2]; const float c0 = c4[packed&0xF]*norm; const float c1 = c4[packed>>4]*norm;
+    for (int l = 0; l < ne; l += 2) {
+        const int byte_idx = (elem + l) >> 1;
+        int start_byte = byte_idx & ~1;
+        if (start_byte > (int)(TBQ_K64/2) - 4) start_byte = (int)(TBQ_K64/2) - 4; // qs is 32 bytes
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &x[ib].qs[start_byte]);
+        const int packed = (qs_word >> ((byte_idx - start_byte) * 8)) & 0xFF;
+        const float c0 = c4[packed&0xF]*norm; const float c1 = c4[packed>>4]*norm;
         if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l]=c0; ((float*)dst)[l+1]=c1; }
 #ifdef FP16_AVAILABLE
         else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l]=__float2half(c0); ((half*)dst)[l+1]=__float2half(c1); }
@@ -1132,15 +1304,21 @@ static __device__ __forceinline__ void dequantize_V_tbq4_2(const void * __restri
     }
 }
 
+// block_tbq3_2: d at 0, qs[24] at offset 2 (2-byte aligned).
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_tbq3_2(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_tbq3_2 * x = (const block_tbq3_2 *) vx;
     static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
     const int64_t ib = i0 / TBQ_K64; const int elem = i0 % TBQ_K64; const float norm = __half2float(x[ib].d);
 #pragma unroll
-    for (int l = 0; l < ne; ++l) { const int e = elem+l; const int bp = e*3; const int by = bp/8, bo = bp%8;
-        uint32_t v = (uint32_t)x[ib].qs[by]>>bo; if (bo > 5 && by+1 < TBQ_K64*3/8) v |= (uint32_t)x[ib].qs[by+1]<<(8-bo);
-        const float cent = c3[v&0x7]*norm;
+    for (int l = 0; l < ne; ++l) {
+        const int e = elem+l; const int bp = e*3; const int by = bp >> 3;
+        int start_byte = by & ~1;
+        if (start_byte > (int)(TBQ_K64*3/8) - 4) start_byte = (int)(TBQ_K64*3/8) - 4; // qs is 24 bytes
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &x[ib].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp - (start_byte << 3);
+        const float cent = c3[(qs_word_u >> bit_in_word) & 0x7] * norm;
         if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l]=cent; }
 #ifdef FP16_AVAILABLE
         else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l]=__float2half(cent); }
@@ -1148,7 +1326,7 @@ static __device__ __forceinline__ void dequantize_V_tbq3_2(const void * __restri
     }
 }
 
-// TBQP3_2: fused MSE + Direct Sign (64-block)
+// TBQP3_2: block_tbqp3_2 has d at 0, d_qjl at 2, qs[16] at 4, qjl[8] at 20. All 4-aligned.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_2(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1156,12 +1334,26 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_2(
     GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
     static constexpr float c2[4] = { -1.5104f,-0.4528f,0.4528f,1.5104f }; float sum = 0.0f;
     #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2; const int ib = elem/TBQ_K64;
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads);
+        const int elem = k*2; const int ib = elem/TBQ_K64; const int e_in = elem - ib*TBQ_K64;
         const float norm = __half2float(K[ib].d); const float d_direct = __half2float(K[ib].d_qjl);
-        const float cent0 = c2[(K[ib].qs[(elem%TBQ_K64)/4]>>(((elem%TBQ_K64)%4)*2))&0x3];
-        const float cent1 = c2[(K[ib].qs[((elem+1)%TBQ_K64)/4]>>((((elem+1)%TBQ_K64)%4)*2))&0x3];
-        const int s0 = (K[ib].qjl[(elem%TBQ_K64)/8]>>((elem%TBQ_K64)%8))&1;
-        const int s1 = (K[ib].qjl[((elem+1)%TBQ_K64)/8]>>(((elem+1)%TBQ_K64)%8))&1;
+        // qs (16 bytes, 4-aligned): single 4-byte int load covers whole block
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 4>(&qs_word, &K[ib].qs[(e_in>>2) & ~3]);
+        const int qs_byte = e_in >> 2;
+        const int qs_byte_val = (qs_word >> ((qs_byte & 3) * 8)) & 0xFF;
+        const int bit_off = (e_in & 3) * 2;
+        const float cent0 = c2[(qs_byte_val >> bit_off)       & 0x3];
+        const float cent1 = c2[(qs_byte_val >> (bit_off + 2)) & 0x3];
+        // qjl (8 bytes, 4-aligned): clamp start to 4
+        int qjl_byte = e_in >> 3;
+        int qjl_aligned = qjl_byte & ~3;
+        if (qjl_aligned > (int)(TBQ_K64/8) - 4) qjl_aligned = (int)(TBQ_K64/8) - 4;
+        int qjl_word; ggml_cuda_memcpy_1<sizeof(int), 4>(&qjl_word, &K[ib].qjl[qjl_aligned]);
+        const int qjl_byte_val = (qjl_word >> ((qjl_byte - qjl_aligned) * 8)) & 0xFF;
+        const int sign_bit = e_in & 7;
+        const int s0 = (qjl_byte_val >> sign_bit)       & 1;
+        const int s1 = (qjl_byte_val >> (sign_bit + 1)) & 1;
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
 #else
@@ -1172,7 +1364,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_2(
     return sum;
 }
 
-// TBQP4_2: fused MSE + Direct Sign (64-block)
+// TBQP4_2: block_tbqp4_2 has d at 0, d_qjl at 2, qs[24] at 4, qjl[8] at 28. All 4-aligned.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_2(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1180,13 +1372,29 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_2(
     GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
     static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f }; float sum = 0.0f;
     #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2; const int ib = elem/TBQ_K64;
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads);
+        const int elem = k*2; const int ib = elem/TBQ_K64; const int e_in = elem - ib*TBQ_K64;
         const float norm = __half2float(K[ib].d); const float d_direct = __half2float(K[ib].d_qjl);
-        float cent0, cent1;
-        { int bp=(elem%TBQ_K64)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K[ib].qs[by]>>bo; if(bo>5&&by+1<TBQ_K64*3/8) v|=(uint32_t)K[ib].qs[by+1]<<(8-bo); cent0=c3[v&0x7]; }
-        { int bp=((elem+1)%TBQ_K64)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K[ib].qs[by]>>bo; if(bo>5&&by+1<TBQ_K64*3/8) v|=(uint32_t)K[ib].qs[by+1]<<(8-bo); cent1=c3[v&0x7]; }
-        const int s0 = (K[ib].qjl[(elem%TBQ_K64)/8]>>((elem%TBQ_K64)%8))&1;
-        const int s1 = (K[ib].qjl[((elem+1)%TBQ_K64)/8]>>(((elem+1)%TBQ_K64)%8))&1;
+        // qs (24 bytes, 4-aligned for tbqp): use 2-byte aligned 4-byte load for bit-window safety
+        const int bp0 = e_in * 3;
+        const int byte_idx0 = bp0 >> 3;
+        int start_byte = byte_idx0 & ~1;
+        if (start_byte > (int)(TBQ_K64*3/8) - 4) start_byte = (int)(TBQ_K64*3/8) - 4;
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K[ib].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp0 - (start_byte << 3);
+        const float cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+        const float cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
+        // qjl (8 bytes, 4-aligned)
+        int qjl_byte = e_in >> 3;
+        int qjl_aligned = qjl_byte & ~3;
+        if (qjl_aligned > (int)(TBQ_K64/8) - 4) qjl_aligned = (int)(TBQ_K64/8) - 4;
+        int qjl_word; ggml_cuda_memcpy_1<sizeof(int), 4>(&qjl_word, &K[ib].qjl[qjl_aligned]);
+        const int qjl_byte_val = (qjl_word >> ((qjl_byte - qjl_aligned) * 8)) & 0xFF;
+        const int sign_bit = e_in & 7;
+        const int s0 = (qjl_byte_val >> sign_bit)       & 1;
+        const int s1 = (qjl_byte_val >> (sign_bit + 1)) & 1;
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
 #else
@@ -1197,6 +1405,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_2(
     return sum;
 }
 
+// block_tbq4_2: d at 0, qs[32] at offset 2 (2-byte aligned).
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_2(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1204,8 +1413,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_2(
     static constexpr float c4[16] = { -2.7326f,-2.0690f,-1.6180f,-1.2562f,-0.9424f,-0.6568f,-0.3881f,-0.1284f,0.1284f,0.3881f,0.6568f,0.9424f,1.2562f,1.6180f,2.0690f,2.7326f };
     const float norm = __half2float(K_tbq[0].d); float sum = 0.0f;
     #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads);
-        const uint8_t packed = K_tbq[0].qs[k];
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads);
+        const int qs_byte = k;
+        int start_byte = qs_byte & ~1;
+        if (start_byte > (int)(TBQ_K64/2) - 4) start_byte = (int)(TBQ_K64/2) - 4;
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K_tbq[0].qs[start_byte]);
+        const int packed = (qs_word >> ((qs_byte - start_byte) * 8)) & 0xFF;
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
 #else
@@ -1216,6 +1430,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_2(
     return norm*sum;
 }
 
+// block_tbq3_2: d at 0, qs[24] at offset 2 (2-byte aligned).
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_2(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1223,10 +1438,18 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_2(
     static constexpr float c3[8] = { -2.1520f,-1.3440f,-0.7560f,-0.2451f,0.2451f,0.7560f,1.3440f,2.1520f };
     const float norm = __half2float(K_tbq[0].d); float sum = 0.0f;
     #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) { const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads); const int elem = k*2;
-        float cent0, cent1;
-        { int bp0=elem*3,by0=bp0/8,bo0=bp0%8; uint32_t v0=(uint32_t)K_tbq[0].qs[by0]>>bo0; if(bo0>5) v0|=(uint32_t)K_tbq[0].qs[by0+1]<<(8-bo0); cent0=c3[v0&0x7]; }
-        { int bp1=(elem+1)*3,by1=bp1/8,bo1=bp1%8; uint32_t v1=(uint32_t)K_tbq[0].qs[by1]>>bo1; if(bo1>5) v1|=(uint32_t)K_tbq[0].qs[by1+1]<<(8-bo1); cent1=c3[v1&0x7]; }
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
+        const int k = k_KQ_0+(nthreads==WARP_SIZE?threadIdx.x:threadIdx.x%nthreads);
+        const int elem = k*2;
+        const int bp0 = elem * 3;
+        const int byte_idx0 = bp0 >> 3;
+        int start_byte = byte_idx0 & ~1;
+        if (start_byte > (int)(TBQ_K64*3/8) - 4) start_byte = (int)(TBQ_K64*3/8) - 4;
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &K_tbq[0].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp0 - (start_byte << 3);
+        const float cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+        const float cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
 #else
@@ -1243,6 +1466,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_2(
 // ============================================================
 
 // TBQP3_4: 2-bit Lloyd-Max + QJL(256) / DirectSign(64)
+// block_tbqp3_4: qs1[64] at offset 4, qjl1[32] at 68, qs2[64] at 104, qjl2[32] at 168 — all 4-aligned.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_4(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1254,35 +1478,44 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_4(
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
         const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = k * 2;
-        // Determine sub-block
         float norm, d_corr, cent0, cent1;
-        int corr0, corr1; // correction bits
-        bool use_qjl; // true for sub-blocks 1,2 (QJL), false for sub-block 3 (Direct Sign)
-        if (elem < 256) {
-            // Sub-block 1: elements [0, 256)
-            const int e = elem;
-            norm = __half2float(K->d1); d_corr = __half2float(K->d1_qjl);
-            cent0 = c2[(K->qs1[e/4]>>((e%4)*2))&0x3];
-            cent1 = c2[(K->qs1[(e+1)/4]>>(((e+1)%4)*2))&0x3];
-            corr0 = (K->qjl1[e/8]>>(e%8))&1;
-            corr1 = (K->qjl1[(e+1)/8]>>((e+1)%8))&1;
-            use_qjl = true;
-        } else if (elem < 512) {
-            // Sub-block 2: elements [256, 512)
-            const int e = elem - 256;
-            norm = __half2float(K->d2); d_corr = __half2float(K->d2_qjl);
-            cent0 = c2[(K->qs2[e/4]>>((e%4)*2))&0x3];
-            cent1 = c2[(K->qs2[(e+1)/4]>>(((e+1)%4)*2))&0x3];
-            corr0 = (K->qjl2[e/8]>>(e%8))&1;
-            corr1 = (K->qjl2[(e+1)/8]>>((e+1)%8))&1;
+        int corr0, corr1;
+        bool use_qjl;
+        if (elem < 512) {
+            const bool is_blk1 = (elem < 256);
+            const int e = is_blk1 ? elem : (elem - 256);
+            norm   = __half2float(is_blk1 ? K->d1     : K->d2);
+            d_corr = __half2float(is_blk1 ? K->d1_qjl : K->d2_qjl);
+            const uint8_t * qs_sub  = is_blk1 ? K->qs1  : K->qs2;
+            const uint8_t * qjl_sub = is_blk1 ? K->qjl1 : K->qjl2;
+            // qs (64 bytes, 4-aligned): single 4-byte int load
+            const int qs_byte = e >> 2;
+            const int qs_aligned = qs_byte & ~3;
+            int qs_word; ggml_cuda_memcpy_1<sizeof(int), 4>(&qs_word, &qs_sub[qs_aligned]);
+            const int qs_byte_val = (qs_word >> ((qs_byte & 3) * 8)) & 0xFF;
+            const int bit_off = (e & 3) * 2;
+            cent0 = c2[(qs_byte_val >> bit_off)       & 0x3];
+            cent1 = c2[(qs_byte_val >> (bit_off + 2)) & 0x3];
+            // qjl (32 bytes, 4-aligned): 4-byte int load
+            const int qjl_byte = e >> 3;
+            const int qjl_aligned = qjl_byte & ~3;
+            int qjl_word; ggml_cuda_memcpy_1<sizeof(int), 4>(&qjl_word, &qjl_sub[qjl_aligned]);
+            const int qjl_byte_val = (qjl_word >> ((qjl_byte & 3) * 8)) & 0xFF;
+            const int sign_bit = e & 7;
+            corr0 = (qjl_byte_val >> sign_bit)       & 1;
+            corr1 = (qjl_byte_val >> (sign_bit + 1)) & 1;
             use_qjl = true;
         } else {
-            // Sub-block 3: f16 passthrough (rope)
+            // Sub-block 3: f16 passthrough (rope) — 2-byte aligned half loads, 2 elements
             const int e = elem - 512;
-            cent0 = __half2float(K->rope[e]);
-            cent1 = __half2float(K->rope[e + 1]);
+            int rope_pair_word;
+            ggml_cuda_memcpy_1<sizeof(int), 2>(&rope_pair_word, &K->rope[e]);
+            const half2 rope_h2 = *reinterpret_cast<const half2 *>(&rope_pair_word);
+            const float2 rope_f2 = __half22float2(rope_h2);
+            cent0 = rope_f2.x;
+            cent1 = rope_f2.y;
             use_qjl = false;
-            norm = 0.0f; d_corr = 0.0f; // unused, suppress warnings
+            norm = 0.0f; d_corr = 0.0f;
             corr0 = 0; corr1 = 0;
         }
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -1295,7 +1528,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_4(
             sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
                  + d_corr*((corr0?q_qjl.x:-q_qjl.x) + (corr1?q_qjl.y:-q_qjl.y));
         } else {
-            // f16 passthrough: Q_reg already has Q_raw * scale, values are raw f16
             sum += q_mse.x*cent0 + q_mse.y*cent1;
         }
     }
@@ -1303,6 +1535,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp3_4(
 }
 
 // TBQP4_4: 3-bit Lloyd-Max + QJL(256) / DirectSign(64)
+// block_tbqp4_4: qs1[96] at offset 4, qjl1[32] at 100, qs2[96] at 136, qjl2[32] at 232 — all 4-aligned.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_4(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1317,29 +1550,43 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_4(
         float norm, d_corr, cent0, cent1;
         int corr0, corr1;
         bool use_qjl;
-        if (elem < 256) {
-            const int e = elem;
-            norm = __half2float(K->d1); d_corr = __half2float(K->d1_qjl);
-            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs1[by]>>bo; if(bo>5) v|=(uint32_t)K->qs1[by+1]<<(8-bo); cent0=c3[v&0x7]; }
-            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs1[by]>>bo; if(bo>5) v|=(uint32_t)K->qs1[by+1]<<(8-bo); cent1=c3[v&0x7]; }
-            corr0 = (K->qjl1[e/8]>>(e%8))&1;
-            corr1 = (K->qjl1[(e+1)/8]>>((e+1)%8))&1;
-            use_qjl = true;
-        } else if (elem < 512) {
-            const int e = elem - 256;
-            norm = __half2float(K->d2); d_corr = __half2float(K->d2_qjl);
-            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs2[by]>>bo; if(bo>5) v|=(uint32_t)K->qs2[by+1]<<(8-bo); cent0=c3[v&0x7]; }
-            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)K->qs2[by]>>bo; if(bo>5) v|=(uint32_t)K->qs2[by+1]<<(8-bo); cent1=c3[v&0x7]; }
-            corr0 = (K->qjl2[e/8]>>(e%8))&1;
-            corr1 = (K->qjl2[(e+1)/8]>>((e+1)%8))&1;
+        if (elem < 512) {
+            const bool is_blk1 = (elem < 256);
+            const int e = is_blk1 ? elem : (elem - 256);
+            norm   = __half2float(is_blk1 ? K->d1     : K->d2);
+            d_corr = __half2float(is_blk1 ? K->d1_qjl : K->d2_qjl);
+            const uint8_t * qs_sub  = is_blk1 ? K->qs1  : K->qs2;
+            const uint8_t * qjl_sub = is_blk1 ? K->qjl1 : K->qjl2;
+            // qs (96 bytes, 4-aligned). Use 2-byte aligned 4-byte int load (bit-window safe).
+            const int bp0 = e * 3;
+            const int byte_idx0 = bp0 >> 3;
+            int start_byte = byte_idx0 & ~1;
+            if (start_byte > (int)(QK_K*3/8) - 4) start_byte = (int)(QK_K*3/8) - 4;
+            int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &qs_sub[start_byte]);
+            const uint32_t qs_word_u = (uint32_t) qs_word;
+            const int bit_in_word = bp0 - (start_byte << 3);
+            cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+            cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
+            // qjl (32 bytes, 4-aligned)
+            const int qjl_byte = e >> 3;
+            const int qjl_aligned = qjl_byte & ~3;
+            int qjl_word; ggml_cuda_memcpy_1<sizeof(int), 4>(&qjl_word, &qjl_sub[qjl_aligned]);
+            const int qjl_byte_val = (qjl_word >> ((qjl_byte & 3) * 8)) & 0xFF;
+            const int sign_bit = e & 7;
+            corr0 = (qjl_byte_val >> sign_bit)       & 1;
+            corr1 = (qjl_byte_val >> (sign_bit + 1)) & 1;
             use_qjl = true;
         } else {
-            // Sub-block 3: f16 passthrough (rope)
+            // Sub-block 3: f16 passthrough (rope) — 4-byte aligned int load yields 2 halves
             const int e = elem - 512;
-            cent0 = __half2float(K->rope[e]);
-            cent1 = __half2float(K->rope[e + 1]);
+            int rope_pair_word;
+            ggml_cuda_memcpy_1<sizeof(int), 2>(&rope_pair_word, &K->rope[e]);
+            const half2 rope_h2 = *reinterpret_cast<const half2 *>(&rope_pair_word);
+            const float2 rope_f2 = __half22float2(rope_h2);
+            cent0 = rope_f2.x;
+            cent1 = rope_f2.y;
             use_qjl = false;
-            norm = 0.0f; d_corr = 0.0f; // unused, suppress warnings
+            norm = 0.0f; d_corr = 0.0f;
             corr0 = 0; corr1 = 0;
         }
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -1352,7 +1599,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_4(
             sum += norm*(q_mse.x*cent0 + q_mse.y*cent1)
                  + d_corr*((corr0?q_qjl.x:-q_qjl.x) + (corr1?q_qjl.y:-q_qjl.y));
         } else {
-            // f16 passthrough: Q_reg already has Q_raw * scale, values are raw f16
             sum += q_mse.x*cent0 + q_mse.y*cent1;
         }
     }
@@ -1360,6 +1606,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbqp4_4(
 }
 
 // TBQ3_4: 3-bit Lloyd-Max (no QJL), split 256+256+64
+// block_tbq3_4: qs1[96] at offset 2 (2-aligned), qs2[96] at offset 100 (4-aligned).
+// Use alignment=2 for both — strictly correct for both sub-blocks.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_4(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1371,23 +1619,32 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_4(
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
         const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = k * 2;
-        float norm; const uint8_t * qs;
-        int e;
         float cent0, cent1;
+        float norm = 0.0f;
         bool is_rope = false;
-        if (elem < 256) { norm = __half2float(K->d1); qs = K->qs1; e = elem; }
-        else if (elem < 512) { norm = __half2float(K->d2); qs = K->qs2; e = elem - 256; }
-        else {
-            // Sub-block 3: f16 passthrough (rope)
-            e = elem - 512;
-            cent0 = __half2float(K->rope[e]);
-            cent1 = __half2float(K->rope[e + 1]);
+        if (elem < 512) {
+            const bool is_blk1 = (elem < 256);
+            const int e = is_blk1 ? elem : (elem - 256);
+            norm = __half2float(is_blk1 ? K->d1 : K->d2);
+            const uint8_t * qs = is_blk1 ? K->qs1 : K->qs2;
+            const int bp0 = e * 3;
+            const int byte_idx0 = bp0 >> 3;
+            int start_byte = byte_idx0 & ~1;
+            if (start_byte > (int)(QK_K*3/8) - 4) start_byte = (int)(QK_K*3/8) - 4;
+            int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &qs[start_byte]);
+            const uint32_t qs_word_u = (uint32_t) qs_word;
+            const int bit_in_word = bp0 - (start_byte << 3);
+            cent0 = c3[(qs_word_u >> bit_in_word)       & 0x7];
+            cent1 = c3[(qs_word_u >> (bit_in_word + 3)) & 0x7];
+        } else {
+            const int e = elem - 512;
+            int rope_pair_word;
+            ggml_cuda_memcpy_1<sizeof(int), 2>(&rope_pair_word, &K->rope[e]);
+            const half2 rope_h2 = *reinterpret_cast<const half2 *>(&rope_pair_word);
+            const float2 rope_f2 = __half22float2(rope_h2);
+            cent0 = rope_f2.x;
+            cent1 = rope_f2.y;
             is_rope = true;
-            norm = 0.0f; qs = nullptr;
-        }
-        if (!is_rope) {
-            { int bp=e*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent0=c3[v&0x7]; }
-            { int bp=(e+1)*3,by=bp/8,bo=bp%8; uint32_t v=(uint32_t)qs[by]>>bo; if(bo>5) v|=(uint32_t)qs[by+1]<<(8-bo); cent1=c3[v&0x7]; }
         }
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
@@ -1404,6 +1661,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_4(
 }
 
 // TBQ4_4: 4-bit Lloyd-Max (no QJL), split 256+256+64
+// block_tbq4_4: qs1[128] at offset 2 (2-aligned), qs2[128] at offset 132 (4-aligned).
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_4(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -1415,25 +1673,31 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_4(
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads) {
         const int k = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = k * 2;
-        float norm; const uint8_t * qs;
-        int e;
         float cent0, cent1;
+        float norm = 0.0f;
         bool is_rope = false;
-        if (elem < 256) { norm = __half2float(K->d1); qs = K->qs1; e = elem; }
-        else if (elem < 512) { norm = __half2float(K->d2); qs = K->qs2; e = elem - 256; }
-        else {
-            // Sub-block 3: f16 passthrough (rope)
-            e = elem - 512;
-            cent0 = __half2float(K->rope[e]);
-            cent1 = __half2float(K->rope[e + 1]);
+        if (elem < 512) {
+            const bool is_blk1 = (elem < 256);
+            const int e = is_blk1 ? elem : (elem - 256);
+            norm = __half2float(is_blk1 ? K->d1 : K->d2);
+            const uint8_t * qs = is_blk1 ? K->qs1 : K->qs2;
+            // 4-bit packed: each thread reads 1 byte (2 elements). 2-aligned 4-byte int load.
+            const int qs_byte = e >> 1;  // elem and elem+1 share same byte
+            int start_byte = qs_byte & ~1;
+            if (start_byte > (int)(QK_K/2) - 4) start_byte = (int)(QK_K/2) - 4;
+            int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &qs[start_byte]);
+            const int packed = (qs_word >> ((qs_byte - start_byte) * 8)) & 0xFF;
+            cent0 = c4[packed & 0xF];
+            cent1 = c4[packed >> 4];
+        } else {
+            const int e = elem - 512;
+            int rope_pair_word;
+            ggml_cuda_memcpy_1<sizeof(int), 2>(&rope_pair_word, &K->rope[e]);
+            const half2 rope_h2 = *reinterpret_cast<const half2 *>(&rope_pair_word);
+            const float2 rope_f2 = __half22float2(rope_h2);
+            cent0 = rope_f2.x;
+            cent1 = rope_f2.y;
             is_rope = true;
-            norm = 0.0f; qs = nullptr;
-        }
-        if (!is_rope) {
-            const uint8_t packed = qs[e/2];
-            cent0 = (e % 2 == 0) ? c4[packed & 0xF] : c4[packed >> 4];
-            const uint8_t packed1 = qs[(e+1)/2];
-            cent1 = ((e+1) % 2 == 0) ? c4[packed1 & 0xF] : c4[packed1 >> 4];
         }
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 q = __half22float2(((const half2*)Q_v)[k_KQ_0/nthreads]);
@@ -1457,11 +1721,13 @@ static __device__ __forceinline__ void dequantize_V_tbq3_4(const void * __restri
     const int64_t ib = i0 / TBQ_K576;
     const int elem = i0 % TBQ_K576;
 
-    // Sub-block 3: f16 passthrough (rope) — early return
+    // Sub-block 3: f16 passthrough (rope) — use memcpy_1 for half loads
     if (elem >= 512) {
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
-            const float val = __half2float(x[ib].rope[elem - 512 + l]);
+            half rope_h;
+            ggml_cuda_memcpy_1<sizeof(half), 2>(&rope_h, &x[ib].rope[elem - 512 + l]);
+            const float val = __half2float(rope_h);
             if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = val; }
 #ifdef FP16_AVAILABLE
             else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(val); }
@@ -1470,20 +1736,22 @@ static __device__ __forceinline__ void dequantize_V_tbq3_4(const void * __restri
         return;
     }
 
-    // Hoist sub-block selection + half2float out of unrolled loop (consecutive elements stay in same sub-block)
     const bool is_blk1 = (elem < 256);
     const float norm = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
     const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
     const int e_base = is_blk1 ? elem : (elem - 256);
-    constexpr int qs_len = QK_K*3/8;
 
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         const int e = e_base + l;
-        const int bp = e*3, by = bp/8, bo = bp%8;
-        uint32_t v = (uint32_t)qs[by]>>bo;
-        if (bo > 5 && by+1 < qs_len) v |= (uint32_t)qs[by+1]<<(8-bo);
-        const float cent = c3[v&0x7] * norm;
+        const int bp = e*3;
+        const int by = bp >> 3;
+        int start_byte = by & ~1;
+        if (start_byte > (int)(QK_K*3/8) - 4) start_byte = (int)(QK_K*3/8) - 4;
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp - (start_byte << 3);
+        const float cent = c3[(qs_word_u >> bit_in_word) & 0x7] * norm;
         if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = cent; }
 #ifdef FP16_AVAILABLE
         else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(cent); }
@@ -1499,11 +1767,12 @@ static __device__ __forceinline__ void dequantize_V_tbq4_4(const void * __restri
     const int64_t ib = i0 / TBQ_K576;
     const int elem = i0 % TBQ_K576;
 
-    // Sub-block 3: f16 passthrough (rope) — early return
     if (elem >= 512) {
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
-            const float val = __half2float(x[ib].rope[elem - 512 + l]);
+            half rope_h;
+            ggml_cuda_memcpy_1<sizeof(half), 2>(&rope_h, &x[ib].rope[elem - 512 + l]);
+            const float val = __half2float(rope_h);
             if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = val; }
 #ifdef FP16_AVAILABLE
             else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(val); }
@@ -1512,7 +1781,6 @@ static __device__ __forceinline__ void dequantize_V_tbq4_4(const void * __restri
         return;
     }
 
-    // Hoist sub-block selection + half2float out of unrolled loop
     const bool is_blk1 = (elem < 256);
     const float norm = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
     const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
@@ -1521,7 +1789,12 @@ static __device__ __forceinline__ void dequantize_V_tbq4_4(const void * __restri
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         const int e = e_base + l;
-        const float cent = c4[(qs[e/2] >> ((e%2)*4)) & 0xF] * norm;
+        const int qs_byte = e >> 1;
+        int start_byte = qs_byte & ~1;
+        if (start_byte > (int)(QK_K/2) - 4) start_byte = (int)(QK_K/2) - 4;
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &qs[start_byte]);
+        const int packed = (qs_word >> ((qs_byte - start_byte) * 8)) & 0xFF;
+        const float cent = c4[(packed >> ((e&1)*4)) & 0xF] * norm;
         if constexpr (std::is_same_v<T,float>) { ((float*)dst)[l] = cent; }
 #ifdef FP16_AVAILABLE
         else if constexpr (std::is_same_v<T,half>) { ((half*)dst)[l] = __float2half(cent); }
@@ -1530,8 +1803,7 @@ static __device__ __forceinline__ void dequantize_V_tbq4_4(const void * __restri
 }
 
 // V dequantize for TBQP3_4 (576-block, 2-bit Lloyd-Max + 1-bit QJL)
-// For MLA V view: only sub-blocks 1,2 (elements 0..511) are accessed.
-// Sub-block selection is hoisted out of the inner loop for speed.
+// block_tbqp3_4: qs1[64]/qs2[64] at struct offset 4/104 (4-aligned).
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_tbqp3_4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_tbqp3_4 * x = (const block_tbqp3_4 *) vx;
@@ -1539,12 +1811,12 @@ static __device__ __forceinline__ void dequantize_V_tbqp3_4(const void * __restr
     const int64_t ib = i0 / TBQ_K576;
     const int elem = i0 % TBQ_K576;
 
-    // For D_V=512 (MLA), elem is always < 512 so sub-block 3 is never reached.
     if (elem >= 512) {
-        // Sub-block 3: f16 passthrough (rope)
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
-            const float val = __half2float(x[ib].rope[elem - 512 + l]);
+            half rope_h;
+            ggml_cuda_memcpy_1<sizeof(half), 2>(&rope_h, &x[ib].rope[elem - 512 + l]);
+            const float val = __half2float(rope_h);
             if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
 #ifdef FP16_AVAILABLE
             else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
@@ -1553,9 +1825,7 @@ static __device__ __forceinline__ void dequantize_V_tbqp3_4(const void * __restr
         return;
     }
 
-    // Hoist sub-block selection and half->float conversion out of the unrolled loop.
-    // NOTE: QJL correction is NOT applied here. QJL is for K·Q dot product correction only,
-    // not for V value reconstruction. V needs pure MSE centroid * norm for IWHT to work correctly.
+    // NOTE: QJL correction is NOT applied here — QJL is for K·Q dot product only.
     const bool is_blk1 = (elem < 256);
     const float norm  = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
     const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
@@ -1564,7 +1834,12 @@ static __device__ __forceinline__ void dequantize_V_tbqp3_4(const void * __restr
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         const int e = e_base + l;
-        const float val = c2[(qs[e/4] >> ((e%4)*2)) & 0x3] * norm;
+        const int qs_byte = e >> 2;
+        int start_byte = qs_byte & ~3;
+        if (start_byte > (int)(QK_K/4) - 4) start_byte = (int)(QK_K/4) - 4; // qs is 64 bytes
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 4>(&qs_word, &qs[start_byte]);
+        const int qs_byte_val = (qs_word >> ((qs_byte - start_byte) * 8)) & 0xFF;
+        const float val = c2[(qs_byte_val >> ((e & 3) * 2)) & 0x3] * norm;
         if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
 #ifdef FP16_AVAILABLE
         else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
@@ -1573,8 +1848,7 @@ static __device__ __forceinline__ void dequantize_V_tbqp3_4(const void * __restr
 }
 
 // V dequantize for TBQP4_4 (576-block, 3-bit Lloyd-Max + 1-bit QJL)
-// For MLA V view: only sub-blocks 1,2 (elements 0..511) are accessed.
-// Sub-block selection and half->float hoisted out of inner loop.
+// block_tbqp4_4: qs1[96]/qs2[96] at struct offset 4/136 (4-aligned).
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_tbqp4_4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_tbqp4_4 * x = (const block_tbqp4_4 *) vx;
@@ -1582,12 +1856,12 @@ static __device__ __forceinline__ void dequantize_V_tbqp4_4(const void * __restr
     const int64_t ib = i0 / TBQ_K576;
     const int elem = i0 % TBQ_K576;
 
-    // For D_V=512 (MLA), elem is always < 512 so sub-block 3 is never reached.
     if (elem >= 512) {
-        // Sub-block 3: f16 passthrough (rope)
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
-            const float val = __half2float(x[ib].rope[elem - 512 + l]);
+            half rope_h;
+            ggml_cuda_memcpy_1<sizeof(half), 2>(&rope_h, &x[ib].rope[elem - 512 + l]);
+            const float val = __half2float(rope_h);
             if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
 #ifdef FP16_AVAILABLE
             else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
@@ -1596,21 +1870,22 @@ static __device__ __forceinline__ void dequantize_V_tbqp4_4(const void * __restr
         return;
     }
 
-    // NOTE: QJL correction is NOT applied for V dequantization.
-    // QJL corrects K·Q dot products only, not per-element V reconstruction.
     const bool is_blk1 = (elem < 256);
     const float norm  = __half2float(is_blk1 ? x[ib].d1 : x[ib].d2);
     const uint8_t * qs = is_blk1 ? x[ib].qs1 : x[ib].qs2;
     const int e_base = is_blk1 ? elem : (elem - 256);
-    constexpr int qs_len = QK_K*3/8; // 96, always sub-block 1 or 2
 
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         const int e = e_base + l;
-        const int bp = e*3, by = bp/8, bo = bp%8;
-        uint32_t v = (uint32_t)qs[by] >> bo;
-        if (bo > 5 && by+1 < qs_len) v |= (uint32_t)qs[by+1] << (8-bo);
-        const float val = c3[v & 0x7] * norm;
+        const int bp = e*3;
+        const int by = bp >> 3;
+        int start_byte = by & ~1;
+        if (start_byte > (int)(QK_K*3/8) - 4) start_byte = (int)(QK_K*3/8) - 4;
+        int qs_word; ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp - (start_byte << 3);
+        const float val = c3[(qs_word_u >> bit_in_word) & 0x7] * norm;
         if constexpr (std::is_same_v<T, float>) { ((float *)dst)[l] = val; }
 #ifdef FP16_AVAILABLE
         else if constexpr (std::is_same_v<T, half>) { ((half *)dst)[l] = __float2half(val); }
@@ -1634,6 +1909,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_tbq4_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQ3_1) {
         return vec_dot_fattn_vec_KQ_tbq3_1<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_AMX3_1) {
+        return vec_dot_fattn_vec_KQ_amx3_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP3_1) {
         return vec_dot_fattn_vec_KQ_tbqp3_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQP4_1) {
@@ -1704,6 +1981,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_tbq4_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ3_1) {
         return dequantize_V_tbq3_1<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_AMXV3_1) {
+        return dequantize_V_amxv3_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ4_2) {
         return dequantize_V_tbq4_2<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ3_2) {
@@ -2034,6 +2313,10 @@ void launch_fattn(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    // TurboQuant side-channel tensors (optional, only set when relevant):
+    //   src[5]: k_rope (f16) — decoupled rope slice for MLA `_4` types (GLM/DeepSeek)
+    const ggml_tensor * k_rope     = dst->src[5];
+
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
@@ -2152,21 +2435,15 @@ void launch_fattn(
 
     // TBQP: K is spatial. Q stays spatial (no WHT needed for dot product).
     // Only Q_wht2 needed for QJL scalar correction. Q_wht1 is intermediate.
-    struct q_wht_cache_t { void * ptr = nullptr; size_t sz = 0; ~q_wht_cache_t() { if (ptr) cudaFree(ptr); } };
-    static thread_local q_wht_cache_t q_wht_cache;
+    ggml_cuda_pool_alloc<float> q_wht_buf(pool);
     const char * q_wht2_ptr = nullptr;
     int32_t q_wht2_stride = 0;
     if (tbqp_wht_mode) {
         extern void tbq_q_wht12_cuda(const float *, float *, float *, int64_t, int64_t, int64_t, cudaStream_t);
-        const size_t n_q_bytes = ggml_nelements(Q) * sizeof(float);
-        const size_t n_q_total = 2 * n_q_bytes;  // [Q_wht1 (temp) | Q_wht2 (for QJL)]
-        if (q_wht_cache.sz < n_q_total) {
-            if (q_wht_cache.ptr) CUDA_CHECK(cudaFree(q_wht_cache.ptr));
-            CUDA_CHECK(cudaMalloc(&q_wht_cache.ptr, n_q_total));
-            q_wht_cache.sz = n_q_total;
-        }
-        float * q_wht1 = (float *)q_wht_cache.ptr;
-        float * q_wht2 = (float *)((char *)q_wht_cache.ptr + n_q_bytes);
+        const size_t n_q_elems = ggml_nelements(Q);
+        q_wht_buf.alloc(2 * n_q_elems);  // [Q_wht1 (temp) | Q_wht2 (for QJL)]
+        float * q_wht1 = q_wht_buf.ptr;
+        float * q_wht2 = q_wht_buf.ptr + n_q_elems;
         // Reads Q->data directly, computes Q_wht1 (temp) + Q_wht2 (for QJL). No cudaMemcpy.
         tbq_q_wht12_cuda((const float *)Q->data, q_wht1, q_wht2,
                          Q->ne[0], Q->ne[1]*Q->ne[2]*Q->ne[3], Q->ne[0], main_stream);
@@ -2295,6 +2572,10 @@ void launch_fattn(
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
+    // TurboQuant side-channel pointers (nullptr unless the corresponding src slot is bound):
+    const char * k_rope_data      = k_rope     ? (const char *)  k_rope->data     : nullptr;
+    const int32_t k_rope_stride_b = k_rope     ? (int32_t) k_rope->nb[1]           : 0;
+
     GGML_ASSERT(block_dim.x % warp_size == 0);
     // TBQP: Q stays spatial (K is spatial too). V = K view (spatial). No hacks.
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
@@ -2314,7 +2595,9 @@ void launch_fattn(
         tbqp_wht_mode ? K_data_orig : nullptr,
         tbqp_wht_mode ? (int32_t)K->nb[1] : 0,
         q_wht2_ptr,
-        q_wht2_stride
+        q_wht2_stride,
+        k_rope_data,
+        k_rope_stride_b
     );
     CUDA_CHECK(cudaGetLastError());
 

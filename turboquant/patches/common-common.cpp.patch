@@ -1,0 +1,327 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index f7f33e817..d2b08ccec 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1232,6 +1232,302 @@ common_init_result::common_init_result(common_params & params) :
+         cparams.n_samplers = pimpl->samplers_seq_config.size();
+     }
+ 
++    // TurboQuant auto-mapping: resolve _0 placeholder to correct _N based on head_dim
++    // Also enforce K=q8_0 fallback for head_dim=64 (WHT quality insufficient)
++    int32_t head_dim = 0; // outside block scope — used by D=512 validation at lines 1504/1522
++    {
++        // Quick check: skip entirely if neither K nor V uses TBQ types
++        auto is_any_tbq = [](ggml_type t) -> bool {
++            return t == GGML_TYPE_TBQ3_0  || t == GGML_TYPE_TBQ4_0
++                || t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP4_0
++                || t == GGML_TYPE_TBQ3_1  || t == GGML_TYPE_TBQ4_1
++                || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
++                || t == GGML_TYPE_TBQ3_2  || t == GGML_TYPE_TBQ4_2
++                || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
++                || t == GGML_TYPE_TBQ3_3  || t == GGML_TYPE_TBQ4_3
++                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3
++                || t == GGML_TYPE_TBQ3_4  || t == GGML_TYPE_TBQ4_4
++                || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4;
++        };
++
++      if (is_any_tbq(cparams.type_k) || is_any_tbq(cparams.type_v)) {
++        // Detect KV head dimension with multi-signal cross-validation
++        // TurboQuant WHT requires exact head_dim — wrong value = garbage output
++        int32_t s_val_outer = 0; // V head_dim for asymmetric models (e.g. GLM K=576, V=512)
++        auto is_supported_dim = [](int dim) -> bool {
++            if (dim <= 0) return false;
++            if ((dim & (dim - 1)) == 0) return true; // power-of-2 (64, 128, 256, 512, ...)
++            if (dim == 576) return true; // GLM-4.7-Flash K: 256+256+64 block split
++            return false;
++        };
++        {
++            char arch[64] = {}, buf[64] = {};
++            llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
++            auto read_meta = [&](const char * key) -> int32_t {
++                return (llama_model_meta_val_str(model, (std::string(arch) + key).c_str(),
++                        buf, sizeof(buf)) > 0) ? std::atoi(buf) : 0;
++            };
++
++            // Gather all available signals
++            int32_t s_key     = read_meta(".attention.key_length");       // GGUF key dim (authoritative)
++            int32_t s_val     = read_meta(".attention.value_length");     // GGUF value dim (cross-check)
++            int32_t s_key_mla = read_meta(".attention.key_length_mla");   // MLA compressed key dim
++            int32_t s_val_mla = read_meta(".attention.value_length_mla"); // MLA compressed value dim
++            int32_t s_key_swa = read_meta(".attention.key_length_swa");   // SWA key dim
++            int32_t s_computed = 0;
++            {
++                int32_t n_embd = llama_model_n_embd(model);
++                int32_t n_head = llama_model_n_head(model);
++                if (n_head > 0) s_computed = n_embd / n_head;
++            }
++
++            // Log all signals for diagnostics
++            LOG_INF("%s: TurboQuant head_dim signals — key=%d val=%d computed=%d mla_k=%d mla_v=%d swa_k=%d\n",
++                    __func__, s_key, s_val, s_computed, s_key_mla, s_val_mla, s_key_swa);
++
++            // Priority cascade — most reliable first, cross-check against others
++            //
++            //   Priority 1: attention.key_length     (100% — GGUF converter sets directly)
++            //   Priority 2: attention.key_length_mla  (100% — MLA-specific, authoritative)
++            //   Priority 3: attention.key_length_swa  (100% — SWA-specific, authoritative)
++            //   Priority 4: attention.value_length    ( 95% — usually == key, but can differ)
++            //   Priority 5: n_embd / n_head           ( 70% — wrong for MoE/GQA/MLA)
++            //
++            //   Qwen3-MoE proof: n_embd/n_head=64 but actual head_dim=128
++            //   Without priority cascade, WHT would use wrong block size
++
++            if (s_key > 0) {
++                // P1: strongest — use it, cross-check lower signals
++                head_dim = s_key;
++                if (s_val > 0 && s_val != s_key)
++                    LOG_INF("%s: [P1] asymmetric K=%d V=%d\n", __func__, s_key, s_val);
++                if (s_computed > 0 && s_computed != s_key)
++                    LOG_WRN("%s: [P1✓ P5✗] key_length=%d but n_embd/n_head=%d — using P1\n",
++                            __func__, s_key, s_computed);
++            } else if (s_key_mla > 0) {
++                // P2: MLA model — use compressed key dim
++                head_dim = s_key_mla;
++                if (s_val_mla > 0 && s_val_mla != s_key_mla)
++                    LOG_INF("%s: [P2] MLA asymmetric K=%d V=%d\n", __func__, s_key_mla, s_val_mla);
++                if (s_computed > 0 && s_computed != s_key_mla)
++                    LOG_INF("%s: [P2✓ P5✗] MLA key=%d vs n_embd/n_head=%d — using P2\n",
++                            __func__, s_key_mla, s_computed);
++            } else if (s_key_swa > 0) {
++                // P3: SWA model without key_length or MLA — use SWA key dim
++                head_dim = s_key_swa;
++                if (s_computed > 0 && s_computed != s_key_swa)
++                    LOG_INF("%s: [P3✓ P5✗] SWA key=%d vs n_embd/n_head=%d — using P3\n",
++                            __func__, s_key_swa, s_computed);
++            } else if (s_val > 0) {
++                // P4: no key metadata but value_length exists — likely same
++                head_dim = s_val;
++                if (s_computed > 0 && s_computed != s_val)
++                    LOG_WRN("%s: [P4✓ P5✗] value_length=%d but n_embd/n_head=%d — using P4\n",
++                            __func__, s_val, s_computed);
++                else if (s_computed > 0)
++                    LOG_INF("%s: [P4+P5] value_length=%d confirmed by n_embd/n_head\n",
++                            __func__, s_val);
++            } else if (s_computed > 0) {
++                // P5: last resort — no metadata at all, only computation
++                head_dim = s_computed;
++                LOG_INF("%s: [P5 only] no GGUF metadata, using n_embd/n_head=%d\n",
++                        __func__, s_computed);
++            }
++
++            // Save s_val for asymmetric K/V resolution
++            s_val_outer = s_val;
++
++            if (head_dim > 0 && !is_supported_dim(head_dim)) {
++                LOG_WRN("%s: head_dim=%d is not supported — TurboQuant WHT cannot operate\n",
++                        __func__, head_dim);
++                head_dim = 0; // force fallback path
++            }
++        }
++
++        // Helper: check if a type is any TBQ/TBQP variant
++        auto is_tbq_type = [](ggml_type t) -> bool {
++            return t == GGML_TYPE_TBQ3_0  || t == GGML_TYPE_TBQ4_0
++                || t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP4_0
++                || t == GGML_TYPE_TBQ3_1  || t == GGML_TYPE_TBQ4_1
++                || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
++                || t == GGML_TYPE_TBQ3_2  || t == GGML_TYPE_TBQ4_2
++                || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
++                || t == GGML_TYPE_TBQ3_3  || t == GGML_TYPE_TBQ4_3
++                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3
++                || t == GGML_TYPE_TBQ3_4  || t == GGML_TYPE_TBQ4_4
++                || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4;
++        };
++        auto is_tbqp_type = [](ggml_type t) -> bool {
++            return t == GGML_TYPE_TBQP3_0 || t == GGML_TYPE_TBQP4_0
++                || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
++                || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2
++                || t == GGML_TYPE_TBQP3_3 || t == GGML_TYPE_TBQP4_3
++                || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4;
++        };
++
++        // Validation 1: V cache must not use TBQP (QJL) — no QJL dequantize for V
++        if (is_tbqp_type(cparams.type_v)) {
++            const char * orig = ggml_type_name(cparams.type_v);
++            // Downgrade tbqp → tbq (strip QJL, keep bit-width)
++                 if (cparams.type_v == GGML_TYPE_TBQP3_0) cparams.type_v = GGML_TYPE_TBQ3_0;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_0) cparams.type_v = GGML_TYPE_TBQ4_0;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_1) cparams.type_v = GGML_TYPE_TBQ3_1;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_1) cparams.type_v = GGML_TYPE_TBQ4_1;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_2) cparams.type_v = GGML_TYPE_TBQ3_2;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_2) cparams.type_v = GGML_TYPE_TBQ4_2;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_3) cparams.type_v = GGML_TYPE_TBQ3_3;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_3) cparams.type_v = GGML_TYPE_TBQ4_3;
++            else if (cparams.type_v == GGML_TYPE_TBQP3_4) cparams.type_v = GGML_TYPE_TBQ3_4;
++            else if (cparams.type_v == GGML_TYPE_TBQP4_4) cparams.type_v = GGML_TYPE_TBQ4_4;
++            LOG_WRN("%s: TBQP (QJL) not supported for V cache, downgraded %s → %s\n",
++                    __func__, orig, ggml_type_name(cparams.type_v));
++        }
++
++        // Validation 2: _3 (cross-head) types → strip to _0 (will be re-mapped below)
++        auto strip_cross_head = [](ggml_type t) -> ggml_type {
++            if (t == GGML_TYPE_TBQ3_3)  return GGML_TYPE_TBQ3_0;
++            if (t == GGML_TYPE_TBQ4_3)  return GGML_TYPE_TBQ4_0;
++            if (t == GGML_TYPE_TBQP3_3) return GGML_TYPE_TBQP3_0;
++            if (t == GGML_TYPE_TBQP4_3) return GGML_TYPE_TBQP4_0;
++            return t;
++        };
++        if (cparams.type_k != strip_cross_head(cparams.type_k)) {
++            LOG_WRN("%s: cross-head _3 types are deprecated, auto-mapping to standard type\n", __func__);
++            cparams.type_k = strip_cross_head(cparams.type_k);
++        }
++        if (cparams.type_v != strip_cross_head(cparams.type_v)) {
++            LOG_WRN("%s: cross-head _3 types are deprecated, auto-mapping to standard type\n", __func__);
++            cparams.type_v = strip_cross_head(cparams.type_v);
++        }
++
++        // Auto-map _0 types to correct _N based on head_dim
++        auto tbq_resolve = [&](ggml_type type, bool is_key) -> ggml_type {
++            struct tbq_map { ggml_type from; ggml_type to_256; ggml_type to_128; ggml_type to_64; ggml_type to_576; ggml_type to_cross_head; };
++            static const tbq_map maps[] = {
++                { GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_1,  GGML_TYPE_TBQ3_2,  GGML_TYPE_TBQ3_4,  GGML_TYPE_TBQ3_3  },
++                { GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_1,  GGML_TYPE_TBQ4_2,  GGML_TYPE_TBQ4_4,  GGML_TYPE_TBQ4_3  },
++                { GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_0, GGML_TYPE_TBQP3_1, GGML_TYPE_TBQP3_2, GGML_TYPE_TBQP3_4, GGML_TYPE_TBQP3_3 },
++                { GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQP4_1, GGML_TYPE_TBQP4_2, GGML_TYPE_TBQP4_4, GGML_TYPE_TBQP4_3 },
++            };
++
++            // Also catch _1/_2/_4 types that don't match head_dim (user specified directly)
++            auto is_wrong_suffix = [&](ggml_type t) -> bool {
++                bool is_1 = (t == GGML_TYPE_TBQ3_1 || t == GGML_TYPE_TBQ4_1 || t == GGML_TYPE_TBQP3_1 || t == GGML_TYPE_TBQP4_1
++                            || t == GGML_TYPE_AMX3_1 || t == GGML_TYPE_AMXV3_1);
++                bool is_2 = (t == GGML_TYPE_TBQ3_2 || t == GGML_TYPE_TBQ4_2 || t == GGML_TYPE_TBQP3_2 || t == GGML_TYPE_TBQP4_2);
++                bool is_4 = (t == GGML_TYPE_TBQ3_4 || t == GGML_TYPE_TBQ4_4 || t == GGML_TYPE_TBQP3_4 || t == GGML_TYPE_TBQP4_4);
++                if (is_1 && head_dim != 128) return true;
++                if (is_2 && head_dim != 64)  return true;
++                if (is_4 && head_dim != 576) return true;
++                return false;
++            };
++            if (is_wrong_suffix(type)) {
++                LOG_WRN("%s: %s does not match head_dim=%d, falling back to q8_0\n",
++                        __func__, ggml_type_name(type), head_dim);
++                return GGML_TYPE_Q8_0;
++            }
++
++            for (const auto & m : maps) {
++                if (type == m.from) {
++                    if (head_dim == 256) {
++                        if (m.to_256 != type) {
++                            LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
++                                    __func__, ggml_type_name(type), ggml_type_name(m.to_256), head_dim);
++                        }
++                        return m.to_256;
++                    } else if (head_dim == 128) {
++                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
++                                __func__, ggml_type_name(type), ggml_type_name(m.to_128), head_dim);
++                        return m.to_128;
++                    } else if (head_dim == 64) {
++                        if (is_key) {
++                            // head_dim=64 K: TBQP3_3 (double WHT per-head + QJL)
++                            // QJL 1-bit is critical for multi-turn stability (7+ turns verified)
++                            ggml_type forced = GGML_TYPE_TBQP3_3;
++                            if (type == GGML_TYPE_TBQ4_0 || type == GGML_TYPE_TBQP4_0) {
++                                forced = GGML_TYPE_TBQP4_3; // 4-bit + QJL
++                            }
++                            LOG_WRN("\n");
++                            LOG_WRN("╔════════════════════════════════════════════════════════════════════════\n");
++                            LOG_WRN("║  TurboQuant: head_dim=%d — K mapped to %s (double WHT per-head)\n", head_dim, ggml_type_name(forced));
++                            LOG_WRN("╚════════════════════════════════════════════════════════════════════════\n");
++                            LOG_WRN("\n");
++                            return forced;
++                        }
++                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d)\n",
++                                __func__, ggml_type_name(type), ggml_type_name(m.to_64), head_dim);
++                        return m.to_64;
++                    } else if (head_dim == 512) {
++                        // V head_dim=512 (e.g. GLM-4.7-Flash V): 256-block × 2, use _0 type
++                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d, 256-block × 2)\n",
++                                __func__, ggml_type_name(type), ggml_type_name(m.to_256), head_dim);
++                        return m.to_256;
++                    } else if (head_dim == 576) {
++                        // GLM-4.7-Flash: head_dim=576, split 256+256+64
++                        LOG_INF("%s: TurboQuant auto-mapped %s → %s (head_dim=%d, split 256+256+64)\n",
++                                __func__, ggml_type_name(type), ggml_type_name(m.to_576), head_dim);
++                        return m.to_576;
++                    } else {
++                        // Unsupported head_dim: disable TurboQuant, fallback to q8_0
++                        LOG_WRN("\n");
++                        LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
++                        LOG_WRN("║  TurboQuant: head_dim=%d is not supported                   ║\n", head_dim);
++                        LOG_WRN("║  WHT requires power-of-2 dimensions (64, 128, 256, or 576). ║\n");
++                        LOG_WRN("║  Falling back to q8_0 for KV cache.                         ║\n");
++                        LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
++                        return GGML_TYPE_Q8_0;
++                    }
++                }
++            }
++            return type; // not a _0 TBQ type, pass through
++        };
++
++        if (is_tbq_type(cparams.type_k) || is_tbq_type(cparams.type_v)) {
++            if (head_dim <= 0) {
++                LOG_WRN("%s: could not determine head_dim, TurboQuant disabled (falling back to q8_0)\n", __func__);
++                if (is_tbq_type(cparams.type_k)) cparams.type_k = GGML_TYPE_Q8_0;
++                if (is_tbq_type(cparams.type_v)) cparams.type_v = GGML_TYPE_Q8_0;
++            } else {
++                // For asymmetric models (e.g. GLM-4.7-Flash: K=576, V=512),
++                // resolve K and V with their respective head dimensions
++                int32_t head_dim_v = head_dim; // default: same as K
++                if (s_val_outer > 0 && s_val_outer != head_dim && is_supported_dim(s_val_outer)) {
++                    head_dim_v = s_val_outer;
++                    LOG_INF("%s: asymmetric head_dim: K=%d, V=%d — resolving separately\n",
++                            __func__, head_dim, head_dim_v);
++                }
++                cparams.type_k = tbq_resolve(cparams.type_k, true);
++                const int32_t saved_head_dim = head_dim;
++                head_dim = head_dim_v;
++                cparams.type_v = tbq_resolve(cparams.type_v, false);
++                head_dim = saved_head_dim; // restore
++            }
++        }
++      } // end is_any_tbq
++    }
++
++    // D=512 K cache: TBQP3 (QJL) now supported at D=512 with SWA f16 bypass
++
++    // D=512 V cache type validation: only f16 and TBQ types have flash attention dispatch
++    if (head_dim == 512) {
++        const ggml_type vt = cparams.type_v;
++        const bool v_ok = vt == GGML_TYPE_F16 || vt == GGML_TYPE_F32
++            || vt == GGML_TYPE_TBQ3_0  || vt == GGML_TYPE_TBQ4_0
++            || vt == GGML_TYPE_TBQ3_1  || vt == GGML_TYPE_TBQ4_1
++            || vt == GGML_TYPE_TBQ3_2  || vt == GGML_TYPE_TBQ4_2
++            || vt == GGML_TYPE_TBQ3_4  || vt == GGML_TYPE_TBQ4_4;
++        if (!v_ok) {
++            LOG_WRN("\n");
++            LOG_WRN("╔══════════════════════════════════════════════════════════════╗\n");
++            LOG_WRN("║  head_dim=512: V cache type '%s' not supported          ║\n", ggml_type_name(vt));
++            LOG_WRN("║  Only f16 and TBQ types have flash attention at D=512.      ║\n");
++            LOG_WRN("║  Falling back to f16 for V cache.                           ║\n");
++            LOG_WRN("╚══════════════════════════════════════════════════════════════╝\n");
++            LOG_WRN("\n");
++            cparams.type_v = GGML_TYPE_F16;
++        }
++    }
++
+     llama_context * lctx = llama_init_from_model(model, cparams);
+     if (lctx == NULL) {
+         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
+@@ -1288,6 +1584,19 @@ common_init_result_ptr common_init_from_params(common_params & params) {
+         params.ctx_shift = false;
+     }
+ 
++    if (!params.triattention_stats_path.empty() && params.triattention_budget > 0) {
++        struct llama_tria_stats * tstats = llama_tria_load(params.triattention_stats_path.c_str());
++        if (tstats) {
++            llama_tria_attach(lctx, tstats,
++                    params.triattention_budget,
++                    params.triattention_interval,
++                    params.triattention_keep_first);
++        } else {
++            LOG_WRN("%s: failed to load TriAttention stats '%s' — scoring disabled\n",
++                    __func__, params.triattention_stats_path.c_str());
++        }
++    }
++
+     if (!params.control_vectors.empty()) {
+         if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
+         if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);

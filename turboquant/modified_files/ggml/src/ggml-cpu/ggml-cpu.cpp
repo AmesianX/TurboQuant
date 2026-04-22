@@ -195,6 +195,8 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .free                    = */ ggml_backend_cpu_free,
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
+    /* .set_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
     /* .synchronize             = */ NULL,
     /* .graph_plan_create       = */ ggml_backend_cpu_graph_plan_create,
@@ -490,7 +492,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 type_k == GGML_TYPE_TBQ3_4  || type_k == GGML_TYPE_TBQ4_4  ||
                 type_k == GGML_TYPE_TBQP3_4 || type_k == GGML_TYPE_TBQP4_4 ||
                 type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4  ||
-                type_v == GGML_TYPE_TBQP3_4 || type_v == GGML_TYPE_TBQP4_4) {
+                type_v == GGML_TYPE_TBQP3_4 || type_v == GGML_TYPE_TBQP4_4 ||
+                type_k == GGML_TYPE_AMX3_1  || type_k == GGML_TYPE_AMXV3_1 ||
+                type_v == GGML_TYPE_AMX3_1  || type_v == GGML_TYPE_AMXV3_1) {
                 return false;
             }
             return true;

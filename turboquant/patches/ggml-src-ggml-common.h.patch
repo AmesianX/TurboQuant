@@ -1,0 +1,211 @@
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index f05683b44..0c4c079a8 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -277,6 +277,206 @@ typedef struct {
+ } block_tq2_0;
+ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
+ 
++// TurboQuant 3-bit: ~3.0625 bpw
++// 256 elements x 3 bits = 96 bytes packed + 2 bytes norm
++typedef struct {
++    ggml_half d;           // L2 norm of original vector
++    uint8_t qs[QK_K*3/8]; // 3-bit packed indices (96 bytes for QK_K=256)
++} block_tbq3_0;
++static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + QK_K*3/8, "wrong tbq3_0 block size/padding");
++
++// TurboQuant 4-bit: ~4.0625 bpw
++// 256 elements x 4 bits = 128 bytes packed + 2 bytes norm
++typedef struct {
++    ggml_half d;           // L2 norm of original vector
++    uint8_t qs[QK_K/2];   // 4-bit packed indices (128 bytes for QK_K=256)
++} block_tbq4_0;
++static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_K/2, "wrong tbq4_0 block size/padding");
++
++// TurboQuant_prod 3-bit: (b-1)=2-bit Lloyd-Max + 1-bit QJL correction
++// Provides unbiased inner product estimation (paper's recommended variant for Key cache)
++// 256 x 2-bit indices + 256 x 1-bit QJL signs + MSE norm + residual norm
++typedef struct {
++    ggml_half d;             // L2 norm (MSE part)
++    ggml_half d_qjl;         // residual L2 norm (QJL part)
++    uint8_t qs[QK_K/4];     // 2-bit packed Lloyd-Max indices (64 bytes)
++    uint8_t qjl[QK_K/8];    // 1-bit QJL signs (32 bytes)
++} block_tbqp3_0;
++static_assert(sizeof(block_tbqp3_0) == 2*sizeof(ggml_half) + QK_K/4 + QK_K/8, "wrong tbqp3_0 block size/padding");
++
++// TurboQuant_prod 4-bit: (b-1)=3-bit Lloyd-Max + 1-bit QJL correction
++typedef struct {
++    ggml_half d;             // L2 norm (MSE part)
++    ggml_half d_qjl;         // residual L2 norm (QJL part)
++    uint8_t qs[QK_K*3/8];   // 3-bit packed Lloyd-Max indices (96 bytes)
++    uint8_t qjl[QK_K/8];    // 1-bit QJL signs (32 bytes)
++} block_tbqp4_0;
++static_assert(sizeof(block_tbqp4_0) == 2*sizeof(ggml_half) + QK_K*3/8 + QK_K/8, "wrong tbqp4_0 block size/padding");
++
++// TurboQuant head_dim=128 variants (blck_size=128)
++#define TBQ_K128 128
++
++// TurboQuant 3-bit, 128-block: ~3.125 bpw
++typedef struct {
++    ggml_half d;               // L2 norm of original vector
++    uint8_t qs[TBQ_K128*3/8]; // 3-bit packed indices (48 bytes for 128 elements)
++} block_tbq3_1;
++static_assert(sizeof(block_tbq3_1) == sizeof(ggml_half) + TBQ_K128*3/8, "wrong tbq3_1 block size/padding");
++
++// TurboQuant 4-bit, 128-block: ~4.125 bpw
++typedef struct {
++    ggml_half d;               // L2 norm of original vector
++    uint8_t qs[TBQ_K128/2];   // 4-bit packed indices (64 bytes for 128 elements)
++} block_tbq4_1;
++static_assert(sizeof(block_tbq4_1) == sizeof(ggml_half) + TBQ_K128/2, "wrong tbq4_1 block size/padding");
++
++// TurboQuant_prod 3-bit, 128-block: 2-bit Lloyd-Max + 1-bit QJL
++typedef struct {
++    ggml_half d;                 // L2 norm (MSE part)
++    ggml_half d_qjl;             // residual L2 norm (QJL part)
++    uint8_t qs[TBQ_K128/4];     // 2-bit packed Lloyd-Max indices (32 bytes)
++    uint8_t qjl[TBQ_K128/8];    // 1-bit QJL signs (16 bytes)
++} block_tbqp3_1;
++static_assert(sizeof(block_tbqp3_1) == 2*sizeof(ggml_half) + TBQ_K128/4 + TBQ_K128/8, "wrong tbqp3_1 block size/padding");
++
++// TurboQuant_prod 4-bit, 128-block: 3-bit Lloyd-Max + 1-bit QJL
++typedef struct {
++    ggml_half d;                 // L2 norm (MSE part)
++    ggml_half d_qjl;             // residual L2 norm (QJL part)
++    uint8_t qs[TBQ_K128*3/8];   // 3-bit packed Lloyd-Max indices (48 bytes)
++    uint8_t qjl[TBQ_K128/8];    // 1-bit QJL signs (16 bytes)
++} block_tbqp4_1;
++static_assert(sizeof(block_tbqp4_1) == 2*sizeof(ggml_half) + TBQ_K128*3/8 + TBQ_K128/8, "wrong tbqp4_1 block size/padding");
++
++// AMX K-side 128-block: Hybrid (WHT FA-path + Polar Derotate TriAttention-path) 108B = 6.75 bpw.
++// Part A (FA attention) — tbq3_1 동치: post-RoPE K → WHT → 3-bit Lloyd-Max
++//   d_wht (2B) + qs[48] 3-bit scalar (48B) = 50B
++// Part B (TriAttention scoring) — pre-RoPE polar: derotate → (r, φ_content) → 3r + 4φ
++//   d_r (2B) + qr[24] 3-bit Rayleigh (24B) + qphi[32] 4-bit uniform (32B) = 58B
++// TriAttention 50% retention 시 effective 3.375 bpw.
++typedef struct {
++    // Part A — TurboQuant WHT (FA path, tbq3_1 동치)
++    ggml_half d_wht;                  // L2 norm after WHT (2B)
++    uint8_t   qs  [TBQ_K128*3/8];     // 3-bit WHT + Lloyd-Max (48B)
++    // Part B — Polar Derotate (TriAttention scoring, pre-RoPE)
++    ggml_half d_r;                    // Rayleigh σ (2B)
++    uint8_t   qr  [TBQ_K128*3/16];    // 3-bit r indices, 64 pairs (24B)
++    uint8_t   qphi[TBQ_K128/4];       // 4-bit φ indices, 64 pairs (32B)
++} block_amx3_1;
++static_assert(sizeof(block_amx3_1) == 2*sizeof(ggml_half) + TBQ_K128*3/8 + TBQ_K128*3/16 + TBQ_K128/4, "wrong amx3_1 block size/padding");
++
++// AMX V-side 128-block: TurboQuant (WHT + 3-bit Lloyd-Max), tbq3_1 동치, ~3.125 bpw.
++typedef struct {
++    ggml_half d;                // L2 norm of original vector
++    uint8_t qs[TBQ_K128*3/8];   // 3-bit packed indices (48 bytes for 128 elements)
++} block_amxv3_1;
++static_assert(sizeof(block_amxv3_1) == sizeof(ggml_half) + TBQ_K128*3/8, "wrong amxv3_1 block size/padding");
++
++
++// TurboQuant head_dim=64 variants (blck_size=64)
++#define TBQ_K64 64
++
++typedef struct {
++    ggml_half d;
++    uint8_t qs[TBQ_K64*3/8];
++} block_tbq3_2;
++static_assert(sizeof(block_tbq3_2) == sizeof(ggml_half) + TBQ_K64*3/8, "wrong tbq3_2 block size/padding");
++
++typedef struct {
++    ggml_half d;
++    uint8_t qs[TBQ_K64/2];
++} block_tbq4_2;
++static_assert(sizeof(block_tbq4_2) == sizeof(ggml_half) + TBQ_K64/2, "wrong tbq4_2 block size/padding");
++
++typedef struct {
++    ggml_half d;
++    ggml_half d_qjl;
++    uint8_t qs[TBQ_K64/4];
++    uint8_t qjl[TBQ_K64/8];
++} block_tbqp3_2;
++static_assert(sizeof(block_tbqp3_2) == 2*sizeof(ggml_half) + TBQ_K64/4 + TBQ_K64/8, "wrong tbqp3_2 block size/padding");
++
++typedef struct {
++    ggml_half d;
++    ggml_half d_qjl;
++    uint8_t qs[TBQ_K64*3/8];
++    uint8_t qjl[TBQ_K64/8];
++} block_tbqp4_2;
++static_assert(sizeof(block_tbqp4_2) == 2*sizeof(ggml_half) + TBQ_K64*3/8 + TBQ_K64/8, "wrong tbqp4_2 block size/padding");
++
++// TurboQuant cross-head WHT variants (8 heads × 64 dims = 512-element WHT)
++// Block format identical to _2 (blck_size=64), but quantization spans 8 heads
++// The 'd' field stores the L2 norm of the 512-element concatenated vector
++
++typedef block_tbq3_2  block_tbq3_3;
++typedef block_tbq4_2  block_tbq4_3;
++typedef block_tbqp3_2 block_tbqp3_3;
++typedef block_tbqp4_2 block_tbqp4_3;
++
++// TurboQuant head_dim=576 variants (split 256+256+64, each sub-block WHT'd independently)
++#define TBQ_K576 576
++
++// TurboQuant 3-bit, 576-block: 3-bit Lloyd-Max on [0:511], f16 passthrough on [512:575] (rope)
++// MLA models (GLM-4.7-Flash): K=concat(latent[512], rope[64]), rope stored as f16 to avoid quantization error
++typedef struct {
++    // Sub-block 1: 256 elements (WHT + 3-bit Lloyd-Max)
++    ggml_half d1;
++    uint8_t qs1[QK_K*3/8];       // 3-bit packed indices (96 bytes for 256 elements)
++    // Sub-block 2: 256 elements (WHT + 3-bit Lloyd-Max)
++    ggml_half d2;
++    uint8_t qs2[QK_K*3/8];       // 96 bytes
++    // Sub-block 3: 64 elements (f16 passthrough — rope values stored directly, no WHT)
++    ggml_half rope[TBQ_K64];     // 128 bytes
++} block_tbq3_4;
++static_assert(sizeof(block_tbq3_4) == 2*sizeof(ggml_half) + 2*(QK_K*3/8) + TBQ_K64*sizeof(ggml_half), "wrong tbq3_4 block size/padding");
++
++// TurboQuant 4-bit, 576-block: 4-bit Lloyd-Max on [0:511], f16 passthrough on [512:575] (rope)
++typedef struct {
++    // Sub-block 1: 256 elements (WHT + 4-bit Lloyd-Max)
++    ggml_half d1;
++    uint8_t qs1[QK_K/2];         // 4-bit packed indices (128 bytes for 256 elements)
++    // Sub-block 2: 256 elements (WHT + 4-bit Lloyd-Max)
++    ggml_half d2;
++    uint8_t qs2[QK_K/2];         // 128 bytes
++    // Sub-block 3: 64 elements (f16 passthrough — rope values stored directly, no WHT)
++    ggml_half rope[TBQ_K64];     // 128 bytes
++} block_tbq4_4;
++static_assert(sizeof(block_tbq4_4) == 2*sizeof(ggml_half) + 2*(QK_K/2) + TBQ_K64*sizeof(ggml_half), "wrong tbq4_4 block size/padding");
++
++// TurboQuant_prod 3-bit, 576-block: 2-bit Lloyd-Max + 1-bit QJL on [0:511], f16 passthrough on [512:575] (rope)
++typedef struct {
++    // Sub-block 1: 256 elements (WHT + 2-bit Lloyd-Max + QJL SRHT correction)
++    ggml_half d1;
++    ggml_half d1_qjl;
++    uint8_t qs1[QK_K/4];         // 2-bit packed Lloyd-Max indices (64 bytes)
++    uint8_t qjl1[QK_K/8];        // 1-bit QJL signs (32 bytes)
++    // Sub-block 2: 256 elements (WHT + 2-bit Lloyd-Max + QJL SRHT correction)
++    ggml_half d2;
++    ggml_half d2_qjl;
++    uint8_t qs2[QK_K/4];         // 64 bytes
++    uint8_t qjl2[QK_K/8];        // 32 bytes
++    // Sub-block 3: 64 elements (f16 passthrough — rope values stored directly, no WHT)
++    ggml_half rope[TBQ_K64];     // 128 bytes
++} block_tbqp3_4;
++static_assert(sizeof(block_tbqp3_4) == 4*sizeof(ggml_half) + 2*(QK_K/4 + QK_K/8) + TBQ_K64*sizeof(ggml_half), "wrong tbqp3_4 block size/padding");
++
++// TurboQuant_prod 4-bit, 576-block: 3-bit Lloyd-Max + 1-bit QJL on [0:511], f16 passthrough on [512:575] (rope)
++typedef struct {
++    // Sub-block 1: 256 elements (WHT + 3-bit Lloyd-Max + QJL SRHT correction)
++    ggml_half d1;
++    ggml_half d1_qjl;
++    uint8_t qs1[QK_K*3/8];       // 3-bit packed Lloyd-Max indices (96 bytes)
++    uint8_t qjl1[QK_K/8];        // 1-bit QJL signs (32 bytes)
++    // Sub-block 2: 256 elements (WHT + 3-bit Lloyd-Max + QJL SRHT correction)
++    ggml_half d2;
++    ggml_half d2_qjl;
++    uint8_t qs2[QK_K*3/8];       // 96 bytes
++    uint8_t qjl2[QK_K/8];        // 32 bytes
++    // Sub-block 3: 64 elements (f16 passthrough — rope values stored directly, no WHT)
++    ggml_half rope[TBQ_K64];     // 128 bytes
++} block_tbqp4_4;
++static_assert(sizeof(block_tbqp4_4) == 4*sizeof(ggml_half) + 2*(QK_K*3/8 + QK_K/8) + TBQ_K64*sizeof(ggml_half), "wrong tbqp4_4 block size/padding");
++
+ //
+ // Super-block quantization structures
+ //

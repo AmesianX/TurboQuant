@@ -1,5 +1,6 @@
 #include "arg.h"
 
+#include "build-info.h"
 #include "chat.h"
 #include "common.h"
 #include "download.h"
@@ -291,14 +292,16 @@ static bool common_params_handle_remote_preset(common_params & params, llama_exa
         hf_tag = "default";
     }
 
-    const bool offline = params.offline;
-    std::string model_endpoint = get_model_endpoint();
+    std::string model_endpoint = common_get_model_endpoint();
     auto preset_url = model_endpoint + hf_repo + "/resolve/main/preset.ini";
 
     // prepare local path for caching
     auto preset_fname = clean_file_name(hf_repo + "_preset.ini");
     auto preset_path = fs_get_cache_file(preset_fname);
-    const int status = common_download_file_single(preset_url, preset_path, params.hf_token, offline);
+    common_download_opts opts;
+    opts.bearer_token = params.hf_token;
+    opts.offline = params.offline;
+    const int status = common_download_file_single(preset_url, preset_path, opts);
     const bool has_preset = status >= 200 && status < 400;
 
     // remote preset is optional, so we don't error out if not found
@@ -341,10 +344,10 @@ static handle_model_result common_params_handle_model(struct common_params_model
             model.hf_file = model.path;
             model.path = "";
         }
-        common_download_model_opts opts;
-        opts.download_mmproj = true;
+        common_download_opts opts;
+        opts.bearer_token = bearer_token;
         opts.offline = offline;
-        auto download_result = common_download_model(model, bearer_token, opts);
+        auto download_result = common_download_model(model, opts, true);
 
         if (download_result.model_path.empty()) {
             LOG_ERR("error: failed to download model from Hugging Face\n");
@@ -365,9 +368,10 @@ static handle_model_result common_params_handle_model(struct common_params_model
             model.path = fs_get_cache_file(string_split<std::string>(f, '/').back());
         }
 
-        common_download_model_opts opts;
+        common_download_opts opts;
+        opts.bearer_token = bearer_token;
         opts.offline = offline;
-        auto download_result = common_download_model(model, bearer_token, opts);
+        auto download_result = common_download_model(model, opts);
         if (download_result.model_path.empty()) {
             LOG_ERR("error: failed to download model from %s\n", model.url.c_str());
             exit(1);
@@ -399,19 +403,33 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TBQ4_2,
     GGML_TYPE_TBQP3_2,
     GGML_TYPE_TBQP4_2,
+    GGML_TYPE_AMX3_1,
+    GGML_TYPE_AMXV3_1,
 };
 
-static ggml_type kv_cache_type_from_str(const std::string & s) {
+static ggml_type kv_cache_type_from_str(const std::string & s, bool is_v = false) {
     // TurboQuant shorthand: "tbq3" → tbq3_0 (resolved to correct _N by head_dim later)
-    // Users don't need to know about _0/_1/_2 suffixes
-    static const std::unordered_map<std::string, ggml_type> tbq_shortcuts = {
+    // Users don't need to know about _0/_1/_2 suffixes.
+    // "amx3" maps to different enums depending on K vs V context:
+    //   -ctk amx3 → AMX3_1  (K: 128-WHT + polar + cosine-optimal)
+    //   -ctv amx3 → AMXV3_1 (V: WHT + 3-bit Lloyd-Max, optimization 후추가 예정)
+    static const std::unordered_map<std::string, ggml_type> tbq_shortcuts_k = {
         {"tbq3",  GGML_TYPE_TBQ3_0},
         {"tbq4",  GGML_TYPE_TBQ4_0},
         {"tbqp3", GGML_TYPE_TBQP3_0},
         {"tbqp4", GGML_TYPE_TBQP4_0},
+        {"amx3",  GGML_TYPE_AMX3_1},
     };
-    auto it = tbq_shortcuts.find(s);
-    if (it != tbq_shortcuts.end()) {
+    static const std::unordered_map<std::string, ggml_type> tbq_shortcuts_v = {
+        {"tbq3",  GGML_TYPE_TBQ3_0},
+        {"tbq4",  GGML_TYPE_TBQ4_0},
+        {"tbqp3", GGML_TYPE_TBQP3_0},
+        {"tbqp4", GGML_TYPE_TBQP4_0},
+        {"amx3",  GGML_TYPE_AMXV3_1},
+    };
+    const auto & shortcuts = is_v ? tbq_shortcuts_v : tbq_shortcuts_k;
+    auto it = shortcuts.find(s);
+    if (it != shortcuts.end()) {
         return it->second;
     }
     for (const auto & type : kv_cache_types) {
@@ -428,6 +446,7 @@ static std::string get_all_kv_cache_types() {
     static const std::unordered_map<ggml_type, std::string> tbq_display = {
         {GGML_TYPE_TBQ3_0,  "tbq3"},   {GGML_TYPE_TBQ4_0,  "tbq4"},
         {GGML_TYPE_TBQP3_0, "tbqp3"},  {GGML_TYPE_TBQP4_0, "tbqp4"},
+        {GGML_TYPE_AMX3_1,  "amx3"},   {GGML_TYPE_AMXV3_1, "amx3"},
     };
     std::set<std::string> seen_tbq;
     std::ostringstream msg;
@@ -442,7 +461,8 @@ static std::string get_all_kv_cache_types() {
         } else {
             // Skip internal TBQ subtypes (_1, _2, _3, _4) from display
             std::string raw = ggml_type_name(type);
-            if (raw.find("tbq") != std::string::npos || raw.find("tbqp") != std::string::npos) continue;
+            if (raw.find("tbq") != std::string::npos || raw.find("tbqp") != std::string::npos
+                || raw.find("amx") != std::string::npos) continue;
             name = raw;
         }
         if (!first) msg << ", ";
@@ -1087,8 +1107,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--version"},
         "show version and build info",
         [](common_params &) {
-            fprintf(stderr, "version: %d (%s)\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT);
-            fprintf(stderr, "built with %s for %s\n", LLAMA_COMPILER, LLAMA_BUILD_TARGET);
+            fprintf(stderr, "version: %d (%s)\n", llama_build_number(), llama_commit());
+            fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
             exit(0);
         }
     ));
@@ -1358,13 +1378,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
-        {"--clear-idle"},
-        {"--no-clear-idle"},
+        {"--cache-idle-slots"},
+        {"--no-cache-idle-slots"},
         "save and clear idle slots on new task (default: enabled, requires unified KV and cache-ram)",
         [](common_params & params, bool value) {
-            params.clear_idle = value;
+            params.cache_idle_slots = value;
         }
-    ).set_env("LLAMA_ARG_CLEAR_IDLE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
@@ -2058,9 +2078,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            params.cache_type_k = kv_cache_type_from_str(value, /*is_v=*/false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
+    add_opt(common_arg(
+        {"--triattention"}, "FILE",
+        "TriAttention calibration stats file (TRIA v2). Enables Top-B KV eviction on AMX3_1 K cache.",
+        [](common_params & params, const std::string & value) {
+            params.triattention_stats_path = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tri-budget"}, "N",
+        string_format("TriAttention per-KV-head Top-B budget (default: %d, 0 = disabled)", params.triattention_budget),
+        [](common_params & params, int value) {
+            params.triattention_budget = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tri-interval"}, "N",
+        string_format("TriAttention scoring trigger interval in tokens (default: %d)", params.triattention_interval),
+        [](common_params & params, int value) {
+            params.triattention_interval = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tri-keep-first"}, "N",
+        string_format("TriAttention attention-sink size — first N slots always kept (default: %d)", params.triattention_keep_first),
+        [](common_params & params, int value) {
+            params.triattention_keep_first = value;
+        }
+    ));
     add_opt(common_arg(
         {"-ctv", "--cache-type-v"}, "TYPE",
         string_format(
@@ -2071,7 +2119,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_v = kv_cache_type_from_str(value);
+            params.cache_type_v = kv_cache_type_from_str(value, /*is_v=*/true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
@@ -2394,19 +2442,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row}",
+        {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
-        "- layer (default): split layers and KV across GPUs\n"
-        "- row: split rows across GPUs",
+        "- layer (default): split layers and KV across GPUs (pipelined)\n"
+        "- row: split weight across GPUs by rows (parallelized)\n"
+        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
         [](common_params & params, const std::string & value) {
-            std::string arg_next = value;
-            if (arg_next == "none") {
+            if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
-            } else if (arg_next == "layer") {
+            } else if (value == "layer") {
                 params.split_mode = LLAMA_SPLIT_MODE_LAYER;
-            } else if (arg_next == "row") {
+            } else if (value == "row") {
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
+            } else if (value == "tensor") {
+                params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
             } else {
                 throw std::invalid_argument("invalid value");
             }
@@ -2466,6 +2516,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_FIT"));
+    add_opt(common_arg(
+        { "-fitp", "--fit-print" }, "[on|off]",
+        string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.fit_params_print = true;
+            } else if (is_falsey(value)) {
+                params.fit_params_print = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit-print: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_FIT_ESTIMATE"));
     add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "
@@ -3604,7 +3668,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.speculative.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.cache_type_k = kv_cache_type_from_str(value);
+            params.speculative.cache_type_k = kv_cache_type_from_str(value, /*is_v=*/false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K_DRAFT"));
     add_opt(common_arg(
@@ -3617,7 +3681,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.speculative.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.cache_type_v = kv_cache_type_from_str(value);
+            params.speculative.cache_type_v = kv_cache_type_from_str(value, /*is_v=*/true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_DRAFT"));
 
@@ -3925,6 +3989,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.port = 8014;
             params.n_ctx = 0;
             params.use_jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-default"},
+        string_format("enable default speculative decoding config"),
+        [](common_params & params) {
+            params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+            params.speculative.ngram_size_n = 24;
+            params.speculative.n_min = 48;
+            params.speculative.n_max = 64;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

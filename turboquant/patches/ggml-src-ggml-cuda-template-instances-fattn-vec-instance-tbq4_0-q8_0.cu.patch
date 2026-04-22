@@ -1,0 +1,12 @@
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-q8_0.cu
+new file mode 100644
+index 000000000..67bc21c54
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_0-q8_0.cu
+@@ -0,0 +1,6 @@
++// TurboQuant 4-bit K + Q8_0 V
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0);
++DECL_FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0);

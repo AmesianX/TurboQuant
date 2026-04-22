@@ -1,0 +1,18 @@
+diff --git a/tools/server/webui/src/lib/stores/settings.svelte.ts b/tools/server/webui/src/lib/stores/settings.svelte.ts
+index f591de26b..93b742fb3 100644
+--- a/tools/server/webui/src/lib/stores/settings.svelte.ts
++++ b/tools/server/webui/src/lib/stores/settings.svelte.ts
+@@ -337,6 +337,13 @@ class SettingsStore {
+ 			if (normalizedCurrent === normalizedDefault) {
+ 				this.userOverrides.delete(key);
+ 			}
++
++			// TurboQuant: write server-provided defaults (from CLI --temp/--top-p/etc)
++			// into config so they are actually sent in requests and visible in the UI,
++			// instead of relying on placeholder-only display + server-side fallback.
++			if (!this.userOverrides.has(key) && propsValue !== undefined) {
++				setConfigValue(this.config, key, propsValue);
++			}
+ 		}
+ 
+ 		// webui settings need actual values in config (no placeholder mechanism),

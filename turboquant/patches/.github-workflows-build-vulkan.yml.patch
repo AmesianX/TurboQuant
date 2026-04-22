@@ -1,0 +1,11 @@
+diff --git a/.github/workflows/build-vulkan.yml b/.github/workflows/build-vulkan.yml
+index ab32b6525..de38bb2db 100644
+--- a/.github/workflows/build-vulkan.yml
++++ b/.github/workflows/build-vulkan.yml
+@@ -93,5 +93,4 @@ jobs:
+           export GGML_VK_DISABLE_F16=1
+           export GGML_VK_DISABLE_COOPMAT=1
+           # This is using llvmpipe and runs slower than other backends
+-          # test-backend-ops is too slow on llvmpipe, skip it
+-          ctest -L main -E test-backend-ops --verbose --timeout 900
++          ctest -L main --verbose --timeout 4800

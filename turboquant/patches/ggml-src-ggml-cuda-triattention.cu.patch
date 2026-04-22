@@ -1,0 +1,746 @@
+diff --git a/ggml/src/ggml-cuda/triattention.cu b/ggml/src/ggml-cuda/triattention.cu
+new file mode 100644
+index 000000000..2d0148d6d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/triattention.cu
+@@ -0,0 +1,740 @@
++// TriAttention scoring implementation — reads block_amx3_1 Part B (polar) directly.
++// Dequant-free pre-RoPE scoring; no GPU→CPU transfer for K data.
++#include "triattention.cuh"
++#include "ggml-cuda.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cmath>
++#include <cstdint>
++#include <vector>
++
++// 3-bit Rayleigh Lloyd-Max centroids (must match encoder in cpy-utils.cuh).
++__device__ static constexpr float TRIA_R_CENT[8] = {
++    0.3399f, 0.6422f, 0.8651f, 1.0730f, 1.2869f, 1.5277f, 1.8371f, 2.4546f
++};
++
++static constexpr float TRIA_TWO_PI = 6.28318530717958647692f;
++static constexpr float TRIA_PI     = 3.14159265358979323846f;
++
++// ---------------------------------------------------------------------------
++// Host-side verbose toggle (env: TRIA_VERBOSE=1 → per-layer logs)
++// ---------------------------------------------------------------------------
++
++static bool tria_verbose_cached     = false;
++static bool tria_verbose_ready      = false;
++static bool tria_is_verbose() {
++    if (!tria_verbose_ready) {
++        const char * e = getenv("TRIA_VERBOSE");
++        tria_verbose_cached = (e && e[0] == '1');
++        tria_verbose_ready  = true;
++    }
++    return tria_verbose_cached;
++}
++
++// ---------------------------------------------------------------------------
++// Binary loader (host)
++// ---------------------------------------------------------------------------
++
++static void tria_stats_free_device(struct tria_stats * s) {
++    if (!s) return;
++    if (s->d_layer_budget_scales) cudaFree(s->d_layer_budget_scales);
++    if (s->d_omega)               cudaFree(s->d_omega);
++    if (s->d_q_mean_real_flat)    cudaFree(s->d_q_mean_real_flat);
++    if (s->d_q_mean_imag_flat)    cudaFree(s->d_q_mean_imag_flat);
++    if (s->d_q_abs_mean_flat)     cudaFree(s->d_q_abs_mean_flat);
++    if (s->d_qma_flat)            cudaFree(s->d_qma_flat);
++    s->d_layer_budget_scales = nullptr;
++    s->d_omega               = nullptr;
++    s->d_q_mean_real_flat    = nullptr;
++    s->d_q_mean_imag_flat    = nullptr;
++    s->d_q_abs_mean_flat     = nullptr;
++    s->d_qma_flat            = nullptr;
++}
++
++struct tria_stats * tria_load(const char * path) {
++    FILE * fp = fopen(path, "rb");
++    if (!fp) { perror(path); return nullptr; }
++
++    struct tria_stats * s = nullptr;
++    cudaError_t err = cudaSuccess;
++
++    uint32_t magic = 0, version = 0;
++    if (fread(&magic, 4, 1, fp) != 1 || fread(&version, 4, 1, fp) != 1) {
++        fprintf(stderr, "tria_load: short read on header\n");
++        goto fail;
++    }
++    if (magic != TRIA_MAGIC || (version != 1 && version != 2)) {
++        fprintf(stderr, "tria_load: bad magic/version 0x%x v%u\n", magic, version);
++        goto fail;
++    }
++
++    {
++        uint32_t nl, nh, nkv, hd, fc;
++        float rope_theta, attn_scale;
++        if (fread(&nl,  4, 1, fp) != 1 ||
++            fread(&nh,  4, 1, fp) != 1 ||
++            fread(&nkv, 4, 1, fp) != 1 ||
++            fread(&hd,  4, 1, fp) != 1 ||
++            fread(&fc,  4, 1, fp) != 1 ||
++            fread(&rope_theta, 4, 1, fp) != 1 ||
++            fread(&attn_scale, 4, 1, fp) != 1) {
++            fprintf(stderr, "tria_load: short read on header fields\n");
++            goto fail;
++        }
++        if (fseek(fp, TRIA_HEADER_SIZE, SEEK_SET) != 0) goto fail;
++
++        std::vector<float> h_layer_scales(nl, 1.0f);
++        if (version >= 2) {
++            if (fread(h_layer_scales.data(), 4, nl, fp) != nl) {
++                fprintf(stderr, "tria_load: short read on layer scales\n");
++                goto fail;
++            }
++        }
++
++        const size_t flat_count = (size_t)nl * nh * fc;
++        std::vector<float> h_qmr(flat_count), h_qmi(flat_count), h_qam(flat_count), h_qma(flat_count);
++        std::vector<float> tmp_mrl(fc);
++        for (uint32_t li = 0; li < nl; li++) {
++            for (uint32_t hi = 0; hi < nh; hi++) {
++                const size_t off = ((size_t)li * nh + hi) * fc;
++                if (fread(h_qmr.data() + off, 4, fc, fp) != fc ||
++                    fread(h_qmi.data() + off, 4, fc, fp) != fc ||
++                    fread(h_qam.data() + off, 4, fc, fp) != fc ||
++                    fread(tmp_mrl.data(),    4, fc, fp) != fc) {
++                    fprintf(stderr, "tria_load: short read on head (l=%u h=%u)\n", li, hi);
++                    goto fail;
++                }
++                for (uint32_t f = 0; f < fc; f++) {
++                    const float r = h_qmr[off + f], i = h_qmi[off + f];
++                    h_qma[off + f] = sqrtf(r*r + i*i);
++                }
++            }
++        }
++        fclose(fp);
++        fp = nullptr;
++
++        std::vector<float> h_omega(fc);
++        for (uint32_t f = 0; f < fc; f++) {
++            h_omega[f] = powf(rope_theta, -2.0f * (float)f / (float)hd);
++        }
++
++        s = (struct tria_stats *)calloc(1, sizeof(struct tria_stats));
++        if (!s) goto fail;
++        s->num_layers   = nl;
++        s->num_heads    = nh;
++        s->num_kv_heads = nkv;
++        s->head_dim     = hd;
++        s->freq_count   = fc;
++        s->rope_theta   = rope_theta;
++        s->attn_scale   = attn_scale;
++
++        #define TRIA_ALLOC(ptr, bytes) \
++            err = cudaMalloc(&(ptr), (bytes)); \
++            if (err != cudaSuccess) { fprintf(stderr, "tria_load: cudaMalloc failed (%s)\n", cudaGetErrorString(err)); goto fail; }
++        #define TRIA_COPY(dst, src, bytes) \
++            err = cudaMemcpy((dst), (src), (bytes), cudaMemcpyHostToDevice); \
++            if (err != cudaSuccess) { fprintf(stderr, "tria_load: cudaMemcpy failed (%s)\n", cudaGetErrorString(err)); goto fail; }
++
++        TRIA_ALLOC(s->d_layer_budget_scales, nl * sizeof(float));
++        TRIA_ALLOC(s->d_omega,               fc * sizeof(float));
++        TRIA_ALLOC(s->d_q_mean_real_flat, flat_count * sizeof(float));
++        TRIA_ALLOC(s->d_q_mean_imag_flat, flat_count * sizeof(float));
++        TRIA_ALLOC(s->d_q_abs_mean_flat,  flat_count * sizeof(float));
++        TRIA_ALLOC(s->d_qma_flat,         flat_count * sizeof(float));
++
++        TRIA_COPY(s->d_layer_budget_scales, h_layer_scales.data(), nl * sizeof(float));
++        TRIA_COPY(s->d_omega,               h_omega.data(),         fc * sizeof(float));
++        TRIA_COPY(s->d_q_mean_real_flat,    h_qmr.data(), flat_count * sizeof(float));
++        TRIA_COPY(s->d_q_mean_imag_flat,    h_qmi.data(), flat_count * sizeof(float));
++        TRIA_COPY(s->d_q_abs_mean_flat,     h_qam.data(), flat_count * sizeof(float));
++        TRIA_COPY(s->d_qma_flat,            h_qma.data(), flat_count * sizeof(float));
++
++        #undef TRIA_ALLOC
++        #undef TRIA_COPY
++
++        fprintf(stderr, "tria_load: v%u loaded L=%u H=%u KV=%u D=%u F=%u theta=%.1f\n",
++                version, nl, nh, nkv, hd, fc, rope_theta);
++        // Host layer scales will be attached later via wrapper (see llama_tria_load).
++        return s;
++    }
++
++fail:
++    if (s) {
++        tria_stats_free_device(s);
++        free(s);
++    }
++    if (fp) fclose(fp);
++    return nullptr;
++}
++
++void tria_free(struct tria_stats * s) {
++    if (!s) return;
++    tria_stats_free_device(s);
++    free(s);
++}
++
++// ---------------------------------------------------------------------------
++// Part-B pair decoder (shared by scoring kernel)
++// ---------------------------------------------------------------------------
++
++__device__ __forceinline__ void tria_decode_pair(
++        const block_amx3_1 & blk, int p, float sigma,
++        float & kxc, float & kyc, float & ka) {
++    const int r_bit  = p * 3;
++    const int r_byte = r_bit >> 3;
++    const int r_off  = r_bit & 7;
++    int r_idx;
++    if (r_off > 5) {
++        r_idx = ((blk.qr[r_byte] >> r_off) | (blk.qr[r_byte + 1] << (8 - r_off))) & 0x7;
++    } else {
++        r_idx = (blk.qr[r_byte] >> r_off) & 0x7;
++    }
++    const int p_idx = (blk.qphi[p >> 1] >> ((p & 1) * 4)) & 0xF;
++
++    const float r_rec = sigma * TRIA_R_CENT[r_idx];
++    const float phi_c = ((float)p_idx + 0.5f) * (TRIA_TWO_PI / 16.0f) - TRIA_PI;
++    float c, s;
++    sincosf(phi_c, &s, &c);
++    kxc = r_rec * c;
++    kyc = r_rec * s;
++    ka  = r_rec;
++}
++
++__device__ __forceinline__ float tria_block_sum(float v, float * shm, int n_warps) {
++    const int tid  = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
++    if (lane == 0) shm[warp] = v;
++    __syncthreads();
++    if (warp == 0) {
++        float acc = (lane < n_warps) ? shm[lane] : 0.0f;
++        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
++        if (lane == 0) shm[0] = acc;
++    }
++    __syncthreads();
++    return shm[0];
++}
++
++// ---------------------------------------------------------------------------
++// Kernel 1: raw per-(ah, slot) TriAttention score
++//     grid=(n_kv, num_heads), block=fc (one thread per frequency pair)
++// ---------------------------------------------------------------------------
++
++__global__ void tria_raw_kernel(
++        const block_amx3_1 * __restrict__ K_blocks,
++        int                   n_kv,
++        int                   num_kv_heads,
++        int                   gqa,
++        int                   cur_pos,
++        const int  * __restrict__ key_pos,
++        const float * __restrict__ omega,
++        int                   freq_count,
++        const float * __restrict__ q_mean_real,
++        const float * __restrict__ q_mean_imag,
++        const float * __restrict__ q_abs_mean,
++        const float * __restrict__ qma,
++        float      * __restrict__ tmp_raw
++) {
++    const int slot = blockIdx.x;
++    const int ah   = blockIdx.y;
++    const int tid  = threadIdx.x;
++    const int kv_h = ah / gqa;
++
++    const block_amx3_1 & blk = K_blocks[(size_t)slot * num_kv_heads + kv_h];
++    const float sigma = __half2float(blk.d_r);
++
++    float kxc, kyc, ka;
++    tria_decode_pair(blk, tid, sigma, kxc, kyc, ka);
++
++    const int   head_off = ah * freq_count + tid;
++    const float qmr = q_mean_real[head_off];
++    const float qmi = q_mean_imag[head_off];
++    const float qam = q_abs_mean[head_off];
++    const float qa  = qma[head_off];
++
++    const float rel_r = qmr * kxc + qmi * kyc;
++    const float rel_i = qmi * kxc - qmr * kyc;
++    const float extra_f = fmaxf(0.0f, qam - qa) * ka;
++
++    const float om         = omega[tid];
++    const float base_delta = (float)(cur_pos - key_pos[slot]);
++
++    float trig_f = 0.0f;
++    #pragma unroll
++    for (int o = 0; o < TRIA_N_OFFSETS; o++) {
++        const float delta = base_delta + (float)(1 << o);
++        const float angle = delta * om;
++        float c, s;
++        sincosf(angle, &s, &c);
++        trig_f += rel_r * c - rel_i * s;
++    }
++
++    const int n_warps = (blockDim.x + 31) >> 5;
++
++    __shared__ float shm[8];
++    const float trig_sum = tria_block_sum(trig_f, shm, n_warps);
++
++    __shared__ float shm2[8];
++    const float extra_sum = tria_block_sum(extra_f, shm2, n_warps);
++
++    if (tid == 0) {
++        const float inv_n = 1.0f / (float)TRIA_N_OFFSETS;
++        tmp_raw[(size_t)ah * n_kv + slot] = trig_sum * inv_n + extra_sum;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Kernel 2: z-normalize tmp_raw per ah in place
++// ---------------------------------------------------------------------------
++
++__global__ void tria_znorm_kernel(
++        float * __restrict__ tmp_raw,
++        int                  n_kv
++) {
++    const int ah  = blockIdx.x;
++    const int tid = threadIdx.x;
++    const int bw  = blockDim.x;
++
++    float * row = tmp_raw + (size_t)ah * n_kv;
++
++    float local_sum = 0.0f;
++    for (int s = tid; s < n_kv; s += bw) local_sum += row[s];
++
++    __shared__ float shm[8];
++    for (int off = 16; off > 0; off >>= 1) local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
++    const int warp_id = tid >> 5;
++    const int lane    = tid & 31;
++    if (lane == 0) shm[warp_id] = local_sum;
++    __syncthreads();
++
++    if (tid < 8) {
++        float block_sum = (tid < bw / 32) ? shm[tid] : 0.0f;
++        for (int off = 4; off > 0; off >>= 1) block_sum += __shfl_down_sync(0xff, block_sum, off);
++        if (tid == 0) shm[0] = block_sum / (float)n_kv;
++    }
++    __syncthreads();
++    const float mean = shm[0];
++
++    float local_var = 0.0f;
++    for (int s = tid; s < n_kv; s += bw) {
++        const float d = row[s] - mean;
++        local_var += d * d;
++    }
++    for (int off = 16; off > 0; off >>= 1) local_var += __shfl_down_sync(0xffffffff, local_var, off);
++    if (lane == 0) shm[warp_id] = local_var;
++    __syncthreads();
++
++    if (tid < 8) {
++        float block_sum = (tid < bw / 32) ? shm[tid] : 0.0f;
++        for (int off = 4; off > 0; off >>= 1) block_sum += __shfl_down_sync(0xff, block_sum, off);
++        if (tid == 0) {
++            float std = sqrtf(block_sum / (float)n_kv);
++            if (std < 1e-6f) std = 1e-6f;
++            shm[1] = 1.0f / std;
++        }
++    }
++    __syncthreads();
++    const float inv_std = shm[1];
++
++    for (int s = tid; s < n_kv; s += bw) {
++        row[s] = (row[s] - mean) * inv_std;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Kernel 3: per-slot max across all query heads
++// ---------------------------------------------------------------------------
++
++__global__ void tria_aggregate_kernel(
++        const float * __restrict__ tmp_raw,
++        int                        n_kv,
++        int                        num_heads,
++        float      * __restrict__  out_scores
++) {
++    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
++    if (slot >= n_kv) return;
++
++    float best = -INFINITY;
++    for (int ah = 0; ah < num_heads; ah++) {
++        const float v = tmp_raw[(size_t)ah * n_kv + slot];
++        if (v > best) best = v;
++    }
++    out_scores[slot] = best;
++}
++
++// ---------------------------------------------------------------------------
++// Layer-level scoring pipeline (3 kernels)
++// ---------------------------------------------------------------------------
++
++void tria_score_layer(
++        const struct tria_stats * stats,
++        const char * K_cache,
++        int          n_kv,
++        int          cur_pos,
++        const int  * key_pos,
++        int          layer_idx,
++        float      * out_scores,
++        float      * tmp_scores,
++        cudaStream_t stream
++) {
++    if (!stats || n_kv <= 0) return;
++    const int nh  = (int)stats->num_heads;
++    const int nkv = (int)stats->num_kv_heads;
++    const int fc  = (int)stats->freq_count;
++    const int gqa = nh / nkv;
++
++    const size_t layer_off = (size_t)layer_idx * nh * fc;
++    const float * qmr = stats->d_q_mean_real_flat + layer_off;
++    const float * qmi = stats->d_q_mean_imag_flat + layer_off;
++    const float * qam = stats->d_q_abs_mean_flat  + layer_off;
++    const float * qa  = stats->d_qma_flat         + layer_off;
++
++    const block_amx3_1 * K_blocks = reinterpret_cast<const block_amx3_1 *>(K_cache);
++
++    tria_raw_kernel<<<dim3(n_kv, nh, 1), dim3(fc, 1, 1), 0, stream>>>(
++        K_blocks, n_kv, nkv, gqa, cur_pos, key_pos,
++        stats->d_omega, fc, qmr, qmi, qam, qa, tmp_scores);
++
++    tria_znorm_kernel<<<dim3(nh, 1, 1), dim3(256, 1, 1), 0, stream>>>(
++        tmp_scores, n_kv);
++
++    const int T = 128;
++    tria_aggregate_kernel<<<dim3((n_kv + T - 1) / T, 1, 1), dim3(T, 1, 1), 0, stream>>>(
++        tmp_scores, n_kv, nh, out_scores);
++}
++
++// ---------------------------------------------------------------------------
++// Top-B threshold + mask (histogram-based K-th largest, single block)
++// ---------------------------------------------------------------------------
++
++__global__ void tria_topb_threshold_kernel(
++        const float * __restrict__ scores,
++        int                        n_kv,
++        int                        budget,
++        float      * __restrict__  out_threshold
++) {
++    if (blockIdx.x != 0 || threadIdx.x != 0) return;
++    if (budget >= n_kv) { *out_threshold = -INFINITY; return; }
++
++    float vmin =  INFINITY, vmax = -INFINITY;
++    for (int i = 0; i < n_kv; i++) {
++        const float v = scores[i];
++        if (isfinite(v)) {
++            if (v < vmin) vmin = v;
++            if (v > vmax) vmax = v;
++        }
++    }
++    if (!(vmax > vmin)) { *out_threshold = vmin; return; }
++
++    const int NBINS = 1024;
++    int hist[NBINS];
++    for (int b = 0; b < NBINS; b++) hist[b] = 0;
++    const float inv_span = (float)(NBINS - 1) / (vmax - vmin);
++    for (int i = 0; i < n_kv; i++) {
++        const float v = scores[i];
++        if (!isfinite(v)) { hist[NBINS - 1]++; continue; }  // +INF lands in top bin
++        int b = (int)((v - vmin) * inv_span);
++        if (b < 0) b = 0;
++        if (b > NBINS - 1) b = NBINS - 1;
++        hist[b]++;
++    }
++    int accum = 0;
++    int cutoff = 0;
++    for (int b = NBINS - 1; b >= 0; b--) {
++        accum += hist[b];
++        if (accum >= budget) { cutoff = b; break; }
++    }
++    *out_threshold = vmin + (float)cutoff / inv_span;
++}
++
++__global__ void tria_topb_mask_kernel(
++        const float   * __restrict__ scores,
++        const float   * __restrict__ threshold,
++        int                          n_kv,
++        uint8_t       * __restrict__ out_mask
++) {
++    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
++    if (slot >= n_kv) return;
++    out_mask[slot] = (scores[slot] >= *threshold) ? 1 : 0;
++}
++
++void tria_topb_mask(
++        const float * scores,
++        int           n_kv,
++        int           budget,
++        uint8_t     * out_mask,
++        cudaStream_t  stream
++) {
++    if (n_kv <= 0) return;
++    float * d_threshold = nullptr;
++    if (cudaMallocAsync(&d_threshold, sizeof(float), stream) != cudaSuccess) return;
++    tria_topb_threshold_kernel<<<1, 1, 0, stream>>>(scores, n_kv, budget, d_threshold);
++    const int T = 256;
++    tria_topb_mask_kernel<<<dim3((n_kv + T - 1) / T, 1, 1), dim3(T, 1, 1), 0, stream>>>(
++        scores, d_threshold, n_kv, out_mask);
++    cudaFreeAsync(d_threshold, stream);
++}
++
++// ---------------------------------------------------------------------------
++// Attention sink — force-keep first K slots regardless of score
++// ---------------------------------------------------------------------------
++
++__global__ void tria_force_keep_kernel(
++        uint8_t * __restrict__ mask,
++        int                    n_kv,
++        int                    keep_first) {
++    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
++    if (slot >= n_kv) return;
++    if (slot < keep_first) mask[slot] = 1;
++}
++
++// ---------------------------------------------------------------------------
++// Physical eviction — zero BOTH Part A (d_wht) and Part B (d_r) of evicted slots.
++//   Part A zero  → FA decoder produces K=0 → attention weight 0.
++//   Part B zero  → future scoring sees r_rec=0 → consistently lowest score → stays evicted.
++// ---------------------------------------------------------------------------
++
++__global__ void tria_apply_eviction_kernel(
++        block_amx3_1 * __restrict__ K_blocks,
++        const uint8_t * __restrict__ mask,
++        int                          n_kv,
++        int                          num_kv_heads) {
++    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
++    const int kvh  = blockIdx.y;
++    if (slot >= n_kv || kvh >= num_kv_heads) return;
++    if (mask[slot] != 0) return;
++    block_amx3_1 & blk = K_blocks[(size_t)slot * num_kv_heads + kvh];
++    blk.d_wht = __float2half(0.0f);
++    blk.d_r   = __float2half(0.0f);
++}
++
++// ---------------------------------------------------------------------------
++// llama_tria_stats wrapper (host-side state + scratch)
++// ---------------------------------------------------------------------------
++
++struct llama_tria_stats {
++    struct tria_stats * impl = nullptr;
++
++    // Host copy of per-model-layer budget scales.
++    std::vector<float> layer_scales;
++
++    // Persistent GPU/pinned-host scratch, grows on demand.
++    int         capacity_n_kv    = 0;
++    int         capacity_tmp_cnt = 0;
++    int       * d_key_pos   = nullptr;
++    float     * d_tmp       = nullptr;
++    float     * d_scores    = nullptr;
++    uint8_t   * d_mask      = nullptr;
++    uint8_t   * h_mask_pin  = nullptr;
++
++    // Per-trigger aggregate state.
++    int trigger_n_kv           = 0;
++    int trigger_layer_count    = 0;
++    int trigger_kept_sum       = 0;
++    int trigger_evicted_sum    = 0;
++    int trigger_positions_done = 0;  // 1 after H2D upload in _prepare
++    const int * trigger_host_pos_ref = nullptr;  // for per-layer log
++};
++
++static void tria_scratch_free(struct llama_tria_stats * w) {
++    if (!w) return;
++    cudaStreamSynchronize(0);
++    if (w->d_key_pos)  { cudaFree(w->d_key_pos);      w->d_key_pos  = nullptr; }
++    if (w->d_tmp)      { cudaFree(w->d_tmp);          w->d_tmp      = nullptr; }
++    if (w->d_scores)   { cudaFree(w->d_scores);       w->d_scores   = nullptr; }
++    if (w->d_mask)     { cudaFree(w->d_mask);         w->d_mask     = nullptr; }
++    if (w->h_mask_pin) { cudaFreeHost(w->h_mask_pin); w->h_mask_pin = nullptr; }
++    w->capacity_n_kv    = 0;
++    w->capacity_tmp_cnt = 0;
++}
++
++static bool tria_scratch_ensure(struct llama_tria_stats * w, int n_kv, int num_heads) {
++    if (!w) return false;
++    const int need_tmp = num_heads * n_kv;
++    if (n_kv <= w->capacity_n_kv && need_tmp <= w->capacity_tmp_cnt) return true;
++
++    tria_scratch_free(w);
++
++    const int new_n_kv    = n_kv + n_kv / 4 + 64;
++    const int new_tmp_cnt = need_tmp + need_tmp / 4 + 64;
++
++    cudaError_t err = cudaSuccess;
++    err = cudaMalloc(&w->d_key_pos, new_n_kv    * sizeof(int));     if (err != cudaSuccess) goto fail;
++    err = cudaMalloc(&w->d_tmp,     new_tmp_cnt * sizeof(float));   if (err != cudaSuccess) goto fail;
++    err = cudaMalloc(&w->d_scores,  new_n_kv    * sizeof(float));   if (err != cudaSuccess) goto fail;
++    err = cudaMalloc(&w->d_mask,    new_n_kv    * sizeof(uint8_t)); if (err != cudaSuccess) goto fail;
++    err = cudaMallocHost(&w->h_mask_pin, new_n_kv * sizeof(uint8_t)); if (err != cudaSuccess) goto fail;
++
++    w->capacity_n_kv    = new_n_kv;
++    w->capacity_tmp_cnt = new_tmp_cnt;
++    return true;
++
++fail:
++    fprintf(stderr, "tria_scratch_ensure: CUDA alloc failed (%s)\n", cudaGetErrorString(err));
++    tria_scratch_free(w);
++    return false;
++}
++
++// ---------------------------------------------------------------------------
++// Backend-side entry points for the llama.h API shims.
++//
++// llama_tria_load / llama_tria_free are declared LLAMA_API in llama.h, so
++// Windows consumers expect them to be exported from llama.dll.  The real
++// implementation, however, needs CUDA — it lives here in ggml-cuda.dll.
++// To keep the library boundary clean we expose backend-prefixed entry
++// points via GGML_BACKEND_API (→ __declspec(dllexport) on Windows shared
++// builds) and let a thin wrapper in src/llama-context.cpp re-export them
++// under the official llama_tria_* names.  Before v1.7.1 the shim below
++// used the llama_ names directly, which caused Windows llama-common.dll
++// to fail linking with LNK2019 __imp_llama_tria_load.
++// ---------------------------------------------------------------------------
++
++extern "C" struct llama_tria_stats * _llama_tria_backend_load(const char * path) {
++    auto * s = tria_load(path);
++    if (!s) return nullptr;
++    auto * w = new llama_tria_stats();
++    w->impl = s;
++    w->layer_scales.assign(s->num_layers, 1.0f);
++    const cudaError_t err = cudaMemcpy(w->layer_scales.data(), s->d_layer_budget_scales,
++                                       s->num_layers * sizeof(float), cudaMemcpyDeviceToHost);
++    if (err != cudaSuccess) {
++        fprintf(stderr, "llama_tria_load: layer scales D2H failed (%s) — using 1.0x fallback\n",
++                cudaGetErrorString(err));
++    }
++    return w;
++}
++
++extern "C" void _llama_tria_backend_free(struct llama_tria_stats * stats) {
++    if (!stats) return;
++    tria_scratch_free(stats);
++    tria_free(stats->impl);
++    delete stats;
++}
++
++extern "C" float tria_layer_scale(struct llama_tria_stats * stats, int model_layer_idx) {
++    if (!stats || model_layer_idx < 0 || (size_t)model_layer_idx >= stats->layer_scales.size()) {
++        return 1.0f;
++    }
++    return stats->layer_scales[model_layer_idx];
++}
++
++// ---------------------------------------------------------------------------
++// Trigger API (3-step: prepare → score each layer → finish)
++// ---------------------------------------------------------------------------
++
++extern "C" void tria_trigger_prepare(
++        struct llama_tria_stats * stats,
++        int                       n_kv,
++        const int *               host_key_pos) {
++    if (!stats) return;
++    // Invalidate any stale trigger state first, so failures below leave the
++    // wrapper in a safe "no active trigger" state.
++    stats->trigger_positions_done = 0;
++    stats->trigger_host_pos_ref   = nullptr;
++    stats->trigger_layer_count    = 0;
++    stats->trigger_kept_sum       = 0;
++    stats->trigger_evicted_sum    = 0;
++
++    if (!host_key_pos || n_kv <= 0 || !stats->impl) return;
++
++    const int num_heads = (int)stats->impl->num_heads;
++    if (!tria_scratch_ensure(stats, n_kv, num_heads)) return;
++
++    cudaMemcpyAsync(stats->d_key_pos, host_key_pos,
++                    n_kv * sizeof(int), cudaMemcpyHostToDevice, 0);
++
++    stats->trigger_n_kv           = n_kv;
++    stats->trigger_positions_done = 1;
++    stats->trigger_host_pos_ref   = host_key_pos;
++}
++
++extern "C" void tria_trigger_score_layer(
++        struct llama_tria_stats * stats,
++        int                       model_layer_idx,
++        void *                    K_cache_gpu,
++        int                       n_kv,
++        int                       cur_pos,
++        int                       budget,
++        int                       keep_first) {
++    if (!stats || !stats->impl || !K_cache_gpu) return;
++    if (!stats->trigger_positions_done) {
++        fprintf(stderr, "tria_trigger_score_layer: prepare not called\n");
++        return;
++    }
++    if (n_kv <= 0 || budget <= 0) return;
++    if (model_layer_idx < 0 || model_layer_idx >= (int)stats->impl->num_layers) return;
++
++    struct tria_stats * s = stats->impl;
++    const int num_kv_heads = (int)s->num_kv_heads;
++    if (keep_first < 0) keep_first = 0;
++    if (keep_first > n_kv) keep_first = n_kv;
++
++    tria_score_layer(s, reinterpret_cast<char *>(K_cache_gpu),
++                     n_kv, cur_pos, stats->d_key_pos, model_layer_idx,
++                     stats->d_scores, stats->d_tmp, /*stream=*/0);
++
++    tria_topb_mask(stats->d_scores, n_kv, budget, stats->d_mask, /*stream=*/0);
++
++    if (keep_first > 0) {
++        const int T = 256;
++        tria_force_keep_kernel<<<dim3((n_kv + T - 1) / T, 1, 1), dim3(T, 1, 1), 0, 0>>>(
++            stats->d_mask, n_kv, keep_first);
++    }
++
++    if (budget < n_kv) {
++        const int T = 256;
++        dim3 grid((n_kv + T - 1) / T, num_kv_heads, 1);
++        tria_apply_eviction_kernel<<<grid, dim3(T, 1, 1), 0, 0>>>(
++            reinterpret_cast<block_amx3_1 *>(K_cache_gpu),
++            stats->d_mask, n_kv, num_kv_heads);
++    }
++
++    cudaMemcpyAsync(stats->h_mask_pin, stats->d_mask,
++                    n_kv * sizeof(uint8_t), cudaMemcpyDeviceToHost, 0);
++    cudaStreamSynchronize(0);
++
++    int kept = 0;
++    for (int i = 0; i < n_kv; i++) kept += (stats->h_mask_pin[i] != 0);
++    const int evicted = n_kv - kept;
++
++    stats->trigger_layer_count++;
++    stats->trigger_kept_sum    += kept;
++    stats->trigger_evicted_sum += evicted;
++
++    if (tria_is_verbose()) {
++        int first_kept[8]; int nf = 0;
++        int last_kept[8];  int nl = 0;
++        const int * hpos = stats->trigger_host_pos_ref;
++        for (int i = 0; i < n_kv && nf < 8; i++) {
++            if (stats->h_mask_pin[i] && hpos[i] >= 0) first_kept[nf++] = hpos[i];
++        }
++        for (int i = n_kv - 1; i >= 0 && nl < 8; i--) {
++            if (stats->h_mask_pin[i] && hpos[i] >= 0) last_kept[nl++] = hpos[i];
++        }
++        fprintf(stderr, "tria: layer=%d n_kv=%d budget=%d keep_first=%d kept=%d evicted=%d first=[",
++                model_layer_idx, n_kv, budget, keep_first, kept, evicted);
++        for (int i = 0; i < nf; i++) fprintf(stderr, "%s%d", i ? "," : "", first_kept[i]);
++        fprintf(stderr, "] last=[");
++        for (int i = 0; i < nl; i++) fprintf(stderr, "%s%d", i ? "," : "", last_kept[i]);
++        fprintf(stderr, "]\n");
++    }
++}
++
++extern "C" void tria_trigger_finish(struct llama_tria_stats * stats) {
++    if (!stats) return;
++    if (stats->trigger_layer_count > 0) {
++        const float avg_kept    = (float)stats->trigger_kept_sum    / stats->trigger_layer_count;
++        const float avg_evicted = (float)stats->trigger_evicted_sum / stats->trigger_layer_count;
++        fprintf(stderr, "tria: trigger n_kv=%d layers=%d avg_kept=%.1f avg_evicted=%.1f\n",
++                stats->trigger_n_kv, stats->trigger_layer_count, avg_kept, avg_evicted);
++    }
++    // Always clear, even on no-op finish, so next prepare starts clean.
++    stats->trigger_positions_done = 0;
++    stats->trigger_host_pos_ref   = nullptr;
++    stats->trigger_layer_count    = 0;
++    stats->trigger_kept_sum       = 0;
++    stats->trigger_evicted_sum    = 0;
++}

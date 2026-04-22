@@ -1,0 +1,12 @@
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_0.cu
+new file mode 100644
+index 000000000..0b8039358
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-tbq3_0.cu
+@@ -0,0 +1,6 @@
++// Force float accumulation for TBQ V types
++#include "../common.cuh"
++#undef V_DOT2_F32_F16_AVAILABLE
++
++#include "../fattn-vec.cuh"
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_TBQ3_0);

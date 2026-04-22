@@ -1,0 +1,15 @@
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu
+new file mode 100644
+index 000000000..3dc83096a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq4_1-tbq4_1.cu
+@@ -0,0 +1,9 @@
++// Force float accumulation for TBQ V types
++#include "../common.cuh"
++#undef V_DOT2_F32_F16_AVAILABLE
++
++// TurboQuant 128-block: TBQ4_1 keys + TBQ4_1 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_1, GGML_TYPE_TBQ4_1);

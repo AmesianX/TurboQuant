@@ -1,0 +1,13 @@
+diff --git a/.github/workflows/build-android.yml b/.github/workflows/build-android.yml
+index b38a793f1..5fc24d8d3 100644
+--- a/.github/workflows/build-android.yml
++++ b/.github/workflows/build-android.yml
+@@ -51,7 +51,7 @@ jobs:
+           distribution: zulu
+ 
+       - name: Setup Android SDK
+-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
++        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+         with:
+           log-accepted-android-sdk-licenses: false
+ 

@@ -1,0 +1,13 @@
+diff --git a/.github/workflows/close-issue.yml b/.github/workflows/close-issue.yml
+index 4698cee55..ec3df08b2 100644
+--- a/.github/workflows/close-issue.yml
++++ b/.github/workflows/close-issue.yml
+@@ -17,7 +17,7 @@ jobs:
+     steps:
+       - uses: actions/stale@v10
+         with:
+-          exempt-issue-labels: "refactoring,help wanted,good first issue,research 🔬,bug,roadmap,security"
++          exempt-issue-labels: "refactoring,help wanted,good first issue,research 🔬,bug,roadmap"
+           days-before-issue-stale: 30
+           days-before-issue-close: 14
+           stale-issue-label: "stale"

@@ -441,15 +441,17 @@ extern "C" {
         GGML_TYPE_TBQ4_2  = 51, // TurboQuant 4-bit, blck_size=64 (head_dim=64)
         GGML_TYPE_TBQP3_2 = 52, // TurboQuant_prod 3-bit, blck_size=64 (head_dim=64)
         GGML_TYPE_TBQP4_2 = 53, // TurboQuant_prod 4-bit, blck_size=64 (head_dim=64)
-        GGML_TYPE_TBQ3_3  = 54, // TurboQuant 3-bit, cross-head WHT (8×64=512)
-        GGML_TYPE_TBQ4_3  = 55, // TurboQuant 4-bit, cross-head WHT (8×64=512)
-        GGML_TYPE_TBQP3_3 = 56, // TurboQuant_prod 3-bit, cross-head WHT (8×64=512)
-        GGML_TYPE_TBQP4_3 = 57, // TurboQuant_prod 4-bit, cross-head WHT (8×64=512)
+        GGML_TYPE_TBQ3_3  = 54, // TurboQuant 3-bit, double WHT per-head (D=64)
+        GGML_TYPE_TBQ4_3  = 55, // TurboQuant 4-bit, double WHT per-head (D=64)
+        GGML_TYPE_TBQP3_3 = 56, // TurboQuant_prod 3-bit, double WHT per-head (D=64)
+        GGML_TYPE_TBQP4_3 = 57, // TurboQuant_prod 4-bit, double WHT per-head (D=64)
         GGML_TYPE_TBQ3_4  = 58, // TurboQuant 3-bit, blck_size=576 (head_dim=576, split 256+256+64)
         GGML_TYPE_TBQ4_4  = 59, // TurboQuant 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
         GGML_TYPE_TBQP3_4 = 60, // TurboQuant_prod 3-bit, blck_size=576 (head_dim=576, split 256+256+64)
         GGML_TYPE_TBQP4_4 = 61, // TurboQuant_prod 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
-        GGML_TYPE_COUNT   = 62,
+        GGML_TYPE_AMX3_1   = 62, // AMX K-side 3r+4φ polar, 128-WHT + cosine-optimal (head_dim=128)
+        GGML_TYPE_AMXV3_1  = 63, // AMX V-side 3-bit (tbq3_1 동치; optimization 후추가)
+        GGML_TYPE_COUNT    = 64,
     };
 
     // precision
@@ -1793,8 +1795,32 @@ extern "C" {
             int                   n_dims,
             int                   mode);
 
-    // custom RoPE
+    // RoPE operations with extended options
+    // a is the input tensor to apply RoPE to, shape [n_embd, n_head, n_token]
+    // b is an int32 vector with size n_token
     // c is freq factors (e.g. phi3-128k), (optional)
+    // mode can be GGML_ROPE_TYPE_NORMAL or NEOX; for MROPE and VISION mode, use ggml_rope_multi
+    //
+    // pseudo-code for computing theta:
+    //   for i in [0, n_dims/2):
+    //     theta[i] = b[i] * powf(freq_base, -2.0 * i / n_dims);
+    //     theta[i] = theta[i] / c[i];  # if c is provided, divide theta by c
+    //     theta[i] = rope_yarn(theta[i], ...);  # note: theta = theta * freq_scale is applied here
+    //
+    // other params are used by YaRN RoPE scaling, these default values will disable YaRN:
+    //   freq_scale  = 1.0f
+    //   ext_factor  = 0.0f
+    //   attn_factor = 1.0f
+    //   beta_fast   = 0.0f
+    //   beta_slow   = 0.0f
+    //
+    // example:
+    //   (marking: c = cos, s = sin, 0 = unrotated)
+    //   given a single head with size = 8 --> [00000000]
+    //   GGML_ROPE_TYPE_NORMAL  n_dims = 4 --> [cscs0000]
+    //   GGML_ROPE_TYPE_NORMAL  n_dims = 8 --> [cscscscs]
+    //   GGML_ROPE_TYPE_NEOX    n_dims = 4 --> [ccss0000]
+    //   GGML_ROPE_TYPE_NEOX    n_dims = 8 --> [ccccssss]
     GGML_API struct ggml_tensor * ggml_rope_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1810,6 +1836,36 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
+    // multi-dimensional RoPE, for Qwen-VL and similar vision models
+    // mode can be either VISION, MROPE, IMROPE, cannot be combined with NORMAL or NEOX
+    // sections specify how many dimensions to rotate in each section:
+    //   section length is equivalent to number of cos/sin pairs, NOT the number of dims
+    //   (i.e. sum of 4 sections are expected to be n_dims/2)
+    //   last sections can be 0, means ignored
+    // all other options are identical to ggml_rope_ext
+    //
+    // important note:
+    //   - NEOX ordering is automatically applied and cannot be disabled for MROPE and VISION
+    //     if you need normal ordering, there are 2 methods:
+    //     (1) split the tensor manually using ggml_view
+    //     (2) permute the weight upon conversion
+    //   - for VISION, n_dims must be head_size/2
+    //
+    // example M-RoPE:
+    //  given sections = [t=4, y=2, x=2, 0]
+    //  given a single head with size = 18 --> [000000000000000000]
+    //  GGML_ROPE_TYPE_MROPE   n_dims = 16 --> [ttttyyxxttttyyxx00] (cos/sin are applied in NEOX ordering)
+    //  GGML_ROPE_TYPE_IMROPE  n_dims = 16 --> [ttyxttyxttyxttyx00] (interleaved M-RoPE, still NEOX ordering)
+    //  note: the theta for each dim is computed the same way as ggml_rope_ext, no matter the section
+    //        in other words, idx used for theta: [0123456789... until n_dims/2], not reset for each section
+    //
+    // example vision RoPE:
+    //  given sections = [y=4, x=4, 0, 0] (last 2 sections are ignored)
+    //  given a single head with size = 8 --> [00000000]
+    //  GGML_ROPE_TYPE_VISION  n_dims = 4 --> [yyyyxxxx]
+    //  other values of n_dims are untested and is undefined behavior
+    //  note: unlike MROPE, the theta for each dim is computed differently for each section
+    //        in other words, idx used for theta: [0123] for y section, then [0123] for x section
     GGML_API struct ggml_tensor * ggml_rope_multi(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2370,6 +2426,13 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // TurboQuant: attach decoupled rope slice tensor for MLA (_4 types, GLM/DeepSeek).
+    // K tensor stores latent only; k_rope stores the f16 rope[64] portion separately.
+    // Binds to src[5]. Optional — only used when K->type is TBQ `_4` family.
+    GGML_API void ggml_flash_attn_ext_add_k_rope(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_rope);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

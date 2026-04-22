@@ -1,0 +1,33 @@
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+index a5bae7141..5d30b6a03 100644
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -26,10 +26,11 @@ permissions:
+ 
+ jobs:
+   create_tag:
+-    name: Create and push git tag
++    # Resolve the latest semver release tag (e.g. v1.5.3) for docker image tagging
++    # and as the checkout ref in downstream jobs. Does NOT create or push a git tag
++    # — all release tags are managed manually by the maintainer via 'gh release create'.
++    name: Resolve source tag
+     runs-on: ubuntu-slim
+-    permissions:
+-      contents: write
+     outputs:
+       source_tag: ${{ steps.srctag.outputs.name }}
+ 
+@@ -46,13 +47,6 @@ jobs:
+         env:
+           BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+ 
+-      - name: Create and push git tag
+-        env:
+-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-        run: |
+-          git tag ${{ steps.srctag.outputs.name }} || exit 0
+-          git push origin ${{ steps.srctag.outputs.name }} || exit 0
+-
+   prepare_matrices:
+     name: Prepare Docker matrices
+     runs-on: ubuntu-24.04

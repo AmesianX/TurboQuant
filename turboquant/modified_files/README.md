@@ -2,9 +2,207 @@
 
 > Implementation of [TurboQuant (ICLR 2026, Google DeepMind)](https://arxiv.org/abs/2504.19874) — KV cache compression via Walsh-Hadamard Transform + Lloyd-Max quantization with QJL correction
 
-**🇰🇷 [한국어 버전은 아래를 클릭하세요](#korean)**
+[🇰🇷 한국어](README_KO.md)
 
-### 🆕 v1.5.2 — PPL 21%→6%, Precision Fix, Deterministic Kernel
+### 📄 Papers
+
+- 📗 [**TurboQuant in Practice: Implementing 3-Bit KV Cache Compression in a Production LLM Inference Engine**](turboquant/paper/turboquant_impl.pdf) — original TBQ v1 implementation paper (WHT + Lloyd-Max + QJL)
+- 📕 [한국어판 — TurboQuant 구현](turboquant/paper/turboquant_impl_ko.pdf)
+
+### 🆕 v1.7.0 — TriAttention Integration + attn_rot_k Duplicate Rotation Cleanup
+
+**TriAttention token pruning on AMX3_1 hybrid K cache — dequant-free pre-RoPE polar scoring + physical eviction. All TBQ/TBQP/AMX encoders freed from external attn_rot_k dependency (redundant Hadamard now gone).**
+
+> ⚠️ **Breaking change — TBQX3_1 removed.** The v1.6.0 polar-only 3.625 bpw format (TBQX3_1 / `tbqx3`) is **deleted in v1.7.0**. Its polar `(r, φ)` idea now lives inside AMX3_1's Part B, paired with a WHT Part A that handles FA attention — so the "polar" path you used in v1.6.0 for scoring quality still exists, but the standalone polar-as-K-cache shape is gone. Scripts calling `--cache-type-k tbqx3` must switch to `--cache-type-k amx3`.
+
+**Environment:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · Qwen3-14B Q4_K_M · ctx=40960 · temp=0.
+
+#### The compression story (looks like 2.37×, actually more)
+
+| Axis | Before | After | Gain |
+|------|--------|-------|------|
+| **Raw block size** (128 elements) | f16 → 256 B | AMX3_1 → 108 B | **2.37×** |
+| **Live tokens per slot** (budget=128, 50% retention) | all 2500 alive | ~128 alive, 2372 evicted | **~2×** |
+| **Effective token-level compression** | 1× | — | **~4.74×** at sustained attention-equivalent quality |
+
+AMX3_1 alone is already a 2.37× packing win. TriAttention is a **separate second axis** — it says "only ~128 slots per layer actually contribute to each attention step," so the remaining ~95% of the allocated KV cache can be treated as dead weight at inference time. Compound the two axes and an f16 ctx=N quality target fits in roughly `N/4.7` memory. The physical allocation still matches your `-c` flag — what shrinks is how much of it attention has to touch each step.
+
+#### TriAttention — new CLI flags (requires `-ctk amx3` K cache)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--triattention FILE` | — | TRIA v2 calibration file (from `calibrate_ref.py`) |
+| `--tri-budget N` | 0 (off) | Per-layer Top-B slots kept after each trigger |
+| `--tri-interval N` | 128 | Trigger every N decoded tokens (paper β) |
+| `--tri-keep-first N` | 4 | Attention sink — first N slots always kept (set 32 to protect prompt header) |
+
+#### AMX3_1 hybrid K block (108 B, 6.75 bpw raw)
+
+| Part | Size | Purpose |
+|------|------|---------|
+| Part A (WHT) | 50 B (`d_wht` + `qs[48]`) | FA decode — tbq3_1 equivalent |
+| Part B (polar) | 58 B (`d_r` + `qr[24]` + `qphi[32]`) | TriAttention scoring — pre-RoPE `(r, φ)` |
+
+Part B is consumed directly on the GPU by the scoring kernel — no dequant-and-copy, no CPU round-trip.
+
+#### Needle-in-haystack recall (Qwen3-14B · budget=128 · interval=128)
+
+Prompt: "비밀번호는 **다람쥐7429** 이다. [1000자 요약 요청] … 마지막에 비밀번호 정확히 적어라."
+
+| Config | Tokens generated | Finish | Password recall | Observed behavior |
+|--------|------------------|--------|-----------------|-------------------|
+| Before TriAttention fix | 2500 | length | ❌ never mentioned | "다름, 다름, 다름…" infinite loop |
+| keep_first=4 | 575 | stop | ❌ recalled as "다섯" | partial first-syllable hallucination |
+| **keep_first=32** | **366** | **stop** | **✅ "다람쥐7429"** | natural self-stop with correct recall |
+
+#### Korean + scoring-kernel verification across head_dim
+
+All four cases reported `attn_rot_k = 0 / attn_rot_v = 0` at startup (external Hadamard fully disabled; internal WHT carries the rotation):
+
+| head_dim | Model (gguf) | Resolved KV type | Korean 8-line poem | Scoring pipeline |
+|---|---|---|---|---|
+| 64 | gpt-oss-20b-MXFP4 | `tbqp3_3` (double WHT) | ✅ natural | n/a (TriAttention is head_dim=128 only) |
+| **128** | **Qwen3-14B Q4_K_M** | **`tbq3_1` / `amx3_1`** | **✅ + needle pass** | ✅ 3-kernel + eviction + sink verified |
+| 256 | Qwen3.5-9B Q8_0 | `tbq3_0` | ✅ natural | n/a |
+| 576 (MLA) | GLM-4.7-Flash | `tbq3_4` (512-WHT + rope 64 passthrough) | ✅ natural | n/a |
+
+#### Performance (Qwen3-14B Q4_K_M, AMX3_1 hybrid)
+
+| Metric | Value | vs f16 baseline |
+|--------|-------|-----------------|
+| Prompt throughput | 694 tok/s | ~700 (≈parity) |
+| Decode throughput | **20.7 tok/s** | ~21 (≈parity) |
+| Per-trigger overhead | ~120 ms (40 layers × 3 ms) | ≈2% of 128-token decode window |
+| Effective kept slots / n_kv | ~130 / 2500 (95% evicted) | — |
+
+> Quality is preserved **while** 95% of slots are physically zeroed out each trigger — this is the TriAttention claim reproduced locally.
+
+#### Key design decisions (why TriAttention actually works here)
+
+1. **Dequant-free scoring.** Part B decodes straight into the pre-RoPE `(kxc, kyc)` pair the scoring formula needs. There is no shadow fp16 K buffer, no D2H copy — the 3-kernel pipeline (raw · z-norm · aggregate) reads quantized blocks in place.
+2. **Physical eviction with permanence.** Evicted slots zero **both** `d_wht` (so Part A → FA attention produces 0) **and** `d_r` (so Part B → next scoring pass produces 0). Zeroing only d_wht lets "ghost" slots win Top-B next trigger and silently consume budget; zeroing both makes eviction terminal.
+3. **Attention sink is mandatory, not optional.** With `--tri-keep-first 0` the decode collapses into a "다름, 다름, …" token-repetition loop within ~300 tokens. The sink is a StreamingLLM-style fix: always keep the first N slots so softmax has somewhere to dump residual mass. `4` covers the chat template; `32` covers a full prompt header including injected instructions.
+4. **External attn_rot_k was a duplicate rotation.** Every TBQ/TBQP/AMX encoder already runs an internal `tbq_signs` sign-flip + butterfly WHT; fattn-vec runs the identical WHT on the Q side. The Hadamard matmul that llama-kv-cache previously applied before the encoder was a redundant second rotation — it cancels via Parseval between Q and K, so output was unchanged, but every token paid for one extra matmul and a bit of rounding loss. v1.7.0 excludes all 23 internally-WHT types from `attn_rot_k`; verified on head_dim = 64 / 128 / 256 / 576 with Korean prose intact.
+
+#### Recommended config
+
+Qwen3-14B (head_dim=128, has AMX3_1 support):
+```
+--cache-type-k amx3 --cache-type-v amxv3 \
+--triattention calib/qwen3_14b.bin --tri-budget 128 --tri-keep-first 32
+```
+
+Any other head_dim (64/256/576) — TriAttention not wired, but attn_rot_k cleanup still applies automatically:
+```
+--cache-type-k tbq3 --cache-type-v tbq3     # auto-resolves to _2/_0/_4 by head_dim
+```
+
+> ⚠️ **Scope — AMX3_1 requires head_dim=128.** Qwen3.6-35B (K=256 asymmetric), GLM MLA 576, and gpt-oss family are **not** candidates for TriAttention until per-architecture AMX variants are built. `attn_rot_k` cleanup applies universally regardless of head_dim.
+
+#### Credits
+
+- **TriAttention algorithm** — Mao et al., *"Tri-attention: Tail-token saliency via trigonometric scoring on pre-RoPE keys"*, [arxiv 2604.04921](https://arxiv.org/abs/2604.04921) (2026).
+- **Python reference port** — [`domvox/triattention-ggml`](https://github.com/domvox/triattention-ggml). The TRIA v2 binary calibration format, the scoring math, and the per-head statistics extraction were adapted from that reference. The CUDA port, the AMX3_1 hybrid K cache integration, and the physical eviction + attention-sink wiring in llama-kv-cache / llama-context / fattn-vec are new in this release.
+
+#### A small behind-the-scenes note
+
+Back in early v1.6.0 work we sketched out "polar derotation" from scratch — storing K as `(r, φ_content)` with position peeled off algebraically — thinking it was our own little idea. It shipped, we wrote a paper, we pulled the paper when the theoretical framing didn't fully hold (see `eab1d2ad1` — pair structure + content-only WHT + exact Q·K preservation cannot all coexist under RoPE). Then while reading through TriAttention we realized the same polar decomposition was already sitting inside someone else's score formula, used for a different purpose entirely — token importance, not storage. The overlap turned out to be a gift: the AMX3_1 hybrid block slotted into TriAttention's scoring math almost unchanged, because Part B *was* the pre-RoPE polar pair the paper wanted. Independent rediscovery is humbling, but it made this integration much shorter than it had any right to be.
+
+One thing worth being straight about: the domvox Python reference pays a GPU→CPU roundtrip on every scoring trigger — K gets dequantized, pulled to host, scored in Python, mask pushed back. At β=128 and 40 layers that's the dominant latency on a 14B model. Our CUDA port removes that bottleneck entirely: Part B is exactly the layout the scoring formula needs, so the three scoring kernels read quantized blocks in place, the histogram Top-B and the eviction kernel run on the same stream, and nothing except a few-KB position array crosses PCIe during a trigger. Trigger overhead drops to ~2% of a 128-token decode window instead of seconds per trigger. But the tradeoff is memory: because AMX3_1 stores Part A (WHT for attention) AND Part B (polar for scoring) side by side, a block is 108 B instead of tbq3_1's 50 B — a little over 2× the raw K cache footprint at head_dim=128 for the same number of slots. TriAttention gives that memory back by evicting 95% of slots per trigger (so the *live* working set is smaller than plain tbq3_1 would have been), but the **allocated** KV buffer is bigger. We traded bytes for a throughput-neutral scoring path; it's the right trade at scale but worth naming honestly.
+
+#### 🚧 What's coming in v1.8.0 — *to be continued*
+
+Right now the AMX3_1 + TriAttention path rides on the **fattn-vec** kernel. Vec is the sequential-friendly "one token at a time" FlashAttention variant, and it's why decode sits at ~0.87× f16 throughput (**20.7 tok/s on Qwen3-14B**). The actual workhorse kernel on modern Ampere/Hopper/Blackwell parts is **fattn-mma** — the Tensor-Core one that hits GEMM bandwidth. Every other mainstream quant type is already on MMA; AMX3_1 is temporarily on vec only because the polar-derotate read path was faster to wire up there first.
+
+Porting the AMX3_1 dequant into the MMA Q·Kᵀ tile loader — and re-homing the TriAttention scoring kernel onto the same tensor-core path — is the v1.8.0 target. Back-of-envelope expectation: **~40+ tok/s decode** on Qwen3-14B (roughly 2×, since MMA typically recovers the full f16 speed once the tile path is clean), while the compression, the eviction semantics, and the API stay identical. If it lands we get TriAttention's ~4.7× effective compression **at f16 speed**, which is the point of this whole project. Expect a progress-report update, or an announcement that Tensor Core math hates me personally. Either is possible.
+
+---
+
+### v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B) — deprecated, see v1.7.0
+
+**New K cache format: polar-coordinate storage with content/position separation and analytical tangent residual correction. Beats f16 on math reasoning while preserving Korean prose quality.**
+
+**Environment:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · Model: Qwen3-14B Q4_K_M · ctx=40960 · temp=0
+
+**Memory footprint (ctx=40960, 40 layers):**
+
+| Config | K buffer | V buffer | Total KV | Compression |
+|--------|----------|----------|----------|-------------|
+| f16/f16 | 3200 MiB | 3200 MiB | 6400 MiB | 1.0x |
+| **tbqx3/tbq3** | **725 MiB** | 625 MiB | **1350 MiB** | **4.74x** |
+| tbq3/tbq3 | 625 MiB | 625 MiB | 1250 MiB | 5.12x |
+
+**Speed (decode, same prompt):**
+
+| Config | t/s | vs f16 |
+|--------|-----|--------|
+| f16/f16 | 24–25 | 1.00x |
+| **tbqx3/tbq3** | **21–22** | **0.87x** |
+| tbq3/tbq3 | 21–22 | 0.87x |
+
+**Math Accuracy (35 problems, seed=1234, temp=0):**
+
+| Config | Math (/35) | % | vs f16 |
+|--------|------------|---|--------|
+| **tbqx3/tbq3** | **13/35** | **37.1%** | **+8%** |
+| f16/f16 | 12/35 | 34.3% | — |
+| tbq3/tbq3 | 10/35 | 28.6% | −17% |
+
+> **tbqx3/tbq3 beats f16 on math while compressing 4.74x** and matching tbq3/tbq3 speed. Legacy tbq3/tbq3 trails f16 by 17%.
+
+**TBQX3_1 block format (3.625 bpw, head_dim=128):**
+
+| Field | Size | Purpose |
+|-------|------|---------|
+| `d_r` | 2 B | Rayleigh σ (half) |
+| `qr[24]` | 24 B | 3-bit r indices (Rayleigh Lloyd-Max, 64 pairs) |
+| `qphi[24]` | 24 B | 3-bit φ_content indices (uniform, 64 pairs) |
+| `qtan[8]` | 8 B | 1-bit tangent sign per pair |
+| **Total** | **58 B** | **3.625 bpw** |
+
+**Key ideas:**
+
+1. **Polar derotate (content/position separation)**: K is stored as `(r, φ_content) = (r, φ_post − pos·freq_i)` per RoPE pair. Content is position-invariant; re-rotation by `pos·freq_i` at read time restores post-RoPE K. Attention now sees content geometry directly instead of content·position entanglement.
+2. **Rayleigh Lloyd-Max on r**: the magnitude `r = √(x² + y²)` of a complex Gaussian pair is Rayleigh-distributed. Lloyd-Max 8-level codebook derived analytically from Rayleigh quantile boundaries (no calibration required, works across models).
+3. **Tangent Residual (the drift fix)**: the 3-bit uniform φ quantization has bounded error ±π/8. The resulting K perturbation lies almost entirely along the tangent direction `(-sin φ, cos φ)`. One extra bit encodes the sign of `Δφ`, and the magnitude `r · π/16` is analytical (half-cell). No learned scale, reuses already-computed sin/cos — just 2 extra FMAs per pair at read time. Cuts φ error in half (22.5° → 11.25°), eliminates low-probability token drift (Cyrillic contamination on rare-token transliterations).
+4. **No WHT in content path**: polar structure preserves angular information directly; applying WHT across pairs would destroy the RoPE pair structure. TBQX3_1 is the first TBQ variant to skip WHT entirely.
+
+**Recommended config for Qwen3-14B and other head_dim=128 RoPE models:**
+```
+--cache-type-k tbqx3 --cache-type-v tbq3
+```
+
+> ⚠️ **Known limitation — VEC kernel only.** TBQX3_1 is currently implemented on the `fattn-vec` path only. Decode throughput on Qwen3-14B is ~0.87× f16 as a result. Porting to the `fattn-mma` (Tensor Core) kernel would restore full speed but is **not yet implemented** — it is the main open item for a future release.
+
+---
+
+### v1.5.3 — Double WHT Per-Head for head_dim=64 (GPT-OSS 120B)
+
+**Cross-head WHT abandoned. Replaced with double WHT per-head (S1→WHT64→S2→WHT64) for D=64 models. QJL 1-bit correction re-enabled — critical for multi-turn stability.**
+
+**Environment:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · Model: GPT-OSS 120B (MXFP4)
+
+**Math Accuracy (35 problems, temp=0):**
+
+| Config | K cache | V cache | Math (/35) | Korean | Multi-turn |
+|--------|---------|---------|------------|--------|------------|
+| f16/f16 | f16 | f16 | **35/35** | ✅ | ✅ |
+| **tbq4/tbq3** | tbq4_2 | tbq3_2 | **35/35** | ✅ | ✅ |
+| tbqp3/tbq3 | tbqp3_3 | tbq3_2 | ❌ (matrix) | ✅ | ✅ (9+ turns) |
+
+> **Recommended:** `--cache-type-k tbq4 --cache-type-v tbq3` for head_dim=64 models.
+> 4-bit K achieves f16-equivalent math accuracy (35/35) with 3-bit V compression.
+> 3-bit K (tbqp3) supports Korean conversation and multi-turn but cannot reliably compute matrix operations.
+
+**v1.5.3 Key Changes:**
+
+1. **Double WHT per-head (D=64)**: Cross-head WHT (512-point, $H_8 \otimes H_{64}$) abandoned due to Q-K domain mismatch. Replaced with S1→WHT64→S2→WHT64 double WHT per-head. Kurtosis 0.375→0.047 (near-Gaussian).
+2. **QJL re-enabled for K at D=64**: Contrary to v1.5.2 (which removed QJL), the 1-bit QJL correction is critical for multi-turn stability. Without QJL: repetition loops at turn 3-4. With QJL (TBQP3_3): 9+ turns verified.
+3. **TBQ_TUNING D=64 instances**: All D=64 K/V combinations added to TBQ_TUNING build (tbqp3_3, tbq3_3, tbq4_2, f16, q8_0 × tbq3_2/f16).
+
+---
+
+### v1.5.2 — PPL 21%→6%, Precision Fix, Deterministic Kernel
 
 **Critical precision loss in flash attention kernel fixed. 3-bit KV cache now deterministic and achieves 1.06x f16 PPL.**
 
@@ -43,8 +241,8 @@
 6. **Removed 1.15x V hack**: Replaced by principled attention sharpening.
 7. **Fixed tbq4_0 D=512 OOB read**.
 8. **Fixed tbq4/tbqp4 D=512 WHT domain mismatch**: K encoding used 256-point WHT while Q used 512-point WHT. Added 512-point encode functions.
-9. **Cross-head WHT per-head norm (head_dim=64)**: Global L2 norm destroyed small heads' quantization quality. Changed to per-head RMS norm after 512-point WHT.
-10. **head_dim=64 K: auto QJL removal**: QJL adds score noise that exceeds signal gap at D=64. K automatically remapped from tbqp3→tbq3 (pure 3-bit Lloyd-Max) for maximum K score precision. V keeps original type.
+9. **Double WHT per-head (head_dim=64)**: Cross-head 512-point WHT abandoned (Q-K domain mismatch). Replaced with S1→WHT64→S2→WHT64 double WHT per-head. Kurtosis 0.375→0.047 (near-Gaussian). Q and K in same domain — no IWHT needed.
+10. **head_dim=64 K: TBQP3_3 (QJL enabled)**: QJL 1-bit correction critical for multi-turn stability (7+ turns verified). K auto-mapped to TBQP3_3 (2-bit Lloyd-Max + 1-bit QJL + double WHT).
 11. **Dynamic MMSE softening (head_dim=64)**: α(N) = SQNR/(SQNR + √(ln N/ln N₀)), opposite of sharpening — reduces overconfidence when SQNR is low.
 
 ### Attention Sharpening — Theory & Dynamic α Formula
@@ -118,624 +316,7 @@ Use shorthand names (`tbq3`, `tbqp3`, etc.) — internal suffixes (`_0`, `_1`, e
 
 ---
 
-<a id="korean"></a>
-<details open>
-<summary>🇰🇷 한국어</summary>
-
-## 개요
-
-Google DeepMind의 TurboQuant 논문을 llama.cpp에 구현했습니다. KV 캐시를 3~4비트로 압축하여 메모리를 최대 5.2배 절약하면서 FP16 수준의 품질을 유지합니다.
-
-### 🆕 v1.5.2 — PPL 21%→6%, 정밀도 수정, 결정적 커널
-
-**Flash attention 커널의 치명적 정밀도 손실 수정. 3비트 KV cache가 이제 결정적(deterministic)으로 동작하며 f16 대비 PPL 6% 달성.**
-
-**환경:** NVIDIA DGX Spark (GB10, VRAM 128GB) · CUDA 12.8 · Model: [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) UD-Q4_K_XL
-
-**메모리 & 압축률 (262K ctx, Gemma 4 26B MoE):**
-
-| 설정 | Global KV | SWA KV | 총 KV | 압축 |
-|------|-----------|--------|-------|------|
-| f16/f16 | 5,120 MiB | 300 MiB (f16) | 5,420 MiB | 1.0x |
-| **tbqp3/tbq3** | 990 MiB (K:500 + V:490) | 300 MiB (f16) | **1,290 MiB** | **4.2x** |
-
-**PPL 벤치마크 (wikitext-2-raw, ctx=2048):**
-
-| 설정 | PPL | vs f16 |
-|------|-----|--------|
-| f16/f16 | 419.8 | 1.00x |
-| **tbqp3/tbq3** | **445.7** | **1.06x** |
-
-**수학 정확도 벤치마크 (262K ctx, temp=0, 35문제 × 10회):**
-
-| 설정 | 10회 결과 (/35) | 평균 | 피크 |
-|------|----------------|------|------|
-| **tbqp3/tbq3** | 19,23,18,22,18,20,19,16,19,17 | **19.1** | **23** |
-| f16/f16 | 19,20,21,20,20,21,21,19,20,20 | 20.1 | 21 |
-
-> **4.2x 압축, PPL 6% 격차, 수학 f16 동급.** 피크 23은 f16 최고(21)를 초과.
-
-**v1.5.2 핵심 변경:**
-
-1. **Flash Attention 정밀도 수정 (half2→float)**: 업스트림 fattn-vec은 VKQ 누적과 KQ 공유 메모리에 half2(V_DOT2)를 사용. 이 정밀도 손실이 512-point IWHT butterfly에 의해 증폭되어 MoE expert routing이 비결정적으로 동작. 전체 70개 TBQ V 템플릿 인스턴스에 float 누적 경로를 강제(`#undef V_DOT2_F32_F16_AVAILABLE`)하여 수정. **PPL: 454.7 → 445.7 (1.08x → 1.06x).**
-2. **V IWHT Float 스테이징**: reduce 단계에서 `__shared__ half KQ[]`에 half 값으로 저장한 뒤 IWHT가 `float*`로 읽는 타입 불일치 — butterfly에 의해 증폭. float 레지스터 스테이징 + `__syncthreads()` 배리어로 수정.
-3. **동적 Attention Sharpening**: α(N) = 1 + c × √(ln N), MMSE/EVT 이론에서 유도. 생성 시(작은 N) 작은 α, 긴 컨텍스트 prefill 시(큰 N) 큰 α로 자동 적응. clamp 불필요.
-4. **V Rotation 버그 수정 (attn_rot_v=0)**: attn_rot이 V에도 적용되고 있었으나 IWHT decode에 역rotation이 없어 회전된 채로 출력. K rotation은 Q·K dot product에서 자동 상쇄되어 안전.
-5. **Per-block Norm (TBQ3 D=512)**: 512-WHT 후 두 256-half에 독립 norm 적용. TBQP3는 QJL residual이 cross-block 512-WHT를 사용하므로 global norm 유지.
-6. **1.15x V 보정 제거**: 경험적 heavy-tail 보정값 삭제. attention sharpening이 올바른 위치(softmax 전)에서 동일 문제를 해결.
-7. **tbq4_0 D=512 OOB 수정**: K dot product에서 첫 번째 256-block만 읽던 버그를 n_blocks 루프로 수정.
-
-### Attention Sharpening — 이론 & 동적 α 공식
-
-양자화 노이즈가 attention score에 분산을 추가하여 softmax를 평탄화합니다. sharpening factor α로 보정:
-
-**동적 (현재 구현):**
-```
-α(N) = 1 + c × √(ln N)
-c = 1/(2 × SQNR_eff × √(ln N₀))
-```
-N = 현재 KV 토큰 수 (런타임), N₀ = 2048 (기준 컨텍스트 크기).
-
-√(ln N) 항은 **극치 통계학(Extreme Value Theory)**에서 유도 — N개 경쟁 토큰 중 최대 노이즈의 기대값이 √(2 ln N)으로 성장하여, 잘못된 토큰이 softmax 질량을 가로챌 확률이 증가. 생성 시(작은 N) 작은 α, 긴 컨텍스트 prefill 시(큰 N) 큰 α로 자동 적응. clamp 불필요.
-
-**TBQ3와 TBQP3의 α가 다른 이유:**
-
-| 타입 | 구조 | Attention Score 노이즈 | 실효 SQNR | α 계수 |
-|------|------|----------------------|-----------|--------|
-| **TBQ3** | 3비트 Lloyd-Max (8레벨) | 순수 per-element 노이즈만 | 31.2 | 0.016 |
-| **TBQP3** | 2비트 MSE + 1비트 QJL | MSE 노이즈 + QJL random projection 노이즈 | 13.8 | 0.036 |
-| **TBQ4** | 4비트 Lloyd-Max (16레벨) | 최소 노이즈 | 56.2 | 0.009 |
-| **TBQP4** | 3비트 MSE + 1비트 QJL | MSE 노이즈 + QJL projection 노이즈 | 24.5 | 0.020 |
-
-TBQ3는 per-element reconstruction error가 작지만(8레벨), TBQP3의 QJL 보정은 attention score에 **두 번째 노이즈 소스**를 추가합니다: `d_qjl × Σ(Q_wht2[i] × sign[i])`. QJL은 K reconstruction MSE를 줄이지만(V 용도에 유리), attention score variance는 증가시킵니다(softmax에 불리). 이것이 **TBQP3가 TBQ3보다 더 강한 sharpening이 필요한 이유**입니다.
-
-**컨텍스트별 동적 α 테이블:**
-
-| ctx N | TBQ3 | TBQP3 | TBQ4 | TBQP4 |
-|-------|------|-------|------|-------|
-| 256 | 1.012 | 1.027 | 1.007 | 1.015 |
-| 512 | 1.013 | 1.030 | 1.007 | 1.017 |
-| 1024 | 1.015 | 1.033 | 1.008 | 1.018 |
-| **2048** | **1.016** | **1.036** | **1.009** | **1.020** |
-| 4096 | 1.017 | 1.038 | 1.009 | 1.021 |
-| 8192 | 1.018 | 1.041 | 1.010 | 1.023 |
-| 32768 | 1.019 | 1.044 | 1.011 | 1.025 |
-| 131072 | 1.020 | 1.047 | 1.011 | 1.026 |
-| **262144** | **1.021** | **1.048** | **1.012** | **1.027** |
-
-범위가 1.007~1.048로 좁습니다 — √(ln N)이 매우 느리게 성장하기 때문. 128배 컨텍스트 증가(2048→262144)에도 α 변화는 ~0.012. 이는 고정 상수를 실용적 1차 근사로 사용할 수 있음을 검증합니다.
-
-**PPL 개선 과정:**
-
-| 변경 | PPL | vs f16 |
-|------|-----|--------|
-| v1.5.1 원본 | 509.9 | 1.21x |
-| + per-block norm | 498.2 | 1.19x |
-| + 1.15x 제거 + sharpening | 455.0 | 1.08x |
-| + V rotation bugfix | 448.1 | 1.07x |
-| + TBQP3/TBQ3 분리 α | 454.7 | 1.08x |
-| + **float VKQ 누적 (half2→float)** | **445.7** | **1.06x** |
-
-**추천 설정:**
-
-모델: [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) (Q4_K_XL)
-
-```bash
-# 최고 품질 (f16 동급, 4.2x 압축)
-./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
-    -t 4 -c 262144 -n 32768 --parallel 1 \
-    --cont-batching --jinja \
-    --reasoning off --reasoning-budget 0 --reasoning-format none \
-    --n-gpu-layers 999 --flash-attn on \
-    -b 1024 -ub 512 --no-mmap \
-    --cache-type-k tbqp3 --cache-type-v tbq3 \
-    --temp 0 --host 0.0.0.0 --port 8888
-```
-> SWA K+V는 자동으로 f16 업그레이드됩니다. 추가 설정 불필요.
-
-**지원 K/V 조합:**
-
-숏핸드 이름(`tbq3`, `tbqp3` 등)을 사용하세요 — 내부 접미사(`_0`, `_1` 등)는 head dimension에 따라 자동 매핑됩니다.
-
-| `--cache-type-k` \ `--cache-type-v` | f16 | q8_0 | q4_0 | tbq3 | tbq4 |
-|--------------------------------------|-----|------|------|------|------|
-| **f16** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **q8_0** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **q4_0** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **tbq3** | ✅ | ✅ | — | ✅ | ✅ |
-| **tbq4** | ✅ | ✅ | — | ✅ | ✅ |
-| **tbqp3** | ✅ | ✅ | — | ✅ | ✅ |
-| **tbqp4** | ✅ | ✅ | — | ✅ | ✅ |
-
-> **`tbqp` 타입은 K 전용입니다.** `--cache-type-v`에 `tbqp3`/`tbqp4`를 사용하지 마세요 — QJL 보정은 Q·K 내적에서만 동작하며 V cache에는 의미가 없습니다. 추천: `--cache-type-k tbqp3 --cache-type-v tbq3`.
-
----
-
-### v1.5.1 — f16 동급 달성: SWA f16 Bypass + V 512-WHT + QJL D=512 복원
-
-**3비트 KV cache(tbq3/tbq3)로 f16을 넘어서는 품질 달성. SWA f16 bypass가 핵심 브레이크스루.**
-
-**수학 정확도 벤치마크 (262K ctx, temp=0, 65문제 × 10회):**
-
-| 설정 | K cache | V cache | attn_rot_k | Global KV | SWA KV | 수학 정확도 (10회) | 평균 | 압축 |
-|------|---------|---------|-----------|-----------|--------|------------------|------|------|
-| **tbqp3/tbq3** | tbqp3 | tbq3 | OFF(자동) | 990 MiB | 300 MiB(f16) | 37,38,40,38,38,36,37,36,37,37 | **37.4** | **4.2x** |
-| **tbq3/tbq3** | tbq3 | tbq3 | ON | 980 MiB | 300 MiB(f16) | 39,39,37,37,38,35,35,39,35,36 | **37.0** | **4.2x** |
-| f16/f16 | f16 | f16 | OFF | 5120 MiB | 300 MiB(f16) | 37,36,36,36,36,38,36,38,37,36 | 36.6 | 1.0x |
-
-> **tbqp3/tbq3이 f16을 넘어섰습니다 (37.4 > 36.6).** 피크 40/65는 f16 최고(38)보다 높습니다.
-
-**v1.5.1 핵심 기술:**
-
-1. **SWA KV f16 Bypass**: SWA 캐시는 작지만 (300 MiB) 25개 레이어로 전체 품질을 지배합니다. SWA K+V를 자동으로 f16 업그레이드하여 SWA 양자화 오차를 완전 제거.
-
-2. **V 512-WHT + 512-IWHT**: V cache에 K와 동일한 512-point WHT를 적용. Attention 출력 시 512-point IWHT + sign undo + /512 정규화.
-
-3. **QJL D=512 복원**: SWA f16 bypass와 함께 사용하면 tbqp3 K가 tbq3 K보다 우수.
-
-4. **attn_rot 자동 관리**: TBQ K는 attn_rot ON, TBQP K는 attn_rot OFF 자동 적용.
-
-5. **TBQ_TUNING 빌드 모드**: `cmake -DGGML_CUDA_FA_TBQ_TUNING=ON`으로 fattn 템플릿 컴파일 최소화.
-
-```bash
-# 추천 설정 (v1.5.1)
-./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
-    -t 4 -c 262144 -n 32768 --parallel 1 \
-    --cont-batching --jinja \
-    --reasoning off --reasoning-budget 0 --reasoning-format none \
-    --n-gpu-layers 999 --flash-attn on \
-    -b 1024 -ub 512 --no-mmap \
-    --cache-type-k tbqp3 --cache-type-v tbq3 \
-    --temp 0 --host 0.0.0.0 --port 8888
-```
-> SWA K+V는 자동으로 f16 업그레이드됩니다. 추가 설정 불필요.
-
----
-
-### v1.5.0 — Upstream Rebase + Gemma 4 지원
-
-**llama.cpp 최신 upstream(b7ad48ebd)에 완전 리베이스 + Gemma 4 TBQ KV 캐시 지원.**
-
-기존에는 upstream llama.cpp와 별도 히스토리로 관리되어, 최신 기능을 반영하려면 수백 커밋을 수동 패치해야 했습니다. v1.5.0부터 upstream 커밋 히스토리를 공유하는 구조로 전환하여, `git merge upstream/master` 한 줄로 최신 동기화가 가능합니다.
-
-**변경 사항:**
-- upstream llama.cpp 최신 커밋(b7ad48ebd)에 3-way merge로 전체 TBQ/TBQP 코드 적용
-- **Gemma 4 지원**: head_dim=512(global) + 256(SWA) 혼합 아키텍처 완전 지원
-- Deepseek MLA 512x512 MMA config 반영 (upstream 추가분)
-- bf16 flash attention vec 커널 지원 (upstream 추가분)
-- V-less cache, stream-k FA 등 upstream 최적화 포함
-- `git merge upstream/master`로 향후 동기화 가능한 fork 구조 확립
-
-**Gemma 4 핵심 기술:**
-1. **SWA 캐시 타입 자동 재매핑**: global(head_dim=512)과 SWA(head_dim=256)가 다른 경우, SWA 캐시에 올바른 TBQ 서브타입을 자동 할당
-2. **가변 GQA 대응**: Gemma 4는 레이어마다 head_count_kv가 다름(16/4). WHT rotation이 head 단위로 동작하므로 가변 GQA에서도 안전 — `attn_rot_k` 활성화 조건 수정
-3. **D=512 single-pass WHT + global norm**: K 양자화 시 512차원 전체를 한번에 WHT 처리 (9단계 butterfly). 두 256-block에 동일한 global norm을 저장하여 cross-block 스케일 일관성 유지. Q 전처리도 512-point WHT (128스레드 × 4원소). V IWHT는 256-block 독립 처리 (V는 per-block norm)
-4. **head_dim 전달**: `op_params[0]`으로 head_dim을 set_rows 커널에 전달하여 D=512와 D=256을 정확히 구분
-
-**벤치마크 (Gemma 4 31B-it Dense, UD-Q4_K_XL, DGX Spark GB10, 262K ctx):**
-
-| 캐시 | GPU 메모리 | 압축 | PP t/s | TG t/s | PPL (wiki, 2K) | 수학 정확도 | 파울리 |
-|------|-----------|------|--------|--------|----------------|------------|--------|
-| f16/f16 | 41,500 MiB | 1.0x | 152.9 | 10.1 | 309.7 | 42/65 (64.6%) | PASS |
-| **tbq3/tbq3** | **23,215 MiB** | **1.8x** | 112.9 | 9.0 | 212.1 | **32/65 (49.2%)** | **PASS** |
-
-**벤치마크 (Gemma 4 26B-A4B MoE, UD-Q4_K_XL, DGX Spark GB10, 262K ctx):**
-
-| 캐시 | GPU 메모리 | 압축 | TG t/s | 수학 정확도 | 파울리 |
-|------|-----------|------|--------|------------|--------|
-| f16/f16 | 5,720 MiB | 1.0x | 56.4 | 37/65 (56.9%) | PASS |
-| **tbq3/tbq3** | **1,106 MiB** | **5.2x** | 41.1 | **30/65 (46.2%)** | **PASS** |
-
-> **참고:** Gemma 4는 hybrid SWA 아키텍처로, non-SWA 10 layers (head_dim=512) + SWA 50 layers (head_dim=256)입니다. SWA 캐시는 sliding window 크기(1536 cells)로 제한되어, Dense 모델의 압축률(1.8x)은 MLA 모델(5.2x)보다 낮습니다. MoE 변형은 레이어가 적어 **5.2x 압축** 달성.
->
-> **참고:** 수학 정확도는 [turboquant_math_accuracy.py](https://github.com/eullm/eullm/blob/main/bench/turboquant_math_accuracy.py) 벤치마크(2x2/3x3 행렬곱, 스칼라 연산, filler 0-2000t)로 측정. 65개 테스트 중 f16과 TBQ는 **55개(31B Dense) / 58개(26B MoE)에서 동일한 결과**를 보였으며, 차이가 발생한 케이스도 작은 수치 오차(예: 160→150, 519→509)로 garbage 출력이 아닙니다. 파울리 테스트(과학자 이름 한국어 번역)는 정상 통과.
->
-> **✅ v1.5.1 업데이트:** D=512 QJL 제한은 v1.5.1에서 해결되었습니다. SWA f16 bypass와 함께 사용하면 TBQP3(QJL) D=512가 정상 동작하며 tbq3보다 우수합니다. 자세한 내용은 위의 v1.5.1 섹션을 참조하세요.
-
-<details>
-<summary>빌드 및 실행 방법</summary>
-
-**빌드:**
-```bash
-cmake -DCMAKE_BUILD_TYPE=Release \
-      -DBUILD_SHARED_LIBS=ON \
-      -DGGML_CUDA=ON \
-      -DGGML_BLAS=ON \
-      -DGGML_CCACHE=OFF \
-      -DCMAKE_EXE_LINKER_FLAGS="-lpthread -lm" \
-      -DLLAMA_BUILD_TESTS=OFF \
-      -DLLAMA_BUILD_EXAMPLES=OFF \
-      -DLLAMA_BUILD_SERVER=ON \
-      -DCMAKE_VERBOSE_MAKEFILE=ON \
-      ..
-
-make -j12
-```
-
-**서버 실행 (f16 baseline):**
-```bash
-./llama-server -m ~/Models/gemma4/gemma-4-31B-it-UD-Q4_K_XL.gguf \
-    -t 4 -c 262144 -n 32768 --parallel 2 \
-    --cont-batching --jinja --reasoning-format auto \
-    --chat-template-kwargs '{"enable_thinking": false, "reasoning_effort": "medium"}' \
-    --n-gpu-layers 999 --flash-attn on \
-    -b 1024 -ub 512 --no-mmap \
-    --cache-type-k f16 --cache-type-v f16 \
-    --top-k 20 --temp 0.6 --top-p 0.95 --min-p 0.0 \
-    --presence-penalty 0.0 --repeat-penalty 1.0 \
-    --host 127.0.0.1 --port 8888
-```
-
-**서버 실행 (TurboQuant):**
-```bash
-./llama-server -m ~/Models/gemma4/gemma-4-31B-it-UD-Q4_K_XL.gguf \
-    -t 4 -c 262144 -n 32768 --parallel 2 \
-    --cont-batching --jinja --reasoning-format auto \
-    --chat-template-kwargs '{"enable_thinking": false, "reasoning_effort": "medium"}' \
-    --n-gpu-layers 999 --flash-attn on \
-    -b 1024 -ub 512 --no-mmap \
-    --cache-type-k tbq3 --cache-type-v tbq3 \
-    --top-k 20 --temp 0.6 --top-p 0.95 --min-p 0.0 \
-    --presence-penalty 0.0 --repeat-penalty 1.0 \
-    --host 127.0.0.1 --port 8889
-```
-</details>
-
-**호환성:** 기존 v1.4.2의 모든 기능(MMA 텐서코어, QJL scalar correction, MLA 비대칭) 유지. 기존 모델 벤치마크 동일.
-
----
-
-### v1.4.2 — MMA Tensor Core 가속 + QJL Scalar Correction
-
-**TBQ/TBQP MMA 텐서코어 가속으로 토큰 생성 속도 30→49 t/s (+63%).**
-
-GLM-4.7-Flash (MLA, K=576/V=512) 비대칭 모델에서 MMA 텐서코어를 활용한 KV 캐시 attention 가속. vec 커널 대비 최대 1.6배 TG 속도 향상.
-
-**핵심 기술:**
-
-1. **MMA K spatial dequant**: TBQ/TBQP raw blocks → IWHT → spatial f16 → tensor core. Warp shuffle 최적화로 cooperative IWHT의 `__syncthreads` 8→4회 감소.
-2. **QJL scalar correction**: TBQP의 QJL 1-bit 보정을 full MMA pass 대신 경량 scalar 연산으로 수행. K의 raw block에서 sign bits + dq를 직접 읽어 `dq × Σ(Q_wht2[i] × sign[i])` 계산. QJL의 두 번째 sign basis(signs2)를 올바르게 처리.
-3. **V = K view spatial**: K를 spatial domain으로 dequant하므로 V(= K view)도 자동으로 spatial. Output IWHT 완전 제거.
-4. **정식 커널 시그니처**: `fattn_kernel_t`에 `raw_K_data`, `raw_K_stride`, `Q_wht2_data`, `Q_wht2_stride` 파라미터 추가. hack 없는 정석 구현.
-5. **Fused Q WHT12**: Q->data에서 직접 읽어 Q_wht1(중간값) + Q_wht2(QJL용) 계산. cudaMemcpy 제거.
-
-**벤치마크 (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
-
-| 캐시 | KV MiB | 압축 | TG t/s | vs v1.4.1 | 파울리 |
-|------|--------|------|--------|-----------|--------|
-| f16/f16 | 10,469 | 1.0x | 67.5 | — | PASS |
-| **tbq3/tbq3** | **2,944** | **3.6x** | **49.7** | **+55%** (32→49.7) | **PASS** |
-| **tbqp3/tbq3** | **2,981** | **3.5x** | **42.8** | **+36%** (31.5→42.8) | **PASS** |
-| tbq4/tbq4 | 3,526 | 3.0x | ~49 | +47% | PASS |
-| tbqp4/tbq4 | 3,562 | 2.9x | ~42 | +45% | PASS |
-
-> **참고:** TBQP(QJL 보정)가 TBQ보다 느린 이유: QJL은 별도 sign basis(signs2)로 WHT 변환 후 scalar correction을 수행하므로 Q_wht2 precompute + per-token scalar correction 오버헤드. 대신 dot product 정확도가 향상되어 PPL 개선.
-
----
-
-### v1.4.1 — GLM-4.7-Flash (MLA) 비대칭 K/V 지원
-
-**GLM-4.7-Flash, DeepSeek-V2/V3 등 MLA 아키텍처 모델에서 TurboQuant 완전 지원.**
-
-MLA(Multi-head Latent Attention)는 K=concat(latent[512], rope[64])=576차원, V=latent[512]차원의 비대칭 구조입니다. 세 가지 핵심 기술로 해결:
-
-1. **D_V 템플릿 파라미터**: vec 커널이 K/Q 차원(D=576)과 V 차원(D_V=512)을 분리 처리. VKQ 배열, combine stride, IWHT 패스 수, 출력 쓰기 모두 D_V 기준. 기존 대칭 모델은 D_V=D 기본값으로 영향 없음.
-2. **RoPE f16 passthrough**: _4 블록 구조체에서 마지막 64차원(rope)을 WHT+양자화 대신 f16으로 직접 저장. RoPE 값의 norm이 latent 대비 ~80배 커서(10.49 vs 0.13), 어떤 비트 수의 양자화든 오차가 attention score를 지배하는 문제 해결. Q 전처리와 dot product도 sub-block 3을 f16 직접 연산으로 처리.
-3. **MLA V-as-K-view 지원**: MLA absorption 최적화에서 V는 K 캐시의 view(같은 타입). TBQP V dequantize는 MSE centroid만 사용(QJL correction은 K·Q dot product 보정 전용이므로 V 재구성에 미적용). IWHT는 256+256 2패스(rope 64 패스 스킵).
-
-**벤치마크 (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
-
-| 캐시 | KV MiB | 압축 | PP t/s | TG t/s | PPL | 파울리 |
-|------|--------|------|--------|--------|-----|--------|
-| f16/f16 | 10,469 | 1.0x | 73.0 | 60.3 | 5.998 | PASS |
-| **tbq3/tbq3** | **2,944** | **3.6x** | 68.2 | 32.0 | **6.836** | **PASS** |
-| **tbqp3/tbq3** | **2,981** | **3.5x** | 66.8 | 31.5 | **6.586** | **PASS** |
-| tbq4/tbq4 | 3,526 | 3.0x | 67.2 | 33.4 | — | PASS |
-| tbqp4/tbq4 | 3,562 | 2.9x | 65.8 | 28.9 | — | PASS |
-
-> **참고:** MLA 모델의 압축률(3.5x)이 일반 모델(5.2x)보다 낮은 이유: MLA는 이미 KV를 256-dim 잠재 표현으로 압축하므로, 원래 캐시가 작습니다. 7.5GB 절약(10,469→2,981 MiB)은 실질적으로 큰 차이입니다.
->
-> **참고:** TG 속도(31.5 t/s vs f16 60.3 t/s): TBQ는 vec 커널(스칼라 WHT dot product), f16은 MMA 커널(텐서코어 행렬곱)을 사용합니다. MMA 커널에 TBQ on-the-fly dequantize를 추가하면 텐서코어 활용 가능 — 향후 과제.
-
-**해결된 버그:**
-
-| 버그 | 원인 | 수정 |
-|------|------|------|
-| GLM tbqp3/tbq3 크래시 (v1.4.0) | `get_best_fattn_kernel`이 D=576 TBQ를 NONE 반환 | D=576+V=512 TBQ vec 커널 라우팅 추가 |
-| 대칭 dispatch가 비대칭을 먹음 | `FATTN_VEC_CASE`가 V->ne[0] 미확인 → DV=576으로 잘못 launch | ASYM 케이스를 대칭 앞에 배치 |
-| RoPE 양자화 → garbage 출력 | rope norm(~10.49) >> latent norm(~0.13), 양자화 오차가 attention 지배 | sub-block 3를 f16 passthrough로 변경 |
-| TBQP V dequant에 QJL 적용 → garbage | QJL은 K·Q dot product 보정 전용, V 재구성에 부적합 | V dequant에서 QJL 제거 (MSE only) |
-| Q WHT sub-block 간 race condition | sub-block 1 저장 후 `__syncthreads` 누락 → sub-block 2 WHT가 Q_wht 오염 가능 | `__syncthreads` barrier 추가 |
-
----
-
-### v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
-
-**벤치마크 (Qwen3-30B-A3B Q4_K_M, DGX Spark GB10, head_dim=128):**
-
-| 설정 | PPL | vs F16 | 비고 |
-|------|-----|--------|------|
-| f16/f16 | 6.26 | 기준 | |
-| **tbqp4/tbq4** | **6.70** | **+7.1%** | +Direct Sign 보정 (head_dim=128) |
-| tbq4/tbq4 | 6.73 | +7.5% | MSE only |
-| **tbqp3/tbq3** | **7.91** | **+26.3%** | +Direct Sign 보정 (head_dim=128) |
-| tbq3/tbq3 | 8.49 | +35.6% | MSE only |
-
-> **참고:** TBQP의 잔차 보정 방식은 head_dim에 따라 다릅니다:
-> - head_dim=256: **QJL** (논문 원본, SRHT 기반)
-> - head_dim=128/64: **Direct Sign** (QJL 분산 문제 해결, 분산 4.3배 감소)
->
-> 위 수치는 **MoE 모델** (토큰당 3.7B 활성 파라미터)입니다. F16 기준 PPL 6.26 자체가 MoE 특성이며, TurboQuant 이슈가 아닙니다.
-
-**해결된 이슈:**
-
-| 이슈 | 보고자 | 상태 |
-|------|--------|------|
-| Phi-4, DeepSeek 자동 head_dim 감지 실패 | @fritolays | 수정 — P1→P5 캐스케이드 |
-| turbo4-K PPL 폭발 (Cydonia-24B에서 18,202) | @TheTom | 수정 — head_dim 오감지가 원인 |
-| GLM head_dim=576, Qwen3-4B head_dim=80 | @fritolays, @sztlink | 수정 — pow2 검사 + q8_0 폴백 |
-| Qwen3.5-27B-UD에서 "////" 출력 | @modderBUG | v1.3.0에서 재현 불가 |
-| llama-bench TBQ 타입 미지원 | @sztlink | 수정 — 16개 타입 + 4개 약어 |
-| Windows OpenSSL DLL 의존성 | @sztlink | 수정 — 독립 빌드 추가 |
-
-**기타 개선:**
-- llama-bench: -ctk/-ctv로 TBQ/TBQP 타입 완전 지원
-- 미지원 head_dim: q8_0으로 폴백하여 압축 유지
-- 독립 빌드(standalone): 외부 DLL 의존성 없음
-
-<details>
-<summary>🔧 head_dim 감지 기술 상세 (P1→P5 Priority Cascade)</summary>
-
-기존에는 GGUF `{arch}.attention.key_length` 메타데이터만 읽었으나, 대부분의 모델(Phi-4, DeepSeek, Gemma, Mistral)은 이 값을 저장하지 않아 TurboQuant가 조용히 비활성화되는 문제가 있었습니다.
-
-이제 6개 감지 신호를 엄격한 우선순위 캐스케이드로 사용:
-- **P1**: `attention.key_length` (100% — GGUF 공식값)
-- **P2**: `attention.key_length_mla` (100% — DeepSeek V2 등 MLA 모델)
-- **P3**: `attention.key_length_swa` (100% — Gemma 2/3 등 SWA 모델)
-- **P4**: `attention.value_length` (95% — 교차 검증)
-- **P5**: `n_embd / n_head` (70% — 폴백, MoE에서 오류 가능)
-
-신호 간 교차 검증 + 진단 로깅:
-```
-TurboQuant head_dim signals — key=128 val=128 computed=64 mla_k=0 mla_v=0 swa_k=0
-[P1✓ P5✗] key_length=128 but n_embd/n_head=64 — using P1
-```
-
-**n_embd/n_head가 틀리는 실제 사례:**
-
-| 모델 | n_embd/n_head | 실제 head_dim | P5만 사용시 |
-|------|---------------|---------------|-------------|
-| Qwen3-30B-A3B (MoE) | 64 | **128** | 잘못된 WHT 블록 → 쓰레기 출력 |
-| Qwen3.5-27B | 213 | **256** | TurboQuant 비활성 |
-
-Power-of-2 검증으로 WHT 비호환 차원(head_dim=80, 576) 조기 감지.
-</details>
-
----
-
-### v1.2.0 — Auto head_dim Mapping + head_dim=64 Quality Fix + V Cross-Head WHT
-
-**자동 head_dim 매핑 — 사용자가 숫자 접미사를 알 필요 없음:**
-```bash
-# v1.2.0: 그냥 tbq3/tbqp3 입력하면 head_dim에 따라 자동 선택
---cache-type-k tbqp3 --cache-type-v tbq3
-```
-- `head_dim=256`: K=tbqp3_0 (QJL), V=tbq3_0 → **5.2x 압축**
-- `head_dim=128`: K=tbqp3_1 (Direct Sign), V=tbq3_1 → **5.0x 압축**
-- `head_dim=64`: K=**q8_0** (자동 fallback), V=tbq3_2 → **2.7x 압축**
-
-**head_dim=64 품질 문제 발견 및 해결:**
-
-과학자 이름 테스트(독일어→한국어 표준 표기)에서 WHT 양자화의 근본적 한계를 발견:
-- PPL은 개선되어도(2195 < 4008) 실제 생성은 깨지는 현상 (attention smoothing)
-- TurboQuant 논문은 head_dim=128만 검증 — head_dim=64는 CLT 수렴 부족
-- **해결: K cache를 q8_0으로 자동 fallback** + V는 WHT 유지 (V는 가중합이라 노이즈에 관대)
-
-| Model | head_dim | Config | KV Memory | Compress | PPL (2K) | Prompt t/s | Gen t/s | Pauli Test |
-|:------|:---------|:-------|----------:|---------:|---------:|---------:|--------:|:---:|
-| GPT OSS 120B | 64 | F16/F16 | 4,608 MiB | 1.0x | 2413 | 133 | 47 | ✅ |
-| GPT OSS 120B | 64 | **q8_0/tbq3 (auto)** | **1,692 MiB** | **2.7x** | **1925** | **145** | **46** | **✅** |
-| GPT OSS 20B | 64 | F16/F16 | 3,072 MiB | 1.0x | 4008 | 412 | 74 | ✅ |
-| GPT OSS 20B | 64 | **q8_0/tbq3 (auto)** | **1,128 MiB** | **2.7x** | **2649** | **421** | **75** | **✅** |
-| Qwen3.5-122B | 256 | F16/F16 | 6,144 MiB | 1.0x | — | 91 | 23 | ✅ |
-| Qwen3.5-122B | 256 | **tbqp3/tbq3 (auto)** | **1,188 MiB** | **5.2x** | **—** | **102** | **22** | **✅** |
-
-**입력 검증 — 잘못된 조합도 크래시 없이 안전 처리:**
-- V에 TBQP(QJL) 지정 → 자동으로 TBQ로 다운그레이드
-- 잘못된 _N 접미사 → head_dim에 맞게 자동 수정 또는 fallback
-- 미지원 head_dim → q8_0/f16 fallback + 경고
-
-#### 왜 "파울리 테스트"인가? — PPL이 거짓말하는 경우
-
-**문제:** Perplexity(PPL)는 KV 캐시 양자화 품질의 표준 지표입니다. 낮을수록 좋다고 알려져 있지만, head_dim이 작은 경우 WHT 기반 양자화에서 **심각하게 오해를 유발**합니다.
-
-Cross-head WHT(8개 head를 묶어 512-element WHT)를 구현했을 때, F16보다 *더 좋아 보이는* PPL 수치를 달성했습니다:
-
-| 설정 | PPL (2K) | 생성 품질 |
-|:-----|:---------|:---------|
-| F16/F16 (기준) | 4008 | ✅ 정확 |
-| cross-head WHT 3-bit | **2195** (더 좋아 보임!) | ❌ 완전히 깨짐 |
-
-**PPL이 45% 개선**되었지만 모델은 이름조차 제대로 출력하지 못했습니다. WHT 양자화 노이즈가 attention을 평활화(smoothing)하여 극단적인 오답 예측을 줄이면서(평균 surprise 감소 = PPL 하락), 정답 토큰에 집중하는 날카로운 attention peak은 파괴합니다(생성 실패).
-
-**테스트 설계:** 이를 감지하기 위해 독일 과학자 이름의 한국어 표준 표기를 벤치마크로 선정했습니다. 구체적으로 "Wolfgang Pauli" → "볼프강 파울리".
-
-이 테스트가 효과적인 이유:
-- **문화적 특수성:** 한국어에는 외래어 이름에 대한 국가 공식 표준([외래어 표기법](https://kornorms.korean.go.kr/))이 존재합니다. "Wolfgang Pauli"는 반드시 "볼프강 파울리"로만 표기되어야 하며, "볼프강 파우리"나 "워워우 파울리" 등은 오답입니다.
-- **LLM에게 극도로 어려운 과제:** 영어/중국어/일본어에서는 여러 음차가 허용되지만, 한국어는 이름당 **정확히 하나의 정답**만 존재합니다. 독일어 음소를 한국어 음절에 대응하는 표준 음운 규칙에 의해 결정됩니다.
-- **attention 정밀도에 민감:** 다음절 한국어 음차를 정확히 출력하려면 원어 이름에 대한 정밀한 토큰별 attention이 필요합니다. 양자화 노이즈로 인한 attention 흐림은 즉시 잘못된 음절로 나타납니다.
-- **검증 기준:** 정답은 한국 중고등학교 과학 교과서에 수록된 표기와 일치하는지로 판단 — 객관적이고 검증 가능한 기준입니다.
-
-**head_dim=64에서 전체 설정별 결과:**
-
-| K 타입 | 비트 | "Wolfgang Pauli" → | PPL |
-|:-------|:----|:-------------------|:----|
-| F16 | 16 | 볼프강 파울리 ✅ | 4008 |
-| q8_0 | 8 | 볼프강 파울리 ✅ | — |
-| tbq4_0 (4-bit WHT) | 4 | 볼프강 **파우리** ⚠️ (1음절 오류) | — |
-| tbq3_0 (3-bit WHT) | 3 | **파이브라스** ❌ (의미 없음) | — |
-| tbqp3_0 (3-bit + QJL) | 3 | **er** ❌ (한국어도 아님) | — |
-| tbqp3_3 (cross-head) | 3 | **2.** ❌ | **2195** (오해를 유발하는 "좋은" 수치) |
-
-"최고" PPL(2195)을 달성한 cross-head 설정이 가장 나쁜 생성 결과를 보였습니다. **PPL과 생성 품질이 역상관 관계.**
-
-**근본 원인:** TurboQuant 논문(ICLR 2026)은 head_dim=128 모델(Gemma, Mistral, Llama-3.1-8B)만 검증했습니다. head_dim=64에서는 WHT가 요구하는 중심극한정리(CLT) 수렴이 불충분하여, 좌표가 가우시안에 충분히 근사하지 않아 정확한 스칼라 양자화가 불가능합니다.
-
-**해결:** head_dim=64에서는 K 캐시를 자동으로 q8_0으로 fallback(WHT 우회), V 캐시만 WHT 유지(가중합이므로 노이즈에 관대). 파울리 테스트 통과 + 2.7배 압축 달성.
-
-**교훈:** KV 캐시 양자화는 반드시 PPL뿐 아니라 실제 생성 품질 테스트로 검증해야 합니다. attention 분포를 평활화하는 방법은 PPL을 개선하면서도 모델의 정밀한 출력 능력을 파괴할 수 있습니다.
-
-> **참고: Cross-Head WHT 코드에 대하여**
->
-> v1.2.0에는 head_dim=64 모델을 위해 개발한 cross-head WHT 구현(8개 KV head를 묶어 512-element WHT, Kronecker 분해 H_512 = H_8 ⊗ H_64, V cross-head scoring 등)이 포함되어 있습니다. 이 코드는 head_dim=64에서 PPL은 개선했지만 실제 생성 품질을 보존하지 못해 현재 **자동 매핑에서 사용되지 않습니다**. 그러나 head_dim=128 이상에서의 cross-head 실험(예: 1024-element WHT), 다른 변환 기법(KITTY, learned rotation 등)과의 비교 연구, 또는 향후 CLT 수렴이 개선되는 새로운 접근법에서 재활용될 가치가 있으므로 **의도적으로 코드를 유지**하고 있습니다. 관련 타입: `_3` suffix (tbq3_3, tbq4_3, tbqp3_3, tbqp4_3).
-
----
-
-### v1.1.0 — head_dim 64/128 지원 + Direct Sign 잔차 보정
-
-**멀티 head_dim 지원:**
-- `head_dim=256`: 기존 (Qwen3.5, Qwen3-Next) — QJL 잔차 보정
-- `head_dim=128`: **신규** (Llama, Qwen3, Mistral, MiniMax, 대부분 모델) — Direct Sign 잔차 보정
-- `head_dim=64`: **신규** (gpt-oss, 소형 모델) — Direct Sign 잔차 보정
-- 자동 감지 — 사용자 CLI 변경 없음 (`--cache-type-k tbqp3_0` 그대로)
-
-**Direct Sign — 논문 QJL 대비 4.3배 낮은 분산:**
-
-논문의 QJL은 SRHT 랜덤 프로젝션으로 잔차를 보정하지만, d≤128에서 프로젝션 잡음이 보정 효과를 초과합니다. Direct Sign은 `sign(residual)`을 직접 저장하여:
-- 분산 4.3배 감소: `(1-2/π)/(π/2) = 0.23`
-- 두 번째 WHT 불필요 → 속도 향상
-- d=256에서는 QJL 유지 (QJL이 더 우수)
-
-#### head_dim=128 벤치마크 (Qwen3-30B-A3B Q4_K_M, 2K context, DGX Spark GB10)
-
-| K/V 설정 | PPL | 속도 (t/s) | KV 크기 | 압축률 |
-|:---------|----:|---------:|-------:|------:|
-| f16 + f16 (baseline) | 6.69 | 87.8 | 192 MiB | 1.0x |
-| q8_0 + q8_0 | 6.68 | 84.3 | 102 MiB | 1.9x |
-| q4_0 + q4_0 | 7.33 | 85.0 | 54 MiB | 3.6x |
-| tbq4_0 + tbq4_0 | 7.02 | 68.6 | 50 MiB | 3.9x |
-| tbq4_0 + tbq3_0 | 7.19 | 68.1 | 44 MiB | 4.4x |
-| **tbqp4_0 + tbq3_0 (Direct Sign)** | **7.08** | **63.6** | **44 MiB** | **4.3x** |
-| tbqp3_0 + tbq3_0 (Direct Sign) | 7.95 | 65.3 | 38 MiB | 5.0x |
-
-#### Direct Sign vs QJL 비교 (head_dim=128, TBQP3/TBQ3)
-
-| 방식 | PPL | 비고 |
-|:-----|----:|:-----|
-| QJL (논문 원본) | 11.04 | d=128에서 프로젝션 잡음 폭발 |
-| **Direct Sign (v1.1.0)** | **7.95** | **PPL 3.09 감소** |
-
-#### 버그 수정
-
-- `__syncthreads()` race condition: ncols=2(prompt eval)에서 쿼리 WHT shared memory 오염 → PPL 2000+ 폭발, 토큰 생성(ncols=1)은 정상이라 발견 어려운 버그
-
----
-
-### v1.0.0 벤치마크 (head_dim=256)
-
-**핵심 결과: `tbqp3_0 + tbq3_0` = 5.2x 압축 + F16보다 낮은 PPL + 12% 빠른 속도**
-
-### 벤치마크 환경
-
-- **Model**: Qwen3.5-35B-A3B Q4_K_M (19.71 GiB)
-- **System**: NVIDIA DGX Spark, GB10 GPU, 128GB Unified Memory, CUDA 13.0
-- **Dataset**: wikitext-2-raw (test set)
-
-### 종합 성능표
-
-| KV 설정 | KV 메모리 | 압축률 | PPL (2K) | PPL (8K) | 속도 (8K) |
-|:--------|----------:|-------:|---------:|---------:|----------:|
-| f16 + f16 (baseline) | 5,120 MiB | 1.0x | 4.678 | 6.829 | 51.9 t/s |
-| q8_0 + q8_0 | 2,720 MiB | 1.9x | 4.679 | 6.806 | 50.1 t/s |
-| tbq3_0 + tbq3_0 | 980 MiB | 5.2x | 4.756 | 6.963 | 63.5 t/s |
-| **tbqp3_0 + tbq3_0** | **990 MiB** | **5.2x** | **4.672** | **6.850** | **58.3 t/s** |
-
-### 핵심 발견
-
-```
-메모리:  5,120 → 990 MiB  (81% 절약)
-PPL@2K:  4.678 → 4.672   (F16보다 좋음!)
-PPL@8K:  6.829 → 6.850   (+0.3% 차이)
-속도@8K: 51.9  → 58.3 t/s (+12% 빠름)
-```
-
-### 컨텍스트 길이별 Perplexity
-
-| KV 설정 | 2K | 4K | 8K | 32K |
-|:--------|---:|---:|---:|----:|
-| f16 + f16 | 4.678 | 6.591 | 6.829 | 6.151 |
-| q8_0 + q8_0 | 4.679 | 6.585 | 6.806 | 6.144 |
-| tbq3_0 + tbq3_0 | 4.756 | 6.736 | 6.963 | 6.201 |
-| **tbqp3_0 + tbq3_0** | **4.672** | **6.683** | **6.850** | **6.273** |
-
-### 컨텍스트 길이별 토큰 생성 속도 (t/s)
-
-| KV 설정 | 2K | 4K | 8K | 32K |
-|:--------|---:|---:|---:|----:|
-| f16 + f16 | 51.1 | 52.5 | 51.9 | 51.6 |
-| q8_0 + q8_0 | — | 52.3 | 50.1 | — |
-| tbq3_0 + tbq3_0 | 66.9 | 66.4 | 63.5 | 66.3 |
-| **tbqp3_0 + tbq3_0** | **63.9** | **63.0** | **58.3** | **63.3** |
-
-### QJL 보정 효과
-
-QJL (Quantized Johnson-Lindenstrauss) = 논문의 TurboQuant_prod. Key에 1-bit 잔차 보정 추가.
-
-| Context | tbq3_0 (QJL 없음) | tbqp3_0 (QJL 있음) | 개선 |
-|:--------|---:|---:|:---:|
-| 2K | 4.756 | **4.672** | **-0.084** |
-| 4K | 6.736 | **6.683** | **-0.053** |
-| 8K | 6.963 | **6.850** | **-0.113** |
-| 32K | 6.201 | 6.273 | +0.072 |
-
-### 사용법
-
-```bash
-# 빌드
-cmake -B build -DGGML_CUDA=ON
-cmake --build build -j$(nproc)
-
-# 추천: QJL Key + TBQ Value (5.2x 압축, F16급 품질)
-./build/bin/llama-cli -m model.gguf -ngl 99 \
-  --cache-type-k tbqp3 --cache-type-v tbq3
-
-# 속도 우선 (5.2x 압축, 최고 속도)
-./build/bin/llama-cli -m model.gguf -ngl 99 \
-  --cache-type-k tbq3_0 --cache-type-v tbq3_0
-```
-
-### 지원 KV 조합
-
-✅ = 정상 동작 (CUDA 가속) / ❌ = llama.cpp 제한
-
-| K \ V | f16 | q8_0 | tbq3_0 | tbq4_0 |
-|:------|:---:|:----:|:------:|:------:|
-| f16 | ✅ | ❌ | ❌ | ❌ |
-| q8_0 | ✅ | ✅ | ❌ | ❌ |
-| tbq3_0 | ✅ | ✅ | ✅ | ✅ |
-| tbq4_0 | ✅ | ✅ | ✅ | ✅ |
-| tbqp3_0 | ✅ | ✅ | ✅ | ✅ |
-| tbqp4_0 | ✅ | ✅ | ✅ | ✅ |
-
-### 타입 설명
-
-| 타입 | 설명 | bpw |
-|:-----|:-----|----:|
-| tbq3_0 | TurboQuant 3-bit (WHT + Lloyd-Max) | 3.06 |
-| tbq4_0 | TurboQuant 4-bit (WHT + Lloyd-Max) | 4.06 |
-| tbqp3_0 | TurboQuant_prod 3-bit (2-bit LM + 1-bit QJL) | 3.12 |
-| tbqp4_0 | TurboQuant_prod 4-bit (3-bit LM + 1-bit QJL) | 4.12 |
-
-</details>
-
-<details open>
-<summary>🇺🇸 English</summary>
-
-## Overview
-
-This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It compresses KV cache to 3-4 bits, achieving up to 5.2x memory savings while maintaining FP16-level quality.
-
-### 🆕 v1.5.1 — Exceeds f16 Quality: SWA f16 Bypass + V 512-WHT + QJL D=512
+### v1.5.1 — Exceeds f16 Quality: SWA f16 Bypass + V 512-WHT + QJL D=512
 
 **3-bit KV cache (tbq3/tbq3) now EXCEEDS f16 quality. SWA f16 bypass is the key breakthrough.**
 
@@ -752,37 +333,8 @@ This is an implementation of Google DeepMind's TurboQuant paper in llama.cpp. It
 **Key techniques:**
 
 1. **SWA KV f16 Bypass**: SWA cache is small (~300 MiB) but has 25 layers dominating overall quality. Auto-upgrade SWA K+V to f16 eliminates SWA quantization noise — the hidden culprit that masked all previous optimization attempts.
-
 2. **V 512-WHT + 512-IWHT**: V cache now uses the same 512-point WHT as K (sign flip + 9-stage butterfly + global norm). 512-point IWHT at attention output (128 threads × 4 elements, warp shuffle + shared memory butterfly).
-
 3. **QJL D=512 Restored**: Previously removed as "ineffective at D=512" — SWA noise was masking QJL improvement. With SWA f16 bypass, tbqp3 K outperforms tbq3 K (37.4 > 37.0). attn_rot auto-disabled for TBQP (prevents triple rotation).
-
-4. **Recommended config:**
-
-Model: [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) (Q4_K_XL)
-
-```bash
-# Best quality (exceeds f16, 4.2x compression)
-./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
-    -t 4 -c 262144 -n 32768 --parallel 1 \
-    --cont-batching --jinja \
-    --reasoning off --reasoning-budget 0 --reasoning-format none \
-    --n-gpu-layers 999 --flash-attn on \
-    -b 1024 -ub 512 --no-mmap \
-    --cache-type-k tbqp3 --cache-type-v tbq3 \
-    --temp 0 --host 0.0.0.0 --port 8888
-
-# Simple config (matches f16, 4.2x compression)
-./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
-    -t 4 -c 262144 -n 32768 --parallel 1 \
-    --cont-batching --jinja \
-    --reasoning off --reasoning-budget 0 --reasoning-format none \
-    --n-gpu-layers 999 --flash-attn on \
-    -b 1024 -ub 512 --no-mmap \
-    --cache-type-k tbq3 --cache-type-v tbq3 \
-    --temp 0 --host 0.0.0.0 --port 8888
-```
-> SWA K+V auto-upgraded to f16. No additional configuration needed.
 
 ---
 
@@ -1182,354 +734,14 @@ QJL (Quantized Johnson-Lindenstrauss) = paper's TurboQuant_prod. Adds 1-bit resi
 | 8K | 6.963 | **6.850** | **-0.113** |
 | 32K | 6.201 | 6.273 | +0.072 |
 
-### Usage
-
-```bash
-# Build
-cmake -B build -DGGML_CUDA=ON
-cmake --build build -j$(nproc)
-
-# Recommended: QJL Key + TBQ Value (5.2x compression, FP16-level quality)
-./build/bin/llama-cli -m model.gguf -ngl 99 \
-  --cache-type-k tbqp3 --cache-type-v tbq3
-
-# Speed priority (5.2x compression, fastest)
-./build/bin/llama-cli -m model.gguf -ngl 99 \
-  --cache-type-k tbq3_0 --cache-type-v tbq3_0
-```
-
-### Supported KV Combinations
-
-✅ = Working (CUDA accelerated) / ❌ = llama.cpp limitation
-
-| K \ V | f16 | q8_0 | tbq3_0 | tbq4_0 |
-|:------|:---:|:----:|:------:|:------:|
-| f16 | ✅ | ❌ | ❌ | ❌ |
-| q8_0 | ✅ | ✅ | ❌ | ❌ |
-| tbq3_0 | ✅ | ✅ | ✅ | ✅ |
-| tbq4_0 | ✅ | ✅ | ✅ | ✅ |
-| tbqp3_0 | ✅ | ✅ | ✅ | ✅ |
-| tbqp4_0 | ✅ | ✅ | ✅ | ✅ |
-
-### Type Descriptions
-
-| Type | Description | bpw |
-|:-----|:-----------|----:|
-| tbq3_0 | TurboQuant 3-bit (WHT + Lloyd-Max) | 3.06 |
-| tbq4_0 | TurboQuant 4-bit (WHT + Lloyd-Max) | 4.06 |
-| tbqp3_0 | TurboQuant_prod 3-bit (2-bit LM + 1-bit QJL) | 3.12 |
-| tbqp4_0 | TurboQuant_prod 4-bit (3-bit LM + 1-bit QJL) | 4.12 |
-
-</details>
 
 ---
 
-## Applying the Patch / 패치 적용
-
-<details>
-<summary>🇰🇷 한국어</summary>
-
-이 구현은 llama.cpp 커밋 [`f5d1c4179`](https://github.com/ggml-org/llama.cpp/commit/f5d1c4179) 기준입니다.
-
-```bash
-# 방법 1: 이 저장소를 직접 빌드
-cmake -B build -DGGML_CUDA=ON
-cmake --build build -j$(nproc)
-
-# 방법 2: 동일 커밋의 llama.cpp에 패치 적용
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-git checkout f5d1c4179
-git apply /path/to/turboquant/turboquant_kv_cache.patch
-```
-
-### 수정된 파일 목록
-
-| 파일 | 변경 내용 |
-|:-----|:---------|
-| `ggml/include/ggml.h` | TBQ 타입 enum 추가 (41-44) |
-| `ggml/src/ggml-common.h` | 블록 구조체 정의 |
-| `ggml/src/ggml.c` | 타입 traits 등록 |
-| `common/arg.cpp` | KV 캐시 타입 CLI 인자 |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | SET_ROWS 지원 등록 |
-| `ggml/src/ggml-cuda/cpy-utils.cuh` | KV 양자화 함수 (SET_ROWS) |
-| `ggml/src/ggml-cuda/set-rows.cu` | SET_ROWS dispatch |
-| `ggml/src/ggml-cuda/fattn-common.cuh` | Fused attention 연산 |
-| `ggml/src/ggml-cuda/fattn-vec.cuh` | Flash Attention vec 커널 |
-| `ggml/src/ggml-cuda/fattn.cu` | FA dispatch + 조합 검증 |
-| + 16 template instances | FA 커널 인스턴스화 |
-
-</details>
-
-<details open>
-<summary>🇺🇸 English</summary>
-
-This implementation is based on llama.cpp commit [`f5d1c4179`](https://github.com/ggml-org/llama.cpp/commit/f5d1c4179).
-
-```bash
-# Option 1: Build this repository directly
-cmake -B build -DGGML_CUDA=ON
-cmake --build build -j$(nproc)
-
-# Option 2: Apply patch to matching llama.cpp commit
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-git checkout f5d1c4179
-git apply /path/to/turboquant/turboquant_kv_cache.patch
-```
-
-### Modified Files
-
-| File | Changes |
-|:-----|:--------|
-| `ggml/include/ggml.h` | TBQ type enums (41-44) |
-| `ggml/src/ggml-common.h` | Block structure definitions |
-| `ggml/src/ggml.c` | Type traits registration |
-| `common/arg.cpp` | KV cache type CLI arguments |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | SET_ROWS support registration |
-| `ggml/src/ggml-cuda/cpy-utils.cuh` | KV quantization functions (SET_ROWS) |
-| `ggml/src/ggml-cuda/set-rows.cu` | SET_ROWS dispatch |
-| `ggml/src/ggml-cuda/fattn-common.cuh` | Fused attention operations |
-| `ggml/src/ggml-cuda/fattn-vec.cuh` | Flash Attention vec kernel |
-| `ggml/src/ggml-cuda/fattn.cu` | FA dispatch + combination validation |
-| + 16 template instances | FA kernel instantiations |
-
-</details>
-
----
-
-## Technical Details / 기술 상세
-
-<details>
-<summary>🇰🇷 한국어</summary>
-
-### 구현 아키텍처
-
-TurboQuant는 KV 캐시 압축에 최적화된 양자화 기법입니다:
-
-1. **Walsh-Hadamard Transform (WHT)**: 벡터를 회전하여 가우시안 분포로 변환
-2. **Lloyd-Max 양자화**: N(0,1) 분포에 최적인 스칼라 양자화기 적용
-3. **QJL 보정** (tbqp 타입): 1-bit 잔차 보정으로 비편향 내적 추정
-
-#### Key 캐시 처리 흐름
-
-```
-[쓰기] 새 Key → WHT(Key) → Lloyd-Max 양자화 → 3-bit 인덱스 저장
-                                              → 잔차 계산 → SRHT → QJL 1-bit 부호 저장 (tbqp만)
-
-[읽기] Query × Key 내적:
-  WHT(Query) × centroid[key_idx] × scale  (MSE 점수)
-  + WHT₂(Query) × sign[qjl_idx] × scale₂  (QJL 보정, tbqp만)
-```
-
-#### Value 캐시 처리 흐름
-
-```
-[쓰기] 새 Value → WHT(Value) → Lloyd-Max 양자화 → 인덱스 저장
-
-[읽기] softmax(QK) × V:
-  WHT 도메인에서 centroid lookup → 가중합 계산 → IWHT(결과)
-  (IWHT는 선형 연산이므로 가중합 후 한 번만 적용)
-```
-
-#### 핵심 설계 결정
-
-- **Q8_1 비사용**: WHT가 양자화 오차를 16배 증폭 → F32 활성화 사용
-- **직렬 WHT**: Flash Attention은 128 스레드, WHT는 256 원소 → 스레드 0이 직렬 처리
-- **Fused 커널**: Key 역양자화 없이 WHT(Query)×centroid 직접 계산
-- **V IWHT**: softmax×V 가중합 후 FP16 하이브리드 IWHT (shfl + shared memory)
-- **독립 QJL 부호**: MSE용 WHT와 QJL용 SRHT에 서로 다른 부호 패턴 사용 (상관 잡음 방지)
-
-### 왜 KV 캐시에만 적용하는가?
-
-| | 가중치 양자화 | KV 캐시 압축 |
-|:--|:--|:--|
-| WHT 오버헤드 | 매 matmul마다 (느림) | Query당 1회 (무시 가능) |
-| 효과 | Q4_K_M보다 느림 | F16보다 빠르고 5.2x 절약 |
-| 논문 핵심 | 부수적 | **핵심 기여** |
-
-가중치 양자화는 이미 Q4_K_M 등 고도로 최적화된 기법이 있어 TurboQuant의 이점이 없습니다. KV 캐시는 컨텍스트 길이에 비례하여 증가하므로 압축 효과가 극대화됩니다.
-
-</details>
-
-<details open>
-<summary>🇺🇸 English</summary>
-
-### Implementation Architecture
-
-TurboQuant is a quantization technique optimized for KV cache compression:
-
-1. **Walsh-Hadamard Transform (WHT)**: Rotates vectors to approximate Gaussian distribution
-2. **Lloyd-Max quantization**: Applies optimal scalar quantizer for N(0,1) distribution
-3. **QJL correction** (tbqp types): 1-bit residual correction for unbiased inner product estimation
-
-#### Key Cache Pipeline
-
-```
-[Write] New Key → WHT(Key) → Lloyd-Max quantize → store 3-bit indices
-                                                 → compute residual → SRHT → store QJL 1-bit signs (tbqp only)
-
-[Read]  Query × Key dot product:
-  WHT(Query) × centroid[key_idx] × scale  (MSE score)
-  + WHT₂(Query) × sign[qjl_idx] × scale₂  (QJL correction, tbqp only)
-```
-
-#### Value Cache Pipeline
-
-```
-[Write] New Value → WHT(Value) → Lloyd-Max quantize → store indices
-
-[Read]  softmax(QK) × V:
-  Centroid lookup in WHT domain → weighted sum → IWHT(result)
-  (IWHT is linear, so applied once after weighted sum)
-```
-
-#### Key Design Decisions
-
-- **No Q8_1**: WHT amplifies quantization error 16x → use F32 activations
-- **Serial WHT**: Flash Attention has 128 threads, WHT needs 256 elements → thread 0 does serial WHT
-- **Fused kernel**: Compute WHT(Query)×centroid directly without Key dequantization
-- **V IWHT**: FP16 hybrid IWHT (shfl + shared memory) after softmax×V weighted sum
-- **Independent QJL signs**: Different sign patterns for MSE WHT and QJL SRHT (prevents correlated noise)
-
-### Why KV Cache Only?
-
-| | Weight Quantization | KV Cache Compression |
-|:--|:--|:--|
-| WHT overhead | Every matmul (slow) | Once per query (negligible) |
-| Effect | Slower than Q4_K_M | Faster than FP16 + 5.2x savings |
-| Paper focus | Secondary | **Core contribution** |
-
-Weight quantization already has highly optimized methods (Q4_K_M, etc.) where TurboQuant offers no advantage. KV cache grows linearly with context length, maximizing the compression benefit.
-
-</details>
-
----
-
-## Development History / 개발 히스토리
-
-<details>
-<summary>🇰🇷 한국어</summary>
-
-### 구현 과정
-
-이 프로젝트는 논문을 처음부터 llama.cpp의 CUDA 커널로 구현한 작업입니다. 주요 단계:
-
-#### Phase 1: 가중치 양자화 (시행착오)
-
-처음에는 논문의 가중치 양자화를 구현했으나, WHT 오버헤드가 매 matmul마다 발생하여 Q4_K_M (72 t/s) 대비 훨씬 느린 속도 (23 t/s)를 보였습니다. 이를 통해 **TurboQuant의 핵심은 KV 캐시 압축**임을 확인하고 방향을 전환했습니다.
-
-#### Phase 2: KV 캐시 압축 (핵심 구현)
-
-- Flash Attention vec 커널에 TBQ Key/Value 지원 추가
-- Fused attention: Key 역양자화 없이 WHT(Query) × centroid 직접 계산
-- Value: WHT 도메인 저장 + softmax×V 후 IWHT 적용
-
-#### Phase 3: QJL 보정 (TurboQuant_prod)
-
-- tbqp3_0/tbqp4_0 타입 추가: (b-1)-bit Lloyd-Max + 1-bit QJL
-- 독립 SRHT (다른 부호 패턴)로 비편향 내적 추정
-- PPL이 F16보다 좋아지는 결과 달성
-
-### 해결한 주요 버그들
-
-| 문제 | 원인 | 해결 |
-|:-----|:-----|:-----|
-| PPL 폭발 | 1/√d 스케일링이 WHT 후 centroid 분포와 불일치 | 불필요한 스케일링 제거 |
-| Q8_1 오차 증폭 | WHT가 int8 양자화 오차를 16배 증폭 | F32 활성화 사용 |
-| Warp reduction 데드락 | 8 스레드만 shfl_down 호출, 나머지 24 스레드 미참여 | 직렬 합산으로 변경 |
-| nthreads(128) < D(256) | FA 128 스레드로 256원소 WHT 불가 | 스레드 0 직렬 WHT |
-| j 루프 syncthreads 데드락 | 일부 warp가 루프 이탈 후 syncthreads 미스 | 1열씩 처리로 변경 |
-| MMA/tile 커널 라우팅 | TBQ가 존재하지 않는 MMA 커널로 라우팅 | VEC 커널 조기 반환 |
-| 템플릿 인스턴스 누락 | 교차 비트 조합 인스턴스 미생성 → GGML_ABORT | 16개 전체 인스턴스 생성 |
-| Q_ds OOB 접근 | TBQP가 Q_ds[0..3] 접근하나 배열 크기 2 | 동적 Q_ds_size (TBQP=4) |
-| QJL 32K 속도 저하 | Key당 내적 2회 → 계산량 2배 | float 곱셈 제거, 부호 반전으로 최적화 |
-| QJL 품질 저하 | MSE용 WHT와 동일 부호 사용 (상관 잡음) | 독립 qjl_signs 패턴 사용 |
-
-### 파일별 변경 개요 (906줄 추가, 6줄 수정)
-
-총 10개 파일 수정 + 16개 신규 파일:
-
-```
-cpy-utils.cuh    +265  KV 캐시 양자화 (WHT + Lloyd-Max + QJL)
-fattn-common.cuh +274  Fused attention 연산 (vec_dot_KQ, dequantize_V)
-fattn-vec.cuh    +208  Query WHT 전처리, V IWHT 후처리
-fattn.cu          +51  FA dispatch + 조합 검증
-set-rows.cu       +40  SET_ROWS TBQ dispatch
-ggml-common.h     +36  블록 구조체 정의
-ggml.c            +24  타입 traits
-ggml.h             +6  타입 enum
-ggml-cuda.cu       +4  SET_ROWS 지원
-arg.cpp            +4  CLI 인자
-```
-
-</details>
-
-<details open>
-<summary>🇺🇸 English</summary>
-
-### Implementation Journey
-
-This project implements the TurboQuant paper from scratch as CUDA kernels in llama.cpp. Key phases:
-
-#### Phase 1: Weight Quantization (Trial and Error)
-
-Initially implemented the paper's weight quantization, but WHT overhead per matmul made it much slower (23 t/s) than Q4_K_M (72 t/s). This confirmed that **TurboQuant's core value is KV cache compression**, and we pivoted accordingly.
-
-#### Phase 2: KV Cache Compression (Core Implementation)
-
-- Added TBQ Key/Value support to Flash Attention vec kernel
-- Fused attention: compute WHT(Query) × centroid directly without Key dequantization
-- Value: WHT-domain storage + IWHT after softmax×V
-
-#### Phase 3: QJL Correction (TurboQuant_prod)
-
-- Added tbqp3_0/tbqp4_0 types: (b-1)-bit Lloyd-Max + 1-bit QJL
-- Independent SRHT (different sign patterns) for unbiased inner product estimation
-- Achieved PPL better than FP16
-
-### Major Bugs Resolved
-
-| Problem | Root Cause | Fix |
-|:--------|:-----------|:----|
-| PPL explosion | 1/√d scaling mismatched centroid distribution after WHT | Removed unnecessary scaling |
-| Q8_1 error amplification | WHT amplifies int8 quantization error 16x | Use F32 activations |
-| Warp reduction deadlock | Only 8 threads call shfl_down, other 24 don't participate | Changed to serial summation |
-| nthreads(128) < D(256) | FA has 128 threads, WHT needs 256 elements | Serial WHT on thread 0 |
-| j-loop syncthreads deadlock | Some warps exit loop early, miss syncthreads | Process one column at a time |
-| MMA/tile kernel routing | TBQ routed to non-existent MMA kernel | Early VEC kernel return |
-| Missing template instances | Cross-bit combinations not instantiated → GGML_ABORT | Created all 16 instances |
-| Q_ds OOB access | TBQP accesses Q_ds[0..3] but array size was 2 | Dynamic Q_ds_size (TBQP=4) |
-| QJL slow at 32K | Two dot products per key doubled computation | Replaced float multiply with sign-flip |
-| QJL quality degradation | Same WHT signs for MSE and QJL (correlated noise) | Independent qjl_signs pattern |
-
-### Changes Overview (906 lines added, 6 modified)
-
-Total 10 files modified + 16 new files:
-
-```
-cpy-utils.cuh    +265  KV cache quantization (WHT + Lloyd-Max + QJL)
-fattn-common.cuh +274  Fused attention ops (vec_dot_KQ, dequantize_V)
-fattn-vec.cuh    +208  Query WHT preprocessing, V IWHT postprocessing
-fattn.cu          +51  FA dispatch + combination validation
-set-rows.cu       +40  SET_ROWS TBQ dispatch
-ggml-common.h     +36  Block structure definitions
-ggml.c            +24  Type traits
-ggml.h             +6  Type enums
-ggml-cuda.cu       +4  SET_ROWS support
-arg.cpp            +4  CLI arguments
-```
-
-</details>
-
----
-
-## References / 참조
+## References
 
 - [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) (ICLR 2026, Google DeepMind)
 - [Google Research Blog](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) — Base framework
-- **Base commit**: [`f5d1c4179`](https://github.com/ggml-org/llama.cpp/commit/f5d1c4179)
 
 ## License
 

@@ -1,0 +1,11 @@
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-q8_0.cu
+new file mode 100644
+index 000000000..0134d9032
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_2-q8_0.cu
+@@ -0,0 +1,5 @@
++// TurboQuant 64-block: TBQP3_2 keys + Q8_0 values
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(64, GGML_TYPE_TBQP3_2, GGML_TYPE_Q8_0);

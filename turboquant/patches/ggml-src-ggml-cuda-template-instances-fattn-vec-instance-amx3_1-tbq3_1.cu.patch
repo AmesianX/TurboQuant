@@ -1,0 +1,15 @@
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-amx3_1-tbq3_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-amx3_1-tbq3_1.cu
+new file mode 100644
+index 000000000..4713336e4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-amx3_1-tbq3_1.cu
+@@ -0,0 +1,9 @@
++// Force float accumulation for TBQ V types
++#include "../common.cuh"
++#undef V_DOT2_F32_F16_AVAILABLE
++
++// AMX 128-block: AMX3_1 keys + TBQ3_1 values.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1);

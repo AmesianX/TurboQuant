@@ -1,0 +1,87 @@
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 15443aa55..2fe7f6383 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -2407,6 +2407,82 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
+     }
+ }
+ 
++// ====================== TurboQuant head_dim=64 dequantization ======================
++// Restores original float values: centroid lookup → IWHT → sign undo → scale
++
++static const float tbq_c3[8] = {
++    -2.1520f, -1.3440f, -0.7560f, -0.2451f,
++     0.2451f,  0.7560f,  1.3440f,  2.1520f,
++};
++static const float tbq_c4[16] = {
++    -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9424f, -0.6568f, -0.3881f, -0.1284f,
++     0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
++};
++static const uint8_t tbq_signs_64[8] = {
++    0xa7, 0x3b, 0x91, 0xf4, 0x6d, 0xc2, 0x58, 0x0e,
++};
++
++static void tbq_iwht_64(float * data) {
++    for (int len = 1; len < TBQ_K64; len *= 2)
++        for (int i = 0; i < TBQ_K64; i += 2*len)
++            for (int j = 0; j < len; j++) {
++                float u = data[i+j], v = data[i+j+len];
++                data[i+j] = u+v; data[i+j+len] = u-v;
++            }
++}
++
++void dequantize_row_tbq3_2(const block_tbq3_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % TBQ_K64 == 0);
++    const int64_t nb = k / TBQ_K64;
++
++    for (int64_t i = 0; i < nb; i++) {
++        const float norm = GGML_FP16_TO_FP32(x[i].d);
++        float tmp[TBQ_K64];
++
++        // 3-bit unpack → centroid values
++        for (int j = 0; j < TBQ_K64; j++) {
++            int bp = j * 3, by = bp / 8, bo = bp % 8;
++            uint32_t v = (uint32_t)x[i].qs[by] >> bo;
++            if (bo > 5 && by + 1 < TBQ_K64*3/8) v |= (uint32_t)x[i].qs[by+1] << (8 - bo);
++            tmp[j] = tbq_c3[v & 0x7] * norm;
++        }
++
++        // IWHT (WHT is self-inverse up to 1/D)
++        tbq_iwht_64(tmp);
++
++        // Sign undo + 1/D scaling
++        for (int j = 0; j < TBQ_K64; j++) {
++            float sign = ((tbq_signs_64[j >> 3] >> (j & 7)) & 1) ? -1.0f : 1.0f;
++            y[i * TBQ_K64 + j] = tmp[j] * sign / TBQ_K64;
++        }
++    }
++}
++
++void dequantize_row_tbq4_2(const block_tbq4_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % TBQ_K64 == 0);
++    const int64_t nb = k / TBQ_K64;
++
++    for (int64_t i = 0; i < nb; i++) {
++        const float norm = GGML_FP16_TO_FP32(x[i].d);
++        float tmp[TBQ_K64];
++
++        // 4-bit unpack → centroid values
++        for (int j = 0; j < TBQ_K64/2; j++) {
++            tmp[2*j]     = tbq_c4[x[i].qs[j] & 0xF] * norm;
++            tmp[2*j + 1] = tbq_c4[x[i].qs[j] >> 4]  * norm;
++        }
++
++        // IWHT
++        tbq_iwht_64(tmp);
++
++        // Sign undo + 1/D scaling
++        for (int j = 0; j < TBQ_K64; j++) {
++            float sign = ((tbq_signs_64[j >> 3] >> (j & 7)) & 1) ? -1.0f : 1.0f;
++            y[i * TBQ_K64 + j] = tmp[j] * sign / TBQ_K64;
++        }
++    }
++}
++
+ // ====================== "True" 2-bit (de)-quantization
+ 
+ void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
