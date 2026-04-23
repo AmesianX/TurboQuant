@@ -3018,6 +3018,45 @@ llama_context * llama_init_from_model(
         tbq_map(params.type_v, model->hparams.n_embd_head_v());
     }
 
+    // AMX3 (K: AMX3_1, V: AMXV3_1) is hard-wired to head_dim=128 (128-WHT + polar).
+    // Reject before `new llama_context` so we never partially construct the context
+    // and trigger the bad unwinding path that shows up as SIGSEGV on head_dim=256/576.
+    {
+        const bool amx_k = (params.type_k == GGML_TYPE_AMX3_1 || params.type_k == GGML_TYPE_AMXV3_1)
+                       && model->hparams.n_embd_head_k() != 128;
+        const bool amx_v = (params.type_v == GGML_TYPE_AMX3_1 || params.type_v == GGML_TYPE_AMXV3_1)
+                       && model->hparams.n_embd_head_v() != 128;
+        if (amx_k || amx_v) {
+            const uint32_t hd_k = model->hparams.n_embd_head_k();
+            const uint32_t hd_v = model->hparams.n_embd_head_v();
+            // GLM-style MLA (K=576 / V=512) uses 576-block TBQ*_4 family;
+            // the tbq_map auto-resolves `tbqp3`/`tbq3` shorthand to the right
+            // _4 variant based on head_dim, so the suggestion below is correct
+            // for both head_dim=256 (Qwen3.5/3.6) and head_dim=576 (GLM).
+            char line_model[80];
+            snprintf(line_model, sizeof(line_model),
+                     "  This model has head_dim_k=%u head_dim_v=%u.", hd_k, hd_v);
+            LLAMA_LOG_ERROR("\n");
+            LLAMA_LOG_ERROR("╔════════════════════════════════════════════════════════════════════╗\n");
+            LLAMA_LOG_ERROR("║%-68s║\n", "  ERROR: amx3 cache type is incompatible with this model");
+            LLAMA_LOG_ERROR("║%-68s║\n", "");
+            LLAMA_LOG_ERROR("║%-68s║\n", "  amx3 requires head_dim=128 (128-WHT + polar quantization).");
+            LLAMA_LOG_ERROR("║%-68s║\n", line_model);
+            LLAMA_LOG_ERROR("║%-68s║\n", "");
+            LLAMA_LOG_ERROR("║%-68s║\n", "  Use one of these cache types instead:");
+            LLAMA_LOG_ERROR("║%-68s║\n", "    --cache-type-k tbqp3 --cache-type-v tbq3  (recommended 3-bit)");
+            LLAMA_LOG_ERROR("║%-68s║\n", "    --cache-type-k tbqp4 --cache-type-v tbq4  (recommended 4-bit)");
+            LLAMA_LOG_ERROR("║%-68s║\n", "    --cache-type-k f16   --cache-type-v f16   (no quantization)");
+            LLAMA_LOG_ERROR("║%-68s║\n", "");
+            LLAMA_LOG_ERROR("║%-68s║\n", "  amx3 is designed for head_dim=128 models (Qwen3, LLaMA,");
+            LLAMA_LOG_ERROR("║%-68s║\n", "  Mistral, etc.). For larger head_dim, use tbq3/tbqp3 which");
+            LLAMA_LOG_ERROR("║%-68s║\n", "  auto-map to the correct block size for your model.");
+            LLAMA_LOG_ERROR("╚════════════════════════════════════════════════════════════════════╝\n");
+            LLAMA_LOG_ERROR("\n");
+            return nullptr;
+        }
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
