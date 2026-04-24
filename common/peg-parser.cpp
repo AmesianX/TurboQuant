@@ -790,6 +790,12 @@ struct parser_executor {
             }
 
             if (utf8_result.status == utf8_parse_result::INVALID) {
+                if (ctx.is_lenient()) {
+                    // In lenient mode, skip invalid UTF-8 bytes and continue
+                    pos++;
+                    last_valid_pos = pos;
+                    continue;
+                }
                 // Malformed UTF-8
                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start_pos);
             }
