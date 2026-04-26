@@ -1,8 +1,6 @@
-diff --git a/common/arg.cpp b/common/arg.cpp
-index 5c0bbe38e..48db387a1 100644
---- a/common/arg.cpp
-+++ b/common/arg.cpp
-@@ -391,9 +391,47 @@ const std::vector<ggml_type> kv_cache_types = {
+--- -	2026-04-26 16:06:35.838858676 +0900
++++ common/arg.cpp	2026-04-26 15:16:47.871559923 +0900
+@@ -391,9 +391,47 @@
      GGML_TYPE_IQ4_NL,
      GGML_TYPE_Q5_0,
      GGML_TYPE_Q5_1,
@@ -51,7 +49,7 @@ index 5c0bbe38e..48db387a1 100644
      for (const auto & type : kv_cache_types) {
          if (ggml_type_name(type) == s) {
              return type;
-@@ -403,9 +441,33 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
+@@ -403,9 +441,33 @@
  }
  
  static std::string get_all_kv_cache_types() {
@@ -86,7 +84,7 @@ index 5c0bbe38e..48db387a1 100644
      }
      return msg.str();
  }
-@@ -2016,9 +2078,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2016,10 +2078,38 @@
              ggml_type_name(params.cache_type_k)
          ),
          [](common_params & params, const std::string & value) {
@@ -94,7 +92,7 @@ index 5c0bbe38e..48db387a1 100644
 +            params.cache_type_k = kv_cache_type_from_str(value, /*is_v=*/false);
          }
      ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
-+    add_opt(common_arg(
+     add_opt(common_arg(
 +        {"--triattention"}, "FILE",
 +        "TriAttention calibration stats file (TRIA v2). Enables Top-B KV eviction on AMX3_1 K cache.",
 +        [](common_params & params, const std::string & value) {
@@ -122,10 +120,11 @@ index 5c0bbe38e..48db387a1 100644
 +            params.triattention_keep_first = value;
 +        }
 +    ));
-     add_opt(common_arg(
++    add_opt(common_arg(
          {"-ctv", "--cache-type-v"}, "TYPE",
          string_format(
-@@ -2029,7 +2119,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             "KV cache data type for V\n"
+@@ -2029,7 +2119,7 @@
              ggml_type_name(params.cache_type_v)
          ),
          [](common_params & params, const std::string & value) {
@@ -134,7 +133,7 @@ index 5c0bbe38e..48db387a1 100644
          }
      ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
      add_opt(common_arg(
-@@ -3578,7 +3668,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -3578,7 +3668,7 @@
              ggml_type_name(params.speculative.cache_type_k)
          ),
          [](common_params & params, const std::string & value) {
@@ -143,7 +142,7 @@ index 5c0bbe38e..48db387a1 100644
          }
      ).set_env("LLAMA_ARG_CACHE_TYPE_K_DRAFT"));
      add_opt(common_arg(
-@@ -3591,7 +3681,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -3591,7 +3681,7 @@
              ggml_type_name(params.speculative.cache_type_v)
          ),
          [](common_params & params, const std::string & value) {

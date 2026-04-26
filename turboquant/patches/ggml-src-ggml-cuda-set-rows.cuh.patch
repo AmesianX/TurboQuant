@@ -1,7 +1,5 @@
-diff --git a/ggml/src/ggml-cuda/set-rows.cuh b/ggml/src/ggml-cuda/set-rows.cuh
-index c140c0873..af208169e 100644
---- a/ggml/src/ggml-cuda/set-rows.cuh
-+++ b/ggml/src/ggml-cuda/set-rows.cuh
+--- -	2026-04-26 16:06:36.035669312 +0900
++++ ggml/src/ggml-cuda/set-rows.cuh	2026-04-21 02:44:24.227321821 +0900
 @@ -5,3 +5,7 @@
  #define CUDA_SET_ROWS_BLOCK_SIZE 256
  

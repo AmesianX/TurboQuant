@@ -1,8 +1,6 @@
-diff --git a/src/llama-context.h b/src/llama-context.h
-index 53c705eaf..8330f15fa 100644
---- a/src/llama-context.h
-+++ b/src/llama-context.h
-@@ -224,6 +224,8 @@ public:
+--- -	2026-04-26 16:06:35.860211048 +0900
++++ src/llama-context.h	2026-04-22 14:29:10.774311925 +0900
+@@ -224,6 +224,8 @@
  
      bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
  
@@ -11,7 +9,7 @@ index 53c705eaf..8330f15fa 100644
  private:
      llm_graph_params graph_params(
                          llm_graph_result * res,
-@@ -255,6 +257,13 @@ private:
+@@ -255,6 +257,13 @@
  
      std::unique_ptr<llama_memory_i> memory;
  

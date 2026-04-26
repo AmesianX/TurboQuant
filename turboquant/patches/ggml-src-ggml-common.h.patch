@@ -1,8 +1,6 @@
-diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
-index f05683b44..0c4c079a8 100644
---- a/ggml/src/ggml-common.h
-+++ b/ggml/src/ggml-common.h
-@@ -277,6 +277,206 @@ typedef struct {
+--- -	2026-04-26 16:06:35.970614892 +0900
++++ ggml/src/ggml-common.h	2026-04-21 02:44:24.225321805 +0900
+@@ -277,6 +277,206 @@
  } block_tq2_0;
  static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
  

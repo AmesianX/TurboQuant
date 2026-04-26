@@ -1,8 +1,6 @@
-diff --git a/common/common.cpp b/common/common.cpp
-index f7f33e817..d2b08ccec 100644
---- a/common/common.cpp
-+++ b/common/common.cpp
-@@ -1232,6 +1232,302 @@ common_init_result::common_init_result(common_params & params) :
+--- -	2026-04-26 16:06:35.848476004 +0900
++++ common/common.cpp	2026-04-22 14:29:10.766311909 +0900
+@@ -1232,6 +1232,302 @@
          cparams.n_samplers = pimpl->samplers_seq_config.size();
      }
  
@@ -305,7 +303,7 @@ index f7f33e817..d2b08ccec 100644
      llama_context * lctx = llama_init_from_model(model, cparams);
      if (lctx == NULL) {
          LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
-@@ -1288,6 +1584,19 @@ common_init_result_ptr common_init_from_params(common_params & params) {
+@@ -1288,6 +1584,19 @@
          params.ctx_shift = false;
      }
  

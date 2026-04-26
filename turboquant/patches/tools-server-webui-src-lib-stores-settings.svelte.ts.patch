@@ -1,8 +1,6 @@
-diff --git a/tools/server/webui/src/lib/stores/settings.svelte.ts b/tools/server/webui/src/lib/stores/settings.svelte.ts
-index f591de26b..93b742fb3 100644
---- a/tools/server/webui/src/lib/stores/settings.svelte.ts
-+++ b/tools/server/webui/src/lib/stores/settings.svelte.ts
-@@ -337,6 +337,13 @@ class SettingsStore {
+--- -	2026-04-26 16:06:36.613869356 +0900
++++ tools/server/webui/src/lib/stores/settings.svelte.ts	2026-04-21 02:44:24.229321838 +0900
+@@ -337,6 +337,13 @@
  			if (normalizedCurrent === normalizedDefault) {
  				this.userOverrides.delete(key);
  			}

@@ -1,7 +1,5 @@
-diff --git a/README.md b/README.md
-index be23abcea..e99fdd482 100644
---- a/README.md
-+++ b/README.md
+--- -	2026-04-26 16:06:35.829553512 +0900
++++ README.md	2026-04-21 03:07:14.497166368 +0900
 @@ -1,596 +1,748 @@
 -# llama.cpp
 +# TurboQuant KV Cache Compression for llama.cpp
@@ -87,64 +85,19 @@ index be23abcea..e99fdd482 100644
  
 -# Launch OpenAI-compatible API server
 -llama-server -hf ggml-org/gemma-3-1b-it-GGUF
+-```
 +#### Needle-in-haystack recall (Qwen3-14B · budget=128 · interval=128)
-+
+ 
+-## Description
 +Prompt: "비밀번호는 **다람쥐7429** 이다. [1000자 요약 요청] … 마지막에 비밀번호 정확히 적어라."
-+
+ 
+-The main goal of `llama.cpp` is to enable LLM inference with minimal setup and state-of-the-art performance on a wide
+-range of hardware - locally and in the cloud.
 +| Config | Tokens generated | Finish | Password recall | Observed behavior |
 +|--------|------------------|--------|-----------------|-------------------|
 +| Before TriAttention fix | 2500 | length | ❌ never mentioned | "다름, 다름, 다름…" infinite loop |
 +| keep_first=4 | 575 | stop | ❌ recalled as "다섯" | partial first-syllable hallucination |
 +| **keep_first=32** | **366** | **stop** | **✅ "다람쥐7429"** | natural self-stop with correct recall |
-+
-+#### Korean + scoring-kernel verification across head_dim
-+
-+All four cases reported `attn_rot_k = 0 / attn_rot_v = 0` at startup (external Hadamard fully disabled; internal WHT carries the rotation):
-+
-+| head_dim | Model (gguf) | Resolved KV type | Korean 8-line poem | Scoring pipeline |
-+|---|---|---|---|---|
-+| 64 | gpt-oss-20b-MXFP4 | `tbqp3_3` (double WHT) | ✅ natural | n/a (TriAttention is head_dim=128 only) |
-+| **128** | **Qwen3-14B Q4_K_M** | **`tbq3_1` / `amx3_1`** | **✅ + needle pass** | ✅ 3-kernel + eviction + sink verified |
-+| 256 | Qwen3.5-9B Q8_0 | `tbq3_0` | ✅ natural | n/a |
-+| 576 (MLA) | GLM-4.7-Flash | `tbq3_4` (512-WHT + rope 64 passthrough) | ✅ natural | n/a |
-+
-+#### Performance (Qwen3-14B Q4_K_M, AMX3_1 hybrid)
-+
-+| Metric | Value | vs f16 baseline |
-+|--------|-------|-----------------|
-+| Prompt throughput | 694 tok/s | ~700 (≈parity) |
-+| Decode throughput | **20.7 tok/s** | ~21 (≈parity) |
-+| Per-trigger overhead | ~120 ms (40 layers × 3 ms) | ≈2% of 128-token decode window |
-+| Effective kept slots / n_kv | ~130 / 2500 (95% evicted) | — |
-+
-+> Quality is preserved **while** 95% of slots are physically zeroed out each trigger — this is the TriAttention claim reproduced locally.
-+
-+#### Key design decisions (why TriAttention actually works here)
-+
-+1. **Dequant-free scoring.** Part B decodes straight into the pre-RoPE `(kxc, kyc)` pair the scoring formula needs. There is no shadow fp16 K buffer, no D2H copy — the 3-kernel pipeline (raw · z-norm · aggregate) reads quantized blocks in place.
-+2. **Physical eviction with permanence.** Evicted slots zero **both** `d_wht` (so Part A → FA attention produces 0) **and** `d_r` (so Part B → next scoring pass produces 0). Zeroing only d_wht lets "ghost" slots win Top-B next trigger and silently consume budget; zeroing both makes eviction terminal.
-+3. **Attention sink is mandatory, not optional.** With `--tri-keep-first 0` the decode collapses into a "다름, 다름, …" token-repetition loop within ~300 tokens. The sink is a StreamingLLM-style fix: always keep the first N slots so softmax has somewhere to dump residual mass. `4` covers the chat template; `32` covers a full prompt header including injected instructions.
-+4. **External attn_rot_k was a duplicate rotation.** Every TBQ/TBQP/AMX encoder already runs an internal `tbq_signs` sign-flip + butterfly WHT; fattn-vec runs the identical WHT on the Q side. The Hadamard matmul that llama-kv-cache previously applied before the encoder was a redundant second rotation — it cancels via Parseval between Q and K, so output was unchanged, but every token paid for one extra matmul and a bit of rounding loss. v1.7.0 excludes all 23 internally-WHT types from `attn_rot_k`; verified on head_dim = 64 / 128 / 256 / 576 with Korean prose intact.
-+
-+#### Recommended config
-+
-+Qwen3-14B (head_dim=128, has AMX3_1 support):
-+```
-+--cache-type-k amx3 --cache-type-v amxv3 \
-+--triattention calib/qwen3_14b.bin --tri-budget 128 --tri-keep-first 32
-+```
-+
-+Any other head_dim (64/256/576) — TriAttention not wired, but attn_rot_k cleanup still applies automatically:
-+```
-+--cache-type-k tbq3 --cache-type-v tbq3     # auto-resolves to _2/_0/_4 by head_dim
- ```
- 
--## Description
-+> ⚠️ **Scope — AMX3_1 requires head_dim=128.** Qwen3.6-35B (K=256 asymmetric), GLM MLA 576, and gpt-oss family are **not** candidates for TriAttention until per-architecture AMX variants are built. `attn_rot_k` cleanup applies universally regardless of head_dim.
- 
--The main goal of `llama.cpp` is to enable LLM inference with minimal setup and state-of-the-art performance on a wide
--range of hardware - locally and in the cloud.
-+#### Credits
  
 -- Plain C/C++ implementation without any dependencies
 -- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
@@ -154,21 +107,34 @@ index be23abcea..e99fdd482 100644
 -- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
 -- Vulkan and SYCL backend support
 -- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
-+- **TriAttention algorithm** — Mao et al., *"Tri-attention: Tail-token saliency via trigonometric scoring on pre-RoPE keys"*, [arxiv 2604.04921](https://arxiv.org/abs/2604.04921) (2026).
-+- **Python reference port** — [`domvox/triattention-ggml`](https://github.com/domvox/triattention-ggml). The TRIA v2 binary calibration format, the scoring math, and the per-head statistics extraction were adapted from that reference. The CUDA port, the AMX3_1 hybrid K cache integration, and the physical eviction + attention-sink wiring in llama-kv-cache / llama-context / fattn-vec are new in this release.
++#### Korean + scoring-kernel verification across head_dim
  
 -The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
-+#### A small behind-the-scenes note
++All four cases reported `attn_rot_k = 0 / attn_rot_v = 0` at startup (external Hadamard fully disabled; internal WHT carries the rotation):
  
 -<details>
 -<summary>Models</summary>
--
++| head_dim | Model (gguf) | Resolved KV type | Korean 8-line poem | Scoring pipeline |
++|---|---|---|---|---|
++| 64 | gpt-oss-20b-MXFP4 | `tbqp3_3` (double WHT) | ✅ natural | n/a (TriAttention is head_dim=128 only) |
++| **128** | **Qwen3-14B Q4_K_M** | **`tbq3_1` / `amx3_1`** | **✅ + needle pass** | ✅ 3-kernel + eviction + sink verified |
++| 256 | Qwen3.5-9B Q8_0 | `tbq3_0` | ✅ natural | n/a |
++| 576 (MLA) | GLM-4.7-Flash | `tbq3_4` (512-WHT + rope 64 passthrough) | ✅ natural | n/a |
+ 
 -Typically finetunes of the base models below are supported as well.
--
++#### Performance (Qwen3-14B Q4_K_M, AMX3_1 hybrid)
+ 
 -Instructions for adding support for new models: [HOWTO-add-model.md](docs/development/HOWTO-add-model.md)
--
++| Metric | Value | vs f16 baseline |
++|--------|-------|-----------------|
++| Prompt throughput | 694 tok/s | ~700 (≈parity) |
++| Decode throughput | **20.7 tok/s** | ~21 (≈parity) |
++| Per-trigger overhead | ~120 ms (40 layers × 3 ms) | ≈2% of 128-token decode window |
++| Effective kept slots / n_kv | ~130 / 2500 (95% evicted) | — |
+ 
 -#### Text-only
--
++> Quality is preserved **while** 95% of slots are physically zeroed out each trigger — this is the TriAttention claim reproduced locally.
+ 
 -- [X] LLaMA 🦙
 -- [x] LLaMA 2 🦙🦙
 -- [x] LLaMA 3 🦙🦙🦙
@@ -247,14 +213,18 @@ index be23abcea..e99fdd482 100644
 -- [x] [GLM-EDGE](https://huggingface.co/models?search=glm-edge)
 -- [x] [Qwen2-VL](https://huggingface.co/collections/Qwen/qwen2-vl-66cee7455501d7126940800d)
 -- [x] [LFM2-VL](https://huggingface.co/collections/LiquidAI/lfm2-vl-68963bbc84a610f7638d5ffa)
-+Back in early v1.6.0 work we sketched out "polar derotation" from scratch — storing K as `(r, φ_content)` with position peeled off algebraically — thinking it was our own little idea. It shipped, we wrote a paper, we pulled the paper when the theoretical framing didn't fully hold (see `eab1d2ad1` — pair structure + content-only WHT + exact Q·K preservation cannot all coexist under RoPE). Then while reading through TriAttention we realized the same polar decomposition was already sitting inside someone else's score formula, used for a different purpose entirely — token importance, not storage. The overlap turned out to be a gift: the AMX3_1 hybrid block slotted into TriAttention's scoring math almost unchanged, because Part B *was* the pre-RoPE polar pair the paper wanted. Independent rediscovery is humbling, but it made this integration much shorter than it had any right to be.
++#### Key design decisions (why TriAttention actually works here)
  
 -</details>
-+One thing worth being straight about: the domvox Python reference pays a GPU→CPU roundtrip on every scoring trigger — K gets dequantized, pulled to host, scored in Python, mask pushed back. At β=128 and 40 layers that's the dominant latency on a 14B model. Our CUDA port removes that bottleneck entirely: Part B is exactly the layout the scoring formula needs, so the three scoring kernels read quantized blocks in place, the histogram Top-B and the eviction kernel run on the same stream, and nothing except a few-KB position array crosses PCIe during a trigger. Trigger overhead drops to ~2% of a 128-token decode window instead of seconds per trigger. But the tradeoff is memory: because AMX3_1 stores Part A (WHT for attention) AND Part B (polar for scoring) side by side, a block is 108 B instead of tbq3_1's 50 B — a little over 2× the raw K cache footprint at head_dim=128 for the same number of slots. TriAttention gives that memory back by evicting 95% of slots per trigger (so the *live* working set is smaller than plain tbq3_1 would have been), but the **allocated** KV buffer is bigger. We traded bytes for a throughput-neutral scoring path; it's the right trade at scale but worth naming honestly.
++1. **Dequant-free scoring.** Part B decodes straight into the pre-RoPE `(kxc, kyc)` pair the scoring formula needs. There is no shadow fp16 K buffer, no D2H copy — the 3-kernel pipeline (raw · z-norm · aggregate) reads quantized blocks in place.
++2. **Physical eviction with permanence.** Evicted slots zero **both** `d_wht` (so Part A → FA attention produces 0) **and** `d_r` (so Part B → next scoring pass produces 0). Zeroing only d_wht lets "ghost" slots win Top-B next trigger and silently consume budget; zeroing both makes eviction terminal.
++3. **Attention sink is mandatory, not optional.** With `--tri-keep-first 0` the decode collapses into a "다름, 다름, …" token-repetition loop within ~300 tokens. The sink is a StreamingLLM-style fix: always keep the first N slots so softmax has somewhere to dump residual mass. `4` covers the chat template; `32` covers a full prompt header including injected instructions.
++4. **External attn_rot_k was a duplicate rotation.** Every TBQ/TBQP/AMX encoder already runs an internal `tbq_signs` sign-flip + butterfly WHT; fattn-vec runs the identical WHT on the Q side. The Hadamard matmul that llama-kv-cache previously applied before the encoder was a redundant second rotation — it cancels via Parseval between Q and K, so output was unchanged, but every token paid for one extra matmul and a bit of rounding loss. v1.7.0 excludes all 23 internally-WHT types from `attn_rot_k`; verified on head_dim = 64 / 128 / 256 / 576 with Korean prose intact.
  
 -<details>
 -<summary>Bindings</summary>
--
++#### Recommended config
+ 
 -- Python: [ddh0/easy-llama](https://github.com/ddh0/easy-llama)
 -- Python: [abetlen/llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
 -- Go: [go-skynet/go-llama.cpp](https://github.com/go-skynet/go-llama.cpp)
@@ -285,16 +255,25 @@ index be23abcea..e99fdd482 100644
 -- Delphi [Embarcadero/llama-cpp-delphi](https://github.com/Embarcadero/llama-cpp-delphi)
 -- Go (no CGo needed): [hybridgroup/yzma](https://github.com/hybridgroup/yzma)
 -- Android: [llama.android](/examples/llama.android)
-+#### 🚧 What's coming in v1.8.0 — *to be continued*
++Qwen3-14B (head_dim=128, has AMX3_1 support):
++```
++--cache-type-k amx3 --cache-type-v amxv3 \
++--triattention calib/qwen3_14b.bin --tri-budget 128 --tri-keep-first 32
++```
  
 -</details>
-+Right now the AMX3_1 + TriAttention path rides on the **fattn-vec** kernel. Vec is the sequential-friendly "one token at a time" FlashAttention variant, and it's why decode sits at ~0.87× f16 throughput (**20.7 tok/s on Qwen3-14B**). The actual workhorse kernel on modern Ampere/Hopper/Blackwell parts is **fattn-mma** — the Tensor-Core one that hits GEMM bandwidth. Every other mainstream quant type is already on MMA; AMX3_1 is temporarily on vec only because the polar-derotate read path was faster to wire up there first.
++Any other head_dim (64/256/576) — TriAttention not wired, but attn_rot_k cleanup still applies automatically:
++```
++--cache-type-k tbq3 --cache-type-v tbq3     # auto-resolves to _2/_0/_4 by head_dim
++```
  
 -<details>
 -<summary>UIs</summary>
--
++> ⚠️ **Scope — AMX3_1 requires head_dim=128.** Qwen3.6-35B (K=256 asymmetric), GLM MLA 576, and gpt-oss family are **not** candidates for TriAttention until per-architecture AMX variants are built. `attn_rot_k` cleanup applies universally regardless of head_dim.
+ 
 -*(to have a project listed here, it should clearly state that it depends on `llama.cpp`)*
--
++#### Credits
+ 
 -- [AI Sublime Text plugin](https://github.com/yaroslavyaroslav/OpenAI-sublime-text) (MIT)
 -- [BonzAI App](https://apps.apple.com/us/app/bonzai-your-local-ai-agent/id6752847988) (proprietary)
 -- [cztomsik/ava](https://github.com/cztomsik/ava) (MIT)
@@ -330,14 +309,15 @@ index be23abcea..e99fdd482 100644
 -- [semperai/amica](https://github.com/semperai/amica) (MIT)
 -- [withcatai/catai](https://github.com/withcatai/catai) (MIT)
 -- [Autopen](https://github.com/blackhole89/autopen) (GPL)
-+Porting the AMX3_1 dequant into the MMA Q·Kᵀ tile loader — and re-homing the TriAttention scoring kernel onto the same tensor-core path — is the v1.8.0 target. Back-of-envelope expectation: **~40+ tok/s decode** on Qwen3-14B (roughly 2×, since MMA typically recovers the full f16 speed once the tile path is clean), while the compression, the eviction semantics, and the API stay identical. If it lands we get TriAttention's ~4.7× effective compression **at f16 speed**, which is the point of this whole project. Expect a progress-report update, or an announcement that Tensor Core math hates me personally. Either is possible.
++- **TriAttention algorithm** — Mao et al., *"Tri-attention: Tail-token saliency via trigonometric scoring on pre-RoPE keys"*, [arxiv 2604.04921](https://arxiv.org/abs/2604.04921) (2026).
++- **Python reference port** — [`domvox/triattention-ggml`](https://github.com/domvox/triattention-ggml). The TRIA v2 binary calibration format, the scoring math, and the per-head statistics extraction were adapted from that reference. The CUDA port, the AMX3_1 hybrid K cache integration, and the physical eviction + attention-sink wiring in llama-kv-cache / llama-context / fattn-vec are new in this release.
  
 -</details>
-+---
++#### A small behind-the-scenes note
  
 -<details>
 -<summary>Tools</summary>
-+### v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B) — deprecated, see v1.7.0
++Back in early v1.6.0 work we sketched out "polar derotation" from scratch — storing K as `(r, φ_content)` with position peeled off algebraically — thinking it was our own little idea. It shipped, we wrote a paper, we pulled the paper when the theoretical framing didn't fully hold (see `eab1d2ad1` — pair structure + content-only WHT + exact Q·K preservation cannot all coexist under RoPE). Then while reading through TriAttention we realized the same polar decomposition was already sitting inside someone else's score formula, used for a different purpose entirely — token importance, not storage. The overlap turned out to be a gift: the AMX3_1 hybrid block slotted into TriAttention's scoring math almost unchanged, because Part B *was* the pre-RoPE polar pair the paper wanted. Independent rediscovery is humbling, but it made this integration much shorter than it had any right to be.
  
 -- [akx/ggify](https://github.com/akx/ggify) – download PyTorch models from Hugging Face Hub and convert them to GGML
 -- [akx/ollama-dl](https://github.com/akx/ollama-dl) – download models from the Ollama library to be used directly with llama.cpp
@@ -345,14 +325,15 @@ index be23abcea..e99fdd482 100644
 -- [gpustack/gguf-parser](https://github.com/gpustack/gguf-parser-go/tree/main/cmd/gguf-parser) - review/check the GGUF file and estimate the memory usage
 -- [Styled Lines](https://marketplace.unity.com/packages/tools/generative-ai/styled-lines-llama-cpp-model-292902) (proprietary licensed, async wrapper of inference part for game development in Unity3d with pre-built Mobile and Web platform wrappers and a model example)
 -- [unslothai/unsloth](https://github.com/unslothai/unsloth) – 🦥 exports/saves fine-tuned and trained models to GGUF (Apache-2.0)
-+**New K cache format: polar-coordinate storage with content/position separation and analytical tangent residual correction. Beats f16 on math reasoning while preserving Korean prose quality.**
++One thing worth being straight about: the domvox Python reference pays a GPU→CPU roundtrip on every scoring trigger — K gets dequantized, pulled to host, scored in Python, mask pushed back. At β=128 and 40 layers that's the dominant latency on a 14B model. Our CUDA port removes that bottleneck entirely: Part B is exactly the layout the scoring formula needs, so the three scoring kernels read quantized blocks in place, the histogram Top-B and the eviction kernel run on the same stream, and nothing except a few-KB position array crosses PCIe during a trigger. Trigger overhead drops to ~2% of a 128-token decode window instead of seconds per trigger. But the tradeoff is memory: because AMX3_1 stores Part A (WHT for attention) AND Part B (polar for scoring) side by side, a block is 108 B instead of tbq3_1's 50 B — a little over 2× the raw K cache footprint at head_dim=128 for the same number of slots. TriAttention gives that memory back by evicting 95% of slots per trigger (so the *live* working set is smaller than plain tbq3_1 would have been), but the **allocated** KV buffer is bigger. We traded bytes for a throughput-neutral scoring path; it's the right trade at scale but worth naming honestly.
  
 -</details>
-+**Environment:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · Model: Qwen3-14B Q4_K_M · ctx=40960 · temp=0
++#### 🚧 What's coming in v1.8.0 — *to be continued*
  
 -<details>
 -<summary>Infrastructure</summary>
--
++Right now the AMX3_1 + TriAttention path rides on the **fattn-vec** kernel. Vec is the sequential-friendly "one token at a time" FlashAttention variant, and it's why decode sits at ~0.87× f16 throughput (**20.7 tok/s on Qwen3-14B**). The actual workhorse kernel on modern Ampere/Hopper/Blackwell parts is **fattn-mma** — the Tensor-Core one that hits GEMM bandwidth. Every other mainstream quant type is already on MMA; AMX3_1 is temporarily on vec only because the polar-derotate read path was faster to wire up there first.
+ 
 -- [Paddler](https://github.com/intentee/paddler) - Open-source LLMOps platform for hosting and scaling AI in your own infrastructure
 -- [GPUStack](https://github.com/gpustack/gpustack) - Manage GPU clusters for running LLMs
 -- [llama_cpp_canister](https://github.com/onicai/llama_cpp_canister) - llama.cpp as a smart contract on the Internet Computer, using WebAssembly
@@ -362,34 +343,38 @@ index be23abcea..e99fdd482 100644
 -- [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
 -  support"
 -</details>
-+**Memory footprint (ctx=40960, 40 layers):**
++Porting the AMX3_1 dequant into the MMA Q·Kᵀ tile loader — and re-homing the TriAttention scoring kernel onto the same tensor-core path — is the v1.8.0 target. Back-of-envelope expectation: **~40+ tok/s decode** on Qwen3-14B (roughly 2×, since MMA typically recovers the full f16 speed once the tile path is clean), while the compression, the eviction semantics, and the API stay identical. If it lands we get TriAttention's ~4.7× effective compression **at f16 speed**, which is the point of this whole project. Expect a progress-report update, or an announcement that Tensor Core math hates me personally. Either is possible.
  
 -<details>
 -<summary>Games</summary>
++---
+ 
+-- [Lucy's Labyrinth](https://github.com/MorganRO8/Lucys_Labyrinth) - A simple maze game where agents controlled by an AI model will try to trick you.
++### v1.6.0 — Polar Derotate + Tangent Residual (TBQX3_1, Qwen3-14B) — deprecated, see v1.7.0
+ 
+-</details>
++**New K cache format: polar-coordinate storage with content/position separation and analytical tangent residual correction. Beats f16 on math reasoning while preserving Korean prose quality.**
++
++**Environment:** NVIDIA DGX Spark (GB10, 128GB) · CUDA 12.8 · Model: Qwen3-14B Q4_K_M · ctx=40960 · temp=0
++
++**Memory footprint (ctx=40960, 40 layers):**
++
 +| Config | K buffer | V buffer | Total KV | Compression |
 +|--------|----------|----------|----------|-------------|
 +| f16/f16 | 3200 MiB | 3200 MiB | 6400 MiB | 1.0x |
 +| **tbqx3/tbq3** | **725 MiB** | 625 MiB | **1350 MiB** | **4.74x** |
 +| tbq3/tbq3 | 625 MiB | 625 MiB | 1250 MiB | 5.12x |
- 
--- [Lucy's Labyrinth](https://github.com/MorganRO8/Lucys_Labyrinth) - A simple maze game where agents controlled by an AI model will try to trick you.
++
 +**Speed (decode, same prompt):**
  
--</details>
 +| Config | t/s | vs f16 |
 +|--------|-----|--------|
 +| f16/f16 | 24–25 | 1.00x |
 +| **tbqx3/tbq3** | **21–22** | **0.87x** |
 +| tbq3/tbq3 | 21–22 | 0.87x |
  
-+**Math Accuracy (35 problems, seed=1234, temp=0):**
- 
 -## Supported backends
-+| Config | Math (/35) | % | vs f16 |
-+|--------|------------|---|--------|
-+| **tbqx3/tbq3** | **13/35** | **37.1%** | **+8%** |
-+| f16/f16 | 12/35 | 34.3% | — |
-+| tbq3/tbq3 | 10/35 | 28.6% | −17% |
++**Math Accuracy (35 problems, seed=1234, temp=0):**
  
 -| Backend | Target devices |
 -| --- | --- |
@@ -410,12 +395,20 @@ index be23abcea..e99fdd482 100644
 -| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
 -| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
 -| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-+> **tbqx3/tbq3 beats f16 on math while compressing 4.74x** and matching tbq3/tbq3 speed. Legacy tbq3/tbq3 trails f16 by 17%.
++| Config | Math (/35) | % | vs f16 |
++|--------|------------|---|--------|
++| **tbqx3/tbq3** | **13/35** | **37.1%** | **+8%** |
++| f16/f16 | 12/35 | 34.3% | — |
++| tbq3/tbq3 | 10/35 | 28.6% | −17% |
  
 -## Obtaining and quantizing models
-+**TBQX3_1 block format (3.625 bpw, head_dim=128):**
++> **tbqx3/tbq3 beats f16 on math while compressing 4.74x** and matching tbq3/tbq3 speed. Legacy tbq3/tbq3 trails f16 by 17%.
  
 -The [Hugging Face](https://huggingface.co) platform hosts a [number of LLMs](https://huggingface.co/models?library=gguf&sort=trending) compatible with `llama.cpp`:
++**TBQX3_1 block format (3.625 bpw, head_dim=128):**
+ 
+-- [Trending](https://huggingface.co/models?library=gguf&sort=trending)
+-- [LLaMA](https://huggingface.co/models?sort=trending&search=llama+gguf)
 +| Field | Size | Purpose |
 +|-------|------|---------|
 +| `d_r` | 2 B | Rayleigh σ (half) |
@@ -424,18 +417,16 @@ index be23abcea..e99fdd482 100644
 +| `qtan[8]` | 8 B | 1-bit tangent sign per pair |
 +| **Total** | **58 B** | **3.625 bpw** |
  
--- [Trending](https://huggingface.co/models?library=gguf&sort=trending)
--- [LLaMA](https://huggingface.co/models?sort=trending&search=llama+gguf)
+-You can either manually download the GGUF file or directly use any `llama.cpp`-compatible models from [Hugging Face](https://huggingface.co/) or other model hosting sites, by using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
 +**Key ideas:**
  
--You can either manually download the GGUF file or directly use any `llama.cpp`-compatible models from [Hugging Face](https://huggingface.co/) or other model hosting sites, by using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
+-```sh
+-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
 +1. **Polar derotate (content/position separation)**: K is stored as `(r, φ_content) = (r, φ_post − pos·freq_i)` per RoPE pair. Content is position-invariant; re-rotation by `pos·freq_i` at read time restores post-RoPE K. Attention now sees content geometry directly instead of content·position entanglement.
 +2. **Rayleigh Lloyd-Max on r**: the magnitude `r = √(x² + y²)` of a complex Gaussian pair is Rayleigh-distributed. Lloyd-Max 8-level codebook derived analytically from Rayleigh quantile boundaries (no calibration required, works across models).
 +3. **Tangent Residual (the drift fix)**: the 3-bit uniform φ quantization has bounded error ±π/8. The resulting K perturbation lies almost entirely along the tangent direction `(-sin φ, cos φ)`. One extra bit encodes the sign of `Δφ`, and the magnitude `r · π/16` is analytical (half-cell). No learned scale, reuses already-computed sin/cos — just 2 extra FMAs per pair at read time. Cuts φ error in half (22.5° → 11.25°), eliminates low-probability token drift (Cyrillic contamination on rare-token transliterations).
 +4. **No WHT in content path**: polar structure preserves angular information directly; applying WHT across pairs would destroy the RoPE pair structure. TBQX3_1 is the first TBQ variant to skip WHT entirely.
- 
--```sh
--llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
++
 +**Recommended config for Qwen3-14B and other head_dim=128 RoPE models:**
 +```
 +--cache-type-k tbqx3 --cache-type-v tbq3
@@ -585,18 +576,11 @@ index be23abcea..e99fdd482 100644
 +| **TBQP3** | 2-bit MSE + 1-bit QJL | MSE noise + QJL random projection noise | 13.8 | 0.036 |
 +| **TBQ4** | 4-bit Lloyd-Max (16 levels) | Minimal noise | 56.2 | 0.009 |
 +| **TBQP4** | 3-bit MSE + 1-bit QJL | MSE noise + QJL projection noise | 24.5 | 0.020 |
- 
--    </details>
++
 +TBQ3 has lower per-element reconstruction error (8 levels), but TBQP3's QJL correction adds a **second noise source** to the attention score: the 1-bit random projection `d_qjl × Σ(Q_wht2[i] × sign[i])`. While QJL reduces K reconstruction MSE (good for V-style usage), it increases attention score variance (bad for softmax). This is why **TBQP3 needs stronger sharpening than TBQ3** despite having better reconstruction quality.
- 
--- <details>
--    <summary>Support multiple-users and parallel decoding</summary>
++
 +**Dynamic α by context size:**
- 
--    ```bash
--    # up to 4 concurrent requests, each with 4096 max context
--    llama-server -m model.gguf -c 16384 -np 4
--    ```
++
 +| ctx N | TBQ3 | TBQP3 | TBQ4 | TBQP4 |
 +|-------|------|-------|------|-------|
 +| 256 | 1.012 | 1.027 | 1.007 | 1.015 |
@@ -613,7 +597,7 @@ index be23abcea..e99fdd482 100644
 +The range is narrow (1.007–1.048) because √(ln N) grows very slowly. Even 128× context increase (2048→262144) only shifts α by ~0.012. This validates using a fixed constant as a practical first approximation.
  
 -- <details>
--    <summary>Enable speculative decoding</summary>
+-    <summary>Support multiple-users and parallel decoding</summary>
 +```bash
 +# Recommended (f16-equivalent, 4.2x compression)
 +./llama-server -m ~/Models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
@@ -626,16 +610,18 @@ index be23abcea..e99fdd482 100644
 +    --temp 0 --host 0.0.0.0 --port 8888
 +```
 +> SWA K+V auto-upgraded to f16. No extra config needed.
-+
-+**Supported K/V combinations:**
  
 -    ```bash
--    # the draft.gguf model should be a small variant of the target model.gguf
--    llama-server -m model.gguf -md draft.gguf
+-    # up to 4 concurrent requests, each with 4096 max context
+-    llama-server -m model.gguf -c 16384 -np 4
 -    ```
-+Use shorthand names (`tbq3`, `tbqp3`, etc.) — internal suffixes (`_0`, `_1`, etc.) are auto-mapped by head dimension.
++**Supported K/V combinations:**
  
 -    </details>
++Use shorthand names (`tbq3`, `tbqp3`, etc.) — internal suffixes (`_0`, `_1`, etc.) are auto-mapped by head dimension.
+ 
+-- <details>
+-    <summary>Enable speculative decoding</summary>
 +| `--cache-type-k` \ `--cache-type-v` | f16 | q8_0 | q4_0 | tbq3 | tbq4 |
 +|--------------------------------------|-----|------|------|------|------|
 +| **f16** | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -646,65 +632,67 @@ index be23abcea..e99fdd482 100644
 +| **tbqp3** | ✅ | ✅ | — | ✅ | ✅ |
 +| **tbqp4** | ✅ | ✅ | — | ✅ | ✅ |
  
+-    ```bash
+-    # the draft.gguf model should be a small variant of the target model.gguf
+-    llama-server -m model.gguf -md draft.gguf
+-    ```
++> **`tbqp` types are K-only.** Do NOT use `tbqp3`/`tbqp4` for `--cache-type-v` — QJL correction operates on Q·K dot product and has no meaning for V cache. Recommended: `--cache-type-k tbqp3 --cache-type-v tbq3`.
+ 
+-    </details>
++---
+ 
 -- <details>
 -    <summary>Serve an embedding model</summary>
-+> **`tbqp` types are K-only.** Do NOT use `tbqp3`/`tbqp4` for `--cache-type-v` — QJL correction operates on Q·K dot product and has no meaning for V cache. Recommended: `--cache-type-k tbqp3 --cache-type-v tbq3`.
++### v1.5.1 — Exceeds f16 Quality: SWA f16 Bypass + V 512-WHT + QJL D=512
  
 -    ```bash
 -    # use the /embedding endpoint
 -    llama-server -m model.gguf --embedding --pooling cls -ub 8192
 -    ```
-+---
++**3-bit KV cache (tbq3/tbq3) now EXCEEDS f16 quality. SWA f16 bypass is the key breakthrough.**
  
 -    </details>
-+### v1.5.1 — Exceeds f16 Quality: SWA f16 Bypass + V 512-WHT + QJL D=512
++**Benchmark (Gemma 4 26B-A4B-it MoE, UD-Q4_K_XL, DGX Spark GB10, 262K ctx, temp=0):**
  
 -- <details>
 -    <summary>Serve a reranking model</summary>
-+**3-bit KV cache (tbq3/tbq3) now EXCEEDS f16 quality. SWA f16 bypass is the key breakthrough.**
- 
--    ```bash
--    # use the /reranking endpoint
--    llama-server -m model.gguf --reranking
--    ```
-+**Benchmark (Gemma 4 26B-A4B-it MoE, UD-Q4_K_XL, DGX Spark GB10, 262K ctx, temp=0):**
- 
--    </details>
 +| Config | K cache | V cache | attn_rot_k | Global KV | SWA KV | Math Accuracy (10 runs) | Avg | Compression |
 +|--------|---------|---------|-----------|-----------|--------|------------------------|-----|-------------|
 +| **tbqp3/tbq3** | tbqp3 | tbq3 | OFF(auto) | 990 MiB | 300 MiB(f16) | 37,38,40,38,38,36,37,36,37,37 | **37.4** | **4.2x** |
 +| **tbq3/tbq3** | tbq3 | tbq3 | ON | 980 MiB | 300 MiB(f16) | 39,39,37,37,38,35,35,39,35,36 | **37.0** | **4.2x** |
 +| f16/f16 | f16 | f16 | OFF | 5120 MiB | 300 MiB(f16) | 37,36,36,36,36,38,36,38,37,36 | 36.6 | 1.0x |
  
--- <details>
--    <summary>Constrain all outputs with a grammar</summary>
+-    ```bash
+-    # use the /reranking endpoint
+-    llama-server -m model.gguf --reranking
+-    ```
 +> **tbqp3/tbq3 exceeds f16 (37.4 > 36.6).** Peak 40/65 surpasses f16's best of 38.
  
--    ```bash
--    # custom grammar
--    llama-server -m model.gguf --grammar-file grammar.gbnf
+-    </details>
 +**Key techniques:**
  
--    # JSON
--    llama-server -m model.gguf --grammar-file grammars/json.gbnf
--    ```
+-- <details>
+-    <summary>Constrain all outputs with a grammar</summary>
 +1. **SWA KV f16 Bypass**: SWA cache is small (~300 MiB) but has 25 layers dominating overall quality. Auto-upgrade SWA K+V to f16 eliminates SWA quantization noise — the hidden culprit that masked all previous optimization attempts.
 +2. **V 512-WHT + 512-IWHT**: V cache now uses the same 512-point WHT as K (sign flip + 9-stage butterfly + global norm). 512-point IWHT at attention output (128 threads × 4 elements, warp shuffle + shared memory butterfly).
 +3. **QJL D=512 Restored**: Previously removed as "ineffective at D=512" — SWA noise was masking QJL improvement. With SWA f16 bypass, tbqp3 K outperforms tbq3 K (37.4 > 37.0). attn_rot auto-disabled for TBQP (prevents triple rotation).
  
--    </details>
+-    ```bash
+-    # custom grammar
+-    llama-server -m model.gguf --grammar-file grammar.gbnf
 +---
  
+-    # JSON
+-    llama-server -m model.gguf --grammar-file grammars/json.gbnf
+-    ```
 +### v1.5.0 — Upstream Rebase + Gemma 4 Support
  
--## [`llama-perplexity`](tools/perplexity)
+-    </details>
 +**Full rebase on latest upstream llama.cpp (b7ad48ebd) + Gemma 4 TBQ KV cache support.**
  
--#### A tool for measuring the [perplexity](tools/perplexity/README.md) [^1] (and other quality metrics) of a model over a given text.
 +Previously maintained as a separate history from upstream llama.cpp, requiring manual patching of hundreds of commits for each sync. Starting with v1.5.0, the fork shares upstream commit history, enabling single-command sync via `git merge upstream/master`.
  
--- <details open>
--    <summary>Measure the perplexity over a text file</summary>
+-## [`llama-perplexity`](tools/perplexity)
 +**Changes:**
 +- 3-way merged all TBQ/TBQP code onto latest upstream llama.cpp (b7ad48ebd)
 +- **Gemma 4 support**: hybrid head_dim=512 (global) + 256 (SWA) architecture fully supported
@@ -713,49 +701,49 @@ index be23abcea..e99fdd482 100644
 +- V-less cache, stream-k FA, and other upstream optimizations included
 +- Established proper fork structure for easy future upstream sync
  
--    ```bash
--    llama-perplexity -m model.gguf -f file.txt
+-#### A tool for measuring the [perplexity](tools/perplexity/README.md) [^1] (and other quality metrics) of a model over a given text.
 +**Gemma 4 key techniques:**
 +1. **SWA cache type auto-remapping**: When global (head_dim=512) and SWA (head_dim=256) differ, the SWA cache is automatically assigned the correct TBQ sub-type
 +2. **Variable GQA support**: Gemma 4 has per-layer head_count_kv (16/4). WHT rotation operates per-head, so variable GQA is safe — `attn_rot_k` activation condition updated
 +3. **D=512 single-pass WHT + global norm**: K quantization applies 512-point WHT in one pass (9-stage butterfly). Both 256-blocks share the same global norm for cross-block scale consistency. Q preprocessing also uses 512-point WHT (128 threads × 4 elements). V IWHT uses 256-block independent processing (V has per-block norms)
 +4. **head_dim via op_params**: head_dim passed to set_rows kernel via `op_params[0]` to correctly distinguish D=512 from D=256
  
--    # [1]15.2701,[2]5.4007,[3]5.3073,[4]6.2965,[5]5.8940,[6]5.6096,[7]5.7942,[8]4.9297, ...
--    # Final estimate: PPL = 5.4007 +/- 0.67339
--    ```
+-- <details open>
+-    <summary>Measure the perplexity over a text file</summary>
 +**Benchmark (Gemma 4 31B-it Dense, UD-Q4_K_XL, DGX Spark GB10, 262K ctx):**
  
--    </details>
+-    ```bash
+-    llama-perplexity -m model.gguf -f file.txt
 +| Cache | GPU Memory | Compress | PP t/s | TG t/s | PPL (wiki, 2K) | Math Accuracy | Pauli |
 +|-------|-----------|----------|--------|--------|----------------|---------------|-------|
 +| f16/f16 | 41,500 MiB | 1.0x | 152.9 | 10.1 | 309.7 | 42/65 (64.6%) | PASS |
 +| **tbq3/tbq3** | **23,215 MiB** | **1.8x** | 112.9 | 9.0 | 212.1 | **32/65 (49.2%)** | **PASS** |
  
--- <details>
--    <summary>Measure KL divergence</summary>
+-    # [1]15.2701,[2]5.4007,[3]5.3073,[4]6.2965,[5]5.8940,[6]5.6096,[7]5.7942,[8]4.9297, ...
+-    # Final estimate: PPL = 5.4007 +/- 0.67339
+-    ```
 +**Benchmark (Gemma 4 26B-A4B MoE, UD-Q4_K_XL, DGX Spark GB10, 262K ctx):**
  
--    ```bash
--    # TODO
--    ```
+-    </details>
 +| Cache | GPU Memory | Compress | TG t/s | Math Accuracy | Pauli |
 +|-------|-----------|----------|--------|---------------|-------|
 +| f16/f16 | 5,720 MiB | 1.0x | 56.4 | 37/65 (56.9%) | PASS |
 +| **tbq3/tbq3** | **1,106 MiB** | **5.2x** | 41.1 | **30/65 (46.2%)** | **PASS** |
  
--    </details>
+-- <details>
+-    <summary>Measure KL divergence</summary>
 +> **Note:** Gemma 4 is a hybrid SWA architecture with non-SWA 10 layers (head_dim=512) + SWA 50 layers (head_dim=256). SWA cache is limited to the sliding window size (1536 cells), so Dense compression (1.8x) is lower than MLA models (5.2x). The MoE variant achieves **5.2x compression**.
 +>
 +> **Note:** Math accuracy measured using [turboquant_math_accuracy.py](https://github.com/eullm/eullm/blob/main/bench/turboquant_math_accuracy.py) (2x2/3x3 matrix multiplication, scalar arithmetic, filler 0-2000t). Out of 65 tests, f16 and TBQ **agreed on 55 (31B Dense) / 58 (26B MoE) cases**. Divergent cases show small numerical deviations (e.g. `160→150`, `519→509`), not garbage output. Pauli test (scientist name recall, German→Korean) passes with coherent, diverse output.
 +>
 +> **⚠️ D=512 limitation:** Gemma 4's head_dim=512 extends beyond the TurboQuant paper's validated range (head_dim=128). QJL 1-bit correction (TBQP) does not work at D=512 — **only TBQ (MSE-only) is supported**. All 8 QJL variants tested (global/per-block norm, L2/RMS gamma, correlated/independent sign patterns) degraded quality. TBQP (QJL) works normally for head_dim≤256 models.
  
--[^1]: [https://huggingface.co/docs/transformers/perplexity](https://huggingface.co/docs/transformers/perplexity)
+-    ```bash
+-    # TODO
+-    ```
 +<details>
 +<summary>Build & Run</summary>
- 
--## [`llama-bench`](tools/llama-bench)
++
 +**Build:**
 +```bash
 +cmake -DCMAKE_BUILD_TYPE=Release \
@@ -772,8 +760,7 @@ index be23abcea..e99fdd482 100644
 +
 +make -j12
 +```
- 
--#### Benchmark the performance of the inference for various parameters.
++
 +**Server (f16 baseline):**
 +```bash
 +./llama-server -m ~/Models/gemma4/gemma-4-31B-it-UD-Q4_K_XL.gguf \
@@ -787,9 +774,7 @@ index be23abcea..e99fdd482 100644
 +    --presence-penalty 0.0 --repeat-penalty 1.0 \
 +    --host 127.0.0.1 --port 8888
 +```
- 
--- <details open>
--    <summary>Run default benchmark</summary>
++
 +**Server (TurboQuant):**
 +```bash
 +./llama-server -m ~/Models/gemma4/gemma-4-31B-it-UD-Q4_K_XL.gguf \
@@ -804,10 +789,32 @@ index be23abcea..e99fdd482 100644
 +    --host 127.0.0.1 --port 8889
 +```
 +</details>
++
++**Compatibility:** All v1.4.2 features (MMA tensor core, QJL scalar correction, MLA asymmetric) fully preserved. Existing model benchmarks unchanged.
+ 
+-    </details>
++---
+ 
+-[^1]: [https://huggingface.co/docs/transformers/perplexity](https://huggingface.co/docs/transformers/perplexity)
++### v1.4.2 — MMA Tensor Core Acceleration + QJL Scalar Correction
+ 
+-## [`llama-bench`](tools/llama-bench)
++**TBQ/TBQP MMA tensor core acceleration: TG speed 30→49 t/s (+63%).**
+ 
+-#### Benchmark the performance of the inference for various parameters.
++MMA tensor core attention acceleration for GLM-4.7-Flash (MLA, K=576/V=512) asymmetric models. Up to 1.6x TG speed improvement over vec kernel.
+ 
+-- <details open>
+-    <summary>Run default benchmark</summary>
++**Key features:**
  
 -    ```bash
 -    llama-bench -m model.gguf
-+**Compatibility:** All v1.4.2 features (MMA tensor core, QJL scalar correction, MLA asymmetric) fully preserved. Existing model benchmarks unchanged.
++1. **MMA K spatial dequant**: raw TBQ/TBQP blocks → IWHT → spatial f16 → tensor core. Warp shuffle optimization reduces cooperative IWHT `__syncthreads` from 8 to 4.
++2. **QJL scalar correction**: TBQP 1-bit QJL correction via lightweight scalar ops instead of full MMA pass. Reads sign bits + dq directly from raw K blocks. Correctly handles QJL's second sign basis (signs2).
++3. **V = K view spatial**: K dequanted to spatial domain, V (= K view) automatically spatial. Output IWHT completely eliminated.
++4. **Proper kernel signature**: `fattn_kernel_t` extended with `raw_K_data`, `raw_K_stride`, `Q_wht2_data`, `Q_wht2_stride`. No pointer hacks.
++5. **Fused Q WHT12**: Reads Q->data directly, computes Q_wht1 (intermediate) + Q_wht2 (for QJL). No cudaMemcpy.
  
 -    # Output:
 -    # | model               |       size |     params | backend    | threads |          test |                  t/s |
@@ -816,31 +823,6 @@ index be23abcea..e99fdd482 100644
 -    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         tg128 |        197.71 ± 0.81 |
 -    #
 -    # build: 3e0ba0e60 (4229)
--    ```
-+---
- 
--    </details>
-+### v1.4.2 — MMA Tensor Core Acceleration + QJL Scalar Correction
- 
--## [`llama-simple`](examples/simple)
-+**TBQ/TBQP MMA tensor core acceleration: TG speed 30→49 t/s (+63%).**
- 
--#### A minimal example for implementing apps with `llama.cpp`. Useful for developers.
-+MMA tensor core attention acceleration for GLM-4.7-Flash (MLA, K=576/V=512) asymmetric models. Up to 1.6x TG speed improvement over vec kernel.
- 
--- <details>
--    <summary>Basic text completion</summary>
-+**Key features:**
- 
--    ```bash
--    llama-simple -m model.gguf
-+1. **MMA K spatial dequant**: raw TBQ/TBQP blocks → IWHT → spatial f16 → tensor core. Warp shuffle optimization reduces cooperative IWHT `__syncthreads` from 8 to 4.
-+2. **QJL scalar correction**: TBQP 1-bit QJL correction via lightweight scalar ops instead of full MMA pass. Reads sign bits + dq directly from raw K blocks. Correctly handles QJL's second sign basis (signs2).
-+3. **V = K view spatial**: K dequanted to spatial domain, V (= K view) automatically spatial. Output IWHT completely eliminated.
-+4. **Proper kernel signature**: `fattn_kernel_t` extended with `raw_K_data`, `raw_K_stride`, `Q_wht2_data`, `Q_wht2_stride`. No pointer hacks.
-+5. **Fused Q WHT12**: Reads Q->data directly, computes Q_wht1 (intermediate) + Q_wht2 (for QJL). No cudaMemcpy.
- 
--    # Hello my name is Kaitlyn and I am a 16 year old girl. I am a junior in high school and I am currently taking a class called "The Art of
 -    ```
 +**Benchmarks (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
  
@@ -853,10 +835,39 @@ index be23abcea..e99fdd482 100644
 +| tbq4/tbq4 | 3,526 | 3.0x | ~49 | +47% | PASS |
 +| tbqp4/tbq4 | 3,562 | 2.9x | ~42 | +45% | PASS |
  
+-## [`llama-simple`](examples/simple)
 +> **Note:** TBQP (with QJL) is slower than TBQ because QJL requires a second WHT transform (signs2) for Q_wht2 precomputation + per-token scalar correction overhead. The tradeoff is improved dot product accuracy (better PPL).
  
--## Contributing
+-#### A minimal example for implementing apps with `llama.cpp`. Useful for developers.
 +---
+ 
+-- <details>
+-    <summary>Basic text completion</summary>
++### v1.4.1 — GLM-4.7-Flash (MLA) Asymmetric K/V Support
+ 
+-    ```bash
+-    llama-simple -m model.gguf
++**Full TurboQuant support for MLA architecture models: GLM-4.7-Flash, DeepSeek-V2/V3.**
+ 
+-    # Hello my name is Kaitlyn and I am a 16 year old girl. I am a junior in high school and I am currently taking a class called "The Art of
+-    ```
++MLA (Multi-head Latent Attention) has asymmetric K=concat(latent[512], rope[64])=576 dims and V=latent[512] dims. Three key techniques:
+ 
+-    </details>
++1. **D_V template parameter**: vec kernel separates K/Q dim (D=576) from V dim (D_V=512). VKQ arrays, combine stride, IWHT passes, output writes all use D_V. Symmetric models default D_V=D (zero impact).
++2. **RoPE f16 passthrough**: _4 block structs store sub-block 3 (rope 64) as raw f16 instead of WHT+quantized. RoPE norm (~10.49) is ~80x larger than latent (~0.13) — any quantization error dominates attention scores. Q preprocessing and dot product handle sub-block 3 as direct f16.
++3. **MLA V-as-K-view**: In MLA absorption, V is a view of K cache (same type). TBQP V dequantize uses MSE centroid only (QJL is for K·Q dot product correction, not V reconstruction). IWHT runs 256+256 two-pass (rope pass skipped).
+ 
++**Benchmark (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
+ 
+-## Contributing
++| Cache | KV MiB | Compress | PP t/s | TG t/s | PPL | Pauli |
++|-------|--------|----------|--------|--------|-----|-------|
++| f16/f16 | 10,469 | 1.0x | 73.0 | 60.3 | 5.998 | PASS |
++| **tbq3/tbq3** | **2,944** | **3.6x** | 68.2 | 32.0 | **6.836** | **PASS** |
++| **tbqp3/tbq3** | **2,981** | **3.5x** | 66.8 | 31.5 | **6.586** | **PASS** |
++| tbq4/tbq4 | 3,526 | 3.0x | 67.2 | 33.4 | — | PASS |
++| tbqp4/tbq4 | 3,562 | 2.9x | 65.8 | 28.9 | — | PASS |
  
 -- Contributors can open PRs
 -- Collaborators will be invited based on contributions
@@ -866,37 +877,37 @@ index be23abcea..e99fdd482 100644
 -- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
 -- Make sure to read this: [Inference at the edge](https://github.com/ggml-org/llama.cpp/discussions/205)
 -- A bit of backstory for those who are interested: [Changelog podcast](https://changelog.com/podcast/532)
-+### v1.4.1 — GLM-4.7-Flash (MLA) Asymmetric K/V Support
++> **Note:** MLA compression ratio (3.5x) is lower than standard models (5.2x) because MLA already compresses KV to a 256-dim latent — the original cache is already small. The 7.5GB savings (10,469→2,981 MiB) is still significant.
++>
++> **Note:** TG speed (31.5 vs 60.3 t/s): TBQ uses the vec kernel (scalar WHT dot product), f16 uses the MMA kernel (tensor cores). Adding TBQ on-the-fly dequantize to MMA would enable tensor core acceleration — future work.
  
 -## Other documentation
-+**Full TurboQuant support for MLA architecture models: GLM-4.7-Flash, DeepSeek-V2/V3.**
++**Bugs fixed:**
  
 -- [cli](tools/cli/README.md)
 -- [completion](tools/completion/README.md)
 -- [server](tools/server/README.md)
 -- [GBNF grammars](grammars/README.md)
-+MLA (Multi-head Latent Attention) has asymmetric K=concat(latent[512], rope[64])=576 dims and V=latent[512] dims. Three key techniques:
++| Bug | Root Cause | Fix |
++|-----|-----------|-----|
++| GLM tbqp3/tbq3 crash (v1.4.0) | `get_best_fattn_kernel` returned NONE for D=576 TBQ | Added D=576+V=512 TBQ vec kernel routing |
++| Symmetric dispatch shadows asymmetric | `FATTN_VEC_CASE` doesn't check V->ne[0] → launches DV=576 | ASYM cases placed before symmetric |
++| RoPE quantization → garbage | rope norm(~10.49) >> latent norm(~0.13), quant error dominates attention | Sub-block 3 changed to f16 passthrough |
++| TBQP V dequant with QJL → garbage | QJL corrects K·Q dot products only, not V reconstruction | Removed QJL from V dequant (MSE only) |
++| Q WHT sub-block race condition | Missing `__syncthreads` between sub-block storage and next WHT | Added `__syncthreads` barriers |
  
 -#### Development documentation
-+1. **D_V template parameter**: vec kernel separates K/Q dim (D=576) from V dim (D_V=512). VKQ arrays, combine stride, IWHT passes, output writes all use D_V. Symmetric models default D_V=D (zero impact).
-+2. **RoPE f16 passthrough**: _4 block structs store sub-block 3 (rope 64) as raw f16 instead of WHT+quantized. RoPE norm (~10.49) is ~80x larger than latent (~0.13) — any quantization error dominates attention scores. Q preprocessing and dot product handle sub-block 3 as direct f16.
-+3. **MLA V-as-K-view**: In MLA absorption, V is a view of K cache (same type). TBQP V dequantize uses MSE centroid only (QJL is for K·Q dot product correction, not V reconstruction). IWHT runs 256+256 two-pass (rope pass skipped).
++---
  
 -- [How to build](docs/build.md)
 -- [Running on Docker](docs/docker.md)
 -- [Build on Android](docs/android.md)
 -- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
 -- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-+**Benchmark (GLM-4.7-Flash UD-Q4_K_XL, DGX Spark GB10):**
++### v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
  
 -#### Seminal papers and background on the models
-+| Cache | KV MiB | Compress | PP t/s | TG t/s | PPL | Pauli |
-+|-------|--------|----------|--------|--------|-----|-------|
-+| f16/f16 | 10,469 | 1.0x | 73.0 | 60.3 | 5.998 | PASS |
-+| **tbq3/tbq3** | **2,944** | **3.6x** | 68.2 | 32.0 | **6.836** | **PASS** |
-+| **tbqp3/tbq3** | **2,981** | **3.5x** | 66.8 | 31.5 | **6.586** | **PASS** |
-+| tbq4/tbq4 | 3,526 | 3.0x | 67.2 | 33.4 | — | PASS |
-+| tbqp4/tbq4 | 3,562 | 2.9x | 65.8 | 28.9 | — | PASS |
++**Benchmark (Qwen3-30B-A3B Q4_K_M, DGX Spark GB10, head_dim=128):**
  
 -If your issue is with model generation quality, then please at least scan the following links and papers to understand the limitations of LLaMA models. This is especially important when choosing an appropriate model size and appreciating both the significant and subtle differences between LLaMA models and ChatGPT:
 -- LLaMA:
@@ -907,9 +918,13 @@ index be23abcea..e99fdd482 100644
 -- GPT-3.5 / InstructGPT / ChatGPT:
 -    - [Aligning language models to follow instructions](https://openai.com/research/instruction-following)
 -    - [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
-+> **Note:** MLA compression ratio (3.5x) is lower than standard models (5.2x) because MLA already compresses KV to a 256-dim latent — the original cache is already small. The 7.5GB savings (10,469→2,981 MiB) is still significant.
-+>
-+> **Note:** TG speed (31.5 vs 60.3 t/s): TBQ uses the vec kernel (scalar WHT dot product), f16 uses the MMA kernel (tensor cores). Adding TBQ on-the-fly dequantize to MMA would enable tensor core acceleration — future work.
++| Config | PPL | vs F16 | Note |
++|--------|-----|--------|------|
++| f16/f16 | 6.26 | baseline | |
++| **tbqp4/tbq4** | **6.70** | **+7.1%** | +Direct Sign correction (head_dim=128) |
++| tbq4/tbq4 | 6.73 | +7.5% | MSE only |
++| **tbqp3/tbq3** | **7.91** | **+26.3%** | +Direct Sign correction (head_dim=128) |
++| tbq3/tbq3 | 8.49 | +35.6% | MSE only |
  
 -## XCFramework
 -The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
@@ -918,16 +933,14 @@ index be23abcea..e99fdd482 100644
 -```swift
 -// swift-tools-version: 5.10
 -// The swift-tools-version declares the minimum version of Swift required to build this package.
-+**Bugs fixed:**
++> **Note:** TBQP residual correction method varies by head_dim:
++> - **head_dim=256**: QJL (original paper, SRHT-based)
++> - **head_dim=128/64**: Direct Sign (our fix for QJL variance issue — 4.3x lower variance)
++>
++> PPL numbers above are from a **MoE model** (3.7B active params/token). F16 baseline 6.26 is inherent to the architecture, not a TurboQuant issue.
  
 -import PackageDescription
-+| Bug | Root Cause | Fix |
-+|-----|-----------|-----|
-+| GLM tbqp3/tbq3 crash (v1.4.0) | `get_best_fattn_kernel` returned NONE for D=576 TBQ | Added D=576+V=512 TBQ vec kernel routing |
-+| Symmetric dispatch shadows asymmetric | `FATTN_VEC_CASE` doesn't check V->ne[0] → launches DV=576 | ASYM cases placed before symmetric |
-+| RoPE quantization → garbage | rope norm(~10.49) >> latent norm(~0.13), quant error dominates attention | Sub-block 3 changed to f16 passthrough |
-+| TBQP V dequant with QJL → garbage | QJL corrects K·Q dot products only, not V reconstruction | Removed QJL from V dequant (MSE only) |
-+| Q WHT sub-block race condition | Missing `__syncthreads` between sub-block storage and next WHT | Added `__syncthreads` barriers |
++**Issues Resolved:**
  
 -let package = Package(
 -    name: "MyLlamaPackage",
@@ -944,28 +957,6 @@ index be23abcea..e99fdd482 100644
 -        )
 -    ]
 -)
-+---
-+
-+### v1.3.0 — Bulletproof head_dim Detection + Critical Bug Fixes
-+
-+**Benchmark (Qwen3-30B-A3B Q4_K_M, DGX Spark GB10, head_dim=128):**
-+
-+| Config | PPL | vs F16 | Note |
-+|--------|-----|--------|------|
-+| f16/f16 | 6.26 | baseline | |
-+| **tbqp4/tbq4** | **6.70** | **+7.1%** | +Direct Sign correction (head_dim=128) |
-+| tbq4/tbq4 | 6.73 | +7.5% | MSE only |
-+| **tbqp3/tbq3** | **7.91** | **+26.3%** | +Direct Sign correction (head_dim=128) |
-+| tbq3/tbq3 | 8.49 | +35.6% | MSE only |
-+
-+> **Note:** TBQP residual correction method varies by head_dim:
-+> - **head_dim=256**: QJL (original paper, SRHT-based)
-+> - **head_dim=128/64**: Direct Sign (our fix for QJL variance issue — 4.3x lower variance)
-+>
-+> PPL numbers above are from a **MoE model** (3.7B active params/token). F16 baseline 6.26 is inherent to the architecture, not a TurboQuant issue.
-+
-+**Issues Resolved:**
-+
 +| Issue | Reporter | Status |
 +|-------|----------|--------|
 +| Phi-4, DeepSeek auto head_dim detection failure | @fritolays | Fixed — P1→P5 cascade |
@@ -1028,6 +1019,15 @@ index be23abcea..e99fdd482 100644
 -automatically. For example:
 -```console
 -$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
+-```
+-
+-## Dependencies
+-
+-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
+-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
+-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
+-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
+-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
 +- `head_dim=256`: K=tbqp3_0 (QJL), V=tbq3_0 → **5.2x compression**
 +- `head_dim=128`: K=tbqp3_1 (Direct Sign), V=tbq3_1 → **5.0x compression**
 +- `head_dim=64`: K=**q8_0** (auto fallback), V=tbq3_2 → **2.7x compression**
@@ -1165,9 +1165,8 @@ index be23abcea..e99fdd482 100644
 +PPL@2K:   4.678 → 4.672   (better than FP16!)
 +PPL@8K:   6.829 → 6.850   (+0.3% difference)
 +Speed@8K: 51.9  → 58.3 t/s (+12% faster)
- ```
- 
--## Dependencies
++```
++
 +### Perplexity by Context Length
 +
 +| KV Config | 2K | 4K | 8K | 32K |
@@ -1207,10 +1206,5 @@ index be23abcea..e99fdd482 100644
 +- [llama.cpp](https://github.com/ggml-org/llama.cpp) — Base framework
 +
 +## License
- 
--- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
--- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
--- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
--- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
--- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
++
 +This implementation follows the llama.cpp project license (MIT).

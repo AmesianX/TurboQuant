@@ -1,8 +1,6 @@
-diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index eda041f45..7f45138fe 100644
---- a/ggml/src/ggml.c
-+++ b/ggml/src/ggml.c
-@@ -922,6 +922,140 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+--- -	2026-04-26 16:06:35.986290680 +0900
++++ ggml/src/ggml.c	2026-04-26 15:16:47.898560006 +0900
+@@ -922,6 +922,140 @@
          .type_size                = 0,
          .is_quantized             = false,
      },
@@ -143,7 +141,7 @@ index eda041f45..7f45138fe 100644
  };
  
  const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
-@@ -5390,6 +5524,22 @@ void ggml_flash_attn_ext_add_sinks(
+@@ -5390,6 +5524,22 @@
      a->src[4] = sinks;
  }
  

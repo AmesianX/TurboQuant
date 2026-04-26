@@ -1,8 +1,6 @@
-diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 09102f549..d42660ec8 100644
---- a/src/llama-kv-cache.cpp
-+++ b/src/llama-kv-cache.cpp
-@@ -95,6 +95,26 @@ llama_kv_cache::llama_kv_cache(
+--- -	2026-04-26 16:06:35.886300010 +0900
++++ src/llama-kv-cache.cpp	2026-04-21 07:51:48.945000620 +0900
+@@ -95,6 +95,26 @@
  
      GGML_ASSERT(kv_size % n_pad == 0);
  
@@ -29,7 +27,7 @@ index 09102f549..d42660ec8 100644
      const uint32_t n_layer_kv = hparams.n_layer_kv();
  
      // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
-@@ -286,17 +306,35 @@ llama_kv_cache::llama_kv_cache(
+@@ -286,17 +306,35 @@
          LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
      }
  
@@ -70,7 +68,7 @@ index 09102f549..d42660ec8 100644
  
      LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
      LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
-@@ -1121,6 +1159,67 @@ ggml_type llama_kv_cache::type_k() const {
+@@ -1121,6 +1159,67 @@
      return layers[0].k->type;
  }
  
@@ -138,7 +136,7 @@ index 09102f549..d42660ec8 100644
  ggml_type llama_kv_cache::type_v() const {
      return layers[0].v->type;
  }
-@@ -1225,7 +1324,12 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
+@@ -1225,7 +1324,12 @@
      }
  
      // store the current K values into the cache
@@ -152,7 +150,7 @@ index 09102f549..d42660ec8 100644
  }
  
  ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
-@@ -1260,7 +1364,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
+@@ -1260,7 +1364,11 @@
              v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
          }
  
@@ -165,7 +163,7 @@ index 09102f549..d42660ec8 100644
      }
  
      if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
-@@ -1744,6 +1852,14 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
+@@ -1744,6 +1852,14 @@
                                  : hparams.rope_type;
      ggml_tensor * tmp;
  

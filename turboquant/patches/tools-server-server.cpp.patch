@@ -1,8 +1,6 @@
-diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 6566949ed..79df0f032 100644
---- a/tools/server/server.cpp
-+++ b/tools/server/server.cpp
-@@ -83,6 +83,17 @@ int main(int argc, char ** argv) {
+--- -	2026-04-26 16:06:36.005684184 +0900
++++ tools/server/server.cpp	2026-04-22 14:29:10.778311932 +0900
+@@ -83,6 +83,17 @@
          return 1;
      }
  

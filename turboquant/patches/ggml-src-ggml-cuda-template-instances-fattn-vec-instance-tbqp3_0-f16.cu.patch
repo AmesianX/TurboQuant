@@ -1,9 +1,0 @@
-diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-f16.cu
-new file mode 100644
-index 000000000..a192dedd9
---- /dev/null
-+++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbqp3_0-f16.cu
-@@ -0,0 +1,3 @@
-+#include "../fattn-vec.cuh"
-+DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_F16);
-+DECL_FATTN_VEC_CASE(512, GGML_TYPE_TBQP3_0, GGML_TYPE_F16);

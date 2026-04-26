@@ -1,8 +1,6 @@
-diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 185956317..073044359 100644
---- a/ggml/src/ggml-cuda/ggml-cuda.cu
-+++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4927,7 +4927,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+--- -	2026-04-26 16:06:36.100166223 +0900
++++ ggml/src/ggml-cuda/ggml-cuda.cu	2026-04-26 15:16:47.884559963 +0900
+@@ -4957,7 +4957,18 @@
              {
                  return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                         op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||

@@ -1,7 +1,5 @@
-diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
-index f1cc12cd4..a9d327a4f 100644
---- a/.github/workflows/release.yml
-+++ b/.github/workflows/release.yml
+--- -	2026-04-26 16:06:35.914576706 +0900
++++ .github/workflows/release.yml	2026-04-21 07:49:11.254633997 +0900
 @@ -1,7 +1,7 @@
  name: Release
  
@@ -11,7 +9,7 @@ index f1cc12cd4..a9d327a4f 100644
      inputs:
        create_release:
          description: 'Create new release'
-@@ -10,6 +10,7 @@ on:
+@@ -10,6 +10,7 @@
    push:
      branches:
        - master
@@ -19,7 +17,7 @@ index f1cc12cd4..a9d327a4f 100644
      paths: [
        '.github/workflows/release.yml',
        '**/CMakeLists.txt',
-@@ -35,1141 +36,697 @@ env:
+@@ -35,1230 +36,697 @@
    BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
    CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
  
@@ -74,6 +72,12 @@ index f1cc12cd4..a9d327a4f 100644
 -      - name: Determine tag name
 -        id: tag
 -        uses: ./.github/actions/get-tag-name
+-
+-      - name: Pack artifacts
+-        id: pack_artifacts
+-        run: |
+-          cp LICENSE ./build/bin/
+-          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-macos-${{ matrix.build }}.tar.gz -s ",./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
 +# =====================================================================
 +# TurboQuant release workflow — ONE INDEPENDENT JOB PER GPU/OS COMBO
 +# =====================================================================
@@ -83,12 +87,6 @@ index f1cc12cd4..a9d327a4f 100644
 +# to ~/work/cuda_research/release_workflow_YYYYMMDD.yml.
 +# =====================================================================
  
--      - name: Pack artifacts
--        id: pack_artifacts
--        run: |
--          cp LICENSE ./build/bin/
--          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-macos-${{ matrix.build }}.tar.gz -s ",./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
--
 -      - name: Upload artifacts
 -        uses: actions/upload-artifact@v6
 -        with:
@@ -823,7 +821,9 @@ index f1cc12cd4..a9d327a4f 100644
 -          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
 -          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
 -          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip $dst\*
--
++          path: llama-bin-win-cuda13.1-RTX5090-sm120.zip
++          name: llama-bin-win-cuda13.1-RTX5090-sm120.zip
+ 
 -      - name: Upload Cuda runtime
 -        uses: actions/upload-artifact@v6
 -        with:
@@ -836,13 +836,12 @@ index f1cc12cd4..a9d327a4f 100644
 -    defaults:
 -      run:
 -        shell: bash
-+          path: llama-bin-win-cuda13.1-RTX5090-sm120.zip
-+          name: llama-bin-win-cuda13.1-RTX5090-sm120.zip
- 
+-
 -    env:
--      WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/24751ead-ddc5-4479-b9e6-f9fe2ff8b9f2/intel-deep-learning-essentials-2025.2.1.25_offline.exe
+-      WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b60765d1-2b85-4e85-86b6-cb0e9563a699/intel-deep-learning-essentials-2025.3.3.18_offline.exe
 -      WINDOWS_DPCPP_MKL: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel
 -      ONEAPI_ROOT: "C:/Program Files (x86)/Intel/oneAPI"
+-      ONEAPI_INSTALLER_VERSION: "2025.3.3"
 +  # ======================== Linux CUDA builds =========================
  
 +  linux-cuda-v100:
@@ -852,34 +851,31 @@ index f1cc12cd4..a9d327a4f 100644
 -        id: checkout
          uses: actions/checkout@v6
 -
+-      - name: Use oneAPI Installation Cache
+-        uses: actions/cache@v5
+-        id: cache-sycl
+         with:
+-          path: ${{ env.ONEAPI_ROOT }}
+-          key: oneAPI-${{ env.ONEAPI_INSTALLER_VERSION }}-${{ runner.os }}
+-
+-      - name: Download & Install oneAPI
+-        shell: bash
+-        if: steps.cache-sycl.outputs.cache-hit != 'true'
++          fetch-depth: 0
++      - name: Build with Docker
+         run: |
+-          scripts/install-oneapi.bat $WINDOWS_BASEKIT_URL $WINDOWS_DPCPP_MKL
+-
 -      - name: ccache
 -        uses: ggml-org/ccache-action@v1.2.21
-         with:
+-        with:
 -          key: windows-latest-sycl
 -          variant: ccache
 -          evict-old-files: 1d
 -
--      - name: Install
--        run:  |
--          scripts/install-oneapi.bat $WINDOWS_BASEKIT_URL $WINDOWS_DPCPP_MKL
--
 -      - name: Build
 -        id: cmake_build
 -        shell: cmd
-+          fetch-depth: 0
-+      - name: Build with Docker
-         run: |
--          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
--          cmake -G "Ninja" -B build ^
--            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx ^
--            -DCMAKE_BUILD_TYPE=Release ^
--            -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON ^
--            -DGGML_CPU=OFF -DGGML_SYCL=ON ^
--            -DLLAMA_BUILD_BORINGSSL=ON
--          cmake --build build --target ggml-sycl -j
--
--      - name: Build the release package
--        id: pack_artifacts
 +          docker run --rm \
 +            -v "${PWD}:/workspace" \
 +            -w /workspace \
@@ -905,6 +901,18 @@ index f1cc12cd4..a9d327a4f 100644
 +        uses: ./.github/actions/get-tag-name
 +      - name: Pack artifacts
          run: |
+-          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
+-          cmake -G "Ninja" -B build ^
+-            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx ^
+-            -DCMAKE_BUILD_TYPE=Release ^
+-            -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON ^
+-            -DGGML_CPU=OFF -DGGML_SYCL=ON ^
+-            -DLLAMA_BUILD_BORINGSSL=ON
+-          cmake --build build --target ggml-sycl -j
+-
+-      - name: Build the release package
+-        id: pack_artifacts
+-        run: |
 -          echo "cp oneAPI running time dll files in ${{ env.ONEAPI_ROOT }} to ./build/bin"
 -
 -          cp "${{ env.ONEAPI_ROOT }}/mkl/latest/bin/mkl_sycl_blas.5.dll" ./build/bin
@@ -943,11 +951,113 @@ index f1cc12cd4..a9d327a4f 100644
          with:
 -          path: llama-bin-win-sycl-x64.zip
 -          name: llama-bin-win-sycl-x64.zip
+-
+-  ubuntu-24-sycl:
+-    strategy:
+-      matrix:
+-        build: [fp32, fp16]
+-        include:
+-          - build: fp32
+-            fp16: OFF
+-          - build: fp16
+-            fp16: ON
+-
+-    runs-on: ubuntu-24.04
+-
+-    env:
+-      ONEAPI_ROOT: /opt/intel/oneapi/
+-      ONEAPI_INSTALLER_VERSION: "2025.3.3"
 +          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-V100-sm70.tar.gz
 +          name: llama-bin-linux-cuda12.8-V100-sm70.tar.gz
  
--  ubuntu-22-rocm:
 +  linux-cuda-a100:
++    runs-on: ubuntu-22.04
+     steps:
+       - name: Clone
+-        id: checkout
+         uses: actions/checkout@v6
+         with:
+           fetch-depth: 0
+-
+-      - name: Use oneAPI Installation Cache
+-        uses: actions/cache@v5
+-        id: cache-sycl
+-        with:
+-          path: ${{ env.ONEAPI_ROOT }}
+-          key: oneAPI-${{ env.ONEAPI_INSTALLER_VERSION }}-${{ runner.os }}
+-
+-      - name: Download & Install oneAPI
+-        shell: bash
+-        if: steps.cache-sycl.outputs.cache-hit != 'true'
+-        run: |
+-          cd /tmp
+-          wget https://registrationcenter-download.intel.com/akdlm/IRC_NAS/56f7923a-adb8-43f3-8b02-2b60fcac8cab/intel-deep-learning-essentials-2025.3.3.16_offline.sh -O intel-deep-learning-essentials_offline.sh
+-          sudo bash intel-deep-learning-essentials_offline.sh -s -a --silent --eula accept
+-
+-      - name: ccache
+-        uses: ggml-org/ccache-action@v1.2.21
+-        with:
+-          key: ubuntu-24-sycl-${{ matrix.build }}
+-          evict-old-files: 1d
+-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+-
+-      - name: Build
+-        id: cmake_build
++      - name: Build with Docker
+         run: |
+-          source /opt/intel/oneapi/setvars.sh
+-          cmake -B build \
+-            -G "Ninja" \
+-            -DCMAKE_BUILD_TYPE=Release \
+-            -DGGML_SYCL=ON \
+-            -DCMAKE_C_COMPILER=icx \
+-            -DCMAKE_CXX_COMPILER=icpx \
+-            -DLLAMA_OPENSSL=OFF \
+-            -DGGML_NATIVE=OFF \
+-            -DGGML_SYCL_F16=${{ matrix.fp16 }}
+-          time cmake --build build --config Release -j $(nproc)
+-
++          docker run --rm \
++            -v "${PWD}:/workspace" \
++            -w /workspace \
++            nvidia/cuda:12.8.0-devel-ubuntu22.04 \
++            bash -c '
++              set -e
++              apt-get update && apt-get install -y build-essential cmake git
++              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/libcuda.so.1
++              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/libcuda.so
++              cmake -B build \
++                -DCMAKE_BUILD_TYPE=Release \
++                -DCMAKE_INSTALL_RPATH="\$ORIGIN" \
++                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
++                -DGGML_NATIVE=OFF \
++                -DGGML_CUDA=ON \
++                -DCMAKE_CUDA_ARCHITECTURES="80" \
++                ${{ env.CMAKE_ARGS }}
++              cmake --build build --config Release -j $(nproc)
++              chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
++            '
+       - name: Determine tag name
+         id: tag
+         uses: ./.github/actions/get-tag-name
+-
+       - name: Pack artifacts
+-        id: pack_artifacts
+         run: |
+           cp LICENSE ./build/bin/
+-          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+-
++          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-A100-sm80.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+       - name: Upload artifacts
+         uses: actions/upload-artifact@v6
+         with:
+-          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz
+-          name: llama-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz
++          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-A100-sm80.tar.gz
++          name: llama-bin-linux-cuda12.8-A100-sm80.tar.gz
+ 
+-  ubuntu-22-rocm:
++  linux-cuda-3090ti:
      runs-on: ubuntu-22.04
 -
 -    strategy:
@@ -977,7 +1087,8 @@ index f1cc12cd4..a9d327a4f 100644
 -
 -      - name: Dependencies
 -        id: depends
--        run: |
++      - name: Build with Docker
+         run: |
 -          sudo apt install -y build-essential git cmake wget
 -
 -      - name: Setup Legacy ROCm
@@ -1015,8 +1126,7 @@ index f1cc12cd4..a9d327a4f 100644
 -
 -      - name: Build with native CMake HIP support
 -        id: cmake_build
-+      - name: Build with Docker
-         run: |
+-        run: |
 -          cmake -B build -S . \
 -            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
 -            -DCMAKE_BUILD_TYPE=Release \
@@ -1047,7 +1157,7 @@ index f1cc12cd4..a9d327a4f 100644
 +                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
 +                -DGGML_NATIVE=OFF \
 +                -DGGML_CUDA=ON \
-+                -DCMAKE_CUDA_ARCHITECTURES="80" \
++                -DCMAKE_CUDA_ARCHITECTURES="86" \
 +                ${{ env.CMAKE_ARGS }}
 +              cmake --build build --config Release -j $(nproc)
 +              chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
@@ -1065,7 +1175,7 @@ index f1cc12cd4..a9d327a4f 100644
            cp LICENSE ./build/bin/
 -          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
 -
-+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-A100-sm80.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
++          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX3090Ti-sm86.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
        - name: Upload artifacts
          uses: actions/upload-artifact@v6
          with:
@@ -1083,10 +1193,10 @@ index f1cc12cd4..a9d327a4f 100644
 -        include:
 -          - name: "radeon"
 -            gpu_targets: "gfx1150;gfx1151;gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1030;gfx1031;gfx1032"
-+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-A100-sm80.tar.gz
-+          name: llama-bin-linux-cuda12.8-A100-sm80.tar.gz
++          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX3090Ti-sm86.tar.gz
++          name: llama-bin-linux-cuda12.8-RTX3090Ti-sm86.tar.gz
  
-+  linux-cuda-3090ti:
++  linux-cuda-4090:
 +    runs-on: ubuntu-22.04
      steps:
        - name: Clone
@@ -1103,13 +1213,13 @@ index f1cc12cd4..a9d327a4f 100644
 -      - name: Cache ROCm Installation
 -        id: cache-rocm
 -        uses: actions/cache@v5
--        with:
+         with:
 -          path: C:\Program Files\AMD\ROCm
 -          key: rocm-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
 -
 -      - name: ccache
 -        uses: ggml-org/ccache-action@v1.2.21
-         with:
+-        with:
 -          key: windows-latest-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ matrix.name }}-x64
 -          evict-old-files: 1d
 -
@@ -1188,7 +1298,7 @@ index f1cc12cd4..a9d327a4f 100644
 +                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
 +                -DGGML_NATIVE=OFF \
 +                -DGGML_CUDA=ON \
-+                -DCMAKE_CUDA_ARCHITECTURES="86" \
++                -DCMAKE_CUDA_ARCHITECTURES="89" \
 +                ${{ env.CMAKE_ARGS }}
 +              cmake --build build --config Release -j $(nproc)
 +              chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
@@ -1202,7 +1312,7 @@ index f1cc12cd4..a9d327a4f 100644
 -          7z a -snl llama-bin-win-hip-${{ matrix.name }}-x64.zip .\build\bin\*
 -
 +          cp LICENSE ./build/bin/
-+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX3090Ti-sm86.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
++          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX4090-sm89.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
        - name: Upload artifacts
          uses: actions/upload-artifact@v6
          with:
@@ -1211,10 +1321,10 @@ index f1cc12cd4..a9d327a4f 100644
 -
 -  ios-xcode-build:
 -    runs-on: macos-15
-+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX3090Ti-sm86.tar.gz
-+          name: llama-bin-linux-cuda12.8-RTX3090Ti-sm86.tar.gz
++          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX4090-sm89.tar.gz
++          name: llama-bin-linux-cuda12.8-RTX4090-sm89.tar.gz
  
-+  linux-cuda-4090:
++  linux-cuda-h100:
 +    runs-on: ubuntu-22.04
      steps:
 -      - name: Checkout code
@@ -1268,7 +1378,7 @@ index f1cc12cd4..a9d327a4f 100644
 +                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
 +                -DGGML_NATIVE=OFF \
 +                -DGGML_CUDA=ON \
-+                -DCMAKE_CUDA_ARCHITECTURES="89" \
++                -DCMAKE_CUDA_ARCHITECTURES="90" \
 +                ${{ env.CMAKE_ARGS }}
 +              cmake --build build --config Release -j $(nproc)
 +              chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
@@ -1285,16 +1395,17 @@ index f1cc12cd4..a9d327a4f 100644
 -          zip -r -y llama-${{ steps.tag.outputs.name }}-xcframework.zip build-apple/llama.xcframework
 -
 +          cp LICENSE ./build/bin/
-+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX4090-sm89.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
++          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-H100-sm90.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
        - name: Upload artifacts
          uses: actions/upload-artifact@v6
          with:
 -          path: llama-${{ steps.tag.outputs.name }}-xcframework.zip
 -          name: llama-${{ steps.tag.outputs.name }}-xcframework.zip
-+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-RTX4090-sm89.tar.gz
-+          name: llama-bin-linux-cuda12.8-RTX4090-sm89.tar.gz
++          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-H100-sm90.tar.gz
++          name: llama-bin-linux-cuda12.8-H100-sm90.tar.gz
  
--
++  # ===== DGX Spark (GB10, aarch64, Blackwell sm_100, Ubuntu 24.04) =====
+ 
 -  openEuler-cann:
 -    strategy:
 -      matrix:
@@ -1318,8 +1429,8 @@ index f1cc12cd4..a9d327a4f 100644
 -            build: 'Release'
 -            use_acl_graph: 'off'
 -    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-+  linux-cuda-h100:
-+    runs-on: ubuntu-22.04
++  linux-cuda-aarch64:
++    runs-on: ubuntu-24.04-arm
      steps:
 -      - name: Checkout
 +      - name: Clone
@@ -1334,7 +1445,7 @@ index f1cc12cd4..a9d327a4f 100644
 -
 -      - name: Set container image
 -        id: cann-image
-+      - name: Build with Docker
++      - name: Install CUDA Toolkit
          run: |
 -          image="ascendai/cann:${{ matrix.chip_type == '910b' &&  '8.5.0-910b-openeuler24.03-py3.11' || '8.5.0-310p-openeuler24.03-py3.11' }}"
 -          echo "image=${image}" >> "${GITHUB_OUTPUT}"
@@ -1342,26 +1453,28 @@ index f1cc12cd4..a9d327a4f 100644
 -      - name: Pull container image
 -        run: docker pull "${{ steps.cann-image.outputs.image }}"
 -
--      - name: Build
++          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
++          sudo dpkg -i cuda-keyring_1.1-1_all.deb
++          sudo apt-get update
++          sudo apt-get install -y cuda-toolkit-12-8 build-essential cmake git
+       - name: Build
 -        env:
 -          BUILD_TYPE: ${{ matrix.build }}
 -          SOC_TYPE: ascend${{ matrix.chip_type }}
 -          USE_ACL_GRAPH: ${{ matrix.use_acl_graph }}
--        run: |
+         run: |
 -          HOST_UID=$(id -u)
 -          HOST_GID=$(id -g)
 -
-           docker run --rm \
-             -v "${PWD}:/workspace" \
-             -w /workspace \
+-          docker run --rm \
+-            -v "${PWD}:/workspace" \
+-            -w /workspace \
 -            -e SOC_TYPE=${SOC_TYPE} \
 -            -e BUILD_TYPE=${BUILD_TYPE} \
 -            -e USE_ACL_GRAPH=${USE_ACL_GRAPH} \
 -            "${{ steps.cann-image.outputs.image }}" \
 -            bash -lc '
-+            nvidia/cuda:12.8.0-devel-ubuntu22.04 \
-+            bash -c '
-               set -e
+-              set -e
 -              yum install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs git gcc gcc-c++ make cmake openssl-devel
 -              yum clean all && rm -rf /var/cache/yum
 -              git config --global --add safe.directory "/workspace"
@@ -1374,53 +1487,8 @@ index f1cc12cd4..a9d327a4f 100644
 -              cmake --build build -j $(nproc)
 -
 -              chown -R '"${HOST_UID}"':'"${HOST_GID}"' /workspace/build
-+              apt-get update && apt-get install -y build-essential cmake git
-+              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/libcuda.so.1
-+              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/libcuda.so
-+              cmake -B build \
-+                -DCMAKE_BUILD_TYPE=Release \
-+                -DCMAKE_INSTALL_RPATH="\$ORIGIN" \
-+                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-+                -DGGML_NATIVE=OFF \
-+                -DGGML_CUDA=ON \
-+                -DCMAKE_CUDA_ARCHITECTURES="90" \
-+                ${{ env.CMAKE_ARGS }}
-+              cmake --build build --config Release -j $(nproc)
-+              chown -R '"$(id -u)"':'"$(id -g)"' /workspace/build
-             '
+-            '
 -
-       - name: Determine tag name
-         id: tag
-         uses: ./.github/actions/get-tag-name
--
-       - name: Pack artifacts
-         run: |
-           cp LICENSE ./build/bin/
--          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-${{ matrix.chip_type }}-openEuler-${{ matrix.arch }}${{ matrix.use_acl_graph == 'on' && '-aclgraph' || '' }}.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
-+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-H100-sm90.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
-+      - name: Upload artifacts
-+        uses: actions/upload-artifact@v6
-+        with:
-+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-H100-sm90.tar.gz
-+          name: llama-bin-linux-cuda12.8-H100-sm90.tar.gz
-+
-+  # ===== DGX Spark (GB10, aarch64, Blackwell sm_100, Ubuntu 24.04) =====
- 
-+  linux-cuda-aarch64:
-+    runs-on: ubuntu-24.04-arm
-+    steps:
-+      - name: Clone
-+        uses: actions/checkout@v6
-+        with:
-+          fetch-depth: 0
-+      - name: Install CUDA Toolkit
-+        run: |
-+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
-+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-+          sudo apt-get update
-+          sudo apt-get install -y cuda-toolkit-12-8 build-essential cmake git
-+      - name: Build
-+        run: |
 +          export PATH=/usr/local/cuda-12.8/bin:$PATH
 +          cmake -B build \
 +            -DCMAKE_BUILD_TYPE=Release \
@@ -1432,12 +1500,15 @@ index f1cc12cd4..a9d327a4f 100644
 +            -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
 +            ${{ env.CMAKE_ARGS }}
 +          cmake --build build --config Release -j $(nproc)
-+      - name: Determine tag name
-+        id: tag
-+        uses: ./.github/actions/get-tag-name
-+      - name: Pack artifacts
-+        run: |
-+          cp LICENSE ./build/bin/
+       - name: Determine tag name
+         id: tag
+         uses: ./.github/actions/get-tag-name
+-
+       - name: Pack artifacts
+         run: |
+           cp LICENSE ./build/bin/
+-          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-${{ matrix.chip_type }}-openEuler-${{ matrix.arch }}${{ matrix.use_acl_graph == 'on' && '-aclgraph' || '' }}.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+-
 +          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda12.8-DGXSpark-aarch64-sm100.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
        - name: Upload artifacts
          uses: actions/upload-artifact@v6
@@ -1481,6 +1552,7 @@ index f1cc12cd4..a9d327a4f 100644
 -      - ubuntu-cpu
 -      - ubuntu-vulkan
 -      - ubuntu-24-openvino
+-      - ubuntu-24-sycl
 -      - android-arm64
 -      - macOS-cpu
 -      - ios-xcode-build
@@ -1524,6 +1596,22 @@ index f1cc12cd4..a9d327a4f 100644
 +          mv ./artifact/*.tar.gz ./artifact/release/ 2>/dev/null || true
 +          mv ./artifact/*.zip ./artifact/release/ 2>/dev/null || true
 +          ls -la ./artifact/release/
++
++      # Upload binaries to the LATEST existing semver release (e.g. v1.5.3).
++      # The release itself is created manually by the maintainer; this workflow
++      # only attaches freshly-built binaries. NEVER creates a new release or tag.
++      - name: Find latest semver release
++        id: latest
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          TAG=$(gh release list --repo ${{ github.repository }} --limit 20 --json tagName --jq '[.[].tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0]')
++          if [ -z "$TAG" ]; then
++            echo "ERROR: no semver release (v*.*.*) found — create one manually first with 'gh release create v1.x.y ...'"
++            exit 1
++          fi
++          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
++          echo "Uploading to existing release: $TAG"
  
 -          echo "Adding CPU backend files to existing zips..."
 -          for arch in x64 arm64; do
@@ -1560,11 +1648,7 @@ index f1cc12cd4..a9d327a4f 100644
 -      - name: Create release
 -        id: create_release
 -        uses: ggml-org/action-create-release@v1
-+      # Upload binaries to the LATEST existing semver release (e.g. v1.5.3).
-+      # The release itself is created manually by the maintainer; this workflow
-+      # only attaches freshly-built binaries. NEVER creates a new release or tag.
-+      - name: Find latest semver release
-+        id: latest
++      - name: Upload binaries to latest release
          env:
 -          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 -        with:
@@ -1590,6 +1674,8 @@ index f1cc12cd4..a9d327a4f 100644
 -            - [Ubuntu arm64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-arm64.tar.gz)
 -            - [Ubuntu x64 (ROCm 7.2)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-rocm-7.2-x64.tar.gz)
 -            - [Ubuntu x64 (OpenVINO)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-openvino-${{ needs.ubuntu-24-openvino.outputs.openvino_version }}-x64.tar.gz)
+-            - [Ubuntu x64 (SYCL FP32)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-fp32-x64.tar.gz)
+-            - [Ubuntu x64 (SYCL FP16)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-fp16-x64.tar.gz)
 -
 -            **Android:**
 -            - [Android arm64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-android-arm64.tar.gz)
@@ -1608,16 +1694,7 @@ index f1cc12cd4..a9d327a4f 100644
 -            - [openEuler x86 (910b, ACL Graph)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-910b-openEuler-x86-aclgraph.tar.gz)
 -            - [openEuler aarch64 (310p)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-310p-openEuler-aarch64.tar.gz)
 -            - [openEuler aarch64 (910b, ACL Graph)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-910b-openEuler-aarch64-aclgraph.tar.gz)
-+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-+        run: |
-+          TAG=$(gh release list --repo ${{ github.repository }} --limit 20 --json tagName --jq '[.[].tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0]')
-+          if [ -z "$TAG" ]; then
-+            echo "ERROR: no semver release (v*.*.*) found — create one manually first with 'gh release create v1.x.y ...'"
-+            exit 1
-+          fi
-+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-+          echo "Uploading to existing release: $TAG"
- 
+-
 -      - name: Upload release
 -        id: upload_release
 -        uses: actions/github-script@v8
@@ -1639,8 +1716,6 @@ index f1cc12cd4..a9d327a4f 100644
 -                });
 -              }
 -            }
-+      - name: Upload binaries to latest release
-+        env:
 +          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 +        run: |
 +          cd ./artifact/release

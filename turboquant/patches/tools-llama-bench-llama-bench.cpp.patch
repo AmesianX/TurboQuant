@@ -1,8 +1,6 @@
-diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
-index e21a80e69..604be1c53 100644
---- a/tools/llama-bench/llama-bench.cpp
-+++ b/tools/llama-bench/llama-bench.cpp
-@@ -493,6 +493,24 @@ static ggml_type ggml_type_from_name(const std::string & s) {
+--- -	2026-04-26 16:06:36.018688360 +0900
++++ tools/llama-bench/llama-bench.cpp	2026-04-22 14:29:10.776311929 +0900
+@@ -493,6 +493,24 @@
      if (s == "iq4_nl") {
          return GGML_TYPE_IQ4_NL;
      }

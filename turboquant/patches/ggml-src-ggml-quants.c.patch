@@ -1,8 +1,6 @@
-diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 15443aa55..2fe7f6383 100644
---- a/ggml/src/ggml-quants.c
-+++ b/ggml/src/ggml-quants.c
-@@ -2407,6 +2407,82 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
+--- -	2026-04-26 16:06:35.959212476 +0900
++++ ggml/src/ggml-quants.c	2026-04-21 02:38:32.924541214 +0900
+@@ -2407,6 +2407,82 @@
      }
  }
  

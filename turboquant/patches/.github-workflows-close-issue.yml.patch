@@ -1,8 +1,6 @@
-diff --git a/.github/workflows/close-issue.yml b/.github/workflows/close-issue.yml
-index 4698cee55..ec3df08b2 100644
---- a/.github/workflows/close-issue.yml
-+++ b/.github/workflows/close-issue.yml
-@@ -17,7 +17,7 @@ jobs:
+--- -	2026-04-26 16:06:35.945348594 +0900
++++ .github/workflows/close-issue.yml	2026-04-21 02:31:36.890758245 +0900
+@@ -17,7 +17,7 @@
      steps:
        - uses: actions/stale@v10
          with:

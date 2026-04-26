@@ -1,8 +1,6 @@
-diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 0b62dc7b2..f6a81df9a 100644
---- a/src/llama-kv-cache.h
-+++ b/src/llama-kv-cache.h
-@@ -152,6 +152,10 @@ public:
+--- -	2026-04-26 16:06:35.874489061 +0900
++++ src/llama-kv-cache.h	2026-04-21 02:44:24.229321838 +0900
+@@ -152,6 +152,10 @@
  
      bool get_has_shift() const;
  

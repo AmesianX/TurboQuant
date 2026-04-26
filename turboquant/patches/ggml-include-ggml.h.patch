@@ -1,8 +1,6 @@
-diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 703e37831..81100afe2 100644
---- a/ggml/include/ggml.h
-+++ b/ggml/include/ggml.h
-@@ -429,7 +429,29 @@ extern "C" {
+--- -	2026-04-26 16:06:35.998113101 +0900
++++ ggml/include/ggml.h	2026-04-21 02:44:24.225321805 +0900
+@@ -429,7 +429,29 @@
          GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
          GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
          GGML_TYPE_Q1_0    = 41,
@@ -33,7 +31,7 @@ index 703e37831..81100afe2 100644
      };
  
      // precision
-@@ -2405,6 +2427,13 @@ extern "C" {
+@@ -2405,6 +2427,13 @@
              struct ggml_tensor * a,
              struct ggml_tensor * sinks);
  

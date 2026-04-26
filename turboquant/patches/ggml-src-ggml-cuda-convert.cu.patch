@@ -1,8 +1,6 @@
-diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
-index 61630a35a..2ca08ff48 100644
---- a/ggml/src/ggml-cuda/convert.cu
-+++ b/ggml/src/ggml-cuda/convert.cu
-@@ -698,6 +698,322 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
+--- -	2026-04-26 16:06:36.066616355 +0900
++++ ggml/src/ggml-cuda/convert.cu	2026-04-21 02:38:32.921541191 +0900
+@@ -698,6 +698,322 @@
      convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
  }
  
@@ -325,7 +323,7 @@ index 61630a35a..2ca08ff48 100644
  to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
      switch (type) {
          case GGML_TYPE_F32:
-@@ -762,11 +1078,24 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+@@ -762,11 +1078,24 @@
              return convert_unary_cont_cuda<float>;
          case GGML_TYPE_BF16:
              return convert_unary_cont_cuda<nv_bfloat16>;

@@ -1,8 +1,6 @@
-diff --git a/.github/workflows/build-self-hosted.yml b/.github/workflows/build-self-hosted.yml
-index e9148dd73..eeea820ba 100644
---- a/.github/workflows/build-self-hosted.yml
-+++ b/.github/workflows/build-self-hosted.yml
-@@ -97,36 +97,6 @@ jobs:
+--- -	2026-04-26 16:06:35.933787216 +0900
++++ .github/workflows/build-self-hosted.yml	2026-04-21 02:31:36.877758120 +0900
+@@ -97,36 +97,6 @@
            vulkaninfo --summary
            GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
  
@@ -39,7 +37,7 @@ index e9148dd73..eeea820ba 100644
    # TODO: provision AMX-compatible machine
    #ggml-ci-cpu-amx:
    #  runs-on: [self-hosted, Linux, CPU, AMX]
-@@ -171,59 +141,61 @@ jobs:
+@@ -171,59 +141,61 @@
    #         amd-smi static
    #         GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
  
@@ -154,7 +152,7 @@ index e9148dd73..eeea820ba 100644
  
    ggml-ci-linux-intel-vulkan:
      runs-on: [self-hosted, Linux, Intel]
-@@ -265,10 +237,6 @@ jobs:
+@@ -265,10 +237,6 @@
    ggml-ci-intel-openvino-gpu-low-perf:
      runs-on: [self-hosted, Linux, Intel, OpenVINO]
  

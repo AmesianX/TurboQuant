@@ -1,8 +1,6 @@
-diff --git a/common/common.h b/common/common.h
-index 4137a87f1..3737b370b 100644
---- a/common/common.h
-+++ b/common/common.h
-@@ -537,6 +537,11 @@ struct common_params {
+--- -	2026-04-26 16:06:35.855273239 +0900
++++ common/common.h	2026-04-26 15:16:47.872559926 +0900
+@@ -538,6 +538,11 @@
      ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
      ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
  

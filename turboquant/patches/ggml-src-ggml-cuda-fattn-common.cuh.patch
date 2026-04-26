@@ -1,8 +1,6 @@
-diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index beeb52389..ff092765f 100644
---- a/ggml/src/ggml-cuda/fattn-common.cuh
-+++ b/ggml/src/ggml-cuda/fattn-common.cuh
-@@ -39,7 +39,13 @@ typedef void (* fattn_kernel_t)(
+--- -	2026-04-26 16:06:36.078843516 +0900
++++ ggml/src/ggml-cuda/fattn-common.cuh	2026-04-21 02:44:24.226321813 +0900
+@@ -39,7 +39,13 @@
                              const int32_t nb11, const int32_t nb12, const int64_t nb13,
                              const int32_t nb21, const int32_t nb22, const int64_t nb23,
                              const int32_t ne31, const int32_t ne32, const int32_t ne33,
@@ -17,7 +15,7 @@ index beeb52389..ff092765f 100644
  
  typedef float (*vec_dot_KQ_t)(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
-@@ -577,10 +583,1362 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
+@@ -577,10 +583,1362 @@
      }
  }
  
@@ -1380,7 +1378,7 @@ index beeb52389..ff092765f 100644
      } else if constexpr (type_K == GGML_TYPE_Q4_0) {
          return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
      } else if constexpr (type_K == GGML_TYPE_Q4_1) {
-@@ -615,6 +1973,32 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
+@@ -615,6 +1973,32 @@
          return dequantize_V_q8_0<T, ne>;
      } else if constexpr (type_V == GGML_TYPE_BF16) {
          return dequantize_V_bf16<float, ne>;
@@ -1413,7 +1411,7 @@ index beeb52389..ff092765f 100644
      } else {
          static_assert(type_V == -1, "bad type");
          return nullptr;
-@@ -929,6 +2313,10 @@ void launch_fattn(
+@@ -929,6 +2313,10 @@
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
  
@@ -1424,7 +1422,7 @@ index beeb52389..ff092765f 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -953,10 +2341,17 @@ void launch_fattn(
+@@ -953,10 +2341,17 @@
      ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
  
      const char * K_data = (const char *) K->data;
@@ -1442,17 +1440,17 @@ index beeb52389..ff092765f 100644
      const char * V_data = (const char *) V->data;
      size_t nb21 = V->nb[1];
      size_t nb22 = V->nb[2];
-@@ -965,11 +2360,22 @@ void launch_fattn(
+@@ -965,11 +2360,22 @@
      if (need_f16_K && K->type != GGML_TYPE_F16) {
          const size_t bs = ggml_blck_size(K->type);
          const size_t ts = ggml_type_size(K->type);
 +        const int64_t k_elems = ggml_nelements(K);
-+
-+        // TBQP: K_mse only (1x). QJL correction computed as scalar from raw block data.
-+        K_f16.alloc(k_elems);
  
 -        K_f16.alloc(ggml_nelements(K));
 -        if (ggml_is_contiguously_allocated(K)) {
++        // TBQP: K_mse only (1x). QJL correction computed as scalar from raw block data.
++        K_f16.alloc(k_elems);
++
 +        if (tbqp_wht_mode) {
 +            // TBQP: K_mse WHT f16 (no QJL). QJL applied as scalar correction in MMA kernel.
 +            // to_fp16 already registered as MSE-only WHT dequant for TBQP types.
@@ -1468,7 +1466,7 @@ index beeb52389..ff092765f 100644
  
              nb11 = nb11*bs*sizeof(half)/ts;
              nb12 = nb12*bs*sizeof(half)/ts;
-@@ -986,11 +2392,14 @@ void launch_fattn(
+@@ -986,11 +2392,14 @@
              nb12 = K->ne[1] * nb11;
              nb13 = K->ne[2] * nb12;
          }
@@ -1483,7 +1481,7 @@ index beeb52389..ff092765f 100644
              V_data = K_data;
              nb21   = nb11;
              nb22   = nb12;
-@@ -1024,6 +2433,24 @@ void launch_fattn(
+@@ -1024,6 +2433,24 @@
          }
      }
  
@@ -1508,7 +1506,7 @@ index beeb52389..ff092765f 100644
      const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
      const int gqa_ratio    = Q->ne[2] / K->ne[2];
      const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
-@@ -1145,7 +2572,12 @@ void launch_fattn(
+@@ -1145,7 +2572,12 @@
      // TODO other tensor dimensions after removal of WMMA kernel:
      const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
  
@@ -1521,7 +1519,7 @@ index beeb52389..ff092765f 100644
      fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
          (const char *) Q->data,
          K_data,
-@@ -1159,7 +2591,13 @@ void launch_fattn(
+@@ -1159,7 +2591,13 @@
          K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
          nb21, nb22, nb23,
          mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
@@ -1536,7 +1534,7 @@ index beeb52389..ff092765f 100644
      );
      CUDA_CHECK(cudaGetLastError());
  
-@@ -1209,4 +2647,7 @@ void launch_fattn(
+@@ -1209,4 +2647,7 @@
              (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
      }
      CUDA_CHECK(cudaGetLastError());

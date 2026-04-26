@@ -1,0 +1,14 @@
+--- -	2026-04-26 16:06:36.010925019 +0900
++++ tools/server/server-context.cpp	2026-04-26 15:16:47.908560036 +0900
+@@ -762,6 +762,11 @@
+             return false;
+         }
+ 
++        if (ctx == nullptr) {
++            SRV_ERR("failed to create context, '%s'\n", params_base.model.path.c_str());
++            return false;
++        }
++
+         vocab = llama_model_get_vocab(model);
+ 
+         n_ctx = llama_n_ctx(ctx);

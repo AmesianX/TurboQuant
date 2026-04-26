@@ -1,8 +1,6 @@
-diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
-index a7d4e0ea2..3277d737b 100644
---- a/ggml/src/ggml-hip/CMakeLists.txt
-+++ b/ggml/src/ggml-hip/CMakeLists.txt
-@@ -79,7 +79,117 @@ else()
+--- -	2026-04-26 16:06:36.137090012 +0900
++++ ggml/src/ggml-hip/CMakeLists.txt	2026-04-21 02:38:32.924541214 +0900
+@@ -79,7 +79,117 @@
          ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
          ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
          ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu

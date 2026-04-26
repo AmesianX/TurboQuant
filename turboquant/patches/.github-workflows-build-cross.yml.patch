@@ -1,8 +1,6 @@
-diff --git a/.github/workflows/build-cross.yml b/.github/workflows/build-cross.yml
-index aef45afde..74508129a 100644
---- a/.github/workflows/build-cross.yml
-+++ b/.github/workflows/build-cross.yml
-@@ -246,7 +246,6 @@ jobs:
+--- -	2026-04-26 16:06:35.939135957 +0900
++++ .github/workflows/build-cross.yml	2026-04-21 02:31:36.866758015 +0900
+@@ -246,7 +246,6 @@
            apt-get install -y --no-install-recommends \
                    build-essential \
                    glslc \

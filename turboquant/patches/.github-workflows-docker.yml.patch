@@ -1,8 +1,6 @@
-diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
-index a5bae7141..5d30b6a03 100644
---- a/.github/workflows/docker.yml
-+++ b/.github/workflows/docker.yml
-@@ -26,10 +26,11 @@ permissions:
+--- -	2026-04-26 16:06:35.909685937 +0900
++++ .github/workflows/docker.yml	2026-04-21 02:31:36.895758293 +0900
+@@ -26,10 +26,11 @@
  
  jobs:
    create_tag:
@@ -17,7 +15,7 @@ index a5bae7141..5d30b6a03 100644
      outputs:
        source_tag: ${{ steps.srctag.outputs.name }}
  
-@@ -46,13 +47,6 @@ jobs:
+@@ -46,13 +47,6 @@
          env:
            BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
  

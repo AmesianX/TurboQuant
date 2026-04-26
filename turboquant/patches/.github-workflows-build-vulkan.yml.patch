@@ -1,8 +1,6 @@
-diff --git a/.github/workflows/build-vulkan.yml b/.github/workflows/build-vulkan.yml
-index ab32b6525..de38bb2db 100644
---- a/.github/workflows/build-vulkan.yml
-+++ b/.github/workflows/build-vulkan.yml
-@@ -93,5 +93,4 @@ jobs:
+--- -	2026-04-26 16:06:35.921023905 +0900
++++ .github/workflows/build-vulkan.yml	2026-04-21 02:31:36.881758159 +0900
+@@ -93,5 +93,4 @@
            export GGML_VK_DISABLE_F16=1
            export GGML_VK_DISABLE_COOPMAT=1
            # This is using llvmpipe and runs slower than other backends

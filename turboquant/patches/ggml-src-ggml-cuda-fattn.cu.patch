@@ -1,8 +1,6 @@
-diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index ea6607cd3..85260457b 100644
---- a/ggml/src/ggml-cuda/fattn.cu
-+++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -224,13 +224,145 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
+--- -	2026-04-26 16:06:36.110540742 +0900
++++ ggml/src/ggml-cuda/fattn.cu	2026-04-21 02:44:24.227321821 +0900
+@@ -224,13 +224,145 @@
      FATTN_VEC_CASE(128, type_K, type_V)       \
      FATTN_VEC_CASE(256, type_K, type_V)       \
  
@@ -149,7 +147,7 @@ index ea6607cd3..85260457b 100644
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_F16)
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_F16)
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_F16)
-@@ -285,11 +417,328 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+@@ -285,11 +417,328 @@
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
@@ -478,7 +476,7 @@ index ea6607cd3..85260457b 100644
  #endif // GGML_CUDA_FA_ALL_QUANTS
  
      GGML_ABORT("fatal error");
-@@ -356,7 +805,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -356,7 +805,10 @@
              if (V->ne[0] != K->ne[0]) {
                  return BEST_FATTN_KERNEL_NONE;
              }
@@ -490,7 +488,7 @@ index ea6607cd3..85260457b 100644
                  return BEST_FATTN_KERNEL_NONE;
              }
              break;
-@@ -374,7 +826,31 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -374,7 +826,31 @@
  
  #ifndef GGML_CUDA_FA_ALL_QUANTS
      if (K->type != V->type) {
@@ -523,7 +521,7 @@ index ea6607cd3..85260457b 100644
      }
  #endif // GGML_CUDA_FA_ALL_QUANTS
  
-@@ -391,6 +867,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -391,6 +867,28 @@
          case GGML_TYPE_Q4_0:
          case GGML_TYPE_Q8_0:
          case GGML_TYPE_BF16:
@@ -552,7 +550,7 @@ index ea6607cd3..85260457b 100644
              break;
          default:
              return BEST_FATTN_KERNEL_NONE;
-@@ -400,6 +898,51 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -400,6 +898,51 @@
          return BEST_FATTN_KERNEL_NONE;
      }
  
@@ -604,7 +602,7 @@ index ea6607cd3..85260457b 100644
      // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
      const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
  
-@@ -411,6 +954,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -411,6 +954,18 @@
                      return BEST_FATTN_KERNEL_VEC;
                  }
              } else {

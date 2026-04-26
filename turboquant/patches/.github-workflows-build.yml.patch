@@ -1,8 +1,6 @@
-diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
-index c7f00e359..f4ae36756 100644
---- a/.github/workflows/build.yml
-+++ b/.github/workflows/build.yml
-@@ -267,56 +267,6 @@ jobs:
+--- -	2026-04-26 16:06:35.927246991 +0900
++++ .github/workflows/build.yml	2026-04-21 02:31:36.884758187 +0900
+@@ -267,56 +267,6 @@
            wget https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K-be.gguf
            ./bin/llama-completion -m stories260K-be.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
  
@@ -59,7 +57,7 @@ index c7f00e359..f4ae36756 100644
    ubuntu-latest-rpc:
      runs-on: ubuntu-latest
  
-@@ -368,7 +318,7 @@ jobs:
+@@ -368,7 +318,7 @@
          id: depends
          run: |
            sudo apt-get update
@@ -68,10 +66,111 @@ index c7f00e359..f4ae36756 100644
            echo "CC=gcc-14" >> "$GITHUB_ENV"
            echo "CXX=g++-14" >> "$GITHUB_ENV"
  
-@@ -656,6 +606,86 @@ jobs:
-             -DGGML_SYCL_F16=ON
+@@ -555,6 +505,186 @@
+             -DGGML_MUSA=ON
            time cmake --build build --config Release -j $(nproc)
  
++  ubuntu-22-sycl:
++    runs-on: ubuntu-22.04
++
++    continue-on-error: true
++
++    steps:
++      - uses: actions/checkout@v6
++
++      - name: add oneAPI to apt
++        shell: bash
++        run: |
++          cd /tmp
++          wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
++          sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
++          rm GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
++          sudo add-apt-repository "deb https://apt.repos.intel.com/oneapi all main"
++
++      - name: install oneAPI dpcpp compiler
++        shell: bash
++        run: |
++          sudo apt update
++          sudo apt install intel-oneapi-compiler-dpcpp-cpp libssl-dev
++
++      - name: install oneAPI MKL library
++        shell: bash
++        run: |
++          sudo apt install intel-oneapi-mkl-devel
++
++      - name: Clone
++        id: checkout
++        uses: actions/checkout@v6
++
++      - name: ccache
++        uses: ggml-org/ccache-action@v1.2.21
++        with:
++          key: ubuntu-22-sycl
++          evict-old-files: 1d
++          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
++
++      - name: Build
++        id: cmake_build
++        run: |
++          source /opt/intel/oneapi/setvars.sh
++          cmake -B build \
++            -DGGML_SYCL=ON \
++            -DCMAKE_C_COMPILER=icx \
++            -DCMAKE_CXX_COMPILER=icpx
++          time cmake --build build --config Release -j $(nproc)
++
++  ubuntu-22-sycl-fp16:
++    runs-on: ubuntu-22.04
++
++    continue-on-error: true
++
++    steps:
++      - uses: actions/checkout@v6
++
++      - name: add oneAPI to apt
++        shell: bash
++        run: |
++          cd /tmp
++          wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
++          sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
++          rm GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
++          sudo add-apt-repository "deb https://apt.repos.intel.com/oneapi all main"
++
++      - name: install oneAPI dpcpp compiler
++        shell: bash
++        run: |
++          sudo apt update
++          sudo apt install intel-oneapi-compiler-dpcpp-cpp libssl-dev ninja-build
++
++      - name: install oneAPI MKL library
++        shell: bash
++        run: |
++          sudo apt install intel-oneapi-mkl-devel
++
++      - name: Clone
++        id: checkout
++        uses: actions/checkout@v6
++
++      - name: ccache
++        uses: ggml-org/ccache-action@v1.2.21
++        with:
++          key: ubuntu-22-sycl-fp16
++          evict-old-files: 1d
++          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
++
++      - name: Build
++        id: cmake_build
++        run: |
++          source /opt/intel/oneapi/setvars.sh
++          cmake -B build \
++            -G "Ninja" \
++            -DCMAKE_BUILD_TYPE=Release \
++            -DGGML_SYCL=ON \
++            -DCMAKE_C_COMPILER=icx \
++            -DCMAKE_CXX_COMPILER=icpx \
++            -DGGML_SYCL_F16=ON
++          time cmake --build build --config Release -j $(nproc)
++
 +  ubuntu-24-openvino:
 +      name: ubuntu-24-openvino-${{ matrix.openvino_device }}
 +      strategy:
@@ -151,11 +250,50 @@ index c7f00e359..f4ae36756 100644
 +              export GGML_OPENVINO_DEVICE=GPU
 +            fi
 +            ctest --test-dir build/ReleaseOV -L main -E "test-llama-archs" --verbose --timeout 2000
-+
+ 
    windows-latest:
      runs-on: windows-2025
+@@ -763,6 +893,39 @@
+           cmake --build build --config Release -j %NINJA_JOBS% -t ggml
+           cmake --build build --config Release
  
-@@ -971,14 +1001,22 @@ jobs:
++  windows-latest-sycl:
++    runs-on: windows-2022
++
++    defaults:
++      run:
++        shell: bash
++
++    env:
++      WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/24751ead-ddc5-4479-b9e6-f9fe2ff8b9f2/intel-deep-learning-essentials-2025.2.1.25_offline.exe
++      WINDOWS_DPCPP_MKL: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel
++      ONEAPI_ROOT: "C:/Program Files (x86)/Intel/oneAPI"
++    steps:
++      - name: Clone
++        id: checkout
++        uses: actions/checkout@v6
++
++      - name: ccache
++        uses: ggml-org/ccache-action@v1.2.21
++        with:
++          key: windows-latest-sycl
++          variant: ccache
++          evict-old-files: 1d
++          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
++
++      - name: Install
++        run:  |
++          scripts/install-oneapi.bat $WINDOWS_BASEKIT_URL $WINDOWS_DPCPP_MKL
++
++      # TODO: add ssl support ; we will also need to modify win-build-sycl.bat to accept user-specified args
++
++      - name: Build
++        id: cmake_build
++        run:  examples/sycl/win-build-sycl.bat
+ 
+   windows-latest-hip:
+     runs-on: windows-2022
+@@ -838,14 +1001,22 @@
      steps:
        - name: Install dependencies
          run: |
@@ -180,7 +318,7 @@ index c7f00e359..f4ae36756 100644
            git lfs install
  
        - name: Check environment
-@@ -994,12 +1032,13 @@ jobs:
+@@ -861,12 +1032,13 @@
          id: checkout
          uses: actions/checkout@v6
  

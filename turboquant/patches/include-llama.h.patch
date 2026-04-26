@@ -1,8 +1,6 @@
-diff --git a/include/llama.h b/include/llama.h
-index eb8698140..c9275e1be 100644
---- a/include/llama.h
-+++ b/include/llama.h
-@@ -511,6 +511,24 @@ extern "C" {
+--- -	2026-04-26 16:06:35.892791370 +0900
++++ include/llama.h	2026-04-22 14:33:51.736186166 +0900
+@@ -511,6 +511,24 @@
      // Frees all allocated memory
      LLAMA_API void llama_free(struct llama_context * ctx);
  

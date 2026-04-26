@@ -1,8 +1,6 @@
-diff --git a/.github/workflows/build-riscv.yml b/.github/workflows/build-riscv.yml
-index b78b13140..9733dbaa7 100644
---- a/.github/workflows/build-riscv.yml
-+++ b/.github/workflows/build-riscv.yml
-@@ -47,10 +47,22 @@ jobs:
+--- -	2026-04-26 16:06:35.898062398 +0900
++++ .github/workflows/build-riscv.yml	2026-04-21 02:31:36.871758063 +0900
+@@ -47,10 +47,22 @@
      steps:
        - name: Install dependencies
          run: |
@@ -25,7 +23,7 @@ index b78b13140..9733dbaa7 100644
            git lfs install
  
        - name: GCC version check
-@@ -62,12 +74,12 @@ jobs:
+@@ -62,12 +74,12 @@
          id: checkout
          uses: actions/checkout@v6
  

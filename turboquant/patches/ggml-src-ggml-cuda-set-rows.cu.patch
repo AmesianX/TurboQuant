@@ -1,7 +1,5 @@
-diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
-index 631de7e8f..cf154c427 100644
---- a/ggml/src/ggml-cuda/set-rows.cu
-+++ b/ggml/src/ggml-cuda/set-rows.cu
+--- -	2026-04-26 16:06:36.040813555 +0900
++++ ggml/src/ggml-cuda/set-rows.cu	2026-04-21 02:56:51.823004863 +0900
 @@ -1,6 +1,29 @@
  #include "set-rows.cuh"
  #include "cpy-utils.cuh"
@@ -32,7 +30,7 @@ index 631de7e8f..cf154c427 100644
  typedef void (*set_rows_kernel_t)(const char * src, char * dst);
  
  // Generic quantized set_rows kernel template
-@@ -69,6 +92,353 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
+@@ -69,6 +92,353 @@
      GGML_UNUSED(ne13);
  }
  
@@ -386,7 +384,7 @@ index 631de7e8f..cf154c427 100644
  // Template dispatch function for quantized set_rows
  template<typename idx_t, typename block_type, int qk, void (*quantize_func)(const float*, block_type*)>
  static void set_rows_cuda_quant(
-@@ -109,6 +479,349 @@ static void set_rows_cuda_quant(
+@@ -109,6 +479,349 @@
      }
  }
  
@@ -736,7 +734,7 @@ index 631de7e8f..cf154c427 100644
  template <typename src_t, typename idx_t, typename dst_t>
  static __global__ void k_set_rows(const src_t * __restrict__ src0,
                                    const idx_t * __restrict__ src1,
-@@ -309,6 +1022,205 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+@@ -309,6 +1022,205 @@
              nb1, nb2, nb3,
              stream
          );
