@@ -206,12 +206,12 @@ __device__ __forceinline__ float tria_block_sum(float v, float * shm, int n_warp
     const int tid  = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffffffffffULL, v, off);
     if (lane == 0) shm[warp] = v;
     __syncthreads();
     if (warp == 0) {
         float acc = (lane < n_warps) ? shm[lane] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffffffffffULL, acc, off);
         if (lane == 0) shm[0] = acc;
     }
     __syncthreads();
@@ -304,7 +304,7 @@ __global__ void tria_znorm_kernel(
     for (int s = tid; s < n_kv; s += bw) local_sum += row[s];
 
     __shared__ float shm[8];
-    for (int off = 16; off > 0; off >>= 1) local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
+    for (int off = 16; off > 0; off >>= 1) local_sum += __shfl_down_sync(0xffffffffffffffffULL, local_sum, off);
     const int warp_id = tid >> 5;
     const int lane    = tid & 31;
     if (lane == 0) shm[warp_id] = local_sum;
@@ -312,7 +312,7 @@ __global__ void tria_znorm_kernel(
 
     if (tid < 8) {
         float block_sum = (tid < bw / 32) ? shm[tid] : 0.0f;
-        for (int off = 4; off > 0; off >>= 1) block_sum += __shfl_down_sync(0xff, block_sum, off);
+        for (int off = 4; off > 0; off >>= 1) block_sum += __shfl_down_sync(0xffULL, block_sum, off);
         if (tid == 0) shm[0] = block_sum / (float)n_kv;
     }
     __syncthreads();
@@ -323,13 +323,13 @@ __global__ void tria_znorm_kernel(
         const float d = row[s] - mean;
         local_var += d * d;
     }
-    for (int off = 16; off > 0; off >>= 1) local_var += __shfl_down_sync(0xffffffff, local_var, off);
+    for (int off = 16; off > 0; off >>= 1) local_var += __shfl_down_sync(0xffffffffffffffffULL, local_var, off);
     if (lane == 0) shm[warp_id] = local_var;
     __syncthreads();
 
     if (tid < 8) {
         float block_sum = (tid < bw / 32) ? shm[tid] : 0.0f;
-        for (int off = 4; off > 0; off >>= 1) block_sum += __shfl_down_sync(0xff, block_sum, off);
+        for (int off = 4; off > 0; off >>= 1) block_sum += __shfl_down_sync(0xffULL, block_sum, off);
         if (tid == 0) {
             float std = sqrtf(block_sum / (float)n_kv);
             if (std < 1e-6f) std = 1e-6f;
