@@ -43,6 +43,7 @@ static __global__ void flash_attn_ext_vec(
         const char * __restrict__ raw_K_data, const int32_t raw_K_stride,
         const char * __restrict__ Q_wht2_data, const int32_t Q_wht2_stride,
         const char * __restrict__ k_rope_data, const int32_t k_rope_stride) {
+    ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
 
     // Skip unused kernel variants for faster compilation:
@@ -165,6 +166,9 @@ static __global__ void flash_attn_ext_vec(
         ? (D/2)/nthreads_KQ
         : (1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ));
     float2  Q_ds[ncols][Q_ds_size];
+
+    ggml_cuda_pdl_sync();
+
     if constexpr (Q_q8_1) {
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
