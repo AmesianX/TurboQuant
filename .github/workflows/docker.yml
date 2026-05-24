@@ -154,7 +154,7 @@ jobs:
           set -euo pipefail
 
           REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
-          REPO_NAME="${{ github.event.repository.name }}"
+          REPO_NAME="${GITHUB_REPOSITORY_NAME@L}"   # to lower case (ghcr.io requires lowercase)
           IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
           PREFIX="${IMAGE_REPO}:"
           PLATFORM="${{ matrix.config.platforms }}"
@@ -180,6 +180,7 @@ jobs:
           echo "cache_output_tag=$CACHETAG"  # print out for debugging
         env:
           GITHUB_REPOSITORY_OWNER: '${{ github.repository_owner }}'
+          GITHUB_REPOSITORY_NAME: '${{ github.event.repository.name }}'
 
       - name: Free Disk Space (Ubuntu)
         if: ${{ matrix.config.free_disk_space == true }}
@@ -351,7 +352,7 @@ jobs:
           set -euo pipefail
 
           REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
-          REPO_NAME="${{ github.event.repository.name }}"
+          REPO_NAME="${GITHUB_REPOSITORY_NAME@L}"   # to lower case (ghcr.io requires lowercase)
           IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
           PREFIX="${IMAGE_REPO}:"
           SRC_TAG="${{ needs.create_tag.outputs.source_tag }}"
@@ -434,3 +435,4 @@ jobs:
           done
         env:
           GITHUB_REPOSITORY_OWNER: '${{ github.repository_owner }}'
+          GITHUB_REPOSITORY_NAME: '${{ github.event.repository.name }}'
