@@ -67,14 +67,16 @@ jobs:
           # ggml-cuda path (which also covers ggml-hip via hipify).
           cat > build-matrix.json <<'JSON'
           [
-            { "tag": "cuda12-sm70",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "70",  "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda12-sm80",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "80",  "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda12-sm86",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "86",  "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda12-sm89",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "89",  "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda12-sm90",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "90",  "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12-sm70",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "70",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12-sm80",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "80",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12-sm86",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "86",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12-sm89",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "89",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12-sm90",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "90",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12-sm100", "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "100",  "platforms": "linux/arm64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04-arm" },
+            { "tag": "cuda12-sm120", "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "120",  "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
             { "tag": "cuda13-sm100", "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "13.1.1", "cuda_arch": "100a", "platforms": "linux/arm64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04-arm" },
             { "tag": "cuda13-sm120", "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "13.1.1", "cuda_arch": "120a", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "rocm",         "dockerfile": ".devops/rocm.Dockerfile",                                               "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" }
+            { "tag": "rocm",         "dockerfile": ".devops/rocm.Dockerfile",                                                "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" }
           ]
           JSON
 
