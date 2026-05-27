@@ -67,11 +67,11 @@ jobs:
           # ggml-cuda path (which also covers ggml-hip via hipify).
           cat > build-matrix.json <<'JSON'
           [
-            { "tag": "cuda12.4-sm70",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "cuda_arch": "70",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda12.4-sm80",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "cuda_arch": "80",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda12.4-sm86",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "cuda_arch": "86",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda12.4-sm89",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "cuda_arch": "89",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda12.4-sm90",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "cuda_arch": "90",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12.4-sm70",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "gcc_version": "12", "cuda_arch": "70",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12.4-sm80",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "gcc_version": "12", "cuda_arch": "80",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12.4-sm86",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "gcc_version": "12", "cuda_arch": "86",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12.4-sm89",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "gcc_version": "12", "cuda_arch": "89",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
+            { "tag": "cuda12.4-sm90",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.4.1", "ubuntu_version": "22.04", "gcc_version": "12", "cuda_arch": "90",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
             { "tag": "cuda12.8-sm70",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "70",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
             { "tag": "cuda12.8-sm80",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "80",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
             { "tag": "cuda12.8-sm86",  "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "cuda_arch": "86",   "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
@@ -232,6 +232,7 @@ jobs:
             ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
             ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
             ${{ matrix.config.cuda_arch && format('CUDA_DOCKER_ARCH={0}', matrix.config.cuda_arch) || '' }}
+            ${{ matrix.config.gcc_version && format('GCC_VERSION={0}', matrix.config.gcc_version) || '' }}
           # using github experimental cache
           #cache-from: type=gha
           #cache-to: type=gha,mode=max
@@ -257,6 +258,7 @@ jobs:
             ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
             ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
             ${{ matrix.config.cuda_arch && format('CUDA_DOCKER_ARCH={0}', matrix.config.cuda_arch) || '' }}
+            ${{ matrix.config.gcc_version && format('GCC_VERSION={0}', matrix.config.gcc_version) || '' }}
           # using github experimental cache
           #cache-from: type=gha
           #cache-to: type=gha,mode=max
@@ -282,6 +284,7 @@ jobs:
             ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
             ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
             ${{ matrix.config.cuda_arch && format('CUDA_DOCKER_ARCH={0}', matrix.config.cuda_arch) || '' }}
+            ${{ matrix.config.gcc_version && format('GCC_VERSION={0}', matrix.config.gcc_version) || '' }}
           # using github experimental cache
           #cache-from: type=gha
           #cache-to: type=gha,mode=max

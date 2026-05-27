@@ -15,13 +15,14 @@ FROM ${BASE_CUDA_DEV_CONTAINER} AS build
 # CUDA architecture to build for (defaults to all supported archs)
 ARG CUDA_DOCKER_ARCH=default
 
-RUN apt-get update && \
-    apt-get install -y software-properties-common && \
-    add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
-    apt-get update && \
-    apt-get install -y gcc-14 g++-14 build-essential cmake python3 python3-pip git libssl-dev libgomp1
+# CUDA 12.4 supports gcc up to 13 (use gcc-12, default on Ubuntu 22.04).
+# CUDA 12.8 and 13.x support gcc 14 (in Ubuntu 24.04 default repos).
+ARG GCC_VERSION=14
 
-ENV CC=gcc-14 CXX=g++-14 CUDAHOSTCXX=g++-14
+RUN apt-get update && \
+    apt-get install -y gcc-${GCC_VERSION} g++-${GCC_VERSION} build-essential cmake python3 python3-pip git libssl-dev libgomp1
+
+ENV CC=gcc-${GCC_VERSION} CXX=g++-${GCC_VERSION} CUDAHOSTCXX=g++-${GCC_VERSION}
 
 WORKDIR /app
 
