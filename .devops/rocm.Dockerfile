@@ -38,7 +38,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+RUN HIPCXX="$(hipconfig -l)/clang++" HIP_PATH="$(hipconfig -R)" \
     cmake -S . -B build \
         -DGGML_HIP=ON \
         -DGGML_HIP_ROCWMMA_FATTN=ON \
