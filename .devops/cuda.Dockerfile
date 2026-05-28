@@ -85,9 +85,8 @@ RUN apt-get update \
     python3 \
     python3-pip \
     python3-wheel \
-    && (pip install --break-system-packages --upgrade pip || pip install --upgrade pip) \
-    && pip install --break-system-packages --upgrade setuptools \
-    && pip install --break-system-packages -r requirements.txt \
+    && (pip install --break-system-packages --upgrade setuptools || pip install --upgrade setuptools) \
+    && (pip install --break-system-packages -r requirements.txt || pip install -r requirements.txt) \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
