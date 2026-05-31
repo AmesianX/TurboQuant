@@ -79,6 +79,7 @@ static ggml_tensor * ggml_mul_mat_aux(
 
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
+        const llama_hparams & hparams,
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
@@ -91,7 +92,7 @@ llama_kv_cache::llama_kv_cache(
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
-    model(model), hparams(model.hparams), v_trans(v_trans),
+    model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
@@ -273,7 +274,7 @@ llama_kv_cache::llama_kv_cache(
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
-        if (model.hparams.no_alloc) {
+        if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
@@ -333,9 +334,32 @@ llama_kv_cache::llama_kv_cache(
         !hparams.is_n_embd_k_gqa_variable() &&
         hparams.n_embd_head_k() % 64 == 0;
 
-    // V rotation disabled: IWHT decode path does not undo attn_rot,
-    // so rotated V values would produce incorrect attention output.
-    attn_rot_v = false;
+    // DeepSeek V3.2 DSA lightning indexer needs Hadamard rotation tensors, but skip
+    // this when K uses TurboQuant internal-WHT (TBQ/TBQP/AMX): forcing attn_rot_k on
+    // there would apply a redundant second rotation and corrupt the K cache.
+    if (!is_internal_wht_k &&
+        model.arch == LLM_ARCH_DEEPSEEK32 && hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+        attn_rot_k = true;
+    }
+
+    // V rotation: same rule as K. TurboQuant V carries its own internal WHT, so an
+    // external attn_rot would be a corrupting second rotation -> force OFF.  Only TBQ and
+    // AMX apply to V (TBQP's QJL projection cannot be used on V); every other type keeps
+    // upstream's original behavior untouched.
+    const bool is_tbq_v  = type_v == GGML_TYPE_TBQ3_0  || type_v == GGML_TYPE_TBQ4_0
+                        || type_v == GGML_TYPE_TBQ3_1  || type_v == GGML_TYPE_TBQ4_1
+                        || type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2
+                        || type_v == GGML_TYPE_TBQ3_3  || type_v == GGML_TYPE_TBQ4_3
+                        || type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4;
+    const bool is_amx_v  = type_v == GGML_TYPE_AMX3_1;
+    const bool is_internal_wht_v = is_tbq_v || is_amx_v;
+
+    attn_rot_v =
+        !attn_rot_disable &&
+        !is_internal_wht_v &&
+        n_embd_head_v_all > 0 &&
+        ggml_is_quantized(type_v) &&
+        hparams.n_embd_head_v() % 64 == 0;
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
@@ -1538,8 +1562,8 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
 };
 
-template<bool causal, bool swa, bool is_2d, bool alibi>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
   //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
 
@@ -1552,6 +1576,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     const int64_t n_kv     = args.n_kv;
     const int64_t n_stream = args.n_stream;
     const int64_t n_tps    = args.n_tps;
+
+    const T mask_keep = llama_cast<T>(0.0f);
+    const T mask_drop = llama_cast<T>(-INFINITY);
 
     // the min position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
@@ -1671,46 +1698,55 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                 }
 
                 if (alibi) {
-                    data[idst + j] = -std::abs(p0 - p1);
+                    data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
                 } else {
-                    data[idst + j] = 0.0f;
+                    data[idst + j] = mask_keep;
                 }
 
                 continue;
 skip:
-                data[idst + j] = -INFINITY;
+                data[idst + j] = mask_drop;
             }
         }
     }
 }
 
-template<bool causal, bool swa, bool is_2d>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<typename T, bool causal, bool swa, bool is_2d>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
     const bool alibi = args.hparams.use_alibi;
     if (alibi) {
-        set_input_kq_mask_impl<causal, swa, is_2d, true> (args, data);
+        set_input_kq_mask_impl<T, causal, swa, is_2d, true> (args, data);
     } else {
-        set_input_kq_mask_impl<causal, swa, is_2d, false>(args, data);
+        set_input_kq_mask_impl<T, causal, swa, is_2d, false>(args, data);
     }
 }
 
-template<bool causal, bool swa>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<typename T, bool causal, bool swa>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
     const bool is_2d = args.ubatch->is_pos_2d();
     if (is_2d) {
-        set_input_kq_mask_impl<causal, swa, true> (args, data);
+        set_input_kq_mask_impl<T, causal, swa, true> (args, data);
     } else {
-        set_input_kq_mask_impl<causal, swa, false>(args, data);
+        set_input_kq_mask_impl<T, causal, swa, false>(args, data);
     }
 }
 
-template<bool causal>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<typename T, bool causal>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
     const bool swa = args.swa_type != LLAMA_SWA_TYPE_NONE;
     if (swa) {
-        set_input_kq_mask_impl<causal, true> (args, data);
+        set_input_kq_mask_impl<T, causal, true> (args, data);
     } else {
-        set_input_kq_mask_impl<causal, false>(args, data);
+        set_input_kq_mask_impl<T, causal, false>(args, data);
+    }
+}
+
+template<typename T>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data, bool causal_attn) {
+    if (causal_attn) {
+        set_input_kq_mask_impl<T, true> (args, data);
+    } else {
+        set_input_kq_mask_impl<T, false>(args, data);
     }
 }
 
@@ -1718,7 +1754,6 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    float * data = (float *) dst->data;
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
@@ -1742,10 +1777,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_tps            =*/ n_tps,
     };
 
-    if (causal_attn) {
-        set_input_kq_mask_impl<true> (args, data);
+    if (dst->type == GGML_TYPE_F16) {
+        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
-        set_input_kq_mask_impl<false>(args, data);
+        set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
     //const int64_t t_end = ggml_time_us();
