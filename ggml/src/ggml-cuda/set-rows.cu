@@ -24,6 +24,24 @@ static void amx3_lambda_auto_init() {
     }
 }
 
+// AMX3 Part-A outlier isolation: #outliers pulled per 128-block (0 = off). Env AMX3_OUTLIERS.
+// Read in quantize_f32_amx3_1_block_pos (extract) and applied in fattn-vec (Q·o correction).
+__device__ int g_amx3_outliers = 0;
+static bool g_amx3_outliers_initialized = false;
+
+static void amx3_outliers_auto_init() {
+    if (g_amx3_outliers_initialized) return;
+    g_amx3_outliers_initialized = true;
+    const char * env = getenv("AMX3_OUTLIERS");
+    if (env) {
+        int v = (int) strtol(env, nullptr, 10);
+        if (v < 0) v = 0;
+        if (v > 2) v = 2; // block_amx3_1 reserves exactly 2 outlier slots
+        CUDA_CHECK(cudaMemcpyToSymbol(g_amx3_outliers, &v, sizeof(int)));
+        fprintf(stderr, "AMX3: outliers=%d (from AMX3_OUTLIERS env)\n", v);
+    }
+}
+
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
 // Generic quantized set_rows kernel template
@@ -1133,7 +1151,8 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     } else if (dst->type == GGML_TYPE_AMX3_1) {
         // AMX K-side: Polar Derotate + cosine-optimal quant + TriAttention fusion target.
         // Uses polar kernel with per-cell slot position for derotation.
-        amx3_lambda_auto_init(); // one-time: read AMX3_LAMBDA env var
+        amx3_lambda_auto_init();   // one-time: read AMX3_LAMBDA env var
+        amx3_outliers_auto_init(); // one-time: read AMX3_OUTLIERS env var
         set_rows_cuda_quant_sm_polar<idx_t, block_amx3_1, quantize_f32_amx3_1_block_pos>(
             src0_d, src1_d, (block_amx3_1*)dst->data,
             ne00, ne01, ne02, ne03,

@@ -915,8 +915,31 @@ static __device__ void quantize_f32_amx3_1_block_pos(
     }
 
     // ================ Part A: TurboQuant WHT (FA attention path, tbq3_1 동치) ================
+    // Outlier isolation: pull top-2 |x| out of Part A so the WHT residual spans the full
+    // code range (scale deflation → reclaims the coding gain random rotation forfeits at
+    // 3-bit). Outliers are dotted with raw post-RoPE Q in fattn-vec. Disabled (g==0) →
+    // ol_idx/ol_val = 0 and the residual == full vector (bit-identical to old behavior).
+    extern __device__ int g_amx3_outliers;
+    int ol0 = -1, ol1 = -1;
+    if (g_amx3_outliers > 0) {
+        float m0 = -1.0f, m1 = -1.0f;
+        for (int j = 0; j < TBQ_K128; j++) {
+            const float a = fabsf(x[j]);
+            if (a > m0)      { m1 = m0; ol1 = ol0; m0 = a; ol0 = j; }
+            else if (a > m1) { m1 = a;  ol1 = j; }
+        }
+        y->ol_idx[0] = (uint8_t) ol0; y->ol_idx[1] = (uint8_t) ol1;
+        y->ol_val[0] = __float2half(x[ol0]); y->ol_val[1] = __float2half(x[ol1]);
+    } else {
+        y->ol_idx[0] = 0; y->ol_idx[1] = 0;
+        y->ol_val[0] = __float2half(0.0f); y->ol_val[1] = __float2half(0.0f);
+    }
+
     float sum_sq = 0.0f;
-    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
+    for (int j = 0; j < TBQ_K128; j++) {
+        const float v = (j == ol0 || j == ol1) ? 0.0f : x[j];
+        sum_sq += v * v;
+    }
     const float wht_norm = sqrtf(sum_sq);
     y->d_wht = __float2half(wht_norm);
 
@@ -927,8 +950,9 @@ static __device__ void quantize_f32_amx3_1_block_pos(
 
     const float inv_wht_norm = 1.0f / wht_norm;
     for (int j = 0; j < TBQ_K128; j++) {
+        const float v = (j == ol0 || j == ol1) ? 0.0f : x[j];
         int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
-        tmp[j] = x[j] * inv_wht_norm * sign;
+        tmp[j] = v * inv_wht_norm * sign;
     }
     for (int len = 1; len < TBQ_K128; len *= 2)
         for (int i = 0; i < TBQ_K128; i += 2*len)

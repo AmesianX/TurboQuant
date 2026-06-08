@@ -362,8 +362,14 @@ typedef struct {
     ggml_half d_r;                    // Rayleigh σ (2B)
     uint8_t   qr  [TBQ_K128*3/16];    // 3-bit r indices, 64 pairs (24B)
     uint8_t   qphi[TBQ_K128/4];       // 4-bit φ indices, 64 pairs (32B)
+    // Part A outlier isolation (AMX3_OUTLIERS): top-2 pre-rotation outliers pulled out
+    // of Part A's WHT residual and dotted with raw post-RoPE Q in fattn-vec. ol_val==0
+    // when disabled at quantize → dot correction is a no-op. Appended at end so Part A/B
+    // offsets stay fixed (TriAttention reads of qr/qphi unaffected).
+    uint8_t   ol_idx[2];              // post-RoPE outlier channel indices 0..127 (2B)
+    ggml_half ol_val[2];              // outlier values, fp16 (4B)
 } block_amx3_1;
-static_assert(sizeof(block_amx3_1) == 2*sizeof(ggml_half) + TBQ_K128*3/8 + TBQ_K128*3/16 + TBQ_K128/4, "wrong amx3_1 block size/padding");
+static_assert(sizeof(block_amx3_1) == 2*sizeof(ggml_half) + TBQ_K128*3/8 + TBQ_K128*3/16 + TBQ_K128/4 + 2*sizeof(uint8_t) + 2*sizeof(ggml_half), "wrong amx3_1 block size/padding");
 
 // AMX V-side 128-block: TurboQuant (WHT + 3-bit Lloyd-Max), tbq3_1 동치, ~3.125 bpw.
 typedef struct {
