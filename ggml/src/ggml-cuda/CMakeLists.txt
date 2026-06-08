@@ -168,6 +168,7 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu
             template-instances/fattn-vec-instance-q8_0-tbq4_1.cu
             template-instances/fattn-vec-instance-amx3_1-amxv3_1.cu
+            template-instances/fattn-vec-instance-tbq3_1-amxv3_1.cu
             template-instances/fattn-vec-instance-amx3_1-tbq3_1.cu
             template-instances/fattn-vec-instance-amx3_1-f16.cu
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
@@ -238,6 +239,7 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-tbqp4_1-tbq3_1.cu
             template-instances/fattn-vec-instance-tbqp4_1-tbq4_1.cu
             template-instances/fattn-vec-instance-amx3_1-amxv3_1.cu
+            template-instances/fattn-vec-instance-tbq3_1-amxv3_1.cu
             template-instances/fattn-vec-instance-amx3_1-tbq3_1.cu
             template-instances/fattn-vec-instance-amx3_1-f16.cu
             template-instances/fattn-vec-instance-tbq3_2-f16.cu

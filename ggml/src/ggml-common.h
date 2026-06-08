@@ -316,12 +316,16 @@ static_assert(sizeof(block_tbqp4_0) == 2*sizeof(ggml_half) + QK_K*3/8 + QK_K/8, 
 // TurboQuant head_dim=128 variants (blck_size=128)
 #define TBQ_K128 128
 
-// TurboQuant 3-bit, 128-block: ~3.125 bpw
+// TurboQuant 3-bit, 128-block: ~3.125 bpw (3.5 bpw with outlier isolation = 4.57x vs f16)
 typedef struct {
-    ggml_half d;               // L2 norm of original vector
+    ggml_half d;               // L2 norm of residual (outliers removed when AMX3_OUTLIERS>0)
     uint8_t qs[TBQ_K128*3/8]; // 3-bit packed indices (48 bytes for 128 elements)
+    // Outlier isolation (AMX3_OUTLIERS): top-2 pre-rotation outliers, appended at end so
+    // the qs offset stays fixed. ol_val==0 when disabled -> bit-identical no-op.
+    uint8_t   ol_idx[2];      // outlier channel indices 0..127 (2B)
+    ggml_half ol_val[2];      // outlier values, fp16 (4B)
 } block_tbq3_1;
-static_assert(sizeof(block_tbq3_1) == sizeof(ggml_half) + TBQ_K128*3/8, "wrong tbq3_1 block size/padding");
+static_assert(sizeof(block_tbq3_1) == sizeof(ggml_half) + TBQ_K128*3/8 + 2*sizeof(uint8_t) + 2*sizeof(ggml_half), "wrong tbq3_1 block size/padding");
 
 // TurboQuant 4-bit, 128-block: ~4.125 bpw
 typedef struct {

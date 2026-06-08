@@ -341,6 +341,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,    GGML_TYPE_TBQ4_1)      // primoco recommended
     // AMX: 128-WHT + polar (r, φ) + cosine-optimal. K = AMX3_1, V = AMXV3_1 / TBQ3_1 / F16.
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_AMXV3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_AMXV3_1)  // tbq3 K(+outlier) x amxv3 V (alias)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_F16)
     // Baseline for tq-bench comparison (q4_0 K+V on head_dim=128).
@@ -515,6 +516,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
     // AMX: 128-WHT + polar (r, φ) + cosine-optimal. K = AMX3_1, V = AMXV3_1 / TBQ3_1 / F16.
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_AMXV3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_AMXV3_1)  // tbq3 K(+outlier) x amxv3 V (alias)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_F16)
 
@@ -664,6 +666,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(128, GGML_TYPE_TBQP4_1, GGML_TYPE_Q8_0)
     // AMX: 128-WHT + polar (r, φ) + cosine-optimal. K = AMX3_1, V = AMXV3_1 / TBQ3_1 / F16.
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_AMXV3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_AMXV3_1)  // tbq3 K(+outlier) x amxv3 V (alias)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_F16)
     // TurboQuant 64-block (_2): D=64 only

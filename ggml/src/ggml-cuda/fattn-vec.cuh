@@ -908,6 +908,14 @@ static __global__ void flash_attn_ext_vec(
                                      + Q_raw[K_ol->ol_idx[1]] * __half2float(K_ol->ol_val[1]);
                     sum += scale * corr;
                 }
+                // tbq3_1 (K) outlier isolation: same correction as amx3 Part A (tbq3_1 동치).
+                if constexpr (type_K == GGML_TYPE_TBQ3_1) {
+                    const block_tbq3_1 * K_ol = (const block_tbq3_1 *) (K + i_KQ*nb11);
+                    const float * Q_raw = (const float *) (Q + j*nb01);
+                    const float corr = Q_raw[K_ol->ol_idx[0]] * __half2float(K_ol->ol_val[0])
+                                     + Q_raw[K_ol->ol_idx[1]] * __half2float(K_ol->ol_val[1]);
+                    sum += scale * corr;
+                }
 
                 // Double WHT: apply second /D after scoring (/D in Q × /D here = /D² total)
                 if constexpr (is_double_wht_K) {
