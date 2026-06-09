@@ -78,13 +78,19 @@ static float common_ggml_get_float_value(const uint8_t * data,
 
 static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb, int64_t n, bool abort_on_nan) {
     GGML_ASSERT(n > 0);
-    float sum = 0;
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    float min =  INFINITY;
+    float max = -INFINITY;
     for (int64_t i3 = 0; i3 < ne[3]; i3++) {
         for (int64_t i2 = 0; i2 < ne[2]; i2++) {
             for (int64_t i1 = 0; i1 < ne[1]; i1++) {
                 for (int64_t i0 = 0; i0 < ne[0]; i0++) {
                     const float v = common_ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
                     sum += v;
+                    sum_sq += double(v) * double(v);
+                    min = std::min(min, v);
+                    max = std::max(max, v);
                 }
             }
         }
@@ -109,7 +115,7 @@ static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int6
                         i0 = ne[0] - n;
                     }
                     const float v = common_ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
-                    LOG("%12.4f", v);
+                    LOG("%14.8f", v);
                     if (i0 < ne[0] - 1) {
                         LOG(", ");
                     }
@@ -119,7 +125,11 @@ static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int6
             LOG(INDENT INDENT "],\n");
         }
         LOG(INDENT "]\n");
-        LOG(INDENT "sum = %f\n", sum);
+        const double n_elem = double(ne[0]) * double(ne[1]) * double(ne[2]) * double(ne[3]);
+        LOG(INDENT "sum = %f\n", (float) sum);
+        LOG(INDENT "rms = %f\n", (float) std::sqrt(sum_sq / n_elem));
+        LOG(INDENT "min = %f\n", min);
+        LOG(INDENT "max = %f\n", max);
     }
 
     if (abort_on_nan) {

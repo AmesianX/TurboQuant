@@ -754,7 +754,9 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS 30
+// Reduced from 256. Large models (DeepSeek V4 Flash, 400K+ nodes) can exceed 64 graph inputs
+// due to many DSV4_HC ops across backends. 128 balances memory vs. large model support.
+#define GGML_SCHED_MAX_SPLIT_INPUTS 128
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES

@@ -23,6 +23,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
+#include "ggml-cuda/dsv4.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -3097,6 +3098,21 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+            ggml_cuda_op_dsv4_hc_split_sinkhorn(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_EXPAND:
+            ggml_cuda_op_dsv4_hc_expand(ctx, dst);
+            break;
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+            ggml_cuda_op_dsv4_fp8_kv_quantize(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+            ggml_cuda_op_dsv4_hc_weighted_sum(ctx, dst);
+            break;
+        case GGML_OP_DSV4_ROPE_TAIL:
+            ggml_cuda_op_dsv4_rope_tail(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
             break;
@@ -5438,6 +5454,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_DSV4_ROPE_TAIL:
+            return ggml_cuda_op_dsv4_rope_tail_supported();
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+            return ggml_cuda_op_dsv4_hc_split_sinkhorn_supported();
+        case GGML_OP_DSV4_HC_EXPAND:
+            return ggml_cuda_op_dsv4_hc_expand_supported();
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+            return ggml_cuda_op_dsv4_fp8_kv_quantize_supported();
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+            return ggml_cuda_op_dsv4_hc_weighted_sum_supported();
 
         default:
             return false;
