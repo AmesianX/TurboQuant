@@ -451,7 +451,8 @@ extern "C" {
         GGML_TYPE_TBQP4_4 = 61, // TurboQuant_prod 4-bit, blck_size=576 (head_dim=576, split 256+256+64)
         GGML_TYPE_AMX3_1   = 62, // AMX K-side 3r+4φ polar, 128-WHT + cosine-optimal (head_dim=128)
         GGML_TYPE_AMXV3_1  = 63, // AMX V-side 3-bit (tbq3_1 동치; optimization 후추가)
-        GGML_TYPE_COUNT    = 64,
+        GGML_TYPE_TBQV3_1  = 64, // TurboQuant V-side 3-bit, blck_size=128 (head_dim=128; tbq3 set V, MSE plain)
+        GGML_TYPE_COUNT    = 65,
     };
 
     // precision

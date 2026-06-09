@@ -344,6 +344,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_AMXV3_1)  // tbq3 K(+outlier) x amxv3 V (alias)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_F16)
+    // tbq3 set: K = tbq3_1 (outlier-isolated), V = tbqv3_1 (MSE plain). -ctk tbq3 -ctv tbqv3.
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_TBQV3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_F16,    GGML_TYPE_TBQV3_1)  // baseline K=f16 x tbqv3 V
     // Baseline for tq-bench comparison (q4_0 K+V on head_dim=128).
     FATTN_VEC_CASE(128, GGML_TYPE_Q4_0,    GGML_TYPE_Q4_0)
 
@@ -669,6 +672,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_AMXV3_1)  // tbq3 K(+outlier) x amxv3 V (alias)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1)
     FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_F16)
+    // tbq3 set: K = tbq3_1 (outlier-isolated), V = tbqv3_1 (MSE plain). -ctk tbq3 -ctv tbqv3.
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_TBQV3_1)
+    FATTN_VEC_CASE(128, GGML_TYPE_F16,    GGML_TYPE_TBQV3_1)  // baseline K=f16 x tbqv3 V
     // TurboQuant 64-block (_2): D=64 only
     FATTN_VEC_CASE(64, GGML_TYPE_TBQ3_2, GGML_TYPE_F16)
     FATTN_VEC_CASE(64, GGML_TYPE_TBQ4_2, GGML_TYPE_F16)
@@ -892,7 +898,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         || K->type == GGML_TYPE_AMX3_1;
         const bool tbq_v = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0
                         || V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQ4_1
-                        || V->type == GGML_TYPE_AMXV3_1
+                        || V->type == GGML_TYPE_AMXV3_1 || V->type == GGML_TYPE_TBQV3_1
                         || V->type == GGML_TYPE_TBQ3_2 || V->type == GGML_TYPE_TBQ4_2
                         || V->type == GGML_TYPE_TBQ3_3 || V->type == GGML_TYPE_TBQ4_3
                         || V->type == GGML_TYPE_TBQ3_4 || V->type == GGML_TYPE_TBQ4_4;

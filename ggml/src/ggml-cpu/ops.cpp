@@ -5693,6 +5693,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_TBQP4_4:
         case GGML_TYPE_AMX3_1:
         case GGML_TYPE_AMXV3_1:
+        case GGML_TYPE_TBQV3_1:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");

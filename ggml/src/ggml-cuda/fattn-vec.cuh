@@ -1202,7 +1202,7 @@ static __global__ void flash_attn_ext_vec(
                            || type_V == GGML_TYPE_TBQ4_3 || type_V == GGML_TYPE_TBQ3_3
                            || type_V == GGML_TYPE_TBQ4_4 || type_V == GGML_TYPE_TBQ3_4
                            || type_V == GGML_TYPE_TBQP4_4 || type_V == GGML_TYPE_TBQP3_4
-                           || type_V == GGML_TYPE_AMXV3_1;
+                           || type_V == GGML_TYPE_AMXV3_1  || type_V == GGML_TYPE_TBQV3_1;
 
             constexpr int tbq_nregs = D_V >= nthreads ? D_V / nthreads : 1;
             float tbq_regs[tbq_nregs];
@@ -1349,7 +1349,7 @@ static __global__ void flash_attn_ext_vec(
             }
 
             // TBQ V 128-block IWHT: D=128, 1:1 thread mapping, no stage 7
-            if constexpr (type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1 || type_V == GGML_TYPE_AMXV3_1) {
+            if constexpr (type_V == GGML_TYPE_TBQ4_1 || type_V == GGML_TYPE_TBQ3_1 || type_V == GGML_TYPE_AMXV3_1 || type_V == GGML_TYPE_TBQV3_1) {
                 static constexpr uint8_t tbq_signs_v[16] = {
                     0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
                     0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
@@ -1674,6 +1674,10 @@ EXTERN_DECL_FATTN_VEC_TBQ1(GGML_TYPE_TBQP4_1)
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_AMXV3_1);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_TBQ3_1);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_AMX3_1, GGML_TYPE_F16);
+
+// tbq3 set extern declarations — V = tbqv3_1 (MSE plain), K = tbq3_1 (outlier) / F16.
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_1, GGML_TYPE_TBQV3_1);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16,    GGML_TYPE_TBQV3_1);
 
 // TurboQuant 64-block (_2) extern declarations: D=64 only
 #define EXTERN_DECL_FATTN_VEC_TBQ2(type_K)                            \

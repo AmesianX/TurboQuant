@@ -1061,6 +1061,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(block_amxv3_1),
         .is_quantized             = true,
     },
+    [GGML_TYPE_TBQV3_1] = {
+        .type_name                = "tbqv3_1",
+        .blck_size                = TBQ_K128,
+        .type_size                = sizeof(block_tbqv3_1),
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

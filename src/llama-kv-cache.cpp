@@ -106,12 +106,21 @@ llama_kv_cache::llama_kv_cache(
         throw std::runtime_error(
             "amx3 only supports head_dim=128 for V (got " + std::to_string(hparams.n_embd_head_v()) + ").");
     }
+    // tbqv3_1 (tbq3 set V partner) is hard-wired to head_dim=128 (128-WHT), V-only.
+    if (type_v == GGML_TYPE_TBQV3_1 && hparams.n_embd_head_v() != 128) {
+        throw std::runtime_error(
+            "tbqv3 only supports head_dim=128 (got " + std::to_string(hparams.n_embd_head_v()) + ").");
+    }
     // AMX3_1 is K-only. AMXV3_1 is V-only.
     if (type_v == GGML_TYPE_AMX3_1) {
         throw std::runtime_error("amx3_1 is K-only. Use amxv3_1 (CLI: -ctv amx3) for V cache.");
     }
     if (type_k == GGML_TYPE_AMXV3_1) {
         throw std::runtime_error("amxv3_1 is V-only. Use amx3_1 (CLI: -ctk amx3) for K cache.");
+    }
+    // tbqv3_1 is V-only (its quantizer/dequant are the V partner of tbq3_1 K).
+    if (type_k == GGML_TYPE_TBQV3_1) {
+        throw std::runtime_error("tbqv3_1 is V-only. Use tbq3 (CLI: -ctk tbq3) for K cache.");
     }
 
     // Note: TurboQuant head_dim auto-mapping (_0 → _1/_2) is done in llama_init_from_model()

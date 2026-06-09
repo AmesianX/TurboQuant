@@ -412,6 +412,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TBQP4_2,
     GGML_TYPE_AMX3_1,
     GGML_TYPE_AMXV3_1,
+    GGML_TYPE_TBQV3_1,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s, bool is_v = false) {
@@ -433,6 +434,7 @@ static ggml_type kv_cache_type_from_str(const std::string & s, bool is_v = false
         {"tbqp3", GGML_TYPE_TBQP3_0},
         {"tbqp4", GGML_TYPE_TBQP4_0},
         {"amx3",  GGML_TYPE_AMXV3_1},
+        {"tbqv3", GGML_TYPE_TBQV3_1}, // tbq3 set V partner (MSE plain, head_dim=128)
     };
     const auto & shortcuts = is_v ? tbq_shortcuts_v : tbq_shortcuts_k;
     auto it = shortcuts.find(s);
@@ -454,6 +456,7 @@ static std::string get_all_kv_cache_types() {
         {GGML_TYPE_TBQ3_0,  "tbq3"},   {GGML_TYPE_TBQ4_0,  "tbq4"},
         {GGML_TYPE_TBQP3_0, "tbqp3"},  {GGML_TYPE_TBQP4_0, "tbqp4"},
         {GGML_TYPE_AMX3_1,  "amx3"},   {GGML_TYPE_AMXV3_1, "amx3"},
+        {GGML_TYPE_TBQV3_1, "tbqv3"},
     };
     std::set<std::string> seen_tbq;
     std::ostringstream msg;

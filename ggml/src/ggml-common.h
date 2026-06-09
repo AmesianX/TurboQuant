@@ -382,6 +382,14 @@ typedef struct {
 } block_amxv3_1;
 static_assert(sizeof(block_amxv3_1) == sizeof(ggml_half) + TBQ_K128*3/8, "wrong amxv3_1 block size/padding");
 
+// TurboQuant V-side 128-block: WHT + 3-bit Lloyd-Max (MSE plain, no outlier isolation).
+// amxv3_1 동치 layout; this is the tbq3 family's V partner (pairs with tbq3_1 K). ~3.125 bpw.
+typedef struct {
+    ggml_half d;                // L2 norm of original vector
+    uint8_t qs[TBQ_K128*3/8];   // 3-bit packed indices (48 bytes for 128 elements)
+} block_tbqv3_1;
+static_assert(sizeof(block_tbqv3_1) == sizeof(ggml_half) + TBQ_K128*3/8, "wrong tbqv3_1 block size/padding");
+
 
 // TurboQuant head_dim=64 variants (blck_size=64)
 #define TBQ_K64 64

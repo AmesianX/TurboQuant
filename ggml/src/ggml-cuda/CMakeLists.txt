@@ -171,6 +171,8 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-tbq3_1-amxv3_1.cu
             template-instances/fattn-vec-instance-amx3_1-tbq3_1.cu
             template-instances/fattn-vec-instance-amx3_1-f16.cu
+            template-instances/fattn-vec-instance-tbq3_1-tbqv3_1.cu
+            template-instances/fattn-vec-instance-f16-tbqv3_1.cu
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
 
             # ---- D=256 and D=512 (_0): Qwen3.5, Qwen3-Next, Gemma 4 ----
@@ -242,6 +244,8 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-tbq3_1-amxv3_1.cu
             template-instances/fattn-vec-instance-amx3_1-tbq3_1.cu
             template-instances/fattn-vec-instance-amx3_1-f16.cu
+            template-instances/fattn-vec-instance-tbq3_1-tbqv3_1.cu
+            template-instances/fattn-vec-instance-f16-tbqv3_1.cu
             template-instances/fattn-vec-instance-tbq3_2-f16.cu
             template-instances/fattn-vec-instance-tbq3_2-q8_0.cu
             template-instances/fattn-vec-instance-tbq3_2-tbq3_2.cu

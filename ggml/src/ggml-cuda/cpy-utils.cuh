@@ -1051,6 +1051,55 @@ static __device__ void quantize_f32_amxv3_1_block(const float * __restrict__ x, 
     }
 }
 
+// TBQV3_1: V-side 3-bit, tbq3 family V partner (amxv3_1 동치, MSE plain — no outlier isolation).
+// WHT + 3-bit Gaussian Lloyd-Max + nearest-bin lookup (equiprobable boundaries).
+static __device__ void quantize_f32_tbqv3_1_block(const float * __restrict__ x, block_tbqv3_1 * __restrict__ y, float * __restrict__ tmp) {
+    static constexpr uint8_t tbq_signs[16] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    };
+    static constexpr float tbq3_boundaries[7] = {
+        -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
+    };
+
+    float sum_sq = 0.0f;
+    for (int j = 0; j < TBQ_K128; j++) sum_sq += x[j] * x[j];
+    float norm = sqrtf(sum_sq);
+    y->d = __float2half(norm);
+
+    if (norm < 1e-10f) {
+        for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
+        return;
+    }
+
+    float inv_norm = 1.0f / norm;
+    for (int j = 0; j < TBQ_K128; j++) {
+        int sign = ((tbq_signs[j >> 3] >> (j & 7)) & 1) ? -1 : 1;
+        tmp[j] = x[j] * inv_norm * sign;
+    }
+
+    // Serial WHT (128 elements, 7 stages)
+    for (int len = 1; len < TBQ_K128; len *= 2)
+        for (int i = 0; i < TBQ_K128; i += 2*len)
+            for (int j = 0; j < len; j++) {
+                float u = tmp[i+j], v = tmp[i+j+len];
+                tmp[i+j] = u+v; tmp[i+j+len] = u-v;
+            }
+
+    // 3-bit quantization + packing (nearest boundary).
+    int bit_pos = 0;
+    for (int j = 0; j < TBQ_K128*3/8; j++) y->qs[j] = 0;
+    for (int j = 0; j < TBQ_K128; j++) {
+        uint8_t idx = 7;
+        for (int b = 0; b < 7; b++) { if (tmp[j] < tbq3_boundaries[b]) { idx = b; break; } }
+        int byte_idx = bit_pos / 8;
+        int bit_off = bit_pos % 8;
+        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
+        if (bit_off > 5) y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
+        bit_pos += 3;
+    }
+}
+
 // TBQ4_1: 128-element WHT + 4-bit Lloyd-Max
 // scratch[TBQ_K128] provided by caller (shared memory).
 static __device__ void quantize_f32_tbq4_1_block(const float * __restrict__ x, block_tbq4_1 * __restrict__ y, float * __restrict__ tmp) {

@@ -3466,13 +3466,14 @@ llama_context * llama_init_from_model(
         tbq_map(params.type_v, model->hparams.n_embd_head_v());
     }
 
-    // AMX3 (K: AMX3_1, V: AMXV3_1) is hard-wired to head_dim=128 (128-WHT + polar).
-    // Reject before `new llama_context` so we never partially construct the context
-    // and trigger the bad unwinding path that shows up as SIGSEGV on head_dim=256/576.
+    // AMX3 (K: AMX3_1, V: AMXV3_1) and the tbq3 set V (TBQV3_1) are hard-wired to
+    // head_dim=128 (128-WHT). Reject before `new llama_context` so we never partially
+    // construct the context and trigger the bad unwinding path (SIGSEGV on head_dim=256/576).
     {
         const bool amx_k = (params.type_k == GGML_TYPE_AMX3_1 || params.type_k == GGML_TYPE_AMXV3_1)
                        && model->hparams.n_embd_head_k() != 128;
-        const bool amx_v = (params.type_v == GGML_TYPE_AMX3_1 || params.type_v == GGML_TYPE_AMXV3_1)
+        const bool amx_v = (params.type_v == GGML_TYPE_AMX3_1 || params.type_v == GGML_TYPE_AMXV3_1
+                        ||  params.type_v == GGML_TYPE_TBQV3_1)
                        && model->hparams.n_embd_head_v() != 128;
         if (amx_k || amx_v) {
             const uint32_t hd_k = model->hparams.n_embd_head_k();

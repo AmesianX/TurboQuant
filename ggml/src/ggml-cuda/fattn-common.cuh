@@ -1008,6 +1008,42 @@ static __device__ __forceinline__ void dequantize_V_amxv3_1(const void * __restr
     }
 }
 
+// TBQV3_1 dequantize: tbq3 family V partner (amxv3_1 동치, MSE plain — no outlier add-back).
+// Read-side is identical to amxv3_1 (same 50B layout: d + 3-bit qs).
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbqv3_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbqv3_1 * x = (const block_tbqv3_1 *) vx;
+    static constexpr float c3[8] = {
+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
+    };
+
+    const int64_t ib = i0 / TBQ_K128;
+    const int elem = i0 % TBQ_K128;
+    const float norm = __half2float(x[ib].d);
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int e = elem + l;
+        const int bp = e * 3;
+        const int by = bp >> 3;
+        int start_byte = by & ~1;
+        if (start_byte > (int)(TBQ_K128*3/8) - 4) start_byte = (int)(TBQ_K128*3/8) - 4;
+        int qs_word;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&qs_word, &x[ib].qs[start_byte]);
+        const uint32_t qs_word_u = (uint32_t) qs_word;
+        const int bit_in_word = bp - (start_byte << 3);
+        const float cent = c3[(qs_word_u >> bit_in_word) & 0x7] * norm;
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l] = cent;
+        }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l] = __float2half(cent);
+        }
+#endif
+    }
+}
+
 // TBQP3_1: fused MSE + Direct Sign score (128-block)
 // Direct Sign: sign(residual) stored directly, no SRHT — uses Q_v (MSE query) instead of Q_ds
 // Memory pattern: 4-byte aligned int loads via ggml_cuda_memcpy_1 (matches q4_0/q5_0 pattern)
@@ -1983,6 +2019,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_tbq3_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_AMXV3_1) {
         return dequantize_V_amxv3_1<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQV3_1) {
+        return dequantize_V_tbqv3_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ4_2) {
         return dequantize_V_tbq4_2<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ3_2) {
