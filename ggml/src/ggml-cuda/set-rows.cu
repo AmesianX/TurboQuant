@@ -1138,8 +1138,8 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             );
         }
     } else if (dst->type == GGML_TYPE_TBQ3_1) {
-        // SM scratch variant — DGX Spark unified-memory safe (no local-memory spill)
-        amx3_outliers_auto_init(); // one-time: read AMX3_OUTLIERS env (outlier on tbq3_1 K)
+        // SM scratch variant — DGX Spark unified-memory safe (no local-memory spill).
+        // Outlier isolation is intrinsic to tbq3_1 (always on); no env init needed here.
         set_rows_cuda_quant_sm<idx_t, block_tbq3_1, TBQ_K128, quantize_f32_tbq3_1_block>(
             src0_d, src1_d, (block_tbq3_1*)dst->data,
             ne00, ne01, ne02, ne03,

@@ -3,6 +3,14 @@
 Working doc to resume the outlier-isolation feature. Last updated 2026-06-09.
 Branch: `feat/kv-outlier-isolation` (off `main` a93da4a4b).
 
+> **2026-06-09 update — tbq3/tbqv3 set is now first-class (commit c31be8bbc).**
+> The `-ctv amx3` alias was test-only and is replaced by a dedicated V type `tbqv3_1`.
+> Production config: **`-ctk tbq3 -ctv tbqv3`** (K=tbq3_1 outlier, V=tbqv3_1 MSE-plain).
+> tbq3_1 outlier isolation is now **intrinsic (always on, no env)** — the type defines the
+> behavior. `AMX3_OUTLIERS` only gates amx3 (separate TriAttention family) now.
+> Validated: Qwen3-30B-A3B (18G) + GLM-4.5-Air (69G, head_dim=128); tbqv3 V byte-identical to
+> the amxv3 baseline. Scope unchanged: head_dim=128 only (256 = plain tbq3, 64 dropped).
+
 ---
 
 ## What it is
@@ -10,14 +18,18 @@ Pre-rotation dense-and-sparse outlier isolation for low-bit KV cache: per block,
 pull the top-2 `|x|` channels out BEFORE the WHT, store them as `ol_idx[2]`+`ol_val[2]`
 (fp16) appended to the block, quantize the residual, and add `scale·Σ Q_raw[idx]·ol_val`
 back into the Q·K dot. Reclaims the coding gain that random rotation forfeits at 3-bit.
-Toggle: env `AMX3_OUTLIERS` (0=off default, 2=on). Disabled = bit-identical no-op.
+Toggle: tbq3_1 = intrinsic (always on). amx3_1 = env `AMX3_OUTLIERS` (0=off default, 2=on).
 
 ## DONE (committed, validated)
 - **amx3_1** K (commit `f0b1fbf7b`): 108→114B, env-toggled. Recovers ~98% of 3bit→f16 gap.
   jan-nano math 7.1%→45.7% (f16 46.4%); Pauli 월프강→볼프강.
 - **tbq3_1** K + amxv3_1 V alias (commit `42fee0ae2`): **head_dim 128, 4.83×**.
-  Config: `AMX3_OUTLIERS=2 ... -fa -ctk tbq3 -ctv amx3`. K=tbq3_1(56B)+outlier, V=amxv3_1(50B).
-  Validated Qwen3-30B: baseline 월프강 → outlier 볼프강. 2× better compression than amx3 (2.25×).
+  (Original alias config `-ctk tbq3 -ctv amx3`; superseded by the tbqv3 set below.)
+- **tbqv3_1** dedicated V type — the tbq3 set (commit `c31be8bbc`): **`-ctk tbq3 -ctv tbqv3`**.
+  K=tbq3_1(56B, outlier, intrinsic), V=tbqv3_1(50B, MSE-plain, amxv3_1 동치 클론). No env needed.
+  Full plumbing (enum/struct/traits/quantize/dequant/IWHT/fattn cases/instances/CLI/guards).
+  Validated Qwen3-30B-A3B + GLM-4.5-Air(69G): 볼프강 outlier marker correct, V coherent;
+  tbqv3 output byte-identical to amxv3 baseline on GLM. amx3/amxv3 kept separate (TriAttention).
 - Files touched: ggml-common.h (struct), cpy-utils.cuh (quantize), fattn-vec.cuh (K dot),
   set-rows.cu (g_amx3_outliers global + auto-init), fattn.cu (3 FATTN_VEC_CASE), CMakeLists.txt
   (2 instance lists), template-instances/fattn-vec-instance-tbq3_1-amxv3_1.cu.
@@ -44,33 +56,29 @@ Toggle: env `AMX3_OUTLIERS` (0=off default, 2=on). Disabled = bit-identical no-o
 
 ---
 
-## 정석화 (proper-ization) TODO — for next session
+## 정석화 (proper-ization) TODO
 
-### P1 — make the 128 win production-clean
-1. **Rebuild** to match committed source — current `build/bin/llama-server` (06-09 09:36) was
-   built from the reverted-256 source, so binary≠source. `cmake --build build --target llama-server -j 8`.
-2. **Clean `-ctv tbq3` CLI alias** (remove the `-ctv amx3` workaround). In `common/arg.cpp`,
-   `tbq_shortcuts_v["tbq3"]` currently → TBQ3_0 (resolves to tbq3_1). Want V-side "tbq3" → AMXV3_1
-   (plain). Either change the V shortcut, or add a V branch in the head_dim resolver
-   `tbq_map` (src/llama-context.cpp:3425-3467) so V resolves to the plain type (amxv3_1 @128).
-   Goal: user types `-ctk tbq3 -ctv tbq3` and gets K=tbq3_1(outlier), V=amxv3_1(plain).
-3. **Promote AMX3_OUTLIERS to a real CLI flag** (e.g. `--kv-outliers N`) instead of env-only.
-   Add to common/arg.cpp + common_params + the cuda setter `ggml_cuda_set_*`. Env can stay as fallback.
-4. **Rename the toggle** for clarity: `AMX3_OUTLIERS`/`g_amx3_outliers` now also drives tbq3 —
-   rename to `KV_OUTLIERS`/`g_kv_outliers` (it's no longer amx-specific). Touch set-rows.cu +
-   the externs in cpy-utils.cuh and the fattn-vec.cuh correction comments.
+### P1 — make the 128 win production-clean  ✅ DONE (c31be8bbc)
+1. ✅ **Rebuild** — binary rebuilt from committed source (was reverted-256 stale binary).
+2. ✅ **Clean V type** — instead of an alias, added the dedicated `tbqv3_1` V type. The test-only
+   `-ctv amx3` workaround is superseded; production config is `-ctk tbq3 -ctv tbqv3`
+   (K=tbq3_1 outlier, V=tbqv3_1 MSE-plain). tbqv3 maps directly to the _1 (128-only) type.
+3. ✅ **No env flag needed** — tbq3_1 outlier is now intrinsic to the type (always on), so there is
+   no toggle to promote. amx3_1 keeps `AMX3_OUTLIERS` (separate TriAttention family).
+4. ✅ **No rename needed** — since tbq3_1 no longer reads the env, `AMX3_OUTLIERS`/`g_amx3_outliers`
+   is once again amx-specific; left as-is.
 
-### P2 — correctness hardening
-5. **V-corruption guard**: tbq3_1 is now K-only (its quantize extracts outliers; dequantize_V_tbq3_1
-   ignores them → V corrupt if tbq3_1 used as V). The `tbq3_1-tbq3_1` instance/config is now unsafe.
-   Either (a) GGML_ASSERT/reject tbq3_1 as V, or (b) document that V must be amxv3_1, or (c) add the
-   outlier add-back to dequantize_V_tbq3_1 (WHT-domain Hadamard scatter — see notes below). Pick (a)/(b).
-6. **Read-side note**: the K dot correction lives in `fattn-vec.cuh` (the caller, after warp_reduce),
-   NOT in `vec_dot_fattn_vec_KQ_tbq3_1` (fattn-common.cuh). It IS active (test proved 월→볼). If a
+### P2 — correctness hardening  ✅ DONE (c31be8bbc)
+5. ✅ **V-corruption guard**: V now uses the proper plain type tbqv3_1 (its own quantize/dequant).
+   tbq3_1 and amx3_1 are rejected as a V cache type (llama-context.cpp + llama-kv-cache.cpp:
+   "K-only / V-only" errors), and tbqv3_1 is rejected as K. No silent corruption path remains.
+6. **Read-side note** (unchanged): the K dot correction lives in `fattn-vec.cuh` (the caller, after
+   warp_reduce), NOT in `vec_dot_fattn_vec_KQ_tbq3_1` (fattn-common.cuh). It IS active (월→볼). If a
    non-vec attention path is ever used for these types, the correction must be added there too.
-7. **g_amx3_outliers cross-TU**: it's read in the quantizer (set-rows.cu TU — same TU as def, OK)
-   and the K-dot correction is unconditional (reads ol_val, 0 when disabled — no global read in the
-   hot path). So NO cross-TU issue (unlike the abandoned g_amx3_partb). Keep it that way.
+   The TBQ V IWHT (inverse-WHT of the V output) is in fattn-vec.cuh and must list every TBQ V type
+   (tbqv3_1 was added there — omitting it yields a wrong-basis / garbage V output).
+7. **g_amx3_outliers** is now read only by the amx3 quantizer (same TU as its def in set-rows.cu).
+   tbq3_1 no longer touches it. No cross-TU issue.
 
 ### P3 — validation (run before declaring done)
 8. Proper benchmark sweep with the FINAL clean binary, head_dim 128 model (Qwen3-30B or 14B):
@@ -93,5 +101,8 @@ Toggle: env `AMX3_OUTLIERS` (0=off default, 2=on). Disabled = bit-identical no-o
 
 ### Quick reference — commands
 - Build: `cmake --build build --target llama-server -j 8`
-- Run (128 outlier): `AMX3_OUTLIERS=2 build/bin/llama-server -m <hd128 model> -c 16384 -ngl 999 -fa --reasoning off -ctk tbq3 -ctv amx3 --port 8890`
+- Run (tbq3 set, 128): `build/bin/llama-server -m <hd128 model> -c 16384 -ngl 999 -fa on --reasoning-budget 0 -ctk tbq3 -ctv tbqv3 --port 8890`
+  (outlier is intrinsic to tbq3 now — no `AMX3_OUTLIERS` needed. hd128 models: Qwen3-30B-A3B,
+  Qwen3-14B, GLM-4.5-Air, MiniMax-M2.x. Note: kill servers with `pkill -f "llama-serve[r]"` —
+  the char-class avoids the pkill self-match footgun.)
 - Pauli/math test harness: `/tmp/test2.py <port>` (matrix + German→Korean Pauli); math_bench: `turboquant/math_bench.py collect`

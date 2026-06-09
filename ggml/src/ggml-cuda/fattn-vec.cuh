@@ -896,11 +896,12 @@ static __global__ void flash_attn_ext_vec(
                     sum = warp_reduce_sum<nthreads_KQ>(sum);
                 }
 
-                // AMX3 Part-A outlier isolation: add the sparse pre-rotation outliers back in
-                // the original post-RoPE domain: scale·Σ Q_raw[idx]·ol_val. The WHT path already
-                // folds `scale` into Q_reg, so the residual dot is scale·(Q·K_res); match it here.
-                // ol_val==0 when AMX3_OUTLIERS is off → no-op. `sum` is identical across the
-                // nthreads_KQ reduction lanes and corr is computed identically, so they stay in sync.
+                // Outlier isolation: add the sparse pre-rotation outliers back in the original
+                // post-RoPE domain: scale·Σ Q_raw[idx]·ol_val. The WHT path already folds `scale`
+                // into Q_reg, so the residual dot is scale·(Q·K_res); match it here. For tbq3_1 the
+                // outliers are always present (intrinsic to the type); for amx3_1 they are gated by
+                // AMX3_OUTLIERS (ol_val==0 → no-op). `sum` is identical across the nthreads_KQ
+                // reduction lanes and corr is computed identically, so they stay in sync.
                 if constexpr (type_K == GGML_TYPE_AMX3_1) {
                     const block_amx3_1 * K_ol = (const block_amx3_1 *) (K + i_KQ*nb11);
                     const float * Q_raw = (const float *) (Q + j*nb01);

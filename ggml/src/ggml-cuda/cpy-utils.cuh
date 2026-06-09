@@ -775,12 +775,13 @@ static __device__ void quantize_f32_tbq3_1_block(const float * __restrict__ x, b
         -1.7480f, -1.0500f, -0.5006f, 0.0f, 0.5006f, 1.0500f, 1.7480f,
     };
 
-    // Outlier isolation (AMX3_OUTLIERS): pull top-2 |x| before the WHT so the residual spans
-    // the full code range. Dotted back with raw Q (K) / added back in dequant (V). Disabled
-    // (g==0) -> ol=0 and residual == full vector (bit-identical to old behavior).
-    extern __device__ int g_amx3_outliers;
+    // Outlier isolation (intrinsic to tbq3_1): pull the top-2 |x| out before the WHT so the
+    // residual spans the full code range — scale deflation reclaims the coding gain random
+    // rotation forfeits at 3-bit. The two outliers are masked out of the WHT/quantize and
+    // dotted back with raw Q in the fattn-vec K-dot correction. Always on: tbq3_1 IS the
+    // outlier type (no env gate; the plain V partner is tbqv3_1).
     int ol0 = -1, ol1 = -1;
-    if (g_amx3_outliers > 0) {
+    {
         float m0 = -1.0f, m1 = -1.0f;
         for (int j = 0; j < TBQ_K128; j++) {
             const float a = fabsf(x[j]);
@@ -789,9 +790,6 @@ static __device__ void quantize_f32_tbq3_1_block(const float * __restrict__ x, b
         }
         y->ol_idx[0] = (uint8_t) ol0; y->ol_idx[1] = (uint8_t) ol1;
         y->ol_val[0] = __float2half(x[ol0]); y->ol_val[1] = __float2half(x[ol1]);
-    } else {
-        y->ol_idx[0] = 0; y->ol_idx[1] = 0;
-        y->ol_val[0] = __float2half(0.0f); y->ol_val[1] = __float2half(0.0f);
     }
 
     float sum_sq = 0.0f;
