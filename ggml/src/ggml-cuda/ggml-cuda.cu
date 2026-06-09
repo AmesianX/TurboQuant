@@ -3342,6 +3342,12 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // probe: report the first node whose properties changed (env DSV4_GRAPH_PROBE)
+            static const bool probe = getenv("DSV4_GRAPH_PROBE") != nullptr;
+            if (probe && !res) {
+                fprintf(stderr, "cuda-graph probe: first changed node[%d] op=%s name='%s'\n",
+                        i, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4492,6 +4498,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        {
+            static const bool probe = getenv("DSV4_GRAPH_PROBE") != nullptr;
+            if (probe) {
+                fprintf(stderr, "cuda-graph probe: n_nodes=%d compatible=%d warmup=%d\n",
+                        cgraph->n_nodes, (int) graph_compatible, (int) graph->warmup_complete);
+            }
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -5061,7 +5074,22 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 }
 
 // TODO: move these functions here
+static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op);
+
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    const bool res = ggml_backend_cuda_device_supports_op_impl(dev, op);
+    // probe: report ops the CUDA backend rejects (these force scheduler graph splits)
+    static const bool probe = getenv("DSV4_GRAPH_PROBE") != nullptr;
+    if (probe && !res) {
+        fprintf(stderr, "cuda supports_op REJECT: op=%s name='%s' type=%s ne=[%lld,%lld,%lld,%lld] src0_type=%s\n",
+                ggml_op_name(op->op), op->name, ggml_type_name(op->type),
+                (long long) op->ne[0], (long long) op->ne[1], (long long) op->ne[2], (long long) op->ne[3],
+                op->src[0] ? ggml_type_name(op->src[0]->type) : "none");
+    }
+    return res;
+}
+
+static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
     // split buffers can only be used with GGML_OP_MUL_MAT
@@ -5315,6 +5343,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_REPEAT:
             {
                 ggml_type src0_type = op->src[0]->type;
+                // I32 repeat is supported via the f32 kernel (4-byte bit copy) — see ggml_cuda_op_repeat
+                if (src0_type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32) {
+                    return true;
+                }
                 return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
             } break;
         case GGML_OP_REPEAT_BACK:

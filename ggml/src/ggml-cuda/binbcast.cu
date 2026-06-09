@@ -387,6 +387,14 @@ static void ggml_cuda_op_bin_bcast(
 }
 
 void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    if (dst->type == GGML_TYPE_I32 && src0->type == GGML_TYPE_I32) {
+        // repeat is a pure 4-byte broadcast copy — run the f32 kernel on the i32 bit pattern.
+        // (DeepSeek-V4 repeats i32 routing/position ids; without this they fell back to the
+        // CPU and forced a scheduler graph split on every layer.)
+        bin_bcast_cuda<op_repeat, 0>()(dst, src0, dst, (const float *) nullptr, (const float *) src0->data, (float *) dst->data, ctx.stream());
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_repeat, 0>>(dst, dst->src[0], dst, nullptr, dst->src[0]->data, dst->data, ctx.stream());
 }
 

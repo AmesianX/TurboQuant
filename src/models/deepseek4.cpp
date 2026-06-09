@@ -1310,6 +1310,40 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 }
             }
 
+            // CUDA FA kernels for D=512 require n_kv % FATTN_KQ_STRIDE (256) == 0 (and 16B-aligned
+            // mask rows). DSV4's raw-window + compressed-rows concat yields arbitrary n_kv, which
+            // silently kicked the whole attention to the CPU. Pad K/V with zero rows and the mask
+            // with -inf columns so flash attention stays on the GPU.
+            if (cparams.flash_attn) {
+                const int64_t n_kv     = k_all->ne[2];
+                const int64_t n_kv_pad = GGML_PAD(n_kv, 256);
+                if (n_kv_pad != n_kv) {
+                    const int64_t n_extra = n_kv_pad - n_kv;
+
+                    ggml_tensor * k_pad = dsv4_new_filled_3d(ctx0, k_all->ne[0], k_all->ne[1], n_extra, 0.0f);
+                    if (k_pad->type != k_all->type) {
+                        k_pad = ggml_cast(ctx0, k_pad, k_all->type);
+                    }
+                    const bool v_is_k = (v_all == k_all);
+                    k_all = ggml_concat(ctx0, k_all, k_pad, 2);
+                    if (v_is_k) {
+                        v_all = k_all;
+                    } else {
+                        ggml_tensor * v_pad = dsv4_new_filled_3d(ctx0, v_all->ne[0], v_all->ne[1], n_extra, 0.0f);
+                        if (v_pad->type != v_all->type) {
+                            v_pad = ggml_cast(ctx0, v_pad, v_all->type);
+                        }
+                        v_all = ggml_concat(ctx0, v_all, v_pad, 2);
+                    }
+
+                    ggml_tensor * m_pad = dsv4_new_filled_3d(ctx0, n_extra, attn_mask->ne[1], attn_mask->ne[2], -INFINITY);
+                    if (m_pad->type != attn_mask->type) {
+                        m_pad = ggml_cast(ctx0, m_pad, attn_mask->type);
+                    }
+                    attn_mask = ggml_concat(ctx0, attn_mask, m_pad, 0);
+                }
+            }
+
             ggml_tensor * attn_mask_cnv = (cparams.flash_attn && attn_mask->type != GGML_TYPE_F16) ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
             cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, kq_scale, il);
             cb(cur, "kqv_out", il);

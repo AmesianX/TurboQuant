@@ -798,7 +798,7 @@ enum best_fattn_kernel {
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
-    return BEST_FATTN_KERNEL_NONE;
+    { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
 #endif// FLASH_ATTN_AVAILABLE
 
     const ggml_tensor * KQV   = dst;
@@ -840,46 +840,46 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case 112:
         case 256:
             if (V->ne[0] != K->ne[0]) {
-                return BEST_FATTN_KERNEL_NONE;
+                { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         case 192:
             if (V->ne[0] != 128 || !gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
             }
             if (gqa_ratio % 8 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
+                { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         case 320:
             if (V->ne[0] != 256 || !gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
             }
             if (gqa_ratio % 32 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
+                { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         case 512:
             if (V->ne[0] != K->ne[0]) {
-                return BEST_FATTN_KERNEL_NONE;
+                { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
             }
             // TBQ vec kernel doesn't require GQA opt, only MMA does
             if (!gqa_opt_applies && !ggml_is_quantized(K->type) &&
                 K->type != GGML_TYPE_TBQ3_0 && K->type != GGML_TYPE_TBQ4_0 &&
                 K->type != GGML_TYPE_TBQP3_0 && K->type != GGML_TYPE_TBQP4_0) {
-                return BEST_FATTN_KERNEL_NONE;
+                { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         case 576:
             if (V->ne[0] != 512) {
-                return BEST_FATTN_KERNEL_NONE;
+                { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
             }
             if (!gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         default:
-            return BEST_FATTN_KERNEL_NONE;
+            { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
@@ -907,7 +907,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool std_v = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0;
         // TBQ K + standard/TBQ V, or standard K + TBQ V
         if (!(tbq_k && (std_v || tbq_v)) && !(std_k && tbq_v)) {
-            return BEST_FATTN_KERNEL_NONE;
+            { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
         }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -920,7 +920,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-            return BEST_FATTN_KERNEL_NONE;
+            { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
 #endif // GGML_CUDA_FA_ALL_QUANTS
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
@@ -949,11 +949,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_AMXV3_1:
             break;
         default:
-            return BEST_FATTN_KERNEL_NONE;
+            { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
     }
 
     if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
+        { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
     }
 
     // TBQ kernel support (as of v1.5.3):
@@ -998,7 +998,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         //     }
         //     return BEST_FATTN_KERNEL_VEC;
         // }
-        return BEST_FATTN_KERNEL_NONE;
+        { static const bool p_ = getenv("DSV4_GRAPH_PROBE") != nullptr; if (p_) fprintf(stderr, "fattn NONE @line %d\n", __LINE__); return BEST_FATTN_KERNEL_NONE; }
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
@@ -1122,5 +1122,21 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+    const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel(device, dst);
+    // probe (env DSV4_GRAPH_PROBE): dump the FA problem shape when no kernel is selected
+    static const bool probe = getenv("DSV4_GRAPH_PROBE") != nullptr;
+    if (probe && k == BEST_FATTN_KERNEL_NONE) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const ggml_tensor * m = dst->src[3];
+        fprintf(stderr, "fattn NONE: Q[%lld,%lld,%lld,%lld]%s K[%lld,%lld,%lld,%lld]%s V[%lld,%lld,%lld,%lld]%s mask=%s[%lld,%lld,%lld,%lld]%s\n",
+                (long long)Q->ne[0],(long long)Q->ne[1],(long long)Q->ne[2],(long long)Q->ne[3], ggml_type_name(Q->type),
+                (long long)K->ne[0],(long long)K->ne[1],(long long)K->ne[2],(long long)K->ne[3], ggml_type_name(K->type),
+                (long long)V->ne[0],(long long)V->ne[1],(long long)V->ne[2],(long long)V->ne[3], ggml_type_name(V->type),
+                m ? "y" : "n",
+                m ? (long long)m->ne[0] : 0, m ? (long long)m->ne[1] : 0, m ? (long long)m->ne[2] : 0, m ? (long long)m->ne[3] : 0,
+                m ? ggml_type_name(m->type) : "-");
+    }
+    return k != BEST_FATTN_KERNEL_NONE;
 }
