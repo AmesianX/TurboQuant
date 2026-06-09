@@ -175,6 +175,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_deepseek2ocr(params);
         case LLM_ARCH_DEEPSEEK32:
             return new llama_model_deepseek32(params);
+        case LLM_ARCH_DEEPSEEK4:
+            return new llama_model_deepseek4(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -1980,6 +1982,36 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         hparams.swa_type,
                         nullptr,
                         nullptr);
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                // DeepSeek-V4: SWA attention KV + per-layer compressed (r4/r128) states.
+                // Layers with a compress ratio carry the recurrent compressed stream.
+                llama_memory_i::layer_filter_cb filter_attn = [&](int32_t) {
+                    return true;
+                };
+                llama_memory_i::layer_filter_cb filter_recr = [&](int32_t il) {
+                    return hparams.attn_compress_ratio[il] != 0;
+                };
+
+                res = new llama_memory_hybrid_iswa(
+                        /* model             */ *this,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_swa_full     */ params.swa_full,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_ubatch     */ cparams.n_ubatch,
+                        /* attn_n_pad        */ 1,
+                        /* recurrent_type_r  */ GGML_TYPE_F32,
+                        /* recurrent_type_s  */ GGML_TYPE_F32,
+                        /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* n_rs_seq          */ cparams.n_rs_seq,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(filter_attn),
+                        /* filter_recr       */ std::move(filter_recr));
             } break;
         // Models that need standard caching should rely on recurrent/hybrid
         // checks

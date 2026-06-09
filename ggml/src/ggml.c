@@ -2736,6 +2736,10 @@ struct ggml_tensor * ggml_concat(
     struct ggml_tensor  * b,
     int                   dim) {
     GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS);
+    if (a->type != b->type) {
+        fprintf(stderr, "ggml_concat type mismatch: a='%s' type=%s  b='%s' type=%s  dim=%d\n",
+                a->name, ggml_type_name(a->type), b->name, ggml_type_name(b->type), dim);
+    }
     GGML_ASSERT(a->type == b->type);
 
     int64_t ne[GGML_MAX_DIMS];

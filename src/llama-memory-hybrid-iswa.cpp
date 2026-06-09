@@ -654,10 +654,10 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
     uint32_t n_layer;
     uint32_t n_seq;
 
-    io.read_to(&magic,   sizeof(magic));
-    io.read_to(&version, sizeof(version));
-    io.read_to(&n_layer, sizeof(n_layer));
-    io.read_to(&n_seq,   sizeof(n_seq));
+    io.read(&magic,   sizeof(magic));
+    io.read(&version, sizeof(version));
+    io.read(&n_layer, sizeof(n_layer));
+    io.read(&n_seq,   sizeof(n_seq));
 
     if (magic != DSV4_COMPRESSED_KV_STATE_MAGIC) {
         throw std::runtime_error("failed to restore DeepSeek V4 compressed KV cache: bad magic");
@@ -684,22 +684,22 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
         auto & m = meta[il];
         const auto & layer = dsv4_cache_layers[il];
 
-        io.read_to(&m.n_comp, sizeof(m.n_comp));
+        io.read(&m.n_comp, sizeof(m.n_comp));
 
         uint32_t has_attn;
-        io.read_to(&has_attn, sizeof(has_attn));
+        io.read(&has_attn, sizeof(has_attn));
         m.has_attn = has_attn != 0;
         if (m.has_attn) {
-            io.read_to(&m.attn_type,     sizeof(m.attn_type));
-            io.read_to(&m.attn_row_size, sizeof(m.attn_row_size));
+            io.read(&m.attn_type,     sizeof(m.attn_type));
+            io.read(&m.attn_row_size, sizeof(m.attn_row_size));
         }
 
         uint32_t has_index;
-        io.read_to(&has_index, sizeof(has_index));
+        io.read(&has_index, sizeof(has_index));
         m.has_index = has_index != 0;
         if (m.has_index) {
-            io.read_to(&m.index_type,     sizeof(m.index_type));
-            io.read_to(&m.index_row_size, sizeof(m.index_row_size));
+            io.read(&m.index_type,     sizeof(m.index_type));
+            io.read(&m.index_row_size, sizeof(m.index_row_size));
         }
 
         const bool local_has_attn  = layer.attn_k  != nullptr;
@@ -734,7 +734,7 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
 
     for (uint32_t is = 0; is < n_seq; ++is) {
         llama_seq_id src_seq_id;
-        io.read_to(&src_seq_id, sizeof(src_seq_id));
+        io.read(&src_seq_id, sizeof(src_seq_id));
 
         const llama_seq_id dst_seq_id = seq_id == -1 ? src_seq_id : seq_id;
         if (dst_seq_id < 0 || (uint32_t) dst_seq_id >= dsv4_n_seq_max) {
@@ -746,27 +746,31 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
 
             if (layer.attn_k != nullptr) {
                 uint32_t n_rows;
-                io.read_to(&n_rows, sizeof(n_rows));
+                io.read(&n_rows, sizeof(n_rows));
                 if (n_rows > layer.n_comp) {
                     throw std::runtime_error("failed to restore DeepSeek V4 compressed KV cache: too many attention rows");
                 }
                 if (n_rows > 0) {
                     const size_t row_size = dsv4_cache_row_size(layer.attn_k);
-                    ggml_backend_tensor_set(layer.attn_k, io.read((size_t) n_rows*row_size),
-                            dsv4_cache_offset(layer.attn_k, dst_seq_id, 0), (size_t) n_rows*row_size);
+                    std::vector<uint8_t> buf((size_t) n_rows*row_size);
+                    io.read(buf.data(), buf.size());
+                    ggml_backend_tensor_set(layer.attn_k, buf.data(),
+                            dsv4_cache_offset(layer.attn_k, dst_seq_id, 0), buf.size());
                 }
             }
 
             if (layer.index_k != nullptr) {
                 uint32_t n_rows;
-                io.read_to(&n_rows, sizeof(n_rows));
+                io.read(&n_rows, sizeof(n_rows));
                 if (n_rows > layer.n_comp) {
                     throw std::runtime_error("failed to restore DeepSeek V4 compressed KV cache: too many index rows");
                 }
                 if (n_rows > 0) {
                     const size_t row_size = dsv4_cache_row_size(layer.index_k);
-                    ggml_backend_tensor_set(layer.index_k, io.read((size_t) n_rows*row_size),
-                            dsv4_cache_offset(layer.index_k, dst_seq_id, 0), (size_t) n_rows*row_size);
+                    std::vector<uint8_t> buf((size_t) n_rows*row_size);
+                    io.read(buf.data(), buf.size());
+                    ggml_backend_tensor_set(layer.index_k, buf.data(),
+                            dsv4_cache_offset(layer.index_k, dst_seq_id, 0), buf.size());
                 }
             }
         }
