@@ -148,24 +148,15 @@ struct ggml_cuda_kargs_dsv4_rope_tail {
     bool     src2;
 };
 
-static __global__ void kernel_dsv4_hc_split_sinkhorn(
-        const ggml_cuda_kargs_dsv4_hc_split_sinkhorn args,
-        const float * mixes,
+// per-row split + sinkhorn body, shared by the standalone kernel and the fused
+// split+weighted-sum kernel
+static __device__ void dsv4_hc_split_sinkhorn_one(
+        const ggml_cuda_kargs_dsv4_hc_split_sinkhorn & args,
+        const float * mix,
         const float * scale,
         const float * base,
-        float * dst) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if ((int64_t) tid >= args.n_rows) {
-        return;
-    }
-
+        float * out) {
     const int HC = args.n_hc;
-    if (HC <= 0 || HC > DSV4_HC_MAX) {
-        return;
-    }
-
-    const float * mix = mixes + ((int64_t) tid) * args.mix_hc;
-    float * out = dst + ((int64_t) tid) * args.mix_hc;
 
     const float epsv       = args.eps;
     const float pre_scale  = scale[0];
@@ -251,6 +242,24 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
     for (int i = 0; i < HC * HC; ++i) {
         out[2 * HC + i] = c[i];
     }
+}
+
+static __global__ void kernel_dsv4_hc_split_sinkhorn(
+        const ggml_cuda_kargs_dsv4_hc_split_sinkhorn args,
+        const float * mixes,
+        const float * scale,
+        const float * base,
+        float * dst) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if ((int64_t) tid >= args.n_rows) {
+        return;
+    }
+    if (args.n_hc <= 0 || args.n_hc > DSV4_HC_MAX) {
+        return;
+    }
+    dsv4_hc_split_sinkhorn_one(args,
+        mixes + ((int64_t) tid) * args.mix_hc, scale, base,
+        dst   + ((int64_t) tid) * args.mix_hc);
 }
 
 static __global__ void kernel_dsv4_hc_expand(
@@ -448,7 +457,111 @@ static __global__ void kernel_dsv4_hc_weighted_sum(
     *((float *) (dst + d * args.nb0 + t * args.nb1)) = acc;
 }
 
+// Fused split_sinkhorn + weighted_sum (one block per token): thread 0 computes the
+// 24-value sinkhorn split (also written to the split dst so the later post/comb views
+// stay valid), then all threads do the pre-weighted sum over n_embd*n_hc.
+static __global__ void kernel_dsv4_hc_split_sinkhorn_ws(
+        const ggml_cuda_kargs_dsv4_hc_split_sinkhorn sargs,
+        const float * mixes,
+        const float * scale,
+        const float * base,
+        float * split_dst,
+        const ggml_cuda_kargs_dsv4_hc_weighted_sum wargs,
+        const char * x,
+        char * y) {
+    __shared__ float s_pre[DSV4_HC_MAX];
+
+    const int64_t t = blockIdx.x;  // token row
+    if (t >= sargs.n_rows) {
+        return;
+    }
+
+    if (threadIdx.x == 0) {
+        float * out = split_dst + t * sargs.mix_hc;
+        dsv4_hc_split_sinkhorn_one(sargs, mixes + t * sargs.mix_hc, scale, base, out);
+        for (int h = 0; h < sargs.n_hc; ++h) {
+            s_pre[h] = out[h];
+        }
+    }
+    __syncthreads();
+
+    for (int64_t d = threadIdx.x; d < wargs.n_embd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int64_t h = 0; h < wargs.n_hc; ++h) {
+            acc += *((const float *) (x + d * wargs.nb_x0 + h * wargs.nb_x1 + t * wargs.nb_x2)) * s_pre[h];
+        }
+        *((float *) (y + d * wargs.nb0 + t * wargs.nb1)) = acc;
+    }
+}
+
 } // namespace
+
+bool ggml_cuda_op_dsv4_hc_split_sinkhorn_ws_fused(ggml_backend_cuda_context & ctx, ggml_tensor * split, ggml_tensor * ws) {
+    const ggml_tensor * mixes = split->src[0];
+    const ggml_tensor * scale = split->src[1];
+    const ggml_tensor * base  = split->src[2];
+    const ggml_tensor * x     = ws->src[0];
+
+    if (mixes->type != GGML_TYPE_F32 || split->type != GGML_TYPE_F32 ||
+        x->type != GGML_TYPE_F32 || ws->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int32_t n_hc           = ggml_get_op_params_i32(split, 0);
+    const int32_t sinkhorn_iters = ggml_get_op_params_i32(split, 1);
+    const float eps              = ggml_get_op_params_f32(split, 2);
+
+    if (n_hc <= 0 || n_hc > DSV4_HC_MAX) {
+        return false;
+    }
+
+    const int64_t n_rows   = mixes->ne[1];
+    const int64_t n_embd   = ws->ne[0];
+    const int64_t n_tokens = ws->ne[1];
+    if (n_tokens != n_rows) {
+        return false;
+    }
+
+    const ggml_cuda_kargs_dsv4_hc_split_sinkhorn sargs = {
+        /*.n_hc            =*/ n_hc,
+        /*.sinkhorn_iters  =*/ sinkhorn_iters,
+        /*.n_rows          =*/ n_rows,
+        /*.mix_hc          =*/ mixes->ne[0],
+        /*.nb01            =*/ mixes->nb[1],
+        /*.nb1             =*/ split->nb[1],
+        /*.eps             =*/ eps,
+    };
+    const ggml_cuda_kargs_dsv4_hc_weighted_sum wargs = {
+        /*.n_embd  =*/ n_embd,
+        /*.n_hc    =*/ x->ne[1],
+        /*.n_tokens =*/ n_tokens,
+        /*.nb_x0   =*/ x->nb[0],
+        /*.nb_x1   =*/ x->nb[1],
+        /*.nb_x2   =*/ x->nb[2],
+        /*.nb_w0   =*/ 0,
+        /*.nb_w1   =*/ 0,
+        /*.nb0     =*/ ws->nb[0],
+        /*.nb1     =*/ ws->nb[1],
+    };
+
+    {
+        static const bool probe = getenv("DSV4_GRAPH_PROBE") != nullptr;
+        static int fired = 0;
+        if (probe && fired++ < 3) {
+            fprintf(stderr, "hc fused FIRED (n_rows=%lld n_embd=%lld)\n", (long long) n_rows, (long long) n_embd);
+        }
+    }
+
+    const cudaStream_t stream = ctx.stream();
+    kernel_dsv4_hc_split_sinkhorn_ws<<<n_rows, 256, 0, stream>>>(
+        sargs,
+        (const float *) mixes->data, (const float *) scale->data, (const float *) base->data,
+        (float *) split->data,
+        wargs,
+        (const char *) x->data, (char *) ws->data);
+
+    return true;
+}
 
 bool ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];

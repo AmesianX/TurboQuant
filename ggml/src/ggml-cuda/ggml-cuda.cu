@@ -3939,6 +3939,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // DeepSeek-V4 HC: SPLIT_SINKHORN -> (views/reshapes of the split) -> WEIGHTED_SUM(x, pre-view).
+    // The fused kernel still writes the full split dst, so the skipped views (pre/post/comb) and
+    // their later consumers (hc_expand) stay valid.
+    if (node->op == GGML_OP_DSV4_HC_SPLIT_SINKHORN) {
+        ggml_tensor * pre_view = nullptr;
+        int j = i + 1;
+        const int lim = std::min(cgraph->n_nodes, i + 7);
+        for (; j < lim; j++) {
+            ggml_tensor * t = cgraph->nodes[j];
+            if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE) {
+                const ggml_tensor * s = t->src[0];
+                const bool from_split = s == node ||
+                    (s != nullptr && (s->op == GGML_OP_VIEW || s->op == GGML_OP_RESHAPE || s->op == GGML_OP_PERMUTE) && s->src[0] == node);
+                if (!from_split) {
+                    break;
+                }
+                if (t->op == GGML_OP_VIEW && t->src[0] == node && t->view_offs == 0) {
+                    pre_view = t;
+                }
+                continue;
+            }
+            break;
+        }
+        if (pre_view != nullptr && j < cgraph->n_nodes &&
+                cgraph->nodes[j]->op == GGML_OP_DSV4_HC_WEIGHTED_SUM &&
+                cgraph->nodes[j]->src[1] == pre_view) {
+            if (ggml_cuda_op_dsv4_hc_split_sinkhorn_ws_fused(*cuda_ctx, node, cgraph->nodes[j])) {
+                return j - i;
+            }
+        }
+    }
+
     // Snake activation: y = x + sin(a*x)^2 * inv_b
     // Naive 5-op decomposition emitted by frontends: mul -> sin -> sqr -> mul -> add
     if (ggml_can_fuse_subgraph(cgraph, i,

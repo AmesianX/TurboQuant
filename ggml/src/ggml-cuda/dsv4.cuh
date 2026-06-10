@@ -15,3 +15,6 @@ bool ggml_cuda_op_dsv4_hc_expand(ggml_backend_cuda_context & ctx, ggml_tensor * 
 bool ggml_cuda_op_dsv4_hc_weighted_sum(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_op_dsv4_fp8_kv_quantize(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_op_dsv4_rope_tail(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// fused split_sinkhorn + weighted_sum (the split dst is still fully written so the
+// later post/comb views stay valid); returns false if the shapes don't qualify
+bool ggml_cuda_op_dsv4_hc_split_sinkhorn_ws_fused(ggml_backend_cuda_context & ctx, ggml_tensor * split, ggml_tensor * ws);
