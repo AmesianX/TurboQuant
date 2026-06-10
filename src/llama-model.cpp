@@ -1985,13 +1985,41 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
         case LLM_ARCH_DEEPSEEK4:
             {
+                const uint32_t n_main = hparams.n_layer - hparams.nextn_predict_layers;
+
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                    // MTP draft context: the NextN layer is plain SWA attention
+                    // (no compressor/recurrent state), so a plain attention KV
+                    // cache covering only the trailing layer(s) is enough.
+                    llama_kv_cache::layer_filter_cb filter_mtp = [n_main](int32_t il) {
+                        return (uint32_t) il >= n_main;
+                    };
+
+                    res = new llama_kv_cache_iswa(
+                            *this,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            params.swa_full,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            cparams.n_ubatch,
+                            1,
+                            filter_mtp,
+                            nullptr);
+                    break;
+                }
+
                 // DeepSeek-V4: SWA attention KV + per-layer compressed (r4/r128) states.
                 // Layers with a compress ratio carry the recurrent compressed stream.
-                llama_memory_i::layer_filter_cb filter_attn = [&](int32_t) {
-                    return true;
+                // The trailing NextN/MTP layer(s) belong to the MTP draft context only.
+                llama_memory_i::layer_filter_cb filter_attn = [n_main](int32_t il) {
+                    return (uint32_t) il < n_main;
                 };
-                llama_memory_i::layer_filter_cb filter_recr = [&](int32_t il) {
-                    return hparams.attn_compress_ratio[il] != 0;
+                llama_memory_i::layer_filter_cb filter_recr = [&, n_main](int32_t il) {
+                    return (uint32_t) il < n_main && hparams.attn_compress_ratio[il] != 0;
                 };
 
                 res = new llama_memory_hybrid_iswa(

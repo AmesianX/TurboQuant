@@ -213,6 +213,14 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    // DeepSeek-V4 MTP: split eh_proj (e_proj(enorm(emb)) + h_proj(hnorm(hc)))
+    // and the MTP head's own hyper-connection collapse
+    struct ggml_tensor * e_proj                = nullptr;
+    struct ggml_tensor * h_proj                = nullptr;
+    struct ggml_tensor * hc_head_base          = nullptr;
+    struct ggml_tensor * hc_head_fn            = nullptr;
+    struct ggml_tensor * hc_head_scale         = nullptr;
 };
 
 struct llama_layer {

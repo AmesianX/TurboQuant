@@ -588,6 +588,13 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    // DeepSeek-V4 MTP head: split eh_proj (e_proj + h_proj summed) and its own
+    // hyper-connection collapse in front of the shared output head
+    LLM_TENSOR_NEXTN_E_PROJ,
+    LLM_TENSOR_NEXTN_H_PROJ,
+    LLM_TENSOR_NEXTN_HC_HEAD_BASE,
+    LLM_TENSOR_NEXTN_HC_HEAD_FN,
+    LLM_TENSOR_NEXTN_HC_HEAD_SCALE,
 };
 
 enum llm_tensor_layer {

@@ -1098,7 +1098,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
 
-    for (int il = 0; il < n_layer; ++il) {
+    // the trailing NextN/MTP layer(s) are not part of the main decoder graph
+    const int n_main_layers = n_layer - (int) hparams.nextn_predict_layers;
+
+    for (int il = 0; il < n_main_layers; ++il) {
         const auto & layer = model.layers[il];
         const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
         const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
@@ -1691,6 +1694,24 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
         hparams.dsv4_state_size = std::max(hparams.dsv4_state_size, state_size);
     }
 
+    if (hparams.nextn_predict_layers > 0) {
+        // Include the MTP/NextN draft layer(s) in n_layer (qwen35 convention) so
+        // device mapping and model.layers[] cover them. The main context excludes
+        // them via the create_memory layer filters; per-layer hparams mirror the
+        // last main layer (plain SWA attention, no compressor, no indexer).
+        const uint32_t n_main = hparams.n_layer;
+        for (uint32_t k = 0; k < hparams.nextn_predict_layers; ++k) {
+            const uint32_t il = n_main + k;
+            hparams.attn_compress_ratio[il] = 0;
+            hparams.swa_layers[il]          = 1;
+            hparams.n_head_arr[il]          = hparams.n_head_arr[n_main - 1];
+            hparams.n_head_kv_arr[il]       = hparams.n_head_kv_arr[n_main - 1];
+            hparams.n_ff_arr[il]            = hparams.n_ff_arr[n_main - 1];
+            hparams.swiglu_clamp_exp[il]    = hparams.swiglu_clamp_exp[n_main - 1];
+        }
+        hparams.n_layer += hparams.nextn_predict_layers;
+    }
+
     type = LLM_TYPE_UNKNOWN;
 
     LLAMA_LOG_INFO("%s: n_lora_q              = %d\n",     __func__, hparams.n_lora_q);
@@ -1749,7 +1770,9 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
         norm = create_tensor(tn(indexer ? LLM_TENSOR_INDEXER_COMPRESSOR_NORM : LLM_TENSOR_ATTN_COMPRESSOR_NORM, "weight", bid), {head_size}, 0);
     };
 
-    for (int i = 0; i < n_layer; ++i) {
+    const int n_main_layers = n_layer - (int) hparams.nextn_predict_layers;
+
+    for (int i = 0; i < n_main_layers; ++i) {
         auto & layer = layers[i];
 
         const int64_t compress_ratio = hparams.attn_compress_ratio[i];
@@ -1798,6 +1821,55 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
+    }
+
+    // DeepSeek-V4 MTP/NextN draft layer(s): a full MLA+MoE decoder layer (no
+    // compressor, no indexer, no hash routing) plus the split eh projections
+    // and the head's own hyper-connection collapse. All optional: ds4 GGUFs
+    // advertise nextn_predict_layers in metadata even when the converter did
+    // not preserve the MTP tensors.
+    for (int i = n_main_layers; i < n_layer; ++i) {
+        auto & layer = layers[i];
+        const int f = TENSOR_NOT_REQUIRED;
+
+        layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix}, f);
+        layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix}, f);
+        layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, f);
+        layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix}, f);
+        layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix}, f);
+        layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, f);
+
+        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, f);
+        layer.ffn_norm       = create_tensor(tn(LLM_TENSOR_FFN_NORM,       "weight", i), {n_embd}, f);
+        layer.attn_sinks     = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,     "weight", i), {n_head}, f);
+        layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, f);
+        layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {n_embd_head_k}, f);
+
+        layer.wq_a      = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,    "weight", i), {n_embd, q_lora_rank}, f);
+        layer.wq_b      = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,    "weight", i), {q_lora_rank, n_head * n_embd_head_k}, f);
+        layer.attn_kv   = create_tensor(tn(LLM_TENSOR_ATTN_KV,     "weight", i), {n_embd, n_embd_head_k}, f);
+        layer.attn_wo_a = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,  "weight", i), {n_head * n_embd_head_v / n_out_groups, n_out_groups * o_lora_rank}, f);
+        layer.attn_wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,  "weight", i), {n_out_groups * o_lora_rank, n_embd}, f);
+
+        layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, f);
+        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, f);
+
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, f);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, f);
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, f);
+
+        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, f);
+        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, f);
+        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, f);
+
+        layer.nextn.e_proj           = create_tensor(tn(LLM_TENSOR_NEXTN_E_PROJ,           "weight", i), {n_embd, n_embd}, f);
+        layer.nextn.h_proj           = create_tensor(tn(LLM_TENSOR_NEXTN_H_PROJ,           "weight", i), {n_embd, n_embd}, f);
+        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, f);
+        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, f);
+        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, f);
+        layer.nextn.hc_head_base     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,     "weight", i), {n_hc}, f);
+        layer.nextn.hc_head_fn       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,       "weight", i), {hc_dim, n_hc}, f);
+        layer.nextn.hc_head_scale    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE,    "weight", i), {1}, f);
     }
 }
 
