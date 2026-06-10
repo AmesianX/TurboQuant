@@ -203,6 +203,45 @@ static void concat_cuda_t(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
+// quantized concat: blocks are confined to dim 0, so for dim >= 1 the rows can be
+// copied as raw bytes (TBQ KV-cache concat in the DeepSeek-V4 compressed-attention graph)
+static void concat_cuda_q(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    cudaStream_t stream = ctx.stream();
+
+    const int32_t dim = ((const int32_t *) dst->op_params)[0];
+
+    GGML_ASSERT(dim > 0); // dim 0 would split quantized blocks
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+
+    const char * src0_d = (const char *) src0->data;
+    const char * src1_d = (const char *) src1->data;
+
+    char * dst_d = (char *) dst->data;
+
+    if (dim == 3) {
+        const size_t size0 = ggml_nbytes(src0);
+        const size_t size1 = ggml_nbytes(src1);
+
+        CUDA_CHECK(cudaMemcpyAsync(dst_d,         src0_d, size0, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(dst_d + size0, src1_d, size1, cudaMemcpyDeviceToDevice, stream));
+        return;
+    }
+
+    // src0/src1/dst share ne[0] and the type, so they share the row byte size
+    const int64_t row_bytes = ggml_row_size(dst->type, dst->ne[0]);
+    for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
+        concat_cont_cuda<char>(
+                src0_d + i3*src0->nb[3],
+                src1_d + i3*src1->nb[3],
+                dst_d  + i3* dst->nb[3],
+                row_bytes, src0->ne[1], src0->ne[2],
+                row_bytes,  dst->ne[1],  dst->ne[2], dim, stream);
+    }
+}
+
 void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -218,6 +257,10 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             concat_cuda_t<half>(ctx, dst);
             break;
         default:
+            if (ggml_is_quantized(dst->type)) {
+                concat_cuda_q(ctx, dst);
+                break;
+            }
             GGML_ABORT("unsupported type for concat: %s", ggml_type_name(dst->type));
     }
 }

@@ -229,11 +229,18 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         // +1 scratch row at index n_comp: the phase-uniform decode graph writes its
         // off-boundary (discarded) compress results there, keeping the graph topology
         // token-invariant. Views are capped at n_comp, so scratch is never visible.
-        cache.attn_k = ggml_new_tensor_3d(ctx, type_k, hparams.n_embd_head_k(il), n_comp + 1, dsv4_n_seq_max);
+        //
+        // Both side caches are pinned to F16 regardless of -ctk:
+        //  - attn_k rows are concat'd with SWA cache rows in the graph
+        //    (deepseek4.cpp: k_all = concat(k_raw, kv_comp_cache)), and the SWA cache
+        //    is force-upgraded to F16 in llama_kv_cache_iswa — the types must match.
+        //  - index_k feeds regular mul_mat (indexer scores) and its row width
+        //    (indexer_head_size=128) is smaller than the TBQ*_0 block size (256).
+        cache.attn_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hparams.n_embd_head_k(il), n_comp + 1, dsv4_n_seq_max);
         ggml_format_name(cache.attn_k, "cache_dsv4_attn_k_l%d", il);
 
         if (ratio == 4) {
-            cache.index_k = ggml_new_tensor_3d(ctx, type_k, hparams.indexer_head_size, n_comp + 1, dsv4_n_seq_max);
+            cache.index_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hparams.indexer_head_size, n_comp + 1, dsv4_n_seq_max);
             ggml_format_name(cache.index_k, "cache_dsv4_index_k_l%d", il);
         }
     }
