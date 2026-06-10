@@ -9,7 +9,23 @@
 - 📗 [**TurboQuant 구현: 프로덕션 LLM 추론 엔진에서의 3비트 KV 캐시 압축**](paper/turboquant_impl_ko.pdf) — 원본 TBQ v1 구현 논문 (WHT + Lloyd-Max + QJL)
 - 📕 [English — TurboQuant Impl](paper/turboquant_impl.pdf)
 
-### 🆕 v1.7.0 — TriAttention 통합 + attn_rot_k 중복 회전 제거
+### 🆕 v1.8.0 — DeepSeek-V4-Flash 풀 CUDA 포팅 + MTP 셀프-스펙 디코딩
+
+**DeepSeek-V4-Flash(`deepseek4`)가 TurboQuant 포크에서 end-to-end로 돌아갑니다 — CSA/HCA 압축 attention, hyper-connection, DSA lightning indexer, phase-uniform decode graph(CUDA-graph capture)까지 포함, GB10에서 ds4 레퍼런스 엔진 parity(13.4 t/s). 그 위에 antirez의 사이드 GGUF로부터 MTP 셀프-스펙 디코딩, 그리고 global attention 레이어의 tbq3 KV까지.**
+
+**환경:** NVIDIA DGX Spark (GB10, 128GB) · DeepSeek-V4-Flash-IQ2_XS-XL (82GB, antirez 계보) · ctx=16384 · greedy.
+
+| 모드 | gen t/s | 비고 |
+|------|---------|------|
+| baseline (f16 KV) | 13.4 | ds4 엔진(13.75)의 97% |
+| + MTP (`--spec-type draft-mtp --spec-draft-p-min 0.75 --spec-draft-n-max 2`) | **15.5 (자유 텍스트) / 17.0 (규칙적 텍스트)** | **+15% / +27%**, accept 98–100% |
+
+- **MTP 헤드는 별도 GGUF로 배포됨** — `turboquant/ds4_mtp_to_shard.py`가 `mtp.0.*` 텐서를 `blk.43.nextn.*`로 리네임해 **3번째 split shard**로 변환하고 shard1의 `split.count`를 in-place 패치(6바이트, `--revert` 지원)합니다. 82GB 메인 shard 재양자화 불필요.
+- **draft 헤드의 hidden 입력 = full hyper-connection 상태** (`n_embd_h = n_hc·n_embd = 16384`). 새 `llama_model_n_embd_h()` API로 pre-norm 버퍼/MTP 배치 폭/draft-mtp impl에 배관. **p_min 게이트 필수**: 게이트 없이는 accept 69%로 떨어져 verify+체크포인트 비용이 이득을 역전(baseline보다 느려짐).
+- **`-ctk tbq3 -ctv tbq3`가 DSV4에서 동작** — global(ratio==0) 레이어가 TBQ3_0 @ head_dim 512 (GLM-4.7-Flash 512 커널 재활용), SWA·compressed 사이드 캐시는 품질 정책상 f16 유지. dim≥1 양자화 CUDA concat 추가.
+- **버그픽스:** DSV4 compressed-KV state 복원이 raw 호스트 read를 사용 — ON_DEVICE 체크포인트(스펙 롤백)에서 스트림 어긋남. `read_tensor`로 수정.
+
+### v1.7.0 — TriAttention 통합 + attn_rot_k 중복 회전 제거
 
 **AMX3_1 하이브리드 K 캐시에 TriAttention 토큰 가지치기 — dequant-free pre-RoPE polar 스코어링 + 물리 eviction. 전 TBQ/TBQP/AMX 인코더의 외부 attn_rot_k 의존 제거 (중복 Hadamard 제거).**
 

@@ -9,7 +9,25 @@
 - 📗 [**TurboQuant in Practice: Implementing 3-Bit KV Cache Compression in a Production LLM Inference Engine**](turboquant/paper/turboquant_impl.pdf) — original TBQ v1 implementation paper (WHT + Lloyd-Max + QJL)
 - 📕 [한국어판 — TurboQuant 구현](turboquant/paper/turboquant_impl_ko.pdf)
 
-### 🆕 v1.7.0 — TriAttention Integration + attn_rot_k Duplicate Rotation Cleanup
+### 🆕 v1.8.0 — DeepSeek-V4-Flash Full CUDA Port + MTP Self-Speculative Decoding
+
+**DeepSeek-V4-Flash (`deepseek4`) runs end-to-end on the TurboQuant fork — CSA/HCA compressed attention, hyper-connections, the DSA lightning indexer, and a phase-uniform decode graph with CUDA-graph capture — at ds4-reference-engine parity (13.4 t/s on GB10). On top of that: MTP self-speculative decoding from antirez's side GGUF, and tbq3 KV on the global attention layers.**
+
+> 🚧 The AMX3_1 fattn-mma tensor-core port teased below slides to a future release — DeepSeek-V4-Flash day-N support took the 1.8.0 slot.
+
+**Environment:** NVIDIA DGX Spark (GB10, 128GB) · DeepSeek-V4-Flash-IQ2_XS-XL (82GB, antirez lineage) · ctx=16384 · greedy.
+
+| Mode | gen t/s | Notes |
+|------|---------|-------|
+| baseline (f16 KV) | 13.4 | 97% of the ds4 engine (13.75) |
+| + MTP (`--spec-type draft-mtp --spec-draft-p-min 0.75 --spec-draft-n-max 2`) | **15.5 (free text) / 17.0 (regular text)** | **+15% / +27%**, accept 98–100% |
+
+- **The MTP head ships as a separate GGUF** — `turboquant/ds4_mtp_to_shard.py` renames the `mtp.0.*` tensors to `blk.43.nextn.*`, emits them as a **third split shard**, and patches shard 1's `split.count` in place (6 bytes, `--revert` supported). No requantization of the 82GB main shards.
+- **The draft head consumes the full hyper-connection state** (`n_embd_h = n_hc·n_embd = 16384`) as its hidden input — plumbed via the new `llama_model_n_embd_h()` API through the pre-norm buffers, the MTP batch width, and the draft-mtp impl. **The p_min gate is mandatory**: without it acceptance drops to 69% and verify+checkpoint overhead makes it slower than baseline.
+- **`-ctk tbq3 -ctv tbq3` works on DSV4** — global (ratio==0) layers get TBQ3_0 @ head_dim 512 (reusing the GLM-4.7-Flash 512 kernels); the SWA and compressed side caches stay f16 by quality policy. Quantized CUDA concat added for dim≥1.
+- **Bugfix:** DSV4 compressed-KV state restore used raw host reads — desynced ON_DEVICE checkpoints (speculative rollback). Now `read_tensor`.
+
+### v1.7.0 — TriAttention Integration + attn_rot_k Duplicate Rotation Cleanup
 
 **TriAttention token pruning on AMX3_1 hybrid K cache — dequant-free pre-RoPE polar scoring + physical eviction. All TBQ/TBQP/AMX encoders freed from external attn_rot_k dependency (redundant Hadamard now gone).**
 
@@ -110,7 +128,7 @@ Back in early v1.6.0 work we sketched out "polar derotation" from scratch — st
 
 One thing worth being straight about: the domvox Python reference pays a GPU→CPU roundtrip on every scoring trigger — K gets dequantized, pulled to host, scored in Python, mask pushed back. At β=128 and 40 layers that's the dominant latency on a 14B model. Our CUDA port removes that bottleneck entirely: Part B is exactly the layout the scoring formula needs, so the three scoring kernels read quantized blocks in place, the histogram Top-B and the eviction kernel run on the same stream, and nothing except a few-KB position array crosses PCIe during a trigger. Trigger overhead drops to ~2% of a 128-token decode window instead of seconds per trigger. But the tradeoff is memory: because AMX3_1 stores Part A (WHT for attention) AND Part B (polar for scoring) side by side, a block is 108 B instead of tbq3_1's 50 B — a little over 2× the raw K cache footprint at head_dim=128 for the same number of slots. TriAttention gives that memory back by evicting 95% of slots per trigger (so the *live* working set is smaller than plain tbq3_1 would have been), but the **allocated** KV buffer is bigger. We traded bytes for a throughput-neutral scoring path; it's the right trade at scale but worth naming honestly.
 
-#### 🚧 What's coming in v1.8.0 — *to be continued*
+#### 🚧 What's coming next (was: v1.8.0) — *to be continued*
 
 Right now the AMX3_1 + TriAttention path rides on the **fattn-vec** kernel. Vec is the sequential-friendly "one token at a time" FlashAttention variant, and it's why decode sits at ~0.87× f16 throughput (**20.7 tok/s on Qwen3-14B**). The actual workhorse kernel on modern Ampere/Hopper/Blackwell parts is **fattn-mma** — the Tensor-Core one that hits GEMM bandwidth. Every other mainstream quant type is already on MMA; AMX3_1 is temporarily on vec only because the polar-derotate read path was faster to wire up there first.
 
