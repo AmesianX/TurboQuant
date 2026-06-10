@@ -254,6 +254,38 @@ void get_rows_cuda(
     }
 }
 
+// K-quant get_rows fallback: gather the raw quantized rows, then bulk-dequantize with the
+// existing to_fp32 converter. The simple per-pair k_get_rows kernel can't express K-quant
+// superblocks; without this, token-embedding lookups from K-quant tok_embd (e.g. q5_K in
+// DeepSeek-V4-Flash GGUFs) fell back to the CPU and split the graph at every decode step.
+static __global__ void k_gather_rows_raw(const char * __restrict__ src0, const int32_t * __restrict__ src1,
+        char * __restrict__ dst, const size_t row_bytes, const size_t nb01) {
+    const int64_t i = blockIdx.x;
+    const char * s = src0 + (size_t) src1[i]*nb01;
+    char       * d = dst  + (size_t) i*row_bytes;
+    for (size_t j = threadIdx.x; j < row_bytes; j += blockDim.x) {
+        d[j] = s[j];
+    }
+}
+
+static bool get_rows_cuda_have_simple_kernel(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_F32:
+        case GGML_TYPE_I32:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -268,6 +300,28 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    if (ggml_is_quantized(src0->type) && !get_rows_cuda_have_simple_kernel(src0->type)) {
+        // gather + dequantize path (K-quants etc.)
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ne11 == 1 && ne12 == 1);            // flat index list (e.g. token embedding)
+        GGML_ASSERT(ggml_is_contiguous(src1));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+        GGML_ASSERT(to_fp32 != nullptr);
+
+        const int64_t n_rows    = ne10;
+        const size_t  row_bytes = ggml_row_size(src0->type, ne00);
+
+        if (n_rows > 0) {
+            ggml_cuda_pool_alloc<char> rows_alloc(ctx.pool(), n_rows*row_bytes);
+            k_gather_rows_raw<<<n_rows, 256, 0, stream>>>(
+                (const char *) src0->data, (const int32_t *) src1->data, rows_alloc.get(), row_bytes, nb01);
+            to_fp32(rows_alloc.get(), (float *) dst->data, n_rows*ne00, stream);
+        }
+        return;
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

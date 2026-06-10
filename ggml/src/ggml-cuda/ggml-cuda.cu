@@ -5239,6 +5239,15 @@ static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, co
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                         return true;
+                    // K-quants via the gather+dequantize path in ggml_cuda_op_get_rows
+                    // (flat index list + f32 dst only — the token-embedding shape)
+                    case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_Q3_K:
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q5_K:
+                    case GGML_TYPE_Q6_K:
+                        return op->type == GGML_TYPE_F32 &&
+                               op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 1;
                     default:
                         return false;
                 }
