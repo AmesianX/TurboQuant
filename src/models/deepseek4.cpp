@@ -45,6 +45,17 @@ enum class dsv4_mask_kind {
     ATTN_STATIC,
 };
 
+// position-derived i32 graph inputs for the phase-uniform decode path (n_tokens == 1).
+// Content changes per token but shape/pointer stay fixed, so CUDA-graph node properties
+// remain stable (no per-token re-capture).
+enum class dsv4_ivec_kind {
+    ROW_IDX,    // [1]    state write row:   ratio==4 ? 4 + pos%4 : pos%ratio
+    COMP_POS,   // [1]    rope position of the compressed row: pos + 1 - ratio
+    STATE_PERM, // [rows] state column permutation: boundary ? shift : identity
+    CACHE_ROW,  // [1]    compressed-KV cache row: boundary ? (pos+1)/ratio - 1 : scratch
+    APE_PHASE,  // [1]    ape column: pos % ratio
+};
+
 struct dsv4_mask_entry {
     ggml_tensor   * tensor = nullptr;
     dsv4_mask_kind kind;
@@ -73,7 +84,65 @@ public:
         return t;
     }
 
+    ggml_tensor * add_ivec(
+            ggml_context * ctx,
+            dsv4_ivec_kind kind,
+            int64_t        ratio,
+            int64_t        length,
+            int64_t        scratch_row,
+            const char   * name) {
+        for (const auto & v : ivecs) {
+            if (v.kind == kind && v.ratio == ratio) {
+                return v.tensor;  // shared across layers with the same ratio
+            }
+        }
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, length);
+        ggml_set_input(t);
+        ggml_set_name(t, name);
+        ivecs.push_back({ t, kind, ratio, scratch_row });
+        return t;
+    }
+
     void set_input(const llama_ubatch * ubatch) override {
+        for (const auto & v : ivecs) {
+            if (v.tensor->buffer == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(ubatch->n_tokens == 1 && "dsv4 ivec inputs are decode-only");
+            const llama_pos pos = ubatch->pos ? ubatch->pos[0] : 0;
+            const int64_t  len  = v.tensor->ne[0];
+            const bool boundary = ((pos + 1) % v.ratio) == 0;
+
+            std::vector<int32_t> data(len, 0);
+            switch (v.kind) {
+                case dsv4_ivec_kind::ROW_IDX:
+                    data[0] = (int32_t) (v.ratio == 4 ? v.ratio + pos % v.ratio : pos % v.ratio);
+                    break;
+                case dsv4_ivec_kind::COMP_POS:
+                    data[0] = (int32_t) (pos + 1 - v.ratio);
+                    break;
+                case dsv4_ivec_kind::STATE_PERM:
+                    for (int64_t i = 0; i < len; ++i) {
+                        data[i] = (int32_t) i;
+                    }
+                    if (boundary && v.ratio == 4) {
+                        // shift current window -> previous; duplicated current rows are
+                        // fully overwritten before the next boundary
+                        for (int64_t i = 0; i < len; ++i) {
+                            data[i] = (int32_t) (v.ratio + i % v.ratio);
+                        }
+                    }
+                    break;
+                case dsv4_ivec_kind::CACHE_ROW:
+                    data[0] = (int32_t) (boundary ? (pos + 1) / v.ratio - 1 : v.scratch_row);
+                    break;
+                case dsv4_ivec_kind::APE_PHASE:
+                    data[0] = (int32_t) (pos % v.ratio);
+                    break;
+            }
+            ggml_backend_tensor_set(v.tensor, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+
         for (const auto & mask : masks) {
             GGML_ASSERT(mask.tensor != nullptr);
             if (mask.tensor->buffer == nullptr) {
@@ -151,6 +220,13 @@ private:
     }
 
     std::vector<dsv4_mask_entry> masks;
+    struct dsv4_ivec_entry {
+        ggml_tensor *  tensor;
+        dsv4_ivec_kind kind;
+        int64_t        ratio;
+        int64_t        scratch_row;
+    };
+    std::vector<dsv4_ivec_entry> ivecs;
 };
 
 struct dsv4_rope_cfg {
@@ -253,6 +329,19 @@ static void dsv4_store_cache_rows(
     src = ggml_reshape_2d(ctx, src, cache->ne[0], n_rows);
 
     ggml_tensor * rows = dsv4_arange_i32(ctx, row_start, row_start + n_rows);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache, src, rows));
+}
+
+// phase-uniform variant: the destination row comes from an i32 graph INPUT
+// (CACHE_ROW), so the node properties stay stable across tokens
+static void dsv4_store_cache_rows_idx(
+        ggml_context * ctx,
+        ggml_cgraph  * gf,
+        ggml_tensor  * cache,
+        ggml_tensor  * src,
+        ggml_tensor  * rows) {
+    src = ggml_cont(ctx, src);
+    src = ggml_reshape_2d(ctx, src, cache->ne[0], rows->ne[0]);
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache, src, rows));
 }
 
@@ -692,6 +781,66 @@ static dsv4_decode_compressor dsv4_build_compressor_decode(
             rope_type, rope_cfg, norm_eps);
 }
 
+// phase-uniform decode compressor (n_tokens == 1): identical math to the pos-based
+// version, but every position-dependent construct comes from i32 graph INPUTS so the
+// graph topology and node properties are token-invariant (CUDA-graph capturable):
+//  - state write row / ape column / rope position are input tensors
+//  - pooling runs UNCONDITIONALLY (the ratio==4 pool reads fixed-offset views; off-boundary
+//    results land in the cache scratch row via CACHE_ROW and are never visible)
+//  - the boundary state shift is a column permutation gather (identity off-boundary)
+static dsv4_decode_compressor dsv4_build_compressor_decode_uniform(
+        ggml_context       * ctx,
+        ggml_tensor        * x,
+        ggml_tensor        * prev_kv_state,
+        ggml_tensor        * prev_score_state,
+        ggml_tensor        * wkv,
+        ggml_tensor        * wgate,
+        ggml_tensor        * ape,
+        ggml_tensor        * norm,
+        ggml_tensor        * row_idx,
+        ggml_tensor        * state_perm,  // nullptr for ratio != 4
+        ggml_tensor        * comp_pos,
+        ggml_tensor        * ape_phase,
+        int64_t              head_dim,
+        int64_t              n_rot,
+        int64_t              compress_ratio,
+        int                  rope_type,
+        const dsv4_rope_cfg & rope_cfg,
+        float                norm_eps) {
+    ggml_tensor * kv_cur = ggml_mul_mat(ctx, wkv, x);       // [width, 1]
+    ggml_tensor * sc_cur = ggml_mul_mat(ctx, wgate, x);
+    ggml_tensor * ape_f  = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
+    sc_cur = ggml_add(ctx, sc_cur, ggml_get_rows(ctx, ape_f, ape_phase));
+
+    ggml_tensor * kv_state    = ggml_set_rows(ctx, prev_kv_state,    kv_cur, row_idx);
+    ggml_tensor * score_state = ggml_set_rows(ctx, prev_score_state, sc_cur, row_idx);
+
+    ggml_tensor * kv_pool;
+    ggml_tensor * score_pool;
+    if (compress_ratio == 4) {
+        ggml_tensor * kv_prev = dsv4_view_cols(ctx, kv_state,    head_dim, compress_ratio, 0,        0);
+        ggml_tensor * kv_curr = dsv4_view_cols(ctx, kv_state,    head_dim, compress_ratio, head_dim, compress_ratio);
+        ggml_tensor * sc_prev = dsv4_view_cols(ctx, score_state, head_dim, compress_ratio, 0,        0);
+        ggml_tensor * sc_curr = dsv4_view_cols(ctx, score_state, head_dim, compress_ratio, head_dim, compress_ratio);
+
+        kv_pool    = ggml_concat(ctx, kv_prev, kv_curr, 1);
+        score_pool = ggml_concat(ctx, sc_prev, sc_curr, 1);
+    } else {
+        kv_pool    = kv_state;
+        score_pool = score_state;
+    }
+
+    ggml_tensor * kv_comp = dsv4_pool_decode_state(ctx, kv_pool, score_pool, norm, comp_pos,
+            head_dim, n_rot, rope_type, rope_cfg, norm_eps);
+
+    if (state_perm != nullptr) {
+        kv_state    = ggml_get_rows(ctx, kv_state,    state_perm);
+        score_state = ggml_get_rows(ctx, score_state, state_perm);
+    }
+
+    return { kv_state, score_state, kv_comp };
+}
+
 static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
         ggml_context       * ctx,
         ggml_tensor        * kv_cur,
@@ -1030,6 +1179,18 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                     dsv4_store_cache_rows(ctx0, gf, mctx_dsv4->get_dsv4_index_k(ctx0, il, dst_seq_id), src, row_start, n_rows);
                 }
             };
+            auto store_attn_cache_rows_idx = [&](ggml_tensor * src, ggml_tensor * rows) {
+                for (int32_t is = 0; is < ubatch.n_seq_id[0]; ++is) {
+                    const llama_seq_id dst_seq_id = ubatch.seq_id[0][is];
+                    dsv4_store_cache_rows_idx(ctx0, gf, mctx_dsv4->get_dsv4_attn_k(ctx0, il, dst_seq_id), src, rows);
+                }
+            };
+            auto store_index_cache_rows_idx = [&](ggml_tensor * src, ggml_tensor * rows) {
+                for (int32_t is = 0; is < ubatch.n_seq_id[0]; ++is) {
+                    const llama_seq_id dst_seq_id = ubatch.seq_id[0][is];
+                    dsv4_store_cache_rows_idx(ctx0, gf, mctx_dsv4->get_dsv4_index_k(ctx0, il, dst_seq_id), src, rows);
+                }
+            };
             const int64_t state_size = hparams.n_embd_r();
             const dsv4_state_layout attn_state_layout = dsv4_make_state_layout(compress_ratio, n_embd_head_k);
 
@@ -1152,17 +1313,44 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 const int64_t n_comp_cache = mctx_dsv4->get_dsv4_n_comp(il);
                 GGML_ASSERT(n_comp_visible <= n_comp_cache);
 
+                // phase-uniform decode (n_tokens == 1): position-derived values come from
+                // i32 graph inputs (shared per ratio), the compressed-KV view is padded to
+                // 256-row steps, and off-boundary compress results go to the cache scratch
+                // row — so the graph topology/properties are token-invariant.
+                const std::string rsuf = "_r" + std::to_string(compress_ratio);
+                ggml_tensor * in_row_idx    = nullptr;
+                ggml_tensor * in_state_perm = nullptr;
+                ggml_tensor * in_comp_pos   = nullptr;
+                ggml_tensor * in_ape_phase  = nullptr;
+                ggml_tensor * in_cache_row  = nullptr;
+                if (n_tokens == 1) {
+                    auto * di = get_dsv4_inputs();
+                    in_row_idx   = di->add_ivec(ctx0, dsv4_ivec_kind::ROW_IDX,   compress_ratio, 1, 0, ("dsv4_row_idx"   + rsuf).c_str());
+                    in_comp_pos  = di->add_ivec(ctx0, dsv4_ivec_kind::COMP_POS,  compress_ratio, 1, 0, ("dsv4_comp_pos"  + rsuf).c_str());
+                    in_ape_phase = di->add_ivec(ctx0, dsv4_ivec_kind::APE_PHASE, compress_ratio, 1, 0, ("dsv4_ape_phase" + rsuf).c_str());
+                    in_cache_row = di->add_ivec(ctx0, dsv4_ivec_kind::CACHE_ROW, compress_ratio, 1, n_comp_cache, ("dsv4_cache_row" + rsuf).c_str());
+                    if (compress_ratio == 4) {
+                        in_state_perm = di->add_ivec(ctx0, dsv4_ivec_kind::STATE_PERM, compress_ratio, 2*compress_ratio, 0, ("dsv4_state_perm" + rsuf).c_str());
+                    }
+                }
+                const int64_t n_comp_view = n_tokens == 1
+                    ? std::min<int64_t>(n_comp_cache, GGML_PAD(std::max<int64_t>(n_comp_visible, 1), 256))
+                    : n_comp_visible;
+
                 dsv4_decode_compressor dec = n_tokens == 1
-                    ? dsv4_build_compressor_decode(ctx0, cur,
+                    ? dsv4_build_compressor_decode_uniform(ctx0, cur,
                             prev_attn_kv_state,
                             prev_attn_sc_state,
                             layer.attn_compressor_kv,
                             layer.attn_compressor_gate,
                             layer.attn_compressor_ape,
                             layer.attn_compressor_norm,
+                            in_row_idx,
+                            in_state_perm,
+                            in_comp_pos,
+                            in_ape_phase,
                             n_embd_head_k,
                             n_rot,
-                            first_pos,
                             compress_ratio,
                             rope_type,
                             rope_cfg,
@@ -1186,7 +1374,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 dsv4_store_state_segment(ctx0, gf, dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
                 dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
 
-                if (dec.kv_comp != nullptr) {
+                if (n_tokens == 1) {
+                    ggml_tensor * kv_comp_q = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
+                    store_attn_cache_rows_idx(kv_comp_q, in_cache_row);
+                } else if (dec.kv_comp != nullptr) {
                     dec.kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
                     store_attn_cache_rows(dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before);
                 }
@@ -1197,8 +1388,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 v_all = k_raw;
                 attn_mask = inp_attn->self_kq_mask_swa;
 
-                if (n_comp_visible > 0) {
-                    ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
+                if (n_comp_visible > 0 || n_tokens == 1) {
+                    ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_view);
                     k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
                     v_all = k_all;
 
@@ -1211,16 +1402,19 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                 attn_state_layout.elems, index_state_layout.width, index_state_layout.rows);
 
                         dsv4_decode_compressor index_dec = n_tokens == 1
-                            ? dsv4_build_compressor_decode(ctx0, cur,
+                            ? dsv4_build_compressor_decode_uniform(ctx0, cur,
                                     prev_index_kv_state,
                                     prev_index_sc_state,
                                     layer.indexer_compressor_kv,
                                     layer.indexer_compressor_gate,
                                     layer.indexer_compressor_ape,
                                     layer.indexer_compressor_norm,
+                                    in_row_idx,
+                                    in_state_perm,
+                                    in_comp_pos,
+                                    in_ape_phase,
                                     hparams.indexer_head_size,
                                     n_rot,
-                                    first_pos,
                                     compress_ratio,
                                     rope_type,
                                     rope_cfg,
@@ -1244,19 +1438,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         dsv4_store_state_segment(ctx0, gf, index_dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems);
                         dsv4_store_state_segment(ctx0, gf, index_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems);
 
-                        if (index_dec.kv_comp != nullptr) {
+                        if (n_tokens == 1) {
+                            store_index_cache_rows_idx(index_dec.kv_comp, in_cache_row);
+                        } else if (index_dec.kv_comp != nullptr) {
                             store_index_cache_rows(index_dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before);
                         }
 
                         if (n_tokens == 1 && n_comp_visible <= hparams.indexer_top_k) {
                             comp_mask = get_dsv4_inputs()->add_mask(ctx0,
                                     dsv4_mask_kind::COMPRESS_CAUSAL,
-                                    n_comp_visible, n_tokens,
-                                    0, n_comp_visible, 0, compress_ratio,
+                                    n_comp_view, n_tokens,
+                                    0, n_comp_view, 0, compress_ratio,
                                     "dsv4_attn_compress_mask");
                         } else {
-                            ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible);
-                            index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_visible);
+                            ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_view);
+                            index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_view);
                             ggml_tensor * index_scores = n_tokens == 1
                                 ? dsv4_build_indexer_scores_decode(ctx0,
                                         cur, qr, index_cache,
@@ -1265,12 +1461,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                         inp_pos,
                                         hparams.indexer_n_head,
                                         hparams.indexer_head_size,
-                                        n_comp_visible,
+                                        n_comp_view,
                                         n_rot,
                                         rope_type,
                                         rope_cfg)
                                 : dsv4_build_indexer_scores_prefill(ctx0,
-                                        cur, qr, dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible),
+                                        cur, qr, dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_view),
                                         layer.indexer_attn_q_b,
                                         layer.indexer_proj,
                                         inp_pos,
@@ -1287,7 +1483,18 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                         rope_cfg);
                             cb(index_scores, "indexer_scores", il);
 
-                            const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_visible);
+                            if (n_tokens == 1 && n_comp_view > n_comp_visible) {
+                                // padded cache rows hold scratch/garbage keys: force their
+                                // scores to -inf so top-k can never select them as visible
+                                ggml_tensor * index_causal = get_dsv4_inputs()->add_mask(ctx0,
+                                        dsv4_mask_kind::COMPRESS_CAUSAL,
+                                        n_comp_view, n_tokens,
+                                        0, n_comp_view, 0, compress_ratio,
+                                        "dsv4_indexer_pad_causal_mask");
+                                index_scores = ggml_add(ctx0, index_scores, index_causal);
+                            }
+
+                            const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_view);
                             ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
                             cb(topk, "indexer_topk", il);
 
@@ -1296,8 +1503,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                     } else {
                         comp_mask = get_dsv4_inputs()->add_mask(ctx0,
                                 dsv4_mask_kind::COMPRESS_CAUSAL,
-                                n_comp_visible, n_tokens,
-                                0, n_comp_visible, 0, compress_ratio,
+                                n_comp_view, n_tokens,
+                                0, n_comp_view, 0, compress_ratio,
                                 "dsv4_attn_compress_mask");
                     }
 

@@ -226,11 +226,14 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
 
         auto & cache = dsv4_cache_layers[il];
         cache.n_comp = n_comp;
-        cache.attn_k = ggml_new_tensor_3d(ctx, type_k, hparams.n_embd_head_k(il), n_comp, dsv4_n_seq_max);
+        // +1 scratch row at index n_comp: the phase-uniform decode graph writes its
+        // off-boundary (discarded) compress results there, keeping the graph topology
+        // token-invariant. Views are capped at n_comp, so scratch is never visible.
+        cache.attn_k = ggml_new_tensor_3d(ctx, type_k, hparams.n_embd_head_k(il), n_comp + 1, dsv4_n_seq_max);
         ggml_format_name(cache.attn_k, "cache_dsv4_attn_k_l%d", il);
 
         if (ratio == 4) {
-            cache.index_k = ggml_new_tensor_3d(ctx, type_k, hparams.indexer_head_size, n_comp, dsv4_n_seq_max);
+            cache.index_k = ggml_new_tensor_3d(ctx, type_k, hparams.indexer_head_size, n_comp + 1, dsv4_n_seq_max);
             ggml_format_name(cache.index_k, "cache_dsv4_index_k_l%d", il);
         }
     }
