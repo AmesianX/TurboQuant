@@ -575,6 +575,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out (const struct llama_model * model);
+    // row width of the pre-norm hidden state exposed to MTP draft heads (== n_embd
+    // unless the arch overrides it, e.g. DeepSeek-V4's hyper-connection state)
+    LLAMA_API int32_t llama_model_n_embd_h   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);

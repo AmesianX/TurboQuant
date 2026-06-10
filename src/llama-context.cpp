@@ -913,7 +913,7 @@ float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
             throw std::runtime_error("no pre-norm embeddings");
         }
 
-        const uint32_t n_embd = model.hparams.n_embd;
+        const uint32_t n_embd = model.hparams.n_embd_h();
 
         if (!cparams.embeddings_pre_norm_masked) {
             // unmasked: pre-norm rows are stored densely, indexed by raw token position.
@@ -1482,7 +1482,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
         GGML_ASSERT(backend_h != nullptr);
 
-        const uint32_t n_embd = hparams.n_embd;
+        const uint32_t n_embd = hparams.n_embd_h();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_pre_norm.size);
         ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
     }
@@ -1689,7 +1689,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    // an MTP draft context receives the target's pre-norm hidden rows via
+    // batch.embd — those rows are n_embd_h wide, not n_embd_inp
+    const int64_t n_embd_batch = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+        ? (int64_t) hparams.n_embd_h() : n_embd;
+
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd_batch, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -1933,7 +1938,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd = hparams.n_embd;
+                const uint32_t n_embd = hparams.n_embd_h();
                 float * embd_pre_norm_out = embd_pre_norm.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_pre_norm.size);
@@ -2057,12 +2062,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size        = has_logits        ? n_vocab*n_outputs_max     : 0;
     embd.size          = has_embd          ? n_embd_out*n_outputs_max  : 0;
-    embd_pre_norm.size = has_embd_pre_norm ? n_embd*n_outputs_max      : 0;
+    embd_pre_norm.size = has_embd_pre_norm ? (size_t) hparams.n_embd_h()*n_outputs_max : 0;
 
     if (has_embd_pre_norm && !cparams.embeddings_pre_norm_masked) {
         // unmasked: pre-norm row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_pre_norm.size = (size_t) n_embd * n_batch;
+        embd_pre_norm.size = (size_t) hparams.n_embd_h() * n_batch;
     }
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
@@ -2857,6 +2862,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (getenv("DSV4_STATE_DEBUG")) {
+        fprintf(stderr, "DSV4DBG get_data ctx=%p seq=%d size=%zu flags=%d\n", (void *) this, (int) seq_id, size, (int) flags);
+    }
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -2876,6 +2884,9 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    if (getenv("DSV4_STATE_DEBUG")) {
+        fprintf(stderr, "DSV4DBG set_data ctx=%p seq=%d size=%zu flags=%d\n", (void *) this, (int) seq_id, size, (int) flags);
+    }
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id

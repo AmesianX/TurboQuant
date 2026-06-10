@@ -442,15 +442,42 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
 }
 
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    const bool dbg = getenv("DSV4_STATE_DEBUG") != nullptr;
+    if (dbg) {
+        fprintf(stderr, "DSV4DBG hybrid state_write enter seq=%d flags=%d\n", (int) seq_id, (int) flags);
+    }
+    size_t o0 = io.n_bytes();
     mem_attn->state_write(io, seq_id, flags);
+    size_t o1 = io.n_bytes();
     mem_recr->state_write(io, seq_id, flags);
+    size_t o2 = io.n_bytes();
     dsv4_state_write(io, seq_id);
+    if (dbg) {
+        fprintf(stderr, "DSV4DBG state_write seq=%d flags=%d attn=%zu recr=%zu dsv4=%zu total=%zu\n",
+                (int) seq_id, (int) flags, o1 - o0, o2 - o1, io.n_bytes() - o2, io.n_bytes() - o0);
+    }
 }
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    const bool dbg = getenv("DSV4_STATE_DEBUG") != nullptr;
+    size_t o0 = io.n_bytes();
+    if (dbg) {
+        fprintf(stderr, "DSV4DBG state_read enter seq=%d flags=%d\n", (int) seq_id, (int) flags);
+    }
     mem_attn->state_read(io, seq_id, flags);
+    size_t o1 = io.n_bytes();
+    if (dbg) {
+        fprintf(stderr, "DSV4DBG state_read attn=%zu\n", o1 - o0);
+    }
     mem_recr->state_read(io, seq_id, flags);
+    size_t o2 = io.n_bytes();
+    if (dbg) {
+        fprintf(stderr, "DSV4DBG state_read recr=%zu\n", o2 - o1);
+    }
     dsv4_state_read(io, seq_id);
+    if (dbg) {
+        fprintf(stderr, "DSV4DBG state_read dsv4=%zu total=%zu\n", io.n_bytes() - o2, io.n_bytes() - o0);
+    }
 }
 
 void llama_memory_hybrid_iswa::dsv4_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -754,6 +781,9 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
         for (uint32_t il = 0; il < n_layer; ++il) {
             const auto & layer = dsv4_cache_layers[il];
 
+            // NOTE: must mirror dsv4_state_write's io.write_tensor — a raw io.read
+            // here breaks ON_DEVICE checkpoints (the tensor bytes live in device
+            // storage, not the host stream); read_tensor handles both io kinds.
             if (layer.attn_k != nullptr) {
                 uint32_t n_rows;
                 io.read(&n_rows, sizeof(n_rows));
@@ -762,10 +792,8 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
                 }
                 if (n_rows > 0) {
                     const size_t row_size = dsv4_cache_row_size(layer.attn_k);
-                    std::vector<uint8_t> buf((size_t) n_rows*row_size);
-                    io.read(buf.data(), buf.size());
-                    ggml_backend_tensor_set(layer.attn_k, buf.data(),
-                            dsv4_cache_offset(layer.attn_k, dst_seq_id, 0), buf.size());
+                    io.read_tensor(layer.attn_k,
+                            dsv4_cache_offset(layer.attn_k, dst_seq_id, 0), (size_t) n_rows*row_size);
                 }
             }
 
@@ -777,10 +805,8 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
                 }
                 if (n_rows > 0) {
                     const size_t row_size = dsv4_cache_row_size(layer.index_k);
-                    std::vector<uint8_t> buf((size_t) n_rows*row_size);
-                    io.read(buf.data(), buf.size());
-                    ggml_backend_tensor_set(layer.index_k, buf.data(),
-                            dsv4_cache_offset(layer.index_k, dst_seq_id, 0), buf.size());
+                    io.read_tensor(layer.index_k,
+                            dsv4_cache_offset(layer.index_k, dst_seq_id, 0), (size_t) n_rows*row_size);
                 }
             }
         }

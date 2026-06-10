@@ -1618,10 +1618,27 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inpL = dsv4_hc_post(ctx0, cur, residual, mix.post, mix.comb, n_embd, n_hc, n_tokens);
         cb(inpL, "hc_ffn_post", il);
     }
+    if (cparams.embeddings_pre_norm && !cparams.embeddings_pre_norm_masked) {
+        // expose the full hyper-connection state to the MTP draft head —
+        // one row of n_hc*n_embd per token (unmasked: every batch position).
+        // the view is a graph leaf — expand it so the scheduler allocates it
+        ggml_tensor * h_flat = ggml_reshape_2d(ctx0, inpL, n_embd * n_hc, n_tokens);
+        cb(h_flat, "h_pre_norm", -1);
+        res->t_h_pre_norm = h_flat;
+        ggml_build_forward_expand(gf, h_flat);
+    }
+
     if (inp_out_ids) {
         inpL = ggml_reshape_2d(ctx0, inpL, n_embd * n_hc, n_tokens);
         inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_outputs);
+    }
+
+    if (cparams.embeddings_pre_norm && cparams.embeddings_pre_norm_masked) {
+        ggml_tensor * h_flat = ggml_reshape_2d(ctx0, inpL, n_embd * n_hc, inp_out_ids ? n_outputs : n_tokens);
+        cb(h_flat, "h_pre_norm", -1);
+        res->t_h_pre_norm = h_flat;
+        ggml_build_forward_expand(gf, h_flat);
     }
 
     ggml_tensor * cur = dsv4_hc_head(ctx0, inpL,
@@ -1636,6 +1653,201 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);
+    res->t_logits = cur;
+    ggml_build_forward_expand(gf, cur);
+}
+
+// LLM_GRAPH_TYPE_DECODER_MTP draft head for DeepSeek-V4 (ds4 numerics):
+// input_hc = repeat(e_proj(enorm(emb)), n_hc) + h_proj(hnorm(prev_hc rows)),
+// one plain-SWA MLA+MoE decoder layer (the NextN block), then the MTP head's
+// own hyper-connection collapse in front of the shared output head.
+llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    GGML_ASSERT(hparams.nextn_predict_layers == 1 && "DSV4 MTP supports exactly one NextN layer");
+
+    const int il = (int) hparams.n_layer - 1;
+    const auto & layer = model.layers[il];
+
+    if (!layer.nextn.e_proj || !layer.nextn.h_proj || !layer.nextn.hc_head_fn) {
+        throw std::runtime_error("DeepSeek V4 MTP tensors missing from the GGUF "
+                "(create the MTP shard with turboquant/ds4_mtp_to_shard.py)");
+    }
+
+    const int64_t n_hc        = hparams.n_hc;
+    const int64_t hc_dim      = n_hc * n_embd;
+    const int64_t n_out_group = hparams.n_attn_out_groups;
+    const int64_t n_lora_o    = hparams.n_lora_o;
+
+    const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
+    const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, 0);
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
+    ggml_set_input(inp->embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    GGML_ASSERT(ubatch.token && "DSV4 MTP draft batch must carry tokens");
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    ggml_tensor * h_in = inp->h;
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    auto * inp_attn = build_attn_inp_kv_iswa();
+
+    // e_proj(enorm(emb)) broadcast over the n_hc rows
+    ggml_tensor * e = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e, "mtp_enorm", il);
+    e = ggml_mul_mat(ctx0, layer.nextn.e_proj, e);
+    cb(e, "mtp_e_proj", il);
+    e = ggml_reshape_3d(ctx0, e, n_embd, 1, n_tokens);
+    e = ggml_repeat_4d(ctx0, e, n_embd, n_hc, n_tokens, 1);
+    e = ggml_reshape_3d(ctx0, e, n_embd, n_hc, n_tokens);
+
+    // h_proj(hnorm(.)) applied per hyper-connection row of the target's state
+    ggml_tensor * h = ggml_reshape_2d(ctx0, h_in, n_embd, n_hc * n_tokens);
+    h = build_norm(h, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    cb(h, "mtp_hnorm", il);
+    h = ggml_mul_mat(ctx0, layer.nextn.h_proj, h);
+    cb(h, "mtp_h_proj", il);
+    h = ggml_reshape_3d(ctx0, h, n_embd, n_hc, n_tokens);
+
+    ggml_tensor * inpL = ggml_add(ctx0, e, h);
+    cb(inpL, "mtp_input_hc", il);
+
+    // one plain-SWA decoder layer (= main-graph layer body with compress_ratio == 0)
+    ggml_tensor * residual = inpL;
+    dsv4_hc_mix mix = dsv4_hc_pre(ctx0, inpL,
+            layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
+            n_embd, n_hc, n_tokens, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+    ggml_tensor * cur = mix.x;
+    cb(cur, "mtp_hc_attn_pre", il);
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+
+    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
+    q = ggml_reshape_3d(ctx0, q, n_embd_head_k, n_head, n_tokens);
+    q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+    q = dsv4_apply_rope_tail(ctx0, q, inp_pos,
+            n_embd_head_k, n_head, n_tokens, n_rot, rope_type,
+            rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+            rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
+    cb(q, "mtp_Qcur", il);
+
+    ggml_tensor * kv = ggml_mul_mat(ctx0, layer.attn_kv, cur);
+    kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+    kv = ggml_reshape_3d(ctx0, kv, n_embd_head_k, 1, n_tokens);
+    kv = dsv4_apply_rope_tail(ctx0, kv, inp_pos,
+            n_embd_head_k, 1, n_tokens, n_rot, rope_type,
+            rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+            rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
+    kv = ggml_dsv4_fp8_kv_quantize(ctx0, kv, n_rot);
+    cb(kv, "mtp_KVcur", il);
+
+    const auto * mctx_swa = inp_attn->mctx->get_swa();
+    ggml_build_forward_expand(gf, q);
+    ggml_build_forward_expand(gf, kv);
+    ggml_build_forward_expand(gf, mctx_swa->cpy_k(ctx0, kv, inp_attn->get_k_idxs_swa(), il));
+
+    ggml_tensor * k_cache = mctx_swa->get_k(ctx0, il);
+    k_cache = ggml_reshape_3d(ctx0, k_cache, n_embd_head_k, 1, k_cache->ne[2]);
+    cur = build_attn_mha(q, k_cache, k_cache, nullptr, inp_attn->get_kq_mask_swa(),
+            layer.attn_sinks, nullptr, kq_scale, il);
+    cb(cur, "mtp_kqv_out", il);
+
+    cur = ggml_reshape_3d(ctx0, cur, n_embd_head_v, n_head, n_tokens);
+    cur = dsv4_apply_rope_tail(ctx0, cur, inp_pos,
+            n_embd_head_v, n_head, n_tokens, n_rot, rope_type,
+            rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+            rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, true);
+    cur = dsv4_grouped_out(ctx0, cur, layer.attn_wo_a, layer.attn_wo_b,
+            n_embd_head_v, n_head, n_out_group, n_lora_o, n_tokens);
+    cb(cur, "mtp_attn_out", il);
+    inpL = dsv4_hc_post(ctx0, cur, residual, mix.post, mix.comb, n_embd, n_hc, n_tokens);
+    cb(inpL, "mtp_hc_attn_post", il);
+
+    residual = inpL;
+    mix = dsv4_hc_pre(ctx0, inpL,
+            layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base,
+            n_embd, n_hc, n_tokens, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+    cur = mix.x;
+    cb(cur, "mtp_hc_ffn_pre", il);
+    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    ggml_tensor * moe_out = build_moe_ffn(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps,
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
+            layer.ffn_exp_probs_b,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, hparams.expert_weights_norm,
+            hparams.expert_weights_scale,
+            (llama_expert_gating_func_type) hparams.expert_gating_func,
+            il,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr);
+    cb(moe_out, "mtp_ffn_moe_out", il);
+    ggml_tensor * ffn_shexp = build_ffn(cur,
+            layer.ffn_up_shexp,   nullptr, nullptr,
+            layer.ffn_gate_shexp, nullptr, nullptr,
+            layer.ffn_down_shexp, nullptr, nullptr,
+            nullptr,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+    cb(ffn_shexp, "mtp_ffn_shexp", il);
+
+    cur = ggml_add(ctx0, moe_out, ffn_shexp);
+    inpL = dsv4_hc_post(ctx0, cur, residual, mix.post, mix.comb, n_embd, n_hc, n_tokens);
+    cb(inpL, "mtp_hc_ffn_post", il);
+
+    // expose the post-layer hyper-connection state so the AR draft loop can
+    // seed the next MTP step (same slot as the trunk graph's t_h_pre_norm)
+    {
+        ggml_tensor * h_flat = ggml_reshape_2d(ctx0, inpL, hc_dim, n_tokens);
+        cb(h_flat, "h_pre_norm", -1);
+        res->t_h_pre_norm = h_flat;
+        ggml_build_forward_expand(gf, h_flat);
+    }
+
+    if (inp_out_ids) {
+        inpL = ggml_reshape_2d(ctx0, inpL, hc_dim, n_tokens);
+        inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_outputs);
+    }
+
+    cur = dsv4_hc_head(ctx0, inpL,
+            layer.nextn.hc_head_fn, layer.nextn.hc_head_scale, layer.nextn.hc_head_base,
+            n_embd, n_hc, inp_out_ids ? n_outputs : n_tokens,
+            norm_rms_eps, hparams.hc_eps);
+    cb(cur, "mtp_result_hc", -1);
+
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
+            ? layer.nextn.shared_head_norm
+            : model.output_norm;
+    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "mtp_result_norm", -1);
+    res->t_embd = cur;
+
+    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cb(cur, "mtp_result_output", -1);
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
 }
@@ -1699,6 +1911,8 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
         // device mapping and model.layers[] cover them. The main context excludes
         // them via the create_memory layer filters; per-layer hparams mirror the
         // last main layer (plain SWA attention, no compressor, no indexer).
+        // The MTP head consumes the full hyper-connection state as its hidden input.
+        hparams.n_embd_h_mtp = hparams.n_hc * hparams.n_embd;
         const uint32_t n_main = hparams.n_layer;
         for (uint32_t k = 0; k < hparams.nextn_predict_layers; ++k) {
             const uint32_t il = n_main + k;
@@ -1874,5 +2088,8 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek4::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }

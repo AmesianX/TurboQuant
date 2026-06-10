@@ -84,6 +84,10 @@ uint32_t llama_hparams::n_embd_out() const {
     return n_embd_out_impl > 0 ? n_embd_out_impl : n_embd;
 }
 
+uint32_t llama_hparams::n_embd_h() const {
+    return n_embd_h_mtp > 0 ? n_embd_h_mtp : n_embd;
+}
+
 uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
     if (il < n_layer) {
         return is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full;

@@ -98,6 +98,10 @@ struct llama_hparams {
 
     bool kv_only_nextn = false; // if true, only the last nextn_predict_layers blocks have a KV cache (MTP head arches)
 
+    // row width of the pre-norm hidden state handed to an MTP draft head
+    // (0 = n_embd). DeepSeek-V4 exposes the full hyper-connection state.
+    uint32_t n_embd_h_mtp = 0;
+
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;
@@ -282,6 +286,9 @@ struct llama_hparams {
 
     // dimension of output embeddings
     uint32_t n_embd_out() const;
+
+    // row width of the pre-norm hidden state (MTP draft head input)
+    uint32_t n_embd_h() const;
 
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;

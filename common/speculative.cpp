@@ -444,7 +444,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        n_embd = llama_model_n_embd(llama_get_model(ctx_dft));
+        n_embd = llama_model_n_embd_h(llama_get_model(ctx_dft));
 
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
