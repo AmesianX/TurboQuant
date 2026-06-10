@@ -819,8 +819,10 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_HC_FFN_FN,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_HC_FFN_SCALE,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SCALE}},
     {LLM_TENSOR_FFN_GATE_TID2EID,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
-    {LLM_TENSOR_ATTN_COMPRESSOR_APE,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
-    {LLM_TENSOR_INDEXER_COMPRESSOR_APE,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    // APE weights are consumed via an in-graph f16->f32 cast (CPY); probing them with ADD
+    // fails on CUDA (f32+f16 add unsupported) and strands them on the CPU — see model loader.
+    {LLM_TENSOR_ATTN_COMPRESSOR_APE,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
+    {LLM_TENSOR_INDEXER_COMPRESSOR_APE,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
     // Nemotron 3 Super
     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},

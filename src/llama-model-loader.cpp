@@ -935,6 +935,14 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
                 op_tensor = ggml_add(ctx, a, w);
             } break;
+        case GGML_OP_CPY:
+            {
+                // weights consumed via an in-graph cast/copy (e.g. DeepSeek-V4 compressor APE:
+                // f16 weight cast to f32). Probing those with ADD(f32, f16-weight) fails on CUDA
+                // and wrongly strands the weight on the CPU, splitting the graph at every layer.
+                ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
+                op_tensor = ggml_cpy(ctx, w, b);
+            } break;
         case GGML_OP_ADD_ID:
             {
                 const int n_expert_used = hparams.n_expert_used;
