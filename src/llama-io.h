@@ -14,6 +14,11 @@ public:
     virtual void write(const void * src, size_t size) = 0;
     virtual void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
 
+    // apply any deferred writes; throws on failure. Implementations that defer work (e.g. the
+    // ON_DEVICE writer) must do it here, NOT in the destructor — a failed save must not clobber
+    // previously staged state and must surface as a catchable error.
+    virtual void commit() {}
+
     // bytes written so far
     virtual size_t n_bytes() = 0;
 

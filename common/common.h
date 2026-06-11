@@ -1073,22 +1073,24 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
-    void update_tgt(
+    // all four return false on save/restore failure (and never abort); a failed update clears
+    // the affected data so a half-saved checkpoint can not be restored later
+    bool update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void update_dft(
+    bool update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

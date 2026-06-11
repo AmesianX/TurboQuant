@@ -2615,7 +2615,12 @@ public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
     }
 
-    ~llama_io_write_device() {
+    // Staging happens in an explicit commit(), not the destructor: a save that threw mid-stream
+    // must NOT clobber the previous (still valid) staging for this seq with a partial snapshot,
+    // and allocation failures must surface as catchable errors instead of crashing during unwind.
+    void commit() override {
+        committed = true;
+
         llama_memory_buffers mbufs_new;
 
         for (const auto & winfo : winfos) {
@@ -2633,6 +2638,9 @@ public:
             };
 
             mbuf.ctx.reset(ggml_init(params));
+            if (!mbuf.ctx) {
+                throw std::runtime_error("device state save: failed to create ggml context for staging");
+            }
 
             mbuf.org.reserve(mbuf.n_tensors);
             mbuf.cpy.reserve(mbuf.n_tensors);
@@ -2641,7 +2649,11 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            // bytes -> elements; for quantized types ggml_element_size is the BLOCK byte size,
+            // so the element count must be scaled by the block size or only 1/blck of the
+            // region gets staged
+            const int64_t blck = ggml_blck_size(winfo.tensor->type);
+            const int64_t n    = (int64_t) winfo.size/ggml_element_size(winfo.tensor)*blck;
 
             auto & mbuf = mbufs_new[buft];
 
@@ -2680,8 +2692,12 @@ public:
                     mbuf_cur = std::move(mbuf);
 
                     mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
+                    if (!mbuf_cur.buf) {
+                        mbuf_cur = llama_memory_buffer(); // do not leave half-initialized staging behind
+                        throw std::runtime_error("device state save: failed to allocate staging buffer");
+                    }
 
-                    LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
+                    LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf_cur.total_size/1024.0/1024.0);
                 } else {
                     //LLAMA_LOG_INFO("%s: reallocating tensors in '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
 
@@ -2704,6 +2720,13 @@ public:
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
                 ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
             }
+        }
+    }
+
+    ~llama_io_write_device() {
+        if (!committed && !winfos.empty()) {
+            // the save failed before commit(); the previous staging for this seq is left intact
+            LLAMA_LOG_WARN("%s: discarding %zu uncommitted deferred tensor writes\n", __func__, winfos.size());
         }
     }
 
@@ -2738,6 +2761,8 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+    bool committed = false;
 
     llama_memory_buffers & mbufs;
 };
@@ -2807,14 +2832,17 @@ public:
 
                     const size_t chunk_size = ggml_nbytes(chunk);
                     const size_t seg        = std::min(ri->size - r_off, chunk_size - j_off);
-                    const size_t es         = ggml_element_size(chunk);
+                    // bytes -> elements; for quantized types ggml_element_size is the BLOCK byte
+                    // size, so scale by the block size (segments must be block-aligned)
+                    const size_t ts   = ggml_element_size(chunk);
+                    const size_t blck = (size_t) ggml_blck_size(chunk->type);
 
-                    if (seg % es != 0 || j_off % es != 0 || (ri->offset + r_off) % es != 0) {
+                    if (seg % ts != 0 || j_off % ts != 0 || (ri->offset + r_off) % ts != 0) {
                         throw std::runtime_error("device state restore: unaligned segment");
                     }
 
-                    ggml_tensor * src = ggml_view_1d(vctx.get(), chunk,      seg/es, j_off);
-                    ggml_tensor * dst = ggml_view_1d(vctx.get(), ri->tensor, seg/es, ri->offset + r_off);
+                    ggml_tensor * src = ggml_view_1d(vctx.get(), chunk,      seg/ts*blck, j_off);
+                    ggml_tensor * dst = ggml_view_1d(vctx.get(), ri->tensor, seg/ts*blck, ri->offset + r_off);
                     ggml_backend_view_init(src);
                     ggml_backend_view_init(dst);
                     ggml_backend_tensor_copy(src, dst);
@@ -2943,7 +2971,13 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         io->write(&io_magic, sizeof(io_magic));
         io->write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(*io, seq_id, flags);
+        const size_t n_written = state_seq_write_data(*io, seq_id, flags);
+
+        // apply deferred device-side staging; throws on failure so a bad save reports 0
+        // instead of clobbering the previous staging in its destructor
+        io->commit();
+
+        return n_written;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -2954,28 +2988,32 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     if (getenv("DSV4_STATE_DEBUG")) {
         fprintf(stderr, "DSV4DBG set_data ctx=%p seq=%d size=%zu flags=%d\n", (void *) this, (int) seq_id, size, (int) flags);
     }
-    std::unique_ptr<llama_io_read_i> io;
-    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        // create a temporary io to read the magic and the src seq_id
-        io = std::make_unique<llama_io_read_host>(src, size);
-
-        uint32_t magic_read;
-        io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
-        }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
-
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
-
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
-    } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
-    }
+    bool mutated = false; // memory modules touched — must be cleaned up on failure
 
     try {
+        std::unique_ptr<llama_io_read_i> io;
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            // create a temporary io to read the magic and the src seq_id
+            io = std::make_unique<llama_io_read_host>(src, size);
+
+            uint32_t magic_read;
+            io->read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            llama_seq_id seq_id_read;
+            io->read(&seq_id_read, sizeof(seq_id_read));
+
+            if (mem_storage.find(seq_id_read) == mem_storage.end()) {
+                throw std::runtime_error("no staged device state for the sequence in this blob");
+            }
+
+            io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+        } else {
+            io = std::make_unique<llama_io_read_host>(src, size);
+        }
+
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
         if (io_magic != magic_read) {
@@ -2985,6 +3023,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
+        mutated = true;
         const size_t n_read = state_seq_read_data(*io, seq_id, flags);
 
         // apply deferred device-side reads; throws (and is caught below) on layout mismatch
@@ -2994,6 +3033,14 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         return n_read;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+
+        // state_seq_read_data applies cell/recurrent/side-cache metadata eagerly while the
+        // device reader defers the tensor bytes to commit() — a failure here can leave the
+        // sequence half-restored. Drop it entirely so the caller can reprocess from scratch.
+        if (mutated && memory) {
+            memory->seq_rm(seq_id, -1, -1);
+        }
+
         return 0;
     }
 }

@@ -65,6 +65,10 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// undo per-seq draft carryover to the state before the latest verify batch — call when a
+// checkpoint restore rejects the batch instead of accepting it
+void common_speculative_rewind(common_speculative * spec, llama_seq_id seq_id);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

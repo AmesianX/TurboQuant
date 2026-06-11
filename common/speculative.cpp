@@ -158,6 +158,10 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // undo per-seq carryover state to where it was before the most recent process() call —
+    // used when the caller restores a context checkpoint instead of accepting the batch
+    virtual void rewind(llama_seq_id seq_id) { (void) seq_id; }
+
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
 
@@ -423,6 +427,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
 
+    // pending_h as it was at the entry of the latest process() call: when the server rejects
+    // the verify batch and restores a checkpoint (skipping accept()), the re-decoded batch
+    // starts at the same token again and must pair with this PRE-batch h, not the h of the
+    // rejected branch that process() wrote into pending_h
+    std::vector<std::vector<float>> pending_h_prev;
+
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
@@ -431,10 +441,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
-    // Per-seq draft length from the last draft() call, used in accept() to
-    // roll back ctx_dft's recurrent state past the AR draft's redundant
-    // pre-advancement before process() mirrored the verify batch.
-    std::vector<uint16_t> last_n_drafted;
+
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -491,6 +498,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_h_prev.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
@@ -498,7 +506,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
 
-        last_n_drafted.assign(n_seq, 0);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -572,7 +579,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // DSV4_MTP_PROF: split process() wall into tgt-embd fetch / mirror decode / dft-embd extract
         static const bool prof_on = getenv("DSV4_MTP_PROF") != nullptr;
         static double tp_tgt = 0.0, tp_dec = 0.0, tp_ext = 0.0; static int64_t tp_n = 0;
-        const int64_t tp0 = ggml_time_us();
+        const int64_t tp0 = prof_on ? ggml_time_us() : 0;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -611,12 +618,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            // snapshot for rewind(): a checkpoint-restore rejection re-decodes this same batch
+            // start and needs exactly this h again
+            pending_h_prev[seq_id] = pending_h[seq_id];
+
             set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
         }
 
-        const int64_t tp1 = ggml_time_us();
+        const int64_t tp1 = prof_on ? ggml_time_us() : 0;
         const int32_t rc = llama_decode(ctx_dft, batch);
-        const int64_t tp2 = ggml_time_us();
+        const int64_t tp2 = prof_on ? ggml_time_us() : 0;
         if (rc != 0) {
             LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
             return false;
@@ -661,7 +672,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         static const bool prof_on = getenv("DSV4_MTP_PROF") != nullptr;
-        const int64_t t_draft0 = ggml_time_us();
+        const int64_t t_draft0 = prof_on ? ggml_time_us() : 0;
 
         auto & ctx_dft = params.ctx_dft;
 
@@ -691,7 +702,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
         }
 
-        const int64_t t_dec0 = ggml_time_us();
+        const int64_t t_dec0 = prof_on ? ggml_time_us() : 0;
         int ret = llama_decode(ctx_dft, batch);
         if (prof_on) { mtp_prof.t_decode += (ggml_time_us() - t_dec0)*1e-3; mtp_prof.n_decodes++; }
         if (ret != 0) {
@@ -713,9 +724,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const int64_t t_s0 = ggml_time_us();
+                const int64_t t_s0 = prof_on ? ggml_time_us() : 0;
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
-                const int64_t t_s1 = ggml_time_us();
+                const int64_t t_s1 = prof_on ? ggml_time_us() : 0;
                 h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
                 if (prof_on) { mtp_prof.t_sample += (t_s1 - t_s0)*1e-3; mtp_prof.t_embd += (ggml_time_us() - t_s1)*1e-3; }
                 ++i_batch;
@@ -761,7 +772,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // evaluate the drafted tokens on the draft model
-            const int64_t t_dec1 = ggml_time_us();
+            const int64_t t_dec1 = prof_on ? ggml_time_us() : 0;
             ret = llama_decode(ctx_dft, batch);
             if (prof_on) { mtp_prof.t_decode += (ggml_time_us() - t_dec1)*1e-3; mtp_prof.n_decodes++; }
             if (ret != 0) {
@@ -781,8 +792,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
-
-            last_n_drafted[seq_id] = (uint16_t) dp.result->size();
         }
 
         if (prof_on) {
@@ -809,6 +818,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    void rewind(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        pending_h[seq_id] = pending_h_prev[seq_id];
     }
 
     bool need_embd() const override {
@@ -1676,6 +1692,12 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+}
+
+void common_speculative_rewind(common_speculative * spec, llama_seq_id seq_id) {
+    for (auto & impl : spec->impls) {
+        impl->rewind(seq_id);
     }
 }
 
