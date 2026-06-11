@@ -1294,11 +1294,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        // DSV4_MTP_PROF: cumulative graph build+alloc cost (the price of graphs reused = 0)
+        static const bool build_prof = getenv("DSV4_MTP_PROF") != nullptr;
+        const auto t_start_us = build_prof ? ggml_time_us() : 0;
 
         gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1306,10 +1306,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const auto t_built_us = build_prof ? ggml_time_us() : 0;
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        if (build_prof) {
+            static double t_build_acc = 0.0, t_alloc_acc = 0.0;
+            static int64_t n_builds = 0;
+            t_build_acc += (t_built_us - t_start_us)/1000.0;
+            t_alloc_acc += (ggml_time_us() - t_built_us)/1000.0;
+            if (++n_builds % 200 == 0) {
+                LLAMA_LOG_INFO("DSV4_MTP_PROF: %lld graph builds (%d nodes) | build %.0f ms + alloc %.0f ms\n",
+                        (long long) n_builds, gf ? ggml_graph_n_nodes(gf) : -1, t_build_acc, t_alloc_acc);
+            }
         }
     }
 

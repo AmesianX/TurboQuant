@@ -569,6 +569,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
+        // DSV4_MTP_PROF: split process() wall into tgt-embd fetch / mirror decode / dft-embd extract
+        static const bool prof_on = getenv("DSV4_MTP_PROF") != nullptr;
+        static double tp_tgt = 0.0, tp_dec = 0.0, tp_ext = 0.0; static int64_t tp_n = 0;
+        const int64_t tp0 = ggml_time_us();
+
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         common_batch_clear(batch);
@@ -609,7 +614,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
         }
 
+        const int64_t tp1 = ggml_time_us();
         const int32_t rc = llama_decode(ctx_dft, batch);
+        const int64_t tp2 = ggml_time_us();
         if (rc != 0) {
             LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
             return false;
@@ -633,10 +640,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
+        if (prof_on) {
+            const int64_t tp3 = ggml_time_us();
+            tp_tgt += (tp1 - tp0)*1e-3; tp_dec += (tp2 - tp1)*1e-3; tp_ext += (tp3 - tp2)*1e-3;
+            if (++tp_n % 100 == 0) {
+                LOG_INF("DSV4_MTP_PROF: %lld process() calls | tgt-embd %.0f ms + mirror-decode %.0f ms + extract %.0f ms\n",
+                        (long long) tp_n, tp_tgt, tp_dec, tp_ext);
+            }
+        }
+
         return true;
     }
 
+    // DSV4_MTP_PROF: cumulative wall-time split of draft() (decode vs sample vs embd-fetch),
+    // dumped every 200 calls. Temporary instrumentation.
+    struct mtp_prof_t {
+        double t_decode = 0.0, t_sample = 0.0, t_embd = 0.0, t_total = 0.0;
+        int64_t n_calls = 0, n_decodes = 0;
+    } mtp_prof;
+
     void draft(common_speculative_draft_params_vec & dparams) override {
+        static const bool prof_on = getenv("DSV4_MTP_PROF") != nullptr;
+        const int64_t t_draft0 = ggml_time_us();
+
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -665,7 +691,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
         }
 
+        const int64_t t_dec0 = ggml_time_us();
         int ret = llama_decode(ctx_dft, batch);
+        if (prof_on) { mtp_prof.t_decode += (ggml_time_us() - t_dec0)*1e-3; mtp_prof.n_decodes++; }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -685,8 +713,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                const int64_t t_s0 = ggml_time_us();
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                const int64_t t_s1 = ggml_time_us();
                 h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
+                if (prof_on) { mtp_prof.t_sample += (t_s1 - t_s0)*1e-3; mtp_prof.t_embd += (ggml_time_us() - t_s1)*1e-3; }
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -730,7 +761,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // evaluate the drafted tokens on the draft model
+            const int64_t t_dec1 = ggml_time_us();
             ret = llama_decode(ctx_dft, batch);
+            if (prof_on) { mtp_prof.t_decode += (ggml_time_us() - t_dec1)*1e-3; mtp_prof.n_decodes++; }
             if (ret != 0) {
                 LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
                 break;
@@ -750,6 +783,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             last_n_drafted[seq_id] = (uint16_t) dp.result->size();
+        }
+
+        if (prof_on) {
+            mtp_prof.t_total += (ggml_time_us() - t_draft0)*1e-3;
+            if (++mtp_prof.n_calls % 200 == 0) {
+                LOG_INF("DSV4_MTP_PROF: %lld draft() calls, %lld decodes | total %.0f ms = decode %.0f + sample %.0f + embd %.0f + other %.0f\n",
+                        (long long) mtp_prof.n_calls, (long long) mtp_prof.n_decodes,
+                        mtp_prof.t_total, mtp_prof.t_decode, mtp_prof.t_sample, mtp_prof.t_embd,
+                        mtp_prof.t_total - mtp_prof.t_decode - mtp_prof.t_sample - mtp_prof.t_embd);
+            }
         }
     }
 

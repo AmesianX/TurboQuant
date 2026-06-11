@@ -7,10 +7,12 @@ Branch: `feat/deepseek4`.
 
 | Config | decode t/s | note |
 |---|---|---|
-| baseline f16 KV | **13.8** | was 13.4 before the fp8 QDQ fix (`1d75505b0`) |
+| baseline f16 KV | **14.66** | 13.4 → 13.8 (fp8 QDQ fix) → 14.66 (iq2_xs mmvq + graph reuse, 2026-06-12) |
 | + MTP (`--spec-type draft-mtp --spec-draft-p-min 0.75 --spec-draft-n-max 2`) | 15.5–16.2 free text / ~17 regular | accept 98–100% |
-| tbq3 KV + MTP (production config) | **16.06** essay / 17.0 counting | accept 98–100%; was 15.79 before iq2_xs mmvq work — gain is small under MTP because verify batches bypass the optimized n=1 path (see ①) |
+| tbq3 KV + MTP (production config) | **16.4–16.7** essay | accept 98%; 16.1 before graph-reuse fix; MTP gains are capped by single-slot thrash + verify-graph rebuilds (roadmap 1–2) |
 | prefill | 160–164 t/s @14K prompt | ds4 reference: 343 |
+⚠️ measure t/s only after `ss -tlnp | grep 8888` confirms YOUR pid owns the port — a wrapper-kill
+(`kill $!` on the nohup pid) leaves the old server alive and silently serving your benchmark.
 
 Launch (the production config):
 ```
@@ -19,6 +21,36 @@ build/bin/llama-server -m .../IQ2_XS-XL/DeepSeek-V4-Flash-IQ2_XS-XL-00001-of-000
   --spec-type draft-mtp --spec-draft-p-min 0.75 --spec-draft-n-max 2 \
   --host 0.0.0.0 --api-key "occultsaint@X" --port 8888
 ```
+
+## GRAPH REUSE FIXED (2026-06-12 ~01:00) — graphs reused 0 → 47/47
+
+**Every DSV4 decode was rebuilding the full ~6800-node ggml graph per token** ("graphs reused = 0"):
+`dsv4_graph_inputs` is registered via res->add_input but never overrode `can_reuse` → default false
+vetoes reuse for every graph containing dsv4 masks. Fixed: builder records per-compress-layer
+topology drivers (`add_reuse_key`: 256-padded n_comp_view, visible<=top_k branch, pad-mask branch —
+phase-uniform already made everything else pos-invariant), `can_reuse` recomputes from the new
+ubatch pos and compares. n_tokens>1 honestly returns false (chunk masks are pos-sized).
+Result: plain f16 decode **13.8 → 14.66 t/s (+6%)**, greedy output identical, reused = 47/47.
+
+### MTP round budget (measured, DSV4_MTP_PROF=1 instrumentation, production config, 61ms/round ≈ 2 tok)
+| component | ms | note |
+|---|---|---|
+| verify GPU wait (tgt-embd sync in process()) | 27.8 | the actual model compute — kernel work hits this |
+| unaccounted CPU | ~22 | verify graph build (now partly fixed) + server sampling/emit |
+| draft() total | 9.8 | decode 5.0 (build+submit) + sample-sync 5.6; GPU inside ≈ 3.1 (vocab proj q5_K 1.9) |
+| mirror decode submit | 1.6 | cheap |
+
+### Remaining roadmap (ranked)
+1. **Multi-slot graph cache**: ctx_dft alternates [draft n=1, draft n=1, process n=3] — single-slot
+   gf_res_prev thrashes, so only the 2nd consecutive draft reuses. Caveat: on miss sched_reset
+   invalidates the other slot's allocations → either per-slot sched (memory!) or cache built graphs
+   and redo alloc only (build is the expensive part).
+2. **Phase-uniform chunk graphs** (verify n=2-3 reuse + CUDA-graph eligibility): pad compressed views
+   + data-driven masks for small n_tokens like the n=1 path. Unlocks reuse for the verify pass
+   (biggest CPU item) AND prefill target ③ shares machinery.
+3. **Draft head requant** (quality-safe — wrong drafts get rejected, never emitted): MTP head logits
+   matmul is q5_K 4096x129280 = 1.9ms of every draft token; iq2/iq3 → ~0.8-1.2ms.
+4. Deferred verify_h extraction (overlap mirror decode with server CPU) — small, ~1ms/round.
 
 ## Profiler (use this, not nsys)
 
@@ -55,7 +87,10 @@ nsys 2024.6 captures ZERO CUPTI events on GB10/CUDA13 — don't waste time on it
   2. **smem staging of iq2xs_grid** in mul_mat_vec_q only (gated on rpb>1 so the 512-entry copy amortizes; `vec_dot_iq2_xs_q8_1_grid` core in vecdotq.cuh): gate/up → **106.9 µs** (cumulative **-27%**, 99→136 GB/s).
 - **⚠️ MTP regime lesson (the big one).** Under MTP, gate/up verify batches run at n=2-3 → `mul_mat_vec_q_moe`, NOT the optimized ncols_dst=1 kernel; down runs at n=6×3=18 → outside mmvq entirely. So the n=1 wins only reach plain decode + draft steps; production essay went 15.79 → 16.06 (top of the old noise band). Staging the codebook in the moe kernel was tried and is a measured **+47-54% regression** at n=2-3/k=4096 (64-96-thread blocks; copy+barrier dominate) — reverted; comment in the kernel guards against re-adding.
 - Tried and rejected: rpb=8 via 2*nwarps (gate/up 114µs, fewer blocks → tail imbalance); moe rows_per_block 2→4 (neutral); moe-kernel smem staging (above; in-model down n=6 liked it (-7.7%) but plain-decode-only — MTP regression wins).
-- **NEXT for ①: optimize `mul_mat_vec_q_moe` for the MTP verify regime** (iq2_xs, k=4096, ncols_dst=2-3): microbench baselines 154.7µs (n=2) / 235.6µs (n=3) per 19.4MB — per-token cost dominates production decode. Levers: per-thread MLP (rows_per_block, but 2→4 was neutral at n=6 — retest at n=2-3), staging gated on blockDim, ncols_dst≥4-only paths.
+- **`mul_mat_vec_q_moe` MTP regime — attempted, NO WIN (2026-06-11 late):**
+  - In-model MTP prof (essay, 47×~5 verify tok) confirms the regime split: `MUL_MAT_ID(iq2_xs,4096x2048,n=1)` 12.8% (plain-decode + draft, gets the n=1 win) and `MUL_MAT_ID(iq2_xs,2048x4096,n=6)` 6.9% (down-proj, **the moe kernel** — n=6 = 2 verify tok × 3? actually ncols_dst batches the MTP candidate fan; this is the path to beat). Per-call baselines: n=1 144.4µs, n=6 149.4µs.
+  - **Software pipeline (UF=4 staged x-block loads → registers → compute) REGRESSED +20%** in-model (n=6 149.4→179.5µs); the `q2[UF][rpb]`/`sc`/`dm` register arrays drop occupancy more than the extra in-flight loads recover. REG was already 80/thread. Reverted (working tree == 586c6f3d0). Code comment in mul_mat_vec_q_moe guards against retry.
+  - **Lesson: this kernel is occupancy-bound, not latency-bound.** Any opt that adds registers loses. Real levers left: (a) cut REG below 64 to lift occupancy (split the fat fused n=1 kernel from the moe kernel so launch_bounds minBlocks can rise — the gate/up/bias/glu fusion template is what bloats it), (b) a SWIGLU_LIMITED GLU op to fuse gate+up and halve the n=1 launch count, (c) leave it — decode is within ~30% of the LPDDR ceiling and prefill (③) is the bigger lever now.
 - Kernel facts: REG:80, 6 blocks/SM (~40% occ) for the small_k instance; iq2_xs row = 1184B (74B/256-elem block); per-call footprint = 6 experts × 2048 rows × 1184B = 14.55MB.
 - Remaining headroom (136 vs ~220 isolated): software-pipelined kbx batch loads, occupancy push (force REG≤64 via launch_bounds minBlocks=8 — global attr, needs per-type kernel split), SWIGLU_LIMITED GLU op to recover gate+up fusion.
 - Expert requant to q4_K is NOT an option (experts dominate 82GB; q4_K won't fit in 128GB).

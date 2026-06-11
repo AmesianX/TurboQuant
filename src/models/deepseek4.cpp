@@ -227,6 +227,52 @@ private:
         int64_t        scratch_row;
     };
     std::vector<dsv4_ivec_entry> ivecs;
+
+    // Topology fingerprint for graph reuse: one record per compress layer, capturing every
+    // pos-dependent value that decides graph SHAPE in the phase-uniform (n_tokens==1) decode
+    // path. Mask/ivec CONTENTS are pos-dependent by design and refreshed in set_input(); only
+    // these recorded values change topology: the 256-padded compressed-KV view size, the
+    // visible<=top_k indexer branch and the padded-causal-mask branch.
+    struct dsv4_reuse_rec {
+        int64_t ratio;
+        int64_t top_k;
+        int64_t n_comp_cache;
+        int64_t n_comp_view;
+        bool    le_topk;
+        bool    pad_mask;
+    };
+    std::vector<dsv4_reuse_rec> reuse_recs;
+    uint32_t reuse_n_tokens = 0;
+
+public:
+    void add_reuse_key(int64_t ratio, int64_t top_k, int64_t n_comp_cache, int64_t n_comp_view,
+                       bool le_topk, bool pad_mask, uint32_t n_tokens) {
+        reuse_recs.push_back({ ratio, top_k, n_comp_cache, n_comp_view, le_topk, pad_mask });
+        reuse_n_tokens = n_tokens;
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        // chunk/prefill graphs (n_tokens > 1) size their masks with the raw visible count —
+        // pos-dependent shapes, never reusable. only the phase-uniform decode path qualifies.
+        if (reuse_n_tokens != 1 || params.ubatch.n_tokens != 1 || reuse_recs.empty()) {
+            return false;
+        }
+
+        const llama_pos pos = params.ubatch.pos ? params.ubatch.pos[0] : 0;
+
+        for (const auto & r : reuse_recs) {
+            const int64_t visible = (pos + 1) / r.ratio;
+            const int64_t view    = std::min<int64_t>(r.n_comp_cache,
+                                                      GGML_PAD(std::max<int64_t>(visible, 1), 256));
+            if (view != r.n_comp_view ||
+                (visible <= r.top_k) != r.le_topk ||
+                (view > visible)     != r.pad_mask) {
+                return false;
+            }
+        }
+
+        return true;
+    }
 };
 
 struct dsv4_rope_cfg {
@@ -1339,6 +1385,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 const int64_t n_comp_view = n_tokens == 1
                     ? std::min<int64_t>(n_comp_cache, GGML_PAD(std::max<int64_t>(n_comp_visible, 1), 256))
                     : n_comp_visible;
+
+                if (n_tokens == 1) {
+                    // record the pos-dependent topology drivers so can_reuse() can tell whether a
+                    // new ubatch would rebuild this exact graph shape (see dsv4_graph_inputs)
+                    get_dsv4_inputs()->add_reuse_key(compress_ratio, hparams.indexer_top_k,
+                            n_comp_cache, n_comp_view,
+                            n_comp_visible <= hparams.indexer_top_k,
+                            n_comp_view > n_comp_visible,
+                            n_tokens);
+                }
 
                 dsv4_decode_compressor dec = n_tokens == 1
                     ? dsv4_build_compressor_decode_uniform(ctx0, cur,
