@@ -40,6 +40,21 @@ Result: plain f16 decode **13.8 → 14.66 t/s (+6%)**, greedy output identical, 
 | draft() total | 9.8 | decode 5.0 (build+submit) + sample-sync 5.6; GPU inside ≈ 3.1 (vocab proj q5_K 1.9) |
 | mirror decode submit | 1.6 | cheap |
 
+### ⚠️ OPEN BUG: ON_DEVICE checkpoint restore crash (2026-06-12 ~01:40, crash log /tmp/dsv4-ckpt-crash-*.log)
+`GGML_ABORT "~llama_io_read_device: memory buffer mismatch"` (llama-context.cpp:2788) during
+`common_prompt_checkpoint::load_tgt` (PARTIAL_ONLY|ON_DEVICE) on real multi-turn traffic (restore
+after the seq advanced past the checkpoint; FIRST restore of the same convo succeeded). Mechanism:
+the device reader records read_tensor calls and replays them in its DESTRUCTOR, aborting if the
+(n_tensors, total_size) per buffer don't match the save-time layout — ISWA KV cell layout at
+restore can legitimately differ from save time, so a recoverable miss becomes process death.
+NOT related to the can_reuse/kernel work (state io path untouched). dsv4_state_write/read are
+byte-symmetric and flags-blind (always full) — primary suspect is mem_attn ISWA partial-state
+cell-range derivation. Fix plan: (1) move the device-reader dtor work into an explicit commit()
+so failure throws → llama_state_seq_set_data_ext returns 0 → server falls back to reprocess and
+drops the checkpoint; (2) root-cause the layout asymmetry (DSV4_STATE_DEBUG=1 + log the thrown
+message at the state_seq_set_data catch site). **Production mitigation: server runs with
+`--ctx-checkpoints 0` until fixed** (cost: full re-prefill on context switch, ~10s at 1-2K).
+
 ### Remaining roadmap (ranked)
 1. **Multi-slot graph cache**: ctx_dft alternates [draft n=1, draft n=1, process n=3] — single-slot
    gf_res_prev thrashes, so only the 2nd consecutive draft reuses. Caveat: on miss sched_reset
