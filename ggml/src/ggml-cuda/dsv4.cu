@@ -4,6 +4,8 @@
 #include "common.cuh"
 #include "dsv4.cuh"
 
+#include <cuda_fp8.h>
+
 #ifndef M_PI_F
 #define M_PI_F 3.141592653589793238462643383279502884f
 #endif
@@ -21,21 +23,12 @@ static __device__ __forceinline__ float dsv4_e4m3fn_value(int i) {
 }
 
 static __device__ __forceinline__ float dsv4_e4m3fn_dequant(float x) {
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
-    const float ax = min(abs(x), 448.0f);
-
-    int best = 0;
-    float best_diff = ax;
-    for (int i = 1; i < 127; ++i) {
-        const float val = dsv4_e4m3fn_value(i);
-        const float diff = fabsf(ax - val);
-        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
-            best = i;
-            best_diff = diff;
-        }
-    }
-
-    return sign * dsv4_e4m3fn_value(best);
+    // round-to-nearest-even + saturate-to-448 — identical semantics to the
+    // old 127-entry linear search (even-tie == RTNE on the e4m3fn grid), but
+    // a single hardware cvt instead of a 126-iteration loop per element.
+    const __nv_fp8_storage_t r = __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+    const __half_raw h = __nv_cvt_fp8_to_halfraw(r, __NV_E4M3);
+    return __half2float(h);
 }
 
 static __device__ __forceinline__ float rope_yarn_ramp(const float low, const float high, const int i0) {
