@@ -4492,10 +4492,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                     std::string key = ggml_op_name(node->op);
                     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
-                        key += std::string("(") + ggml_type_name(node->src[0]->type) + ")";
+                        key += std::string("(") + ggml_type_name(node->src[0]->type)
+                             + "," + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1])
+                             + ",n=" + std::to_string(node->src[1]->ne[1]) + ")";
                     } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
                         key += std::string("(K=") + ggml_type_name(node->src[1]->type)
                              + ",D=" + std::to_string(node->src[0]->ne[0]) + ")";
+                    }
+                    if (ms > 5.0f) {
+                        key += std::string(" [") + node->name + "]";
                     }
                     auto & slot = prof.acc[key];
                     slot.first  += ms;
