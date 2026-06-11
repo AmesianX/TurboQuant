@@ -3265,6 +3265,13 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+
+    // DSV4_KERNEL_PROF needs individual node launches for per-op timing
+    static const bool kernel_prof = getenv("DSV4_KERNEL_PROF") != nullptr;
+    if (kernel_prof) {
+        use_cuda_graph = false;
+    }
+
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4447,7 +4454,55 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                // DSV4_KERNEL_PROF: per-op-class GPU time accounting (cudaEvent
+                // bracketing; forces CUDA graphs off via the same env so every
+                // node passes through here). Dumped at process exit.
+                static const bool kernel_prof = getenv("DSV4_KERNEL_PROF") != nullptr;
+
+                bool ok;
+                if (kernel_prof) {
+                    struct prof_acc {
+                        std::map<std::string, std::pair<double, int64_t>> acc;
+                        ~prof_acc() {
+                            std::vector<std::pair<std::string, std::pair<double, int64_t>>> v(acc.begin(), acc.end());
+                            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+                            double total = 0.0;
+                            for (const auto & e : v) total += e.second.first;
+                            fprintf(stderr, "\nDSV4_KERNEL_PROF: total GPU %.1f ms\n", total);
+                            for (size_t k = 0; k < v.size() && k < 30; ++k) {
+                                fprintf(stderr, "  %7.1f ms %5.1f%% %9" PRId64 "x  %s\n",
+                                        v[k].second.first, 100.0 * v[k].second.first / total,
+                                        v[k].second.second, v[k].first.c_str());
+                            }
+                        }
+                    };
+                    static prof_acc prof;
+
+                    cudaEvent_t ev0, ev1;
+                    CUDA_CHECK(cudaEventCreate(&ev0));
+                    CUDA_CHECK(cudaEventCreate(&ev1));
+                    CUDA_CHECK(cudaEventRecord(ev0, cuda_ctx->stream()));
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                    CUDA_CHECK(cudaEventRecord(ev1, cuda_ctx->stream()));
+                    CUDA_CHECK(cudaEventSynchronize(ev1));
+                    float ms = 0.0f;
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+                    CUDA_CHECK(cudaEventDestroy(ev0));
+                    CUDA_CHECK(cudaEventDestroy(ev1));
+
+                    std::string key = ggml_op_name(node->op);
+                    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+                        key += std::string("(") + ggml_type_name(node->src[0]->type) + ")";
+                    } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+                        key += std::string("(K=") + ggml_type_name(node->src[1]->type)
+                             + ",D=" + std::to_string(node->src[0]->ne[0]) + ")";
+                    }
+                    auto & slot = prof.acc[key];
+                    slot.first  += ms;
+                    slot.second += 1;
+                } else {
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
