@@ -1,7 +1,7 @@
 # DSV4 Performance — Status & Attack Plan (GB10)
 
-Working doc to resume DeepSeek-V4-Flash perf work. Last updated 2026-06-11.
-Branch: `feat/deepseek4` @ `0389bac8b` (pushed; main is at v1.8.0 docs — merge these at next release).
+Working doc to resume DeepSeek-V4-Flash perf work. Last updated 2026-06-11 (session 2: iq2_xs MMVQ).
+Branch: `feat/deepseek4`.
 
 ## Current numbers (IQ2_XS-XL 3-split, GB10, greedy)
 
@@ -9,7 +9,7 @@ Branch: `feat/deepseek4` @ `0389bac8b` (pushed; main is at v1.8.0 docs — merge
 |---|---|---|
 | baseline f16 KV | **13.8** | was 13.4 before the fp8 QDQ fix (`1d75505b0`) |
 | + MTP (`--spec-type draft-mtp --spec-draft-p-min 0.75 --spec-draft-n-max 2`) | 15.5–16.2 free text / ~17 regular | accept 98–100% |
-| tbq3 KV + MTP + QDQ fix (current server config) | **15.79** essay | accept 96% |
+| tbq3 KV + MTP (production config) | **16.06** essay / 17.0 counting | accept 98–100%; was 15.79 before iq2_xs mmvq work — gain is small under MTP because verify batches bypass the optimized n=1 path (see ①) |
 | prefill | 160–164 t/s @14K prompt | ds4 reference: 343 |
 
 Launch (the production config):
@@ -45,14 +45,19 @@ nsys 2024.6 captures ZERO CUPTI events on GB10/CUDA13 — don't waste time on it
 
 ## NEXT TARGETS (by payoff)
 
-### ① iq2_xs MMVQ — 33% of decode at ⅓ bandwidth ← START HERE
-- Kernel: `vec_dot_iq2_xs_q8_1` @ `ggml/src/ggml-cuda/vecdotq.cuh:1020`; dispatch in `mmvq.cu` (MUL_MAT_ID n=1 path).
-- Structure: per 32-elem subblock → 4× 512-entry `iq2xs_grid` lookups (`uint2`, 4KB table) + ksigns unpack + dp4a. Random-index global/constant loads are the suspected stall.
-- Ideas, in test order:
-  1. **Stage `iq2xs_grid` (4KB) into shared memory** at kernel start (one-time per block); same for ksigns if tabled.
-  2. Check occupancy/launch shape of mmvq for ne0=4096, 8 experts, n=1 (rows-per-block / blocks count on GB10's SM count); try wider rows_per_cuda_block.
-  3. Compare against `dequantize_mul_mat_vec` path if it still exists for iq2_xs.
-- Measure with DSV4_KERNEL_PROF before/after; success = iq2_xs effective GB/s 87 → 150+ (decode +10–15%).
+### ① iq2_xs MMVQ — IN PROGRESS (2026-06-11 session 2)
+- Kernel: `vec_dot_iq2_xs_q8_1` @ `ggml/src/ggml-cuda/vecdotq.cuh` (now split into `_grid` core); dispatch in `mmvq.cu`.
+- **Diagnosis revised.** Microbench (test-backend-ops, DSV4 shapes added at tests/test-backend-ops.cpp "deepseek-v4-flash" block) shows the kernel itself streams at **~223 GB/s** DRAM-fed (n_used=32/77.6MB, L2-busted) — same as q8_0. The grid-lookup-bound theory was wrong; in-model slowness (~99-132 GB/s) is **cold-weight load latency under-hidden** (per-thread MLP too low; in-model q8_0 matvecs degrade the same way: wq_b 145 vs 222 isolated). ⚠️ Microbench traps: GB10 L2=24MB and test reruns reuse the same experts — footprint must be ≫24MB or numbers are L2-flattered.
+- n_expert=256, n_expert_used=6 (not 8): gate/up = 2 unfused MUL_MAT_ID(n=1) ×~45 layers; down = MUL_MAT_ID(n=6) via mul_mat_vec_q_moe.
+- **Gate/up fusion does NOT fire for DSV4**: per-layer swiglu clamp (`swiglu_clamp_exp`, llama-graph.cpp:1705) expands to CLAMP+SILU+CLAMP+MUL — no GGML_OP_GLU, so the MUL_MAT_ID+MUL_MAT_ID+GLU pattern never matches. Recovering it needs a new GGML_GLU_OP_SWIGLU_LIMITED (SWIGLU_OAI is close but has +1 on up and asymmetric clamp). Side quest — saves launches + y/ids reread, not the main prize.
+- **SHIPPED** (in-model DSV4_KERNEL_PROF, 47 decode tok, greedy output unchanged each step):
+  1. **small_k path opened for iq2_xs** (mmvq.cu `should_use_small_k`: K=4096 sat exactly on the `<` boundary, 16<16). rpb 1→4, per-thread vec_dots 1→4: gate/up 146.6 → **126.5 µs/call** (-14%).
+  2. **smem staging of iq2xs_grid** in mul_mat_vec_q only (gated on rpb>1 so the 512-entry copy amortizes; `vec_dot_iq2_xs_q8_1_grid` core in vecdotq.cuh): gate/up → **106.9 µs** (cumulative **-27%**, 99→136 GB/s).
+- **⚠️ MTP regime lesson (the big one).** Under MTP, gate/up verify batches run at n=2-3 → `mul_mat_vec_q_moe`, NOT the optimized ncols_dst=1 kernel; down runs at n=6×3=18 → outside mmvq entirely. So the n=1 wins only reach plain decode + draft steps; production essay went 15.79 → 16.06 (top of the old noise band). Staging the codebook in the moe kernel was tried and is a measured **+47-54% regression** at n=2-3/k=4096 (64-96-thread blocks; copy+barrier dominate) — reverted; comment in the kernel guards against re-adding.
+- Tried and rejected: rpb=8 via 2*nwarps (gate/up 114µs, fewer blocks → tail imbalance); moe rows_per_block 2→4 (neutral); moe-kernel smem staging (above; in-model down n=6 liked it (-7.7%) but plain-decode-only — MTP regression wins).
+- **NEXT for ①: optimize `mul_mat_vec_q_moe` for the MTP verify regime** (iq2_xs, k=4096, ncols_dst=2-3): microbench baselines 154.7µs (n=2) / 235.6µs (n=3) per 19.4MB — per-token cost dominates production decode. Levers: per-thread MLP (rows_per_block, but 2→4 was neutral at n=6 — retest at n=2-3), staging gated on blockDim, ncols_dst≥4-only paths.
+- Kernel facts: REG:80, 6 blocks/SM (~40% occ) for the small_k instance; iq2_xs row = 1184B (74B/256-elem block); per-call footprint = 6 experts × 2048 rows × 1184B = 14.55MB.
+- Remaining headroom (136 vs ~220 isolated): software-pipelined kbx batch loads, occupancy push (force REG≤64 via launch_bounds minBlocks=8 — global attr, needs per-type kernel split), SWIGLU_LIMITED GLU op to recover gate+up fusion.
 - Expert requant to q4_K is NOT an option (experts dominate 82GB; q4_K won't fit in 128GB).
 
 ### ② wq_b q8_0 GEMV (10.7%, 145 GB/s)

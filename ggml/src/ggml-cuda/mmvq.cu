@@ -457,6 +457,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
         switch (ncols_dst) {
             case 1:
+                // (tested on GB10: 2*nwarps for IQ2_XS regresses — fewer blocks hurts SM load balance)
                 return small_k ? nwarps : 1;
             case 2:
             case 3:
@@ -563,6 +564,18 @@ static __global__ void mul_mat_vec_q(
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
+    // IQ2_XS: stage the 4KB codebook in shared memory. Warp-divergent indices hit L1 with heavy
+    // replays; smem caps this at bank-conflict cost. Only profitable because rows_per_cuda_block>1
+    // amortizes the 512-entry copy (see DSV4_PERF_STATUS.md).
+    constexpr bool stage_iq2xs_grid = (type == GGML_TYPE_IQ2_XS && rows_per_cuda_block > 1);
+    __shared__ uint64_t s_iq2xs_grid[stage_iq2xs_grid ? 512 : 1];
+    if constexpr (stage_iq2xs_grid) {
+        for (int t = tid; t < 512; t += nwarps*warp_size) {
+            s_iq2xs_grid[t] = iq2xs_grid[t];
+        }
+        __syncthreads();
+    }
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
@@ -576,12 +589,22 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                if constexpr (stage_iq2xs_grid) {
+                    tmp[j][i] += vec_dot_iq2_xs_q8_1_grid(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, s_iq2xs_grid);
+                } else {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                }
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        if constexpr (stage_iq2xs_grid) {
+                            tmp_gate[j][i] += vec_dot_iq2_xs_q8_1_grid(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, s_iq2xs_grid);
+                        } else {
+                            tmp_gate[j][i] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
@@ -704,6 +727,10 @@ static __global__ void mul_mat_vec_q_moe(
 
     const uint32_t channel_dst = blockIdx.y;
 
+    // NOTE: do NOT stage iq2xs_grid in smem here. Measured on GB10: +47-54% kernel time at
+    // ncols_dst=2-3 (the MTP verify-batch regime) — blocks are 64-96 threads, so the 512-entry
+    // copy + barrier dominate. See DSV4_PERF_STATUS.md.
+
     if (token_idx >= ncols_dst) {
         return;
     }
@@ -791,7 +818,7 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning (4 for IQ2_XS: no change on GB10)
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst);
     const dim3 block_dims(warp_size, ncols_dst);
@@ -838,6 +865,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int     blocks_per_iter_1warp = vdr * warp_size / qi;
         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
         bool          use                   = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
+
+        // DSV4 IQ2_XS-XL experts (K=4096): blocks_per_row==nwarps*blocks_per_iter_1warp sits exactly on
+        // the boundary, leaving each thread a single vec_dot per launch — too little in-flight work to
+        // hide cold-weight latency at decode. Widen to <= so the small_k path (1 row/warp, 4 sequential
+        // vec_dots/thread) applies. Measured on GB10: gate/up MUL_MAT_ID n=1 146.6us -> see DSV4_PERF_STATUS.md.
+        if (type == GGML_TYPE_IQ2_XS && nwarps > 1 && blocks_per_row_x <= nwarps * blocks_per_iter_1warp) {
+            use = true;
+        }
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,

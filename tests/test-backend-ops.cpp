@@ -9305,6 +9305,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // deepseek-v4-flash IQ2_XS-XL routed experts (DSV4_PERF_STATUS.md target ①)
+    for (int bs : {1, 2, 3, 6, 256}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q8_0}) {
+            for (ggml_type type_b : {GGML_TYPE_F32}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 8, false, 2048, bs, 4096)); // gate/up
+                test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 8, false, 4096, bs, 2048)); // down
+            }
+        }
+    }
+    // L2-busting variants (GB10 L2 = 24MB; n_used=8 plain case is only 19.4MB and gets cached;
+    // even n_used=16/38.8MB rereads the same data so L2 still covers ~60% — use n_used=32/77.6MB)
+    for (int bs : {1, 6}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 64, 32, false, 2048, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,   GGML_TYPE_F32, 64, 32, false, 2048, bs, 4096));
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
