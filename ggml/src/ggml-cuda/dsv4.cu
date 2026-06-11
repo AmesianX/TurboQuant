@@ -14,14 +14,6 @@ namespace {
 
 constexpr int DSV4_HC_MAX = 16;
 
-static __device__ __forceinline__ float dsv4_e4m3fn_value(int i) {
-    const int exp  = (i >> 3) & 0x0f;
-    const int mant = i & 0x07;
-    return exp == 0
-        ? float(mant) * 0.001953125f
-        : (1.0f + float(mant) * 0.125f) * exp2f(float(exp - 7));
-}
-
 static __device__ __forceinline__ float dsv4_e4m3fn_dequant(float x) {
     // round-to-nearest-even + saturate-to-448 — identical semantics to the
     // old 127-entry linear search (even-tie == RTNE on the e4m3fn grid), but
@@ -310,11 +302,14 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
     const int64_t n_nope = args.ne00 - args.n_rot;
 
     for (int64_t off = 0; off < n_nope; off += 64) {
+        // guard the tail chunk: when n_nope % 64 != 0, unguarded lanes would read rope-region
+        // (or out-of-row) values and contaminate the per-chunk amax/scale
+        const bool lane_ok = off + tid < n_nope;
         float v = 0.0f;
-        if (tid < 64) {
+        if (lane_ok) {
             v = *((const float *) (src_base + (off + tid) * args.nb00));
-            scratch[tid] = fabsf(v);
         }
+        scratch[tid] = lane_ok ? fabsf(v) : 0.0f;
         __syncthreads();
 
         for (uint32_t stride = 32; stride > 0; stride >>= 1) {
@@ -326,7 +321,7 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
 
         const float amax = fmaxf(scratch[0], 1.0e-4f);
         const float scale = exp2f(ceilf(log2f(amax / 448.0f)));
-        if (tid < 64) {
+        if (lane_ok) {
             const float q = dsv4_e4m3fn_dequant(fminf(fmaxf(v / scale, -448.0f), 448.0f)) * scale;
             *((float *) (dst_base + (off + tid) * args.nb0)) = q;
         }

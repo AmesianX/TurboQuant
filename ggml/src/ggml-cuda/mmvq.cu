@@ -565,9 +565,11 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     // IQ2_XS: stage the 4KB codebook in shared memory. Warp-divergent indices hit L1 with heavy
-    // replays; smem caps this at bank-conflict cost. Only profitable because rows_per_cuda_block>1
-    // amortizes the 512-entry copy (see DSV4_PERF_STATUS.md).
-    constexpr bool stage_iq2xs_grid = (type == GGML_TYPE_IQ2_XS && rows_per_cuda_block > 1);
+    // replays; smem caps this at bank-conflict cost. rows_per_cuda_block>1 amortizes the
+    // 512-entry copy, and the win is only MEASURED on the ncols_dst==1 small_k decode path —
+    // ncols_dst 2..8 (rpb=2) sits in the same small-block regime where staging regressed the
+    // moe kernel by ~50%, so keep it off there until benchmarked (see DSV4_PERF_STATUS.md).
+    constexpr bool stage_iq2xs_grid = (type == GGML_TYPE_IQ2_XS && ncols_dst == 1 && rows_per_cuda_block > 1);
     __shared__ uint64_t s_iq2xs_grid[stage_iq2xs_grid ? 512 : 1];
     if constexpr (stage_iq2xs_grid) {
         for (int t = tid; t < 512; t += nwarps*warp_size) {

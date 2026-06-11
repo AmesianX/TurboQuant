@@ -77,6 +77,16 @@ public:
             int64_t        window,
             int64_t        ratio,
             const char   * name) {
+        // mask contents are fully determined by (kind, shape, n_raw, n_comp, window, ratio) and
+        // the ubatch — share one tensor across layers with identical parameters so set_input()
+        // fills and uploads each distinct mask once per ubatch instead of once per layer
+        for (const auto & m : masks) {
+            if (m.kind == kind && m.n_raw == n_raw && m.n_comp == n_comp &&
+                m.window == window && m.ratio == ratio &&
+                m.tensor->ne[0] == n0 && m.tensor->ne[1] == n1) {
+                return m.tensor;
+            }
+        }
         ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n0, n1, 1, 1);
         ggml_set_input(t);
         ggml_set_name(t, name);
@@ -93,6 +103,10 @@ public:
             const char   * name) {
         for (const auto & v : ivecs) {
             if (v.kind == kind && v.ratio == ratio) {
+                // a mismatching scratch_row would silently write off-boundary compress results
+                // into a VALID row of the layer with the larger cache
+                GGML_ASSERT(v.scratch_row == scratch_row && v.tensor->ne[0] == length &&
+                            "dsv4 ivec dedup: same (kind,ratio) with different scratch_row/length");
                 return v.tensor;  // shared across layers with the same ratio
             }
         }
@@ -795,38 +809,6 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
         const dsv4_rope_cfg & rope_cfg,
         float                norm_eps);
 
-static dsv4_decode_compressor dsv4_build_compressor_decode(
-        ggml_context       * ctx,
-        ggml_tensor        * x,
-        ggml_tensor        * prev_kv_state,
-        ggml_tensor        * prev_score_state,
-        ggml_tensor        * wkv,
-        ggml_tensor        * wgate,
-        ggml_tensor        * ape,
-        ggml_tensor        * norm,
-        int64_t              head_dim,
-        int64_t              n_rot,
-        int64_t              pos,
-        int64_t              compress_ratio,
-        int                  rope_type,
-        const dsv4_rope_cfg & rope_cfg,
-        float                norm_eps) {
-    const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
-    const int64_t pos_mod = pos % compress_ratio;
-
-    ggml_tensor * kv_cur = ggml_mul_mat(ctx, wkv, x);       // [width, 1]
-    ggml_tensor * sc_cur = ggml_mul_mat(ctx, wgate, x);
-    ggml_tensor * ape_f  = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
-    sc_cur = ggml_add(ctx, sc_cur, ggml_view_2d(ctx, ape_f, layout.width, 1, ape_f->nb[1], pos_mod*ape_f->nb[1]));
-
-    return dsv4_build_compressor_decode_projected(ctx,
-            kv_cur, sc_cur,
-            prev_kv_state, prev_score_state,
-            norm,
-            head_dim, n_rot, pos, compress_ratio,
-            rope_type, rope_cfg, norm_eps);
-}
-
 // phase-uniform decode compressor (n_tokens == 1): identical math to the pos-based
 // version, but every position-dependent construct comes from i32 graph INPUTS so the
 // graph topology and node properties are token-invariant (CUDA-graph capturable):
@@ -1346,7 +1328,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             n_tokens, n_comp, hparams.n_swa, compress_ratio,
                             "dsv4_attn_static_mask");
                 }
-            } else {
+            } else if (is_prefill) {
+                // first chunk shorter than compress_ratio (n_comp == 0): raw window only.
+                // The !is_prefill case needs no mask here — the decode path unconditionally
+                // takes attn_mask from inp_attn->self_kq_mask_swa below.
                 attn_mask = get_dsv4_inputs()->add_mask(ctx0,
                         dsv4_mask_kind::RAW_WINDOW,
                         n_tokens, n_tokens,
@@ -1638,7 +1623,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
         ggml_tensor * selected = nullptr;
-        if ((uint32_t) il < hparams.n_hash_layers && !cparams.warmup) {
+        // hash routing is a function of the token id — embeddings-only batches (ubatch.token ==
+        // nullptr) leave inp_tokens unset, so fall back to gate routing like the warmup case
+        if ((uint32_t) il < hparams.n_hash_layers && !cparams.warmup && ubatch.token != nullptr) {
             selected = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, inp_tokens);
             cb(selected, "ffn_moe_hash_topk", il);
         }

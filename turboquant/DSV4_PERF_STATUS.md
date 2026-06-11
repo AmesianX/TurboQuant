@@ -1,5 +1,39 @@
 # DSV4 Performance — Status & Attack Plan (GB10)
 
+## CODE AUDIT APPLIED (2026-06-12 morning) — 10 findings + 2 bonus fixed
+Full-branch review (7 finder + 4 verifier agents). Fixed:
+1. `load_tgt/dft`/`update_*` no longer GGML_ABORT — bool returns; server falls back per site
+   (drop checkpoint / skip speculation / abandon draft / full reprocess / fail request).
+2. `state_seq_set_data` ON_DEVICE pre-try throws moved inside try (no more std::terminate
+   through the C API on corrupt blobs); failure path now seq_rm's the half-restored seq.
+3. **MTP pending_h rewind** (`common_speculative_rewind`) on the partial-rejection
+   checkpoint-restore path — was permanently baking a rejected-branch h into the draft KV
+   (active bug at temp>0; acceptance degraded over time).
+4. Quantized ON_DEVICE staging unit bug (bytes/element_size is BLOCKS for quantized types —
+   1/blck of data staged): fixed on both write and read; latent (PARTIAL streams only f16/f32).
+5. write_device moved to commit() too — a thrown save no longer clobbers good staging; allocs checked.
+6. Interior seq_rm rejected up-front for compressed KV (silent-corruption API hole).
+7. Hash-layer routing guarded for embeddings-only batches (uninitialized token gather).
+8. `add_mask` dedup — masks shared across same-shape layers; per-token fill+H2D now once per
+   distinct shape instead of per layer (plain decode 14.66→14.85 t/s).
+9. Instrumentation timers gated on DSV4_MTP_PROF (were unconditional vDSO calls per draft token).
+10. Dead code removed: `dsv4_build_compressor_decode` wrapper, `dsv4_e4m3fn_value`, RAW_WINDOW
+    mask scoped to the only path that uses it (is_prefill && n_comp==0 — ⚠️ audit lesson: the
+    finder called it fully orphaned; the else also covered short first prefill chunks and
+    removing it segfaulted fit — always verify the ENCLOSING CONDITION before deleting).
+Bonus: fp8 quantize tail-chunk guard (n_nope%64), iq2_xs smem staging gate scoped to the
+measured ncols_dst==1 path (was silently enabled for unmeasured dense n=2..8).
+Deferred (recorded, not fixed): DSV4_KERNEL_PROF skips fused launches (profile share skew);
+decode-chunk prefill cliff (= roadmap ③); dsv4 can_reuse relies on split_seq equal_seqs +
+inp_rs head checks for seq identity (holds today; assert-worthy).
+
+## NEXT IMPLEMENTATION PRIORITY #1 (user directive 2026-06-12): TBQ → fattn-mma port
+Port the fattn-vec TBQ dequant logic into the fattn-mma TILE LOADER (per-tile native dequant —
+NOT the full-K-cache f16 dequant that froze GB10 at K≈2048). Then drop the TBQ→VEC force in
+fattn.cu (~1019) and make MMA the consistent default with vec as fallback-only, DSV4 included.
+Regression gates: Qwen3-14B tbq3 decode 0.87×→~1.0× of f16; the K≈2048 freeze scenario;
+DSV4 greedy gates. README_KO.md:185 records this as the top open item since v1.7.0.
+
 Working doc to resume DeepSeek-V4-Flash perf work. Last updated 2026-06-11 (session 2: iq2_xs MMVQ).
 Branch: `feat/deepseek4`.
 

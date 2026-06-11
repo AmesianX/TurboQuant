@@ -378,6 +378,18 @@ void llama_memory_hybrid_iswa::clear(bool data) {
 }
 
 bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // The compressed cache cannot honor head/interior removals: row validity is derived from
+    // seq_pos_max, so zeroed interior rows would stay visible to attention (and a mid-row p0
+    // also destroys data of kept positions sharing that compressed row). Only tail removals
+    // (p1 covers through the end) and full clears are representable — reject the rest BEFORE
+    // any sub-cache mutates so the caller can fall back to a full reprocess.
+    if (has_dsv4_compressed_kv() && p1 >= 0) {
+        const llama_pos pos_max = seq_pos_max(seq_id);
+        if (pos_max >= 0 && p1 <= pos_max) {
+            return false;
+        }
+    }
+
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
