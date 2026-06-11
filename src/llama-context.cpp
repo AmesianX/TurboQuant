@@ -2747,53 +2747,103 @@ public:
     llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
     }
 
-    ~llama_io_read_device() {
-        llama_memory_buffers mbufs_new;
+    // The deferred tensor reads are applied here instead of the destructor: errors must throw
+    // through state_seq_set_data's catch (recoverable — caller reprocesses), not GGML_ABORT.
+    //
+    // The save-time staging chunks and the restore-time destinations describe the SAME byte
+    // stream, but may be SPLIT differently: a sequence saved from a contiguous KV slot can be
+    // restored into a fragmented slot (find_slot after cache churn), turning one write_tensor
+    // into several read_tensor calls. The old code required identical splits and aborted
+    // otherwise. Instead, scatter the staged bytes sequentially per buffer type — only the
+    // per-buft total has to match.
+    void commit() override {
+        committed = true;
+
+        std::map<ggml_backend_buffer_type_t, std::vector<const read_info *>> infos_per_buft;
+        std::map<ggml_backend_buffer_type_t, size_t> total_per_buft;
 
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
-
-            mbufs_new[buft].n_tensors++;
-            mbufs_new[buft].total_size += rinfo.size;
+            infos_per_buft[buft].push_back(&rinfo);
+            total_per_buft[buft] += rinfo.size;
         }
 
-        for (auto & [buft, mbuf] : mbufs_new) {
+        for (auto & [buft, infos] : infos_per_buft) {
+            const auto it = mbufs.find(buft);
+            if (it == mbufs.end() || !it->second.buf) {
+                throw std::runtime_error("device state restore: no saved buffer for buffer type");
+            }
+            const auto & mbuf_cur = it->second;
+
+            if (mbuf_cur.total_size != total_per_buft[buft]) {
+                throw std::runtime_error(format(
+                        "device state restore: size mismatch (buft %s: saved %zu bytes, restore wants %zu)",
+                        ggml_backend_buft_name(buft), mbuf_cur.total_size, total_per_buft[buft]));
+            }
+
+            // worst case one extra segment per chunk boundary
+            const size_t max_views = 2*(infos.size() + mbuf_cur.cpy.size());
             ggml_init_params params = {
-                /*.mem_size   =*/ mbuf.n_tensors*ggml_tensor_overhead(),
+                /*.mem_size   =*/ max_views*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
+            ggml_context_ptr vctx { ggml_init(params) };
 
-            mbuf.ctx.reset(ggml_init(params));
+            size_t j     = 0; // saved chunk index
+            size_t j_off = 0; // byte offset within chunk j
 
-            mbuf.org.reserve(mbuf.n_tensors);
-        }
+            for (const read_info * ri : infos) {
+                size_t r_off = 0;
+                while (r_off < ri->size) {
+                    if (j >= mbuf_cur.cpy.size()) {
+                        throw std::runtime_error("device state restore: ran out of saved chunks");
+                    }
+                    ggml_tensor * chunk = mbuf_cur.cpy[j];
 
-        for (const auto & rinfo : rinfos) {
-            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+                    if (chunk->type != ri->tensor->type) {
+                        throw std::runtime_error("device state restore: chunk/destination type mismatch");
+                    }
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+                    const size_t chunk_size = ggml_nbytes(chunk);
+                    const size_t seg        = std::min(ri->size - r_off, chunk_size - j_off);
+                    const size_t es         = ggml_element_size(chunk);
 
-            auto & mbuf = mbufs_new[buft];
+                    if (seg % es != 0 || j_off % es != 0 || (ri->offset + r_off) % es != 0) {
+                        throw std::runtime_error("device state restore: unaligned segment");
+                    }
 
-            mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), rinfo.tensor, n, rinfo.offset));
+                    ggml_tensor * src = ggml_view_1d(vctx.get(), chunk,      seg/es, j_off);
+                    ggml_tensor * dst = ggml_view_1d(vctx.get(), ri->tensor, seg/es, ri->offset + r_off);
+                    ggml_backend_view_init(src);
+                    ggml_backend_view_init(dst);
+                    ggml_backend_tensor_copy(src, dst);
 
-            ggml_backend_view_init(mbuf.org.back());
-        }
-
-        for (auto & [buft, mbuf] : mbufs_new) {
-            const auto & mbuf_cur = mbufs.at(buft);
-
-            if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size) {
-                GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+                    r_off += seg;
+                    j_off += seg;
+                    if (j_off == chunk_size) {
+                        j++;
+                        j_off = 0;
+                    }
+                }
             }
 
-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+            if (j != mbuf_cur.cpy.size() || j_off != 0) {
+                throw std::runtime_error("device state restore: saved chunks not fully consumed");
             }
         }
 
-        GGML_ASSERT(buf_size == 0);
+        if (buf_size != 0) {
+            throw std::runtime_error("device state restore: trailing bytes in state buffer");
+        }
+    }
+
+    ~llama_io_read_device() {
+        if (!committed && !rinfos.empty()) {
+            // restore failed before commit(); deferred reads are dropped on purpose —
+            // the caller falls back to reprocessing the sequence from scratch
+            LLAMA_LOG_WARN("%s: discarding %zu uncommitted deferred tensor reads\n", __func__, rinfos.size());
+        }
     }
 
     void read(void * dst, size_t size) override {
@@ -2827,6 +2877,8 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+
+    bool committed = false;
 
     const llama_memory_buffers & mbufs;
 };
@@ -2933,7 +2985,13 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        return state_seq_read_data(*io, seq_id, flags);
+        const size_t n_read = state_seq_read_data(*io, seq_id, flags);
+
+        // apply deferred device-side reads; throws (and is caught below) on layout mismatch
+        // so a bad checkpoint degrades to "restore failed, reprocess" instead of an abort
+        io->commit();
+
+        return n_read;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
