@@ -40,20 +40,22 @@ Result: plain f16 decode **13.8 → 14.66 t/s (+6%)**, greedy output identical, 
 | draft() total | 9.8 | decode 5.0 (build+submit) + sample-sync 5.6; GPU inside ≈ 3.1 (vocab proj q5_K 1.9) |
 | mirror decode submit | 1.6 | cheap |
 
-### ⚠️ OPEN BUG: ON_DEVICE checkpoint restore crash (2026-06-12 ~01:40, crash log /tmp/dsv4-ckpt-crash-*.log)
-`GGML_ABORT "~llama_io_read_device: memory buffer mismatch"` (llama-context.cpp:2788) during
-`common_prompt_checkpoint::load_tgt` (PARTIAL_ONLY|ON_DEVICE) on real multi-turn traffic (restore
-after the seq advanced past the checkpoint; FIRST restore of the same convo succeeded). Mechanism:
-the device reader records read_tensor calls and replays them in its DESTRUCTOR, aborting if the
-(n_tensors, total_size) per buffer don't match the save-time layout — ISWA KV cell layout at
-restore can legitimately differ from save time, so a recoverable miss becomes process death.
-NOT related to the can_reuse/kernel work (state io path untouched). dsv4_state_write/read are
-byte-symmetric and flags-blind (always full) — primary suspect is mem_attn ISWA partial-state
-cell-range derivation. Fix plan: (1) move the device-reader dtor work into an explicit commit()
-so failure throws → llama_state_seq_set_data_ext returns 0 → server falls back to reprocess and
-drops the checkpoint; (2) root-cause the layout asymmetry (DSV4_STATE_DEBUG=1 + log the thrown
-message at the state_seq_set_data catch site). **Production mitigation: server runs with
-`--ctx-checkpoints 0` until fixed** (cost: full re-prefill on context switch, ~10s at 1-2K).
+### ✅ FIXED: ON_DEVICE checkpoint restore crash (`41516a5f3`, 2026-06-12; crash log /tmp/dsv4-ckpt-crash-*.log)
+Was: `GGML_ABORT "memory buffer mismatch"` in the device reader's DESTRUCTOR during
+`common_prompt_checkpoint::load_tgt` on multi-turn traffic. Root cause: the reader required
+restore-time read_tensor splits to EQUAL save-time write_tensor splits (n_tensors per buft) —
+but a sequence saved from a contiguous KV slot legitimately restores into a fragmented slot
+after cache churn (find_slot splits one saved range across several reads). Over-strict check +
+abort-in-dtor turned a layout difference into process death.
+Fix: reader exposes commit() (called inside state_seq_set_data's try) that scatters the staged
+bytes SEQUENTIALLY per buffer type across differing chunk boundaries — invariants are only the
+per-buft byte total and stream order. True corruption throws → caught → restore returns 0 →
+server reprocesses; crash impossible on this path. Validated: deep-branch repro
+(/tmp/ckpt_repro3.py, branches cut inside a long reply so the divergence lands past checkpoint
+positions) = 7 restores into churned cache, 0 fallbacks, server stable. Checkpoints re-enabled
+in production (no --ctx-checkpoints 0).
+Repro lesson: simple multi-turn extension never restores (prefix==n_past); branches before the
+checkpoint position skip it too — the branch must land BETWEEN checkpoint pos and n_past.
 
 ### Remaining roadmap (ranked)
 1. **Multi-slot graph cache**: ctx_dft alternates [draft n=1, draft n=1, process n=3] — single-slot
