@@ -127,7 +127,8 @@ public:
             const int64_t  len  = v.tensor->ne[0];
             const bool boundary = ((pos + 1) % v.ratio) == 0;
 
-            std::vector<int32_t> data(len, 0);
+            ivec_buf.assign(len, 0);
+            std::vector<int32_t> & data = ivec_buf;
             switch (v.kind) {
                 case dsv4_ivec_kind::ROW_IDX:
                     data[0] = (int32_t) (v.ratio == 4 ? v.ratio + pos % v.ratio : pos % v.ratio);
@@ -166,7 +167,8 @@ public:
             const int64_t n0 = mask.tensor->ne[0];
             const int64_t n1 = mask.tensor->ne[1];
 
-            std::vector<float> data(n0*n1, -INFINITY);
+            mask_buf.assign(n0*n1, -INFINITY);
+            std::vector<float> & data = mask_buf;
 
             switch (mask.kind) {
                 case dsv4_mask_kind::RAW_WINDOW:
@@ -241,6 +243,12 @@ private:
         int64_t        scratch_row;
     };
     std::vector<dsv4_ivec_entry> ivecs;
+
+    // Reused staging buffers for set_input — this object is shared across decode tokens of a
+    // reused graph, so keeping these as members avoids a per-token heap alloc per ivec/mask
+    // (the decode path runs once per generated token over every compress layer).
+    std::vector<int32_t> ivec_buf;
+    std::vector<float>   mask_buf;
 
     // Topology fingerprint for graph reuse: one record per compress layer, capturing every
     // pos-dependent value that decides graph SHAPE in the phase-uniform (n_tokens==1) decode

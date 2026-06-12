@@ -255,8 +255,8 @@ static __global__ void kernel_dsv4_hc_expand(
         const char * comb,
         char * dst) {
     const int64_t n_elem = args.n_embd * args.n_hc * args.n_tokens;
-    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if ((int64_t) gid >= n_elem) {
+    const int64_t gid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_elem) {
         return;
     }
 
@@ -427,8 +427,8 @@ static __global__ void kernel_dsv4_hc_weighted_sum(
         const char * weights,
         char * dst) {
     const int64_t n_elem = args.n_embd * args.n_tokens;
-    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if ((int64_t) gid >= n_elem) {
+    const int64_t gid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_elem) {
         return;
     }
 
