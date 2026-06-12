@@ -179,7 +179,36 @@ Baseline: feat/deepseek4 @ fead3634f (audit-clean, production 16 t/s essay / tg 
 Each item: build + greedy-identity gate + essay/counting t/s A/B + commit. Drive via background.
 
 ### Tier 1 — MTP round (biggest lever; round 61ms = GPU 27.8 + CPU ~22 + draft 9.8 + mirror 1.6)
-1. [DE-RISKED, ready to implement] verify graph phase-uniform → reuse. deepseek4.cpp ~1378/1392.
+1. [INFRA LANDED flag-off-safe; flag-on has a numerical bug + needs #2] verify graph phase-uniform reuse.
+
+  **STATUS 2026-06-13 (commit pending): full uniform-K infra implemented behind `DSV4_VERIFY_REUSE`
+  (default OFF). deepseek4.cpp +173/-48.**
+  - ivec set_input generalized to width K (per-step loop, K==1 byte-identical).
+  - `dsv4_build_compressor_decode_chunk_uniform` (loop `_uniform` K times on sliced K-wide ivecs).
+  - dispatch: `uniform` flag routes n>1 verify through uniform path (attn + indexer compressors,
+    input-indexed cache scatter, 256-padded view, reuse key); n==1 unchanged; chunk fallback kept.
+  - `can_reuse` generalized to n_tokens==K. Cap `DSV4_VERIFY_MAX=16` (prefill/512-reserve stay chunk).
+  - **GATE RESULTS:**
+    - flag-OFF greedy == baseline, SHA a56fd7215e25ee66 byte-identical ✓ (default is safe).
+    - flag-ON greedy DIVERGES: SHA aac34a0ee9c07ff7, shorter coherent output, acceptance 1.00 vs 0.96
+      → a real NUMERICAL bug in the verify-uniform recurrence or K-wide cache write (topology change
+      was supposed to be math-identical). MUST FIX before enabling.
+    - flag-ON `graphs reused` = 16 ≈ baseline 16 → single-slot reuse barely moves because width
+      ALTERNATES (3→1→2→3→4) every step and single-slot can_reuse thrashes on transitions.
+      **#1 alone is insufficient; #2 (multi-slot graph cache keyed by width) is REQUIRED for the gain.**
+  - **FIRST CRASH FIXED:** unbounded uniform unroll made the n_tokens=512 graph reservation build 512
+    `_uniform` steps (unconditional pool/step) → GGML_ASSERT(obj_new) graph-ctx overflow. Cap fixed it.
+  - **NEXT (debug the numerical divergence):** likely suspects in priority order —
+    (1) `cur` shape into _chunk_uniform: confirm it's [n_embd, n_tokens] and the column slice
+        `ggml_view_2d(x, ne0,1, nb1, i*nb1)` selects the right dim (watch for a folded n_hc dim).
+    (2) `ggml_dsv4_fp8_kv_quantize` on [width,1,K] — verify it quantizes K rows independently (n==1
+        only ever passed [width,1,1]); same for the indexer cache write.
+    (3) state-perm composition across K steps vs _projected's concat-shift (single-step proven equal;
+        check K-step threading + scratch-row collisions when two non-boundary steps share scratch_row).
+    Isolate by forcing n_max=1 (verify width 2) first, then widen. flag-off stays the safe default.
+
+  --- original de-risk notes below (still valid) ---
+1b. [DE-RISKED] verify graph phase-uniform → reuse. deepseek4.cpp ~1378/1392.
 
   **MEASURED 2026-06-13 (DSV4_NT_PROF, 40-tok greedy decode, --spec-draft-n-max 2, ctk/ctv tbq3):**
   - `graphs reused = 1` across ~38 MTP calls → the graph is rebuilt almost EVERY step today.

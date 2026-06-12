@@ -118,42 +118,51 @@ public:
     }
 
     void set_input(const llama_ubatch * ubatch) override {
+        // phase-uniform path generalized to width K (K==1 decode, K>1 MTP verify): each ivec is
+        // K*per_step long, step s deriving its values from pos[s] via the identical single-step
+        // formula. K==1 is byte-identical to the original decode-only fill (base=0, per_step=len).
+        const int64_t K = ubatch->n_tokens;
         for (const auto & v : ivecs) {
             if (v.tensor->buffer == nullptr) {
                 continue;
             }
-            GGML_ASSERT(ubatch->n_tokens == 1 && "dsv4 ivec inputs are decode-only");
-            const llama_pos pos = ubatch->pos ? ubatch->pos[0] : 0;
-            const int64_t  len  = v.tensor->ne[0];
-            const bool boundary = ((pos + 1) % v.ratio) == 0;
+            const int64_t len      = v.tensor->ne[0];
+            const int64_t per_step = K > 0 ? len / K : len;
+            GGML_ASSERT(K > 0 && per_step * K == len &&
+                        "dsv4 ivec length must be n_tokens * per-step width");
 
             ivec_buf.assign(len, 0);
             std::vector<int32_t> & data = ivec_buf;
-            switch (v.kind) {
-                case dsv4_ivec_kind::ROW_IDX:
-                    data[0] = (int32_t) (v.ratio == 4 ? v.ratio + pos % v.ratio : pos % v.ratio);
-                    break;
-                case dsv4_ivec_kind::COMP_POS:
-                    data[0] = (int32_t) (pos + 1 - v.ratio);
-                    break;
-                case dsv4_ivec_kind::STATE_PERM:
-                    for (int64_t i = 0; i < len; ++i) {
-                        data[i] = (int32_t) i;
-                    }
-                    if (boundary && v.ratio == 4) {
-                        // shift current window -> previous; duplicated current rows are
-                        // fully overwritten before the next boundary
-                        for (int64_t i = 0; i < len; ++i) {
-                            data[i] = (int32_t) (v.ratio + i % v.ratio);
+            for (int64_t s = 0; s < K; ++s) {
+                const llama_pos pos      = ubatch->pos ? ubatch->pos[s] : (llama_pos) s;
+                const bool      boundary = ((pos + 1) % v.ratio) == 0;
+                const int64_t   base     = s * per_step;
+                switch (v.kind) {
+                    case dsv4_ivec_kind::ROW_IDX:
+                        data[base] = (int32_t) (v.ratio == 4 ? v.ratio + pos % v.ratio : pos % v.ratio);
+                        break;
+                    case dsv4_ivec_kind::COMP_POS:
+                        data[base] = (int32_t) (pos + 1 - v.ratio);
+                        break;
+                    case dsv4_ivec_kind::STATE_PERM:
+                        for (int64_t i = 0; i < per_step; ++i) {
+                            data[base + i] = (int32_t) i;
                         }
-                    }
-                    break;
-                case dsv4_ivec_kind::CACHE_ROW:
-                    data[0] = (int32_t) (boundary ? (pos + 1) / v.ratio - 1 : v.scratch_row);
-                    break;
-                case dsv4_ivec_kind::APE_PHASE:
-                    data[0] = (int32_t) (pos % v.ratio);
-                    break;
+                        if (boundary && v.ratio == 4) {
+                            // shift current window -> previous; duplicated current rows are
+                            // fully overwritten before the next boundary
+                            for (int64_t i = 0; i < per_step; ++i) {
+                                data[base + i] = (int32_t) (v.ratio + i % v.ratio);
+                            }
+                        }
+                        break;
+                    case dsv4_ivec_kind::CACHE_ROW:
+                        data[base] = (int32_t) (boundary ? (pos + 1) / v.ratio - 1 : v.scratch_row);
+                        break;
+                    case dsv4_ivec_kind::APE_PHASE:
+                        data[base] = (int32_t) (pos % v.ratio);
+                        break;
+                }
             }
             ggml_backend_tensor_set(v.tensor, data.data(), 0, data.size()*sizeof(int32_t));
         }
@@ -274,13 +283,18 @@ public:
     }
 
     bool can_reuse(const llm_graph_params & params) override {
-        // chunk/prefill graphs (n_tokens > 1) size their masks with the raw visible count —
-        // pos-dependent shapes, never reusable. only the phase-uniform decode path qualifies.
-        if (reuse_n_tokens != 1 || params.ubatch.n_tokens != 1 || reuse_recs.empty()) {
+        // The phase-uniform path records a reuse key for both decode (n_tokens==1) and the MTP verify
+        // width K (n_tokens==K, only when DSV4_VERIFY_REUSE admitted it). A recorded graph is reusable
+        // iff the new ubatch has the SAME width and the same pos-derived topology drivers (256-padded
+        // view, visible<=top_k, padded-mask) evaluated at its LAST position. chunk/prefill builds never
+        // call add_reuse_key, so reuse_recs stays empty for them and they never qualify.
+        if (reuse_recs.empty() || reuse_n_tokens == 0 ||
+            params.ubatch.n_tokens != reuse_n_tokens) {
             return false;
         }
 
-        const llama_pos pos = params.ubatch.pos ? params.ubatch.pos[0] : 0;
+        const int64_t   last = (int64_t) params.ubatch.n_tokens - 1;
+        const llama_pos pos  = params.ubatch.pos ? params.ubatch.pos[last] : (llama_pos) last;
 
         for (const auto & r : reuse_recs) {
             const int64_t visible = (pos + 1) / r.ratio;
@@ -990,6 +1004,60 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk(
     return { kv_state, score_state, kv_comp };
 }
 
+// phase-uniform multi-token (MTP verify, n_tokens == K) compressor: the K-step state recurrence of
+// dsv4_build_compressor_decode_chunk, but each step calls the input-driven _uniform builder (not the
+// pos-baked _projected) on the i-th slice of the K-wide i32 ivecs. Pooling runs unconditionally every
+// step and off-boundary results route to the cache scratch row (via CACHE_ROW), so the graph topology
+// is position-invariant and the whole verify graph becomes reusable across MTP rounds. kv_comp holds
+// all K pooled rows (concat on dim 2) for a single input-indexed cache scatter. K==1 reduces exactly
+// to _uniform. Used only when DSV4_VERIFY_REUSE is set and n_comp_visible <= indexer_top_k.
+static dsv4_decode_compressor dsv4_build_compressor_decode_chunk_uniform(
+        ggml_context       * ctx,
+        ggml_tensor        * x,
+        ggml_tensor        * prev_kv_state,
+        ggml_tensor        * prev_score_state,
+        ggml_tensor        * wkv,
+        ggml_tensor        * wgate,
+        ggml_tensor        * ape,
+        ggml_tensor        * norm,
+        ggml_tensor        * row_idx,     // [K]
+        ggml_tensor        * state_perm,  // [K * 2*ratio], nullptr for ratio != 4
+        ggml_tensor        * comp_pos,    // [K]
+        ggml_tensor        * ape_phase,   // [K]
+        int64_t              head_dim,
+        int64_t              n_rot,
+        int64_t              n_tokens,
+        int64_t              compress_ratio,
+        int                  rope_type,
+        const dsv4_rope_cfg & rope_cfg,
+        float                norm_eps) {
+    ggml_tensor * kv_state    = prev_kv_state;
+    ggml_tensor * score_state = prev_score_state;
+    ggml_tensor * kv_comp     = nullptr;
+    const int64_t perm_step   = state_perm ? state_perm->ne[0] / n_tokens : 0;
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        ggml_tensor * x_i    = ggml_view_2d(ctx, x, x->ne[0], 1, x->nb[1], i*x->nb[1]);
+        ggml_tensor * row_i  = ggml_view_1d(ctx, row_idx,   1, i*row_idx->nb[0]);
+        ggml_tensor * cpos_i = ggml_view_1d(ctx, comp_pos,  1, i*comp_pos->nb[0]);
+        ggml_tensor * aph_i  = ggml_view_1d(ctx, ape_phase, 1, i*ape_phase->nb[0]);
+        ggml_tensor * perm_i = state_perm
+            ? ggml_view_1d(ctx, state_perm, perm_step, i*perm_step*state_perm->nb[0])
+            : nullptr;
+
+        dsv4_decode_compressor dec = dsv4_build_compressor_decode_uniform(ctx, x_i,
+                kv_state, score_state, wkv, wgate, ape, norm,
+                row_i, perm_i, cpos_i, aph_i,
+                head_dim, n_rot, compress_ratio, rope_type, rope_cfg, norm_eps);
+
+        kv_state    = dec.kv_state;
+        score_state = dec.score_state;
+        kv_comp = kv_comp == nullptr ? dec.kv_comp : ggml_concat(ctx, kv_comp, dec.kv_comp, 2);
+    }
+
+    return { kv_state, score_state, kv_comp };
+}
+
 static ggml_tensor * dsv4_build_indexer_scores_prefill(
         ggml_context       * ctx,
         ggml_tensor        * x,
@@ -1363,6 +1431,24 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 const int64_t n_comp_cache = mctx_dsv4->get_dsv4_n_comp(il);
                 GGML_ASSERT(n_comp_visible <= n_comp_cache);
 
+                // #1 MTP verify-graph reuse: route the K-token verify build through the phase-uniform
+                // path (input-driven ivecs, 256-padded view, scratch-routed cache) so the graph is
+                // reusable across MTP rounds. Gated by DSV4_VERIFY_REUSE and restricted to the regime
+                // where the indexer top-k scores path is unused (n_comp_visible <= indexer_top_k) — the
+                // long-context case falls back to the non-reusable chunk path (correct, just rebuilds).
+                // n_tokens==1 keeps uniform==true → behaviour byte-identical to the validated decode path.
+                // Cap the unrolled uniform path to real MTP verify widths: _chunk_uniform builds K
+                // _uniform steps, each pooling UNCONDITIONALLY (more nodes/step than _chunk's boundary-
+                // only _projected). Wide non-decode batches (prefill chunks, the n_tokens=512 graph
+                // reservation) must stay on _chunk or they overflow the graph context (GGML_ASSERT
+                // obj_new). Measured verify widths are {1..4}; 16 leaves headroom and excludes 512.
+                static const int64_t DSV4_VERIFY_MAX = 16;
+                static const bool dsv4_verify_reuse = getenv("DSV4_VERIFY_REUSE") != nullptr;
+                const bool    uniform  = (n_tokens == 1) ||
+                        (dsv4_verify_reuse && n_tokens > 1 && n_tokens <= DSV4_VERIFY_MAX &&
+                         n_comp_visible <= (int64_t) hparams.indexer_top_k);
+                const int64_t ivec_len = uniform ? n_tokens : 1;
+
                 // phase-uniform decode (n_tokens == 1): position-derived values come from
                 // i32 graph inputs (shared per ratio), the compressed-KV view is padded to
                 // 256-row steps, and off-boundary compress results go to the cache scratch
@@ -1373,21 +1459,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 ggml_tensor * in_comp_pos   = nullptr;
                 ggml_tensor * in_ape_phase  = nullptr;
                 ggml_tensor * in_cache_row  = nullptr;
-                if (n_tokens == 1) {
+                if (uniform) {
                     auto * di = get_dsv4_inputs();
-                    in_row_idx   = di->add_ivec(ctx0, dsv4_ivec_kind::ROW_IDX,   compress_ratio, 1, 0, ("dsv4_row_idx"   + rsuf).c_str());
-                    in_comp_pos  = di->add_ivec(ctx0, dsv4_ivec_kind::COMP_POS,  compress_ratio, 1, 0, ("dsv4_comp_pos"  + rsuf).c_str());
-                    in_ape_phase = di->add_ivec(ctx0, dsv4_ivec_kind::APE_PHASE, compress_ratio, 1, 0, ("dsv4_ape_phase" + rsuf).c_str());
-                    in_cache_row = di->add_ivec(ctx0, dsv4_ivec_kind::CACHE_ROW, compress_ratio, 1, n_comp_cache, ("dsv4_cache_row" + rsuf).c_str());
+                    in_row_idx   = di->add_ivec(ctx0, dsv4_ivec_kind::ROW_IDX,   compress_ratio, ivec_len, 0, ("dsv4_row_idx"   + rsuf).c_str());
+                    in_comp_pos  = di->add_ivec(ctx0, dsv4_ivec_kind::COMP_POS,  compress_ratio, ivec_len, 0, ("dsv4_comp_pos"  + rsuf).c_str());
+                    in_ape_phase = di->add_ivec(ctx0, dsv4_ivec_kind::APE_PHASE, compress_ratio, ivec_len, 0, ("dsv4_ape_phase" + rsuf).c_str());
+                    in_cache_row = di->add_ivec(ctx0, dsv4_ivec_kind::CACHE_ROW, compress_ratio, ivec_len, n_comp_cache, ("dsv4_cache_row" + rsuf).c_str());
                     if (compress_ratio == 4) {
-                        in_state_perm = di->add_ivec(ctx0, dsv4_ivec_kind::STATE_PERM, compress_ratio, 2*compress_ratio, 0, ("dsv4_state_perm" + rsuf).c_str());
+                        in_state_perm = di->add_ivec(ctx0, dsv4_ivec_kind::STATE_PERM, compress_ratio, ivec_len*2*compress_ratio, 0, ("dsv4_state_perm" + rsuf).c_str());
                     }
                 }
-                const int64_t n_comp_view = n_tokens == 1
+                const int64_t n_comp_view = uniform
                     ? std::min<int64_t>(n_comp_cache, GGML_PAD(std::max<int64_t>(n_comp_visible, 1), 256))
                     : n_comp_visible;
 
-                if (n_tokens == 1) {
+                if (uniform) {
                     // record the pos-dependent topology drivers so can_reuse() can tell whether a
                     // new ubatch would rebuild this exact graph shape (see dsv4_graph_inputs)
                     get_dsv4_inputs()->add_reuse_key(compress_ratio, hparams.indexer_top_k,
@@ -1397,8 +1483,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             n_tokens);
                 }
 
-                dsv4_decode_compressor dec = n_tokens == 1
-                    ? dsv4_build_compressor_decode_uniform(ctx0, cur,
+                dsv4_decode_compressor dec =
+                      n_tokens == 1 ? dsv4_build_compressor_decode_uniform(ctx0, cur,
                             prev_attn_kv_state,
                             prev_attn_sc_state,
                             layer.attn_compressor_kv,
@@ -1411,6 +1497,24 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             in_ape_phase,
                             n_embd_head_k,
                             n_rot,
+                            compress_ratio,
+                            rope_type,
+                            rope_cfg,
+                            norm_rms_eps)
+                    : uniform ? dsv4_build_compressor_decode_chunk_uniform(ctx0, cur,
+                            prev_attn_kv_state,
+                            prev_attn_sc_state,
+                            layer.attn_compressor_kv,
+                            layer.attn_compressor_gate,
+                            layer.attn_compressor_ape,
+                            layer.attn_compressor_norm,
+                            in_row_idx,
+                            in_state_perm,
+                            in_comp_pos,
+                            in_ape_phase,
+                            n_embd_head_k,
+                            n_rot,
+                            n_tokens,
                             compress_ratio,
                             rope_type,
                             rope_cfg,
@@ -1434,7 +1538,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 dsv4_store_state_segment(ctx0, gf, dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
                 dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
 
-                if (n_tokens == 1) {
+                if (uniform) {
                     ggml_tensor * kv_comp_q = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
                     store_attn_cache_rows_idx(kv_comp_q, in_cache_row);
                 } else if (dec.kv_comp != nullptr) {
@@ -1448,7 +1552,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 v_all = k_raw;
                 attn_mask = inp_attn->self_kq_mask_swa;
 
-                if (n_comp_visible > 0 || n_tokens == 1) {
+                if (n_comp_visible > 0 || uniform) {
                     ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_view);
                     k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
                     v_all = k_all;
@@ -1461,8 +1565,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         ggml_tensor * prev_index_sc_state = dsv4_view_state_segment(ctx0, prev_sc_state_all,
                                 attn_state_layout.elems, index_state_layout.width, index_state_layout.rows);
 
-                        dsv4_decode_compressor index_dec = n_tokens == 1
-                            ? dsv4_build_compressor_decode_uniform(ctx0, cur,
+                        dsv4_decode_compressor index_dec =
+                              n_tokens == 1 ? dsv4_build_compressor_decode_uniform(ctx0, cur,
                                     prev_index_kv_state,
                                     prev_index_sc_state,
                                     layer.indexer_compressor_kv,
@@ -1475,6 +1579,24 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                     in_ape_phase,
                                     hparams.indexer_head_size,
                                     n_rot,
+                                    compress_ratio,
+                                    rope_type,
+                                    rope_cfg,
+                                    norm_rms_eps)
+                            : uniform ? dsv4_build_compressor_decode_chunk_uniform(ctx0, cur,
+                                    prev_index_kv_state,
+                                    prev_index_sc_state,
+                                    layer.indexer_compressor_kv,
+                                    layer.indexer_compressor_gate,
+                                    layer.indexer_compressor_ape,
+                                    layer.indexer_compressor_norm,
+                                    in_row_idx,
+                                    in_state_perm,
+                                    in_comp_pos,
+                                    in_ape_phase,
+                                    hparams.indexer_head_size,
+                                    n_rot,
+                                    n_tokens,
                                     compress_ratio,
                                     rope_type,
                                     rope_cfg,
@@ -1498,13 +1620,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         dsv4_store_state_segment(ctx0, gf, index_dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems);
                         dsv4_store_state_segment(ctx0, gf, index_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems);
 
-                        if (n_tokens == 1) {
+                        if (uniform) {
                             store_index_cache_rows_idx(index_dec.kv_comp, in_cache_row);
                         } else if (index_dec.kv_comp != nullptr) {
                             store_index_cache_rows(index_dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before);
                         }
 
-                        if (n_tokens == 1 && n_comp_visible <= hparams.indexer_top_k) {
+                        // uniform-K verify is admitted only when n_comp_visible <= indexer_top_k, so it
+                        // always lands here (the simple causal mask) and never reaches the per-query
+                        // indexer-scores top-k path below — which stays n_tokens==1 (decode) / chunk.
+                        if (uniform && n_comp_visible <= (int64_t) hparams.indexer_top_k) {
                             comp_mask = get_dsv4_inputs()->add_mask(ctx0,
                                     dsv4_mask_kind::COMPRESS_CAUSAL,
                                     n_comp_view, n_tokens,
