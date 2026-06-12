@@ -173,3 +173,32 @@ Full validation before the fattn-mma TBQ port: full test-backend-ops clean (3/3 
 pass (matrix exact, counting 18.02 t/s accept 1.00, essay 16.49 t/s ×2 identical, accept
 0.979), checkpoint repro 7 restores / 0 errors / server stable. Any regression during the
 MMA port bisects against this hash.
+
+## OPTIMIZATION SPRINT (2026-06-13) — full roadmap #1-14, recommended order
+Baseline: feat/deepseek4 @ fead3634f (audit-clean, production 16 t/s essay / tg peak ~18-20).
+Each item: build + greedy-identity gate + essay/counting t/s A/B + commit. Drive via background.
+
+### Tier 1 — MTP round (biggest lever; round 61ms = GPU 27.8 + CPU ~22 + draft 9.8 + mirror 1.6)
+1. [ ] verify graph phase-uniform → reuse (n=2-3 verify rebuilds 6800 nodes/round). 256-pad view +
+       data-driven masks + batched compressor extending the n=1 uniform path. Drop reuse veto,
+       widen add_reuse_key on n_tokens. EXPECTED +20-30% (essay 16→~20). deepseek4.cpp ~1378.
+2. [ ] multi-slot graph cache (ctx_dft [n=1,n=1,n=3] single-slot thrash; cache BUILT graphs, redo
+       only alloc on switch — sched_reset invalidates allocs). +4-7ms/round. llama-context.cpp ~1273.
+3. [ ] draft-ahead pipelining (accept 98% → gen draft k+1 during verify-k GPU 27.8ms). +10-15%.
+       speculative.cpp ~685 / server-context.cpp round driver. Needs ctx_dft/ctx_tgt independent streams.
+4. [ ] draft head requant (q5_K 4096x129280 1.9ms→0.8, draft-only quality-safe). +1.5-2ms/round.
+5. [ ] deferred verify_h extraction + pending_h double-buffer (6-8×64KB memcpy/round). +1-2ms.
+
+### Tier 2 — decode kernels
+6. [ ] GGML_GLU_OP_SWIGLU_LIMITED → gate+up MUL_MAT_ID fusion fires (CLAMP+SILU+CLAMP+MUL today).
+       decode +3-5%. llama-graph.cpp ~1704.
+7. [ ] wq_b q8_0 small_k widening (1024x32768 on the boundary; extend the iq2_xs <= to q8_0). +2-3%. mmvq.cu ~875.
+8. [ ] iq2_xs occupancy: launch_bounds minBlocks=8 on the no-fusion instance (REG 80→≤64). +2-4%. mmvq.cu ~478.
+9. [ ] set_input H2D skip-when-unchanged (mask changes only every ratio tokens). swarm reduction. deepseek4.cpp ~161.
+10. [ ] APE F32 cast hoist to load-time (re-emitted ~90×/token). launch reduction. deepseek4.cpp ~662.
+11. [ ] HC-expand fusion matcher (feed expand off split dst views, elide CPY). +1-2%. ggml-cuda.cu ~3952.
+12. [ ] shared-expert into expert-batch (append as always-selected expert). +1%. deepseek4.cpp ~1659.
+
+### Tier 3 — prefill (164 → ds4 343)
+13. [ ] batched compressor for chunk decode (roadmap ③; sequential per-token chain → batched). prefill big. deepseek4.cpp ~933.
+14. [ ] rope_tail/fp8 barrier+logf hoist (host-precompute corr_dims/mscale, warp_reduce_max). prefill minor. dsv4.cu ~336/281.
