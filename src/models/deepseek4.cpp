@@ -1350,6 +1350,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             if (!is_prefill) {
                 const llama_pos first_pos = ubatch.pos ? ubatch.pos[0] : 0;
                 const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : n_tokens - 1;
+                // DSV4_NT_PROF: dump per-build (decode/verify) compressed-layer widths so the
+                // MTP verify-graph reuse work (#1) can measure the n_tokens distribution and the
+                // graph rebuild rate. Off by default; one getenv per process.
+                static const bool dsv4_nt_prof = getenv("DSV4_NT_PROF") != nullptr;
+                if (dsv4_nt_prof) {
+                    fprintf(stderr, "DSV4_NT il=%d n_tokens=%d first_pos=%d last_pos=%d ratio=%u\n",
+                            il, (int) n_tokens, (int) first_pos, (int) last_pos, compress_ratio);
+                }
                 const int64_t n_comp_before  = first_pos / compress_ratio;
                 const int64_t n_comp_visible = (last_pos + 1) / compress_ratio;
                 const int64_t n_comp_cache = mctx_dsv4->get_dsv4_n_comp(il);

@@ -179,9 +179,41 @@ Baseline: feat/deepseek4 @ fead3634f (audit-clean, production 16 t/s essay / tg 
 Each item: build + greedy-identity gate + essay/counting t/s A/B + commit. Drive via background.
 
 ### Tier 1 — MTP round (biggest lever; round 61ms = GPU 27.8 + CPU ~22 + draft 9.8 + mirror 1.6)
-1. [ ] verify graph phase-uniform → reuse (n=2-3 verify rebuilds 6800 nodes/round). 256-pad view +
-       data-driven masks + batched compressor extending the n=1 uniform path. Drop reuse veto,
-       widen add_reuse_key on n_tokens. EXPECTED +20-30% (essay 16→~20). deepseek4.cpp ~1378.
+1. [DE-RISKED, ready to implement] verify graph phase-uniform → reuse. deepseek4.cpp ~1378/1392.
+
+  **MEASURED 2026-06-13 (DSV4_NT_PROF, 40-tok greedy decode, --spec-draft-n-max 2, ctk/ctv tbq3):**
+  - `graphs reused = 1` across ~38 MTP calls → the graph is rebuilt almost EVERY step today.
+    Confirmed: the win is real and large.
+  - Verify width is NOT fixed. Per-compressed-layer n_tokens histogram: 1→164, **2→205, 3→533 (dominant
+    = n_max+1), 4→41**, 512→prefill-chunk. So the original "fixed verify width" premise is WRONG —
+    width ∈ {1,2,3,4}, dominated by 3, varying with per-round MTP acceptance.
+  - Implication: #1 (generalize reuse to width K) and #2 (multi-slot cache, one slot per width) are
+    COUPLED. But dominant-width-3 builds run in consecutive streaks, so single-slot K-generalization
+    already captures the bulk; #2 then recovers the width-transition rebuilds.
+
+  **DE-RISKED DESIGN — the only 3 blockers (everything else already works):**
+  - (a) MASKS ARE ALREADY K-GENERAL. fill_raw_window/fill_compress_causal iterate iq over n1 =
+    ubatch->n_tokens and assert n1==n_tokens (deepseek4.cpp ~197/228). No mask work needed.
+  - (b) The hard part — unconditional pooling + input-driven scratch-row routing for position-INVARIANT
+    topology — is ALREADY SOLVED in `dsv4_build_compressor_decode_uniform` (~827) for ONE step.
+  - Blocker 1: ivec set_input (~120-158) hardcodes `GGML_ASSERT(n_tokens==1)`, pos[0], length-1 vecs.
+    FIX: wrap the per-kind fill in `for s in [0,K): pos=pos[s]; base=s*per_step; <same single-step
+    formula>` where per_step = ne[0]/K (1 for ROW_IDX/COMP_POS/CACHE_ROW/APE_PHASE; 2*ratio for
+    STATE_PERM). K==1 stays byte-identical. add_ivec called with length=K (and K*2*ratio for perm).
+  - Blocker 2: no `_chunk_uniform`. WRITE it = `_chunk`'s loop (~961) but call `_uniform` per step
+    (not `_projected`) slicing the i-th element of the K-wide ivecs, threading kv_state/score_state,
+    concat kv_comp on dim 2. (Mechanical; `_chunk` already does the recurrence with `_projected`.)
+  - Blocker 3: can_reuse (~276) + add_reuse_key (~270/1382) reject n_tokens!=1. Generalize the reuse
+    key to record per-step (or last-pos-derived) view/le_topk/pad_mask and accept n_tokens==K when all
+    K steps' phase-uniform keys match. Dispatch (~1368/1392): take the uniform branch for n_tokens>=1.
+  - STILL TO READ before coding: the decode-attention assembly 1392-1600 (how kv_comp + CACHE_ROW +
+    masks + get_k combine) — _chunk_uniform must feed it exactly as the n=1 uniform path does.
+
+  **STAGING (production-safe): implement behind `getenv("DSV4_VERIFY_REUSE")` flag, default OFF =
+  byte-identical to baseline. Gate: flag-OFF greedy == baseline (no-op proof); flag-ON greedy ==
+  baseline (correctness) AND `graphs reused` rises from 1 toward the width-3 streak length. Only then
+  make default + commit. Tool: DSV4_NT_PROF (committed) measures graphs-reused + width dist.**
+
 2. [ ] multi-slot graph cache (ctx_dft [n=1,n=1,n=3] single-slot thrash; cache BUILT graphs, redo
        only alloc on switch — sched_reset invalidates allocs). +4-7ms/round. llama-context.cpp ~1273.
 3. [ ] draft-ahead pipelining (accept 98% → gen draft k+1 during verify-k GPU 27.8ms). +10-15%.
@@ -192,8 +224,12 @@ Each item: build + greedy-identity gate + essay/counting t/s A/B + commit. Drive
 ### Tier 2 — decode kernels
 6. [ ] GGML_GLU_OP_SWIGLU_LIMITED → gate+up MUL_MAT_ID fusion fires (CLAMP+SILU+CLAMP+MUL today).
        decode +3-5%. llama-graph.cpp ~1704.
-7. [ ] wq_b q8_0 small_k widening (1024x32768 on the boundary; extend the iq2_xs <= to q8_0). +2-3%. mmvq.cu ~875.
-8. [ ] iq2_xs occupancy: launch_bounds minBlocks=8 on the no-fusion instance (REG 80→≤64). +2-4%. mmvq.cu ~478.
+7. [x] wq_b q8_0 small_k widening (1024x32768 on the boundary; extend the iq2_xs <= to q8_0). DONE 4c6a0076d. mmvq.cu ~887.
+8. [REJECTED] iq2_xs occupancy: launch_bounds minBlocks=8 on the no-fusion instance. Slapping minBlocks=8 on the
+       *fused* mul_mat_vec_q template did NOT lower REG (stayed 80, no spill, LOCAL:0) — compiler ignores an
+       unsatisfiable hint. Perf 63.4µs ≈ baseline 65µs (noise). As line 146 predicted, minBlocks needs the
+       per-type KERNEL SPLIT first (separate the fat fused-n=1 GLU template from the moe kernel) — that work is
+       subsumed by #6 (SWIGLU_LIMITED). Reverted (working tree == HEAD 4c6a0076d). Do not retry minBlocks alone.
 9. [ ] set_input H2D skip-when-unchanged (mask changes only every ratio tokens). swarm reduction. deepseek4.cpp ~161.
 10. [ ] APE F32 cast hoist to load-time (re-emitted ~90×/token). launch reduction. deepseek4.cpp ~662.
 11. [ ] HC-expand fusion matcher (feed expand off split dst views, elide CPY). +1-2%. ggml-cuda.cu ~3952.
