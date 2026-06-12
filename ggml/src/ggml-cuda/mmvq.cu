@@ -868,11 +868,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
         bool          use                   = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
-        // DSV4 IQ2_XS-XL experts (K=4096): blocks_per_row==nwarps*blocks_per_iter_1warp sits exactly on
-        // the boundary, leaving each thread a single vec_dot per launch — too little in-flight work to
-        // hide cold-weight latency at decode. Widen to <= so the small_k path (1 row/warp, 4 sequential
-        // vec_dots/thread) applies. Measured on GB10: gate/up MUL_MAT_ID n=1 146.6us -> see DSV4_PERF_STATUS.md.
-        if (type == GGML_TYPE_IQ2_XS && nwarps > 1 && blocks_per_row_x <= nwarps * blocks_per_iter_1warp) {
+        // DSV4 IQ2_XS-XL experts (K=4096) and the wq_b q8_0 GEMV (K=1024, 1024x32768) both sit exactly on
+        // blocks_per_row==nwarps*blocks_per_iter_1warp, leaving each thread a single vec_dot per launch —
+        // too little in-flight work to hide cold-weight latency at decode. Widen to <= so the small_k path
+        // (1 row/warp, sequential vec_dots/thread) applies. The <= only fires on small-K shapes (large-K
+        // q8_0 like wo_b 8192 has blocks_per_row >> nwarps*bpi, untouched). Measured: iq2_xs gate/up n=1
+        // 146.6->106.9us; wq_b q8_0 is the documented target ② (145 -> 200+ GB/s). See DSV4_PERF_STATUS.md.
+        if ((type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_Q8_0) &&
+            nwarps > 1 && blocks_per_row_x <= nwarps * blocks_per_iter_1warp) {
             use = true;
         }
 
