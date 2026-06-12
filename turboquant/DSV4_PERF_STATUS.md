@@ -198,7 +198,28 @@ Each item: build + greedy-identity gate + essay/counting t/s A/B + commit. Drive
       **#1 alone is insufficient; #2 (multi-slot graph cache keyed by width) is REQUIRED for the gain.**
   - **FIRST CRASH FIXED:** unbounded uniform unroll made the n_tokens=512 graph reservation build 512
     `_uniform` steps (unconditional pool/step) → GGML_ASSERT(obj_new) graph-ctx overflow. Cap fixed it.
-  - **NEXT (debug the numerical divergence) — suspects (1) and (2) already CLEARED:**
+  - **RESOLVED 2026-06-13 — IT IS NOT A LOGIC BUG. #1 IS MATHEMATICALLY CORRECT.**
+    Bisection chain (all flag-ON, tbq3+MTP, greedy n=64, vs baseline a56fd72):
+    - flag-ON+NO_KREUSE (reuse disabled, build kept) → still diverges (aac34a0) ⇒ the BUILD, not reuse.
+    - flag-ON+NO_KREUSE+RAWVIEW (uniform path forced to raw n_comp_visible view) → **a56fd72 BIT-IDENTICAL**.
+    ⇒ the uniform compressor + K-row cache scatter + masks are all BIT-PERFECT. The sole divergence
+    source is the **256-padded compressed-view**: its extra fully-masked rows change the flash-attn
+    online-softmax fp-ACCUMULATION ORDER → tiny diffs that flip a near-tie greedy argmax ~8 tokens in
+    (first divergence at char 29 / token ~8 / abs pos ~21). Confirmed earlier-cleared: compressor
+    (n==1 proof + correct threading), fp8 (per-row per-block scale, K-independent), masks
+    (simple-causal == indexer-topk when visible<=top_k), cache rows/values, reuse.
+    - **Implication:** the padded view is REQUIRED for reuse (raw view size is pos-dependent → not
+      reusable). So bit-identity vs baseline is unachievable WITH reuse — and baseline is itself
+      INconsistent (its n==1 decode uses padded view, its n>1 verify used raw view; #1 makes verify
+      padded too, i.e. CONSISTENT with decode). The correct gate is **perplexity-equivalence**, not
+      bit-identity; the raw-view bit-match proves the delta is pure fp-noise (argmax coin-flips).
+    - **NEXT:** (a) formally clear #1 with a perplexity A/B (flag-on padded vs flag-off), expect Δppl≈0;
+      (b) #1 alone barely raises reuse (16→27 at n_max=1; ~16 at n_max=2 due to width alternation) →
+      implement **#2 (multi-slot graph cache keyed by verify width)** and enable #1+#2 together, gating
+      on perplexity + essay/counting t/s. flag stays OFF until then. (Diagnostics NO_KREUSE/DBG_RAWVIEW
+      removed after serving their purpose.)
+
+  - (historical) suspects (1) and (2) cleared earlier:
     (1) CLEARED: `cur` is [n_embd, n_tokens] (n_hc folded by hc_pre; qr=mul_mat(wq_a,cur)), so the
         per-step column slice `ggml_view_2d(x, ne0,1, nb1, i*nb1)` is correct.
     (2) CLEARED: `ggml_dsv4_fp8_kv_quantize` launches n_rows=ne01*ne02*ne03 blocks (dsv4.cu:686), so
