@@ -976,6 +976,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      || K->type == GGML_TYPE_AMX3_1;
     const bool tbq_v_type = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_TBQ3_0
                          || V->type == GGML_TYPE_AMXV3_1
+                         || V->type == GGML_TYPE_TBQV3_1 // was missing: f16-K x tbqv3-V fell
+                                                         // through to MMA -> full-V-cache dequant
+                                                         // per call (the GB10 freeze pattern)
      || V->type == GGML_TYPE_TBQ4_1 || V->type == GGML_TYPE_TBQ3_1
      || V->type == GGML_TYPE_TBQ4_2 || V->type == GGML_TYPE_TBQ3_2
      || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3
