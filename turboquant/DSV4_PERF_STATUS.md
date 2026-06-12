@@ -166,3 +166,10 @@ LoRA/HC fragmentation. Candidates: fuse q_a+kv (same input `cur`), wo_a 그룹 b
 - counting: `Count from 1 to 30, comma-separated.` max_tokens 120 → regular-text ceiling.
 - quality gates: matrix `[[3,4],[5,6]]×[[1,2],[7,8]] = [[31,38],[47,58]]`, Pauli 볼프강/베르너/에르빈 (`/tmp/test2.py <port>` if present).
 - First request after server start = warmup (graph capture + cuBLAS init), measure from the second.
+
+## BASELINE FROZEN @ 910f335ea (2026-06-12 09:25)
+Full validation before the fattn-mma TBQ port: full test-backend-ops clean (3/3 backends OK,
+0 FAIL), plain-decode greedy gate identical (14.85 t/s, graphs reused 47/47), server gates
+pass (matrix exact, counting 18.02 t/s accept 1.00, essay 16.49 t/s ×2 identical, accept
+0.979), checkpoint repro 7 restores / 0 errors / server stable. Any regression during the
+MMA port bisects against this hash.
