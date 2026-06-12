@@ -959,6 +959,47 @@ void tbq_q_wht12_cuda(const float * Q_src, float * Q_wht1, float * Q_wht2, int64
     tbq_q_wht12_kernel<<<dim3(n_rows, 2), 256, 0, stream>>>(Q_src, Q_wht1, Q_wht2, n_rows, row_stride);
 }
 
+// Output IWHT for the 128-elem TBQ family (TBQ3_1/TBQ4_1/AMXV3_1/TBQV3_1 V): the attention
+// output accumulated over WHT-domain V tiles is brought back to the spatial domain.
+// Port of the fattn-vec in-kernel epilogue ("TBQ V 128-block IWHT") as a standalone pass for
+// the MMA path; IWHT is linear so applying it to the final combined dst is equivalent.
+static __global__ void tbq_output_iwht128_kernel(float * __restrict__ dst, int64_t n_rows, int64_t row_stride) {
+    const int64_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const int tid = threadIdx.x;
+
+    static constexpr uint8_t tbq_signs_v[16] = {
+        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    };
+
+    float * out = dst + row*row_stride;
+
+    float f0 = out[tid];
+    // Stages 0-4: warp shuffle
+#pragma unroll
+    for (int st = 0; st < 5; st++) {
+        const float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << st, 32);
+        f0 = (tid & (1 << st)) ? (o0 - f0) : (f0 + o0);
+    }
+    // Stages 5-6 (stride 32/64): shared memory
+    __shared__ float buf[128];
+    buf[tid] = f0;
+    __syncthreads();
+    { const float u = buf[tid], v = buf[tid ^ 32]; f0 = (tid & 32) ? (v - u) : (u + v); }
+    __syncthreads();
+    buf[tid] = f0;
+    __syncthreads();
+    { const float u = buf[tid], v = buf[tid ^ 64]; f0 = (tid & 64) ? (v - u) : (u + v); }
+
+    const float sign0 = ((tbq_signs_v[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
+    out[tid] = f0 * sign0 / 128.0f;
+}
+
+void tbq_output_iwht128_cuda(float * dst, int64_t n_rows, int64_t row_stride, cudaStream_t stream) {
+    tbq_output_iwht128_kernel<<<n_rows, 128, 0, stream>>>(dst, n_rows, row_stride);
+}
+
 static void dequantize_row_tbq3_4_to_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
     dequantize_tbq_4_spatial_f16_kernel<block_tbq3_4, 3><<<k/TBQ_K576, 256, 0, stream>>>(vx, y, k/TBQ_K576);
 }

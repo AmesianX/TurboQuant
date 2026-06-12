@@ -1,6 +1,10 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+
+// fattn-mma-tbq.cu: typed MMA instantiations for quantized KV (TBQ tile-loader dequant)
+extern bool ggml_cuda_fattn_mma_tbq_supported(const ggml_tensor * dst);
+extern void ggml_cuda_flash_attn_ext_mma_f16_tbq(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
@@ -991,6 +995,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         //
         // Historical: v1.4.1 started MLA on VEC (30 t/s, quality-first); v1.4.2 ported to
         // MMA (49 t/s). We're temporarily reverting to the v1.4.1 path for quality work.
+        // fattn-mma TBQ port (turboquant/FATTN_MMA_TBQ_PORT.md): typed MMA path with per-tile
+        // dequant. TEST-ONLY env gate while the port is validated; default routing unchanged.
+        static const bool mma_tbq_test = getenv("GGML_CUDA_FA_MMA_TBQ") != nullptr;
+        if (mma_tbq_test && turing_mma_available(cc) && Q->ne[1] > 2
+            && ggml_cuda_fattn_mma_tbq_supported(KQV)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (Q->ne[0] <= 576 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -1119,7 +1130,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
-            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            if (ggml_is_quantized(dst->src[2]->type) && ggml_cuda_fattn_mma_tbq_supported(dst)) {
+                ggml_cuda_flash_attn_ext_mma_f16_tbq(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            }
             break;
     }
 }

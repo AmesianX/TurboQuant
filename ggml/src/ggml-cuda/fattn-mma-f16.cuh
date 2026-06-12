@@ -3,6 +3,9 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 
+// convert.cu: output IWHT for the 128-elem TBQ V family (MMA typed path epilogue)
+extern void tbq_output_iwht128_cuda(float * dst, int64_t n_rows, int64_t row_stride, cudaStream_t stream);
+
 using namespace ggml_cuda_mma;
 
 // Config options for the MMA kernel.
@@ -444,6 +447,80 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         // 5: max  2*16= 32 bytes,  16 half
         // 6: max  1*16= 16 bytes,   8 half
         ggml_cuda_unroll<6>{}(load);
+    }
+}
+
+// block byte sizes for the 128-elem TBQ family (D-direction block index -> byte offset)
+static constexpr __device__ int ggml_blck_size_bytes_tbq128(ggml_type t) {
+    return t == GGML_TYPE_TBQ3_1 ? (int) sizeof(block_tbq3_1)
+         : t == GGML_TYPE_TBQV3_1 ? (int) sizeof(block_tbqv3_1)
+         :                          (int) sizeof(block_amxv3_1);
+}
+
+// Dequantizing synchronous global->smem tile loader for TBQ-family 128-block KV types.
+// Destination layout/stride is identical to flash_attn_ext_f16_load_tile; the source is read
+// through the quantized blocks: value = d * c3[3-bit Lloyd-Max idx], WHT domain (the consumer
+// is responsible for WHT-side handling: WHT'd Q for K tiles, output IWHT for V tiles).
+// Global reads use 4-byte windows at 2-byte alignment — raw byte indexing freezes GB10 under
+// sustained load (see dequantize_V_tbq3_1 in fattn-common.cuh).
+template <ggml_type type, int stride_tile, int nwarps, int nbatch_fa, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_dequant(
+        const char * const __restrict__ KV_base, // quantized rows, head base
+        const int64_t row0,                      // first KV row of this tile
+        half2       * const __restrict__ tile_KV,
+        const int elem0,                         // first element (in halves) of the D chunk
+        const int n_elems,                       // number of elements (halves) in the D chunk
+        const int stride_KV_bytes,               // bytes per KV row (nb11/nb21)
+        const int i_sup) {                       // rows with i >= i_sup are zero-filled
+    static_assert(type == GGML_TYPE_TBQ3_1 || type == GGML_TYPE_TBQV3_1 || type == GGML_TYPE_AMXV3_1,
+                  "tile dequant: unsupported type");
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    // shared 3-bit Gaussian Lloyd-Max centroids (same table as the vec functors)
+    static constexpr float c3[8] = {
+        -2.1520f,-1.3440f,-0.7560f,-0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f,
+    };
+    constexpr int blck = TBQ_K128; // 128 elems per block; d at offset 0, qs at offset 2 for all three types
+
+    // one 16-byte smem chunk (8 halves = 8 codes = 24 bits, byte-aligned since elem0 % 8 == 0)
+    const int chunks_per_row = n_elems/8;
+    const int tid      = threadIdx.y*warp_size + threadIdx.x;
+    constexpr int nthreads = nwarps*warp_size;
+
+    for (int idx = tid; idx < nbatch_fa*chunks_per_row; idx += nthreads) {
+        const int i = idx / chunks_per_row;
+        const int k = idx % chunks_per_row;
+
+        half2 out[4];
+        if (!oob_check || i < i_sup) {
+            const char * blk_row = KV_base + (row0 + i)*(int64_t) stride_KV_bytes;
+            const int    e0      = elem0 + k*8;
+            const char * blk     = blk_row + (e0/blck)*ggml_blck_size_bytes_tbq128(type);
+            const int    e_loc   = e0 % blck;
+
+            half dh;
+            ggml_cuda_memcpy_1<sizeof(half), 2>(&dh, blk);
+            const float d = __half2float(dh);
+
+            const int bp0 = e_loc*3;
+            const int by0 = bp0 >> 3;           // byte-aligned start (e_loc % 8 == 0)
+            int w0;
+            ggml_cuda_memcpy_1<sizeof(int), 2>(&w0, blk + 2 + (by0 & ~1));
+            const uint32_t w = (uint32_t) w0;
+            const int bo = (by0 & 1)*8;         // 24 used bits end at bo+24 <= 32
+
+#pragma unroll
+            for (int l = 0; l < 8; l += 2) {
+                const float v0 = c3[(w >> (bo + 3*l    )) & 0x7] * d;
+                const float v1 = c3[(w >> (bo + 3*l + 3)) & 0x7] * d;
+                out[l/2] = make_half2(v0, v1);
+            }
+        } else {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                out[l] = make_half2(0.0f, 0.0f);
+            }
+        }
+        ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*4, out);
     }
 }
 
@@ -1049,13 +1126,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
-                constexpr bool use_cp_async = nstages == 1;
-                flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
-                if (use_cp_async) {
-                    cp_async_wait_all();
+                if constexpr (type_V != GGML_TYPE_F16) {
+                    // stride_V carries BYTES per row for quantized V (see kernel body)
+                    flash_attn_ext_f16_load_tile_dequant<type_V, stride_tile_V, nwarps, nbatch_fa, oob_check>
+                        ((const char *) V_h2, k_VKQ_0, tile_V, i0_start, i0_diff, stride_V, k_VKQ_sup);
+                    __syncthreads();
+                } else {
+                    constexpr bool use_cp_async = nstages == 1;
+                    flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
+                    if (use_cp_async) {
+                        cp_async_wait_all();
+                    }
+                    __syncthreads();
                 }
-                __syncthreads();
             }
         }
         const half2 * tile_V_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? tile_V : tile_V + i0_start/2;
@@ -1890,7 +1974,9 @@ static __global__ void flash_attn_ext_f16(
     const int stride_K    = nb11 / sizeof(half2);
     const int stride_mask = nb31 / sizeof(half);
 
-    const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(half2);
+    // quantized V: stride carries BYTES per row (the dequant tile loader addresses rows by byte)
+    const int stride_V = V_is_K_view ? stride_K
+        : (type_V == GGML_TYPE_F16 ? nb21 / (int) sizeof(half2) : nb21);
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
@@ -2005,7 +2091,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
 
-template <int DKQ, int DV, int ncols1, int ncols2>
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
@@ -2055,9 +2141,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
         if constexpr (DKQ == 576) {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>;
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, true, type_K, type_V>;
         } else {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, type_K, type_V>;
         }
 
 #if !defined(GGML_USE_MUSA)
@@ -2066,9 +2152,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     } else {
         constexpr bool use_logit_softcap = true;
         if constexpr (DKQ == 576) {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>;
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, true, type_K, type_V>;
         } else {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, type_K, type_V>;
         }
 
 #if !defined(GGML_USE_MUSA)
@@ -2077,8 +2163,23 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // !defined(GGML_USE_MUSA)
     }
 
+    // typed (quantized) K/V are read natively by the dequantizing tile loader — the full-cache
+    // to_fp16 conversion in launch_fattn must be skipped (it is what froze GB10, and the
+    // _1-family types have no to_fp16 converter anyway)
+    constexpr bool need_f16_K = type_K == GGML_TYPE_F16;
+    constexpr bool need_f16_V = type_V == GGML_TYPE_F16;
+
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, need_f16_K, need_f16_V, true, warp_size_host);
+
+    // TBQ V accumulates in WHT domain: bring the attention output back to spatial domain.
+    // IWHT is linear, so running it on the final combined dst is equivalent to the vec
+    // kernel's in-kernel epilogue (fattn-vec.cuh "TBQ V 128-block IWHT").
+    if constexpr (type_V == GGML_TYPE_TBQ3_1 || type_V == GGML_TYPE_TBQV3_1 || type_V == GGML_TYPE_AMXV3_1) {
+        static_assert(DV == 128, "TBQ _1-family V output IWHT requires DV == 128");
+        const int64_t n_rows = ggml_nelements(dst)/DV;
+        tbq_output_iwht128_cuda((float *) dst->data, n_rows, DV, ctx.stream());
+    }
 }
 
 
