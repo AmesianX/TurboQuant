@@ -198,14 +198,18 @@ Each item: build + greedy-identity gate + essay/counting t/s A/B + commit. Drive
       **#1 alone is insufficient; #2 (multi-slot graph cache keyed by width) is REQUIRED for the gain.**
   - **FIRST CRASH FIXED:** unbounded uniform unroll made the n_tokens=512 graph reservation build 512
     `_uniform` steps (unconditional pool/step) → GGML_ASSERT(obj_new) graph-ctx overflow. Cap fixed it.
-  - **NEXT (debug the numerical divergence):** likely suspects in priority order —
-    (1) `cur` shape into _chunk_uniform: confirm it's [n_embd, n_tokens] and the column slice
-        `ggml_view_2d(x, ne0,1, nb1, i*nb1)` selects the right dim (watch for a folded n_hc dim).
-    (2) `ggml_dsv4_fp8_kv_quantize` on [width,1,K] — verify it quantizes K rows independently (n==1
-        only ever passed [width,1,1]); same for the indexer cache write.
-    (3) state-perm composition across K steps vs _projected's concat-shift (single-step proven equal;
-        check K-step threading + scratch-row collisions when two non-boundary steps share scratch_row).
-    Isolate by forcing n_max=1 (verify width 2) first, then widen. flag-off stays the safe default.
+  - **NEXT (debug the numerical divergence) — suspects (1) and (2) already CLEARED:**
+    (1) CLEARED: `cur` is [n_embd, n_tokens] (n_hc folded by hc_pre; qr=mul_mat(wq_a,cur)), so the
+        per-step column slice `ggml_view_2d(x, ne0,1, nb1, i*nb1)` is correct.
+    (2) CLEARED: `ggml_dsv4_fp8_kv_quantize` launches n_rows=ne01*ne02*ne03 blocks (dsv4.cu:686), so
+        [width,1,K] quantizes all K rows independently. Not the bug.
+    (3) REMAINING — narrowed to the ATTN-path state recurrence / K-row cache scatter for K>=2 (the
+        indexer path isn't read in the visible<=top_k test regime, so the bug is in the attn path that
+        IS read). Check: _chunk_uniform threading of kv_state/score_state through K _uniform calls vs
+        _chunk's K _projected calls; the boundary state-perm (get_rows) composition; whether the K-row
+        `ggml_set_rows` scatter with duplicate scratch indices races a REAL row. Isolate at runtime:
+        force --spec-draft-n-max 1 (verify width 2, single boundary-free case), dump kv_comp/cache rows
+        vs the chunk path, widen once width-2 matches. flag-off stays the safe default throughout.
 
   --- original de-risk notes below (still valid) ---
 1b. [DE-RISKED] verify graph phase-uniform → reuse. deepseek4.cpp ~1378/1392.
