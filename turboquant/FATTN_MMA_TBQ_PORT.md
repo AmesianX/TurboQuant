@@ -75,3 +75,20 @@ block ✓). TBQ row strides not 16B-aligned ⇒ global reads only via ggml_cuda_
 
 ## Session log
 - 2026-06-12: survey (3 agents), design doc, M0 landed.
+- 2026-06-12 S1 (b7b2da012): type_K/type_V template plumbing, defaulted F16, nstages=0 force
+  for quantized; zero behavior change (FLASH_ATTN_EXT suite clean).
+- 2026-06-12 S2a (4cb9328da): V-side VALIDATED. flash_attn_ext_f16_load_tile_dequant
+  (128-block family), byte stride_V, typed _case (need_f16_V=false + standalone 128-pt output
+  IWHT on dst), fattn-mma-tbq.cu dispatcher TU (root dir — generator-safe), env gate
+  GGML_CUDA_FA_MMA_TBQ. Validation on Qwen3-14B q4_k_m, -ctk f16 -ctv tbq3:
+  * short greedy (14-tok prompt, n=32): text IDENTICAL to vec
+  * long prompt (550 tok): greedy diverges at a degenerate repetition point (VEC side was the
+    incoherent one) — adjudicated by PPL instead
+  * wikitext PPL (8×2048): vec 10.6629 ±0.324 vs MMA 10.6302 ±0.322 → 0.31% apart, parity
+  * MMA engagement evidence + speed: prefill 900.7 → 1070.7 t/s (+19%); PPL run wall 25.1s →
+    17.4s (-31%)
+  Decode (ne1<=2) intentionally stays on vec.
+- NEXT S2b (K-side): apply Q-WHT to the Q tile at process_tile load (or host-side pre-pass),
+  K tiles through the same dequant loader (tbq3_1 d at offset 0 — works as-is), rank-2 outlier
+  correction on KQ_C following the DKQ==576 QJL hook pattern with raw-Q global reads. Then
+  TBQP3_1 K via the Direct-Sign fold. Then M3 dispatch flip + 0.87×→1.0× gate.
