@@ -88,7 +88,24 @@ block ✓). TBQ row strides not 16B-aligned ⇒ global reads only via ggml_cuda_
   * MMA engagement evidence + speed: prefill 900.7 → 1070.7 t/s (+19%); PPL run wall 25.1s →
     17.4s (-31%)
   Decode (ne1<=2) intentionally stays on vec.
-- NEXT S2b (K-side): apply Q-WHT to the Q tile at process_tile load (or host-side pre-pass),
-  K tiles through the same dequant loader (tbq3_1 d at offset 0 — works as-is), rank-2 outlier
-  correction on KQ_C following the DKQ==576 QJL hook pattern with raw-Q global reads. Then
-  TBQP3_1 K via the Direct-Sign fold. Then M3 dispatch flip + 0.87×→1.0× gate.
+- 2026-06-12 S2b (K-side) — SHELVED as WIP (stash + turboquant/s2b_kside_wip_20260612.patch).
+  Implemented: host Q-WHT pre-pass (tbq_q_wht128 kernel, strided→contiguous, raw-Q copy on the
+  Q_wht2 channel), K tile dequant (same loader, AMX3_1 d_wht variant), byte stride_K, rank-2
+  outlier correction on KQ_C, typed-K dispatcher pairs. Found & fixed along the way: vec abort
+  from mode-sniffing need_f16_K (modes must be explicit flags from the owning case); a leftover
+  contiguity gate that silently kept MMA from engaging (validations MUST show engagement
+  evidence, e.g. a prefill-speed delta); VMM pool LIFO (pool allocs must destruct in reverse
+  declaration order); consumer-routing segfault (route on src[1] OR src[2] quantized).
+  **Core numerical bug UNLOCALIZED**: K-only (tbq3-K, f16-V) PPL 153 vs vec 6.55. Everything
+  measurable checks out:
+  * Q-WHT proven identical to vec — numpy strided-loop vs shfl-xor butterfly: max diff 0.0
+  * K dequant = byte-identical to the PROVEN V dequant (S2a)
+  * addressing correct: kernel sees nb11=448 (token) nb12=56 (head), loader offsets all mod56=0
+  * tile fingerprints match the cache; K_A mma fragment holds plausible d*c3 values
+  * KQ_C mma output is sane-magnitude logits (~0.3..7), NOT saturated
+  The bug therefore hides in KQ-consumption coordinate mapping OR softmax/V for the typed path,
+  past where per-element probes reach. Next attempt: a self-contained brute-force tile dot vs
+  KQ_C with a CORRECT probe (the earlier brute read wrong smem), or a full-cache-dequant debug
+  path to partition loader-vs-Q. Resume from the patch.
+- Default routing unchanged; tbq3-K stays on vec (supported() requires K==F16). S2a V-side win
+  stands. M3 (dispatch flip, 0.87×→1.0× gate) waits on S2b.

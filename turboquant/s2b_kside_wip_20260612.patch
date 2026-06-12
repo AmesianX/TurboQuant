@@ -1,0 +1,713 @@
+diff --git a/common/debug.cpp b/common/debug.cpp
+index c01452510..3d9970c3f 100644
+--- a/common/debug.cpp
++++ b/common/debug.cpp
+@@ -1,5 +1,7 @@
+ #include "debug.h"
+ 
++#include <cstring>
++
+ #include "common.h"
+ #include "log.h"
+ 
+@@ -196,5 +198,25 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+         common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+     }
+ 
++    // FATTN_DUMP=<dir>: dump full f32 tensors whose name matches the filter to <dir>/<name>.bin
++    // (debug tooling for kernel A/B comparisons; raw row-major bytes + a .shape sidecar)
++    static const char * dump_dir = getenv("FATTN_DUMP");
++    if (dump_dir && matches_filter) { // f32 row-major OR raw quantized bytes
++        const uint8_t * data = is_host ? (const uint8_t *) t->data : pimpl->data.data();
++        std::string base = std::string(dump_dir) + "/" + t->name;
++        for (auto & c : base) if (c == '/' && &c != &base[strlen(dump_dir)]) c = '_';
++        std::string fn = std::string(dump_dir) + "/" + (base.c_str() + strlen(dump_dir) + 1) + ".bin";
++        FILE * f = fopen(fn.c_str(), "wb");
++        if (f) {
++            fwrite(data, 1, ggml_nbytes(t), f);
++            fclose(f);
++        }
++        FILE * fs = fopen((fn + ".shape").c_str(), "w");
++        if (fs) {
++            fprintf(fs, "%lld %lld %lld %lld\n", (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
++            fclose(fs);
++        }
++    }
++
+     return true;
+ }
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 5f79f2909..3e9878350 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -1000,6 +1000,57 @@ void tbq_output_iwht128_cuda(float * dst, int64_t n_rows, int64_t row_stride, cu
+     tbq_output_iwht128_kernel<<<n_rows, 128, 0, stream>>>(dst, n_rows, row_stride);
+ }
+ 
++// Forward WHT for Q rows against 128-block TBQ K caches (MMA typed path): the K tiles are
++// dequantized in the WHT domain, so Q must be moved there too. Mirrors the fattn-vec in-kernel
++// Q prep: q' = WHT(S*q) / 128 (the kernel applies the usual attention scale on top).
++static __global__ void tbq_q_wht128_kernel(const char * __restrict__ src, float * __restrict__ dst,
++                                           float * __restrict__ raw_copy,
++                                           int64_t ne1, int64_t ne2,
++                                           int64_t nb1, int64_t nb2, int64_t nb3) {
++    // strided source (FA's Q is a permuted view); outputs are CONTIGUOUS rows in
++    // (token + head*ne1 + seq*ne1*ne2) order — raw_copy carries the untransformed Q for the
++    // in-kernel outlier correction so downstream addressing never needs the source strides.
++    const int64_t row = blockIdx.x;
++    const int tid = threadIdx.x;
++
++    static constexpr uint8_t tbq_signs[16] = {
++        0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
++        0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
++    };
++
++    const int64_t i1 = row % ne1;
++    const int64_t i2 = (row / ne1) % ne2;
++    const int64_t i3 = row / (ne1*ne2);
++
++    const float * in  = (const float *)(src + i1*nb1 + i2*nb2 + i3*nb3);
++    float       * out = dst + row*128;
++    raw_copy[row*128 + tid] = in[tid];
++
++    const float sign0 = ((tbq_signs[tid >> 3] >> (tid & 7)) & 1) ? -1.0f : 1.0f;
++    float f0 = in[tid] * sign0;
++#pragma unroll
++    for (int st = 0; st < 5; st++) {
++        const float o0 = __shfl_xor_sync(0xffffffff, f0, 1 << st, 32);
++        f0 = (tid & (1 << st)) ? (o0 - f0) : (f0 + o0);
++    }
++    __shared__ float buf[128];
++    buf[tid] = f0;
++    __syncthreads();
++    { const float u = buf[tid], v = buf[tid ^ 32]; f0 = (tid & 32) ? (v - u) : (u + v); }
++    __syncthreads();
++    buf[tid] = f0;
++    __syncthreads();
++    { const float u = buf[tid], v = buf[tid ^ 64]; f0 = (tid & 64) ? (v - u) : (u + v); }
++
++    out[tid] = f0 / 128.0f;
++}
++
++void tbq_q_wht128_cuda(const char * src, float * dst, float * raw_copy,
++                       int64_t ne1, int64_t ne2, int64_t ne3,
++                       int64_t nb1, int64_t nb2, int64_t nb3, cudaStream_t stream) {
++    tbq_q_wht128_kernel<<<ne1*ne2*ne3, 128, 0, stream>>>(src, dst, raw_copy, ne1, ne2, nb1, nb2, nb3);
++}
++
+ static void dequantize_row_tbq3_4_to_f16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+     dequantize_tbq_4_spatial_f16_kernel<block_tbq3_4, 3><<<k/TBQ_K576, 256, 0, stream>>>(vx, y, k/TBQ_K576);
+ }
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index cc6412ac3..3ac3cf097 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -2344,7 +2344,8 @@ static __global__ void flash_attn_combine_results(
+ template <int DV, int ncols1, int ncols2>
+ void launch_fattn(
+     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
++    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
++    const bool tbq_q_wht128 = false // typed MMA path: move Q to the WHT domain for TBQ 128-block K
+ ) {
+     constexpr int ncols = ncols1 * ncols2;
+ 
+@@ -2380,6 +2381,10 @@ void launch_fattn(
+ 
+     ggml_cuda_pool_alloc<half>   K_f16(pool);
+     ggml_cuda_pool_alloc<half>   V_f16(pool);
++    // declared BEFORE KV_max/dst_tmp*: it is allocated earlier in the body, and the VMM pool
++    // requires deallocations in exact reverse allocation order (destructor order = reverse
++    // declaration order)
++    ggml_cuda_pool_alloc<float>  q_wht128_buf(pool);
+     ggml_cuda_pool_alloc<int>    KV_max(pool);
+     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
+     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+@@ -2495,6 +2500,48 @@ void launch_fattn(
+         q_wht2_stride = Q->ne[0] * sizeof(float);
+     }
+ 
++    // TBQ 128-block typed K on the MMA path ONLY (explicit flag — the vec kernel also runs
++    // with need_f16_K == false but does its own in-kernel Q-WHT). Q moves to the WHT domain
++    // (q' = WHT(S*q)/128); a CONTIGUOUS raw-Q copy rides the Q_wht2 channel for the rank-2
++    // outlier correction, and the quantized K base rides the raw_K channel.
++    const bool tbq_wht128_mode = tbq_q_wht128 && !need_f16_K && Q->ne[0] == 128 &&
++        (K->type == GGML_TYPE_TBQ3_1 || K->type == GGML_TYPE_AMX3_1);
++    const char * Q_data_eff = (const char *) Q->data;
++    size_t q_nb1 = Q->nb[1], q_nb2 = Q->nb[2], q_nb3 = Q->nb[3];
++    if (tbq_wht128_mode) {
++        extern void tbq_q_wht128_cuda(const char *, float *, float *,
++                                      int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, cudaStream_t);
++        const int64_t n_rows = Q->ne[1]*Q->ne[2]*Q->ne[3];
++        q_wht128_buf.alloc(2*n_rows*128); // [WHT'd Q | contiguous raw-Q copy]
++        float * q_wht = q_wht128_buf.ptr;
++        float * q_raw = q_wht128_buf.ptr + n_rows*128;
++        tbq_q_wht128_cuda((const char *) Q->data, q_wht, q_raw,
++                          Q->ne[1], Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], main_stream);
++        Q_data_eff = (const char *) q_wht;
++        q_nb1 = 128*sizeof(float);
++        q_nb2 = Q->ne[1]*q_nb1;
++        q_nb3 = Q->ne[2]*q_nb2;
++        // debug bisect: TBQ_MMA_NO_OL=1 disables the outlier correction (raw-Q channel = null)
++        static const bool no_ol = getenv("TBQ_MMA_NO_OL") != nullptr;
++        q_wht2_ptr    = no_ol ? nullptr : (const char *) q_raw; // contiguous RAW Q for the outlier correction
++        q_wht2_stride = (int32_t) (128*sizeof(float));
++
++        // debug: TBQ_QWHT_DUMP=<prefix> writes q_wht + q_raw (first call only) for numpy checks
++        static const char * qdump = getenv("TBQ_QWHT_DUMP");
++        static bool qdumped = false;
++        if (qdump && !qdumped) {
++            qdumped = true;
++            CUDA_CHECK(cudaStreamSynchronize(main_stream));
++            std::vector<float> h(2*n_rows*128);
++            CUDA_CHECK(cudaMemcpy(h.data(), q_wht128_buf.ptr, 2*n_rows*128*sizeof(float), cudaMemcpyDeviceToHost));
++            FILE * fo = fopen((std::string(qdump) + "_wht.bin").c_str(), "wb");
++            if (fo) { fwrite(h.data(), sizeof(float), n_rows*128, fo); fclose(fo); }
++            fo = fopen((std::string(qdump) + "_raw.bin").c_str(), "wb");
++            if (fo) { fwrite(h.data() + n_rows*128, sizeof(float), n_rows*128, fo); fclose(fo); }
++            fprintf(stderr, "TBQ_QWHT_DUMP: wrote %lld rows\n", (long long) n_rows);
++        }
++    }
++
+     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+     const int gqa_ratio    = Q->ne[2] / K->ne[2];
+     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
+@@ -2625,7 +2672,7 @@ void launch_fattn(
+     // TBQP: Q stays spatial (K is spatial too). V = K view (spatial). No hacks.
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+-        (const char *) Q->data,
++        Q_data_eff,
+         K_data,
+         V_data,
+         mask ? ((const char *) mask->data) : nullptr,
+@@ -2633,13 +2680,13 @@ void launch_fattn(
+         KV_max.ptr,
+         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+-        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
++        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], (int32_t) q_nb1, (int32_t) q_nb2, (int32_t) q_nb3,
+         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+         nb21, nb22, nb23,
+         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+-        tbqp_wht_mode ? K_data_orig : nullptr,
+-        tbqp_wht_mode ? (int32_t)K->nb[1] : 0,
++        tbqp_wht_mode ? K_data_orig : (tbq_wht128_mode ? (const char *) K->data : nullptr),
++        tbqp_wht_mode ? (int32_t)K->nb[1] : (tbq_wht128_mode ? (int32_t) K->nb[1] : 0),
+         q_wht2_ptr,
+         q_wht2_stride,
+         k_rope_data,
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 5fed445c8..cfae0560a 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -1,6 +1,7 @@
+ #include "common.cuh"
+ #include "cp-async.cuh"
+ #include "mma.cuh"
++#define TBQ_MMA_DEBUG_PROBE 1
+ #include "fattn-common.cuh"
+ 
+ // convert.cu: output IWHT for the 128-elem TBQ V family (MMA typed path epilogue)
+@@ -454,6 +455,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
+ static constexpr __device__ int ggml_blck_size_bytes_tbq128(ggml_type t) {
+     return t == GGML_TYPE_TBQ3_1 ? (int) sizeof(block_tbq3_1)
+          : t == GGML_TYPE_TBQV3_1 ? (int) sizeof(block_tbqv3_1)
++         : t == GGML_TYPE_AMX3_1  ? (int) sizeof(block_amx3_1)
+          :                          (int) sizeof(block_amxv3_1);
+ }
+ 
+@@ -472,7 +474,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_dequant(
+         const int n_elems,                       // number of elements (halves) in the D chunk
+         const int stride_KV_bytes,               // bytes per KV row (nb11/nb21)
+         const int i_sup) {                       // rows with i >= i_sup are zero-filled
+-    static_assert(type == GGML_TYPE_TBQ3_1 || type == GGML_TYPE_TBQV3_1 || type == GGML_TYPE_AMXV3_1,
++    static_assert(type == GGML_TYPE_TBQ3_1 || type == GGML_TYPE_TBQV3_1 || type == GGML_TYPE_AMXV3_1
++               || type == GGML_TYPE_AMX3_1, // K-side: d_wht at offset 0, qs at 2 — same as tbq3_1
+                   "tile dequant: unsupported type");
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+     // shared 3-bit Gaussian Lloyd-Max centroids (same table as the vec functors)
+@@ -514,6 +517,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_dequant(
+                 const float v1 = c3[(w >> (bo + 3*l + 3)) & 0x7] * d;
+                 out[l/2] = make_half2(v0, v1);
+             }
++#ifdef TBQ_MMA_DEBUG_PROBE
++            if (i == 0 && k == 0 && row0 == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
++                // dump the first 4 dequantized elements we just wrote for KV row 0, head (blockIdx via base)
++                printf("MMA-Kfill blk=%llx out0=%f %f %f %f\n",
++                       (unsigned long long) blk,
++                       __half2float(out[0].x), __half2float(out[0].y),
++                       __half2float(out[1].x), __half2float(out[1].y));
++            }
++#endif
+         } else {
+ #pragma unroll
+             for (int l = 0; l < 4; ++l) {
+@@ -647,7 +659,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+         const char * const __restrict__ raw_K_data,
+         const int raw_K_stride,
+         const char * const __restrict__ Q_wht2_data,
+-        const int Q_wht2_stride) {
++        const int Q_wht2_stride,
++        const char * const __restrict__ Q_raw_tile) { // RAW Q rows for this tile's heads (TBQ K outlier correction)
+ #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
+     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
+     constexpr int  ncols           = ncols1 * ncols2;
+@@ -702,13 +715,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+         const int k0_diff = k0_stop - k0_start;
+ 
+         if constexpr (nstages <= 1) {
+-            constexpr bool use_cp_async = nstages == 1;
+-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+-                (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
+-            if (use_cp_async) {
+-                cp_async_wait_all();
++            if constexpr (type_K != GGML_TYPE_F16) {
++                // stride_K carries BYTES per row for quantized K (see kernel body)
++                flash_attn_ext_f16_load_tile_dequant<type_K, stride_tile_K, nwarps, nbatch_fa, oob_check>
++                    ((const char *) K_h2, k_VKQ_0, tile_K, k0_start*2, k0_diff*2, stride_K, k_VKQ_sup);
++                __syncthreads();
++            } else {
++                constexpr bool use_cp_async = nstages == 1;
++                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
++                    (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
++                if (use_cp_async) {
++                    cp_async_wait_all();
++                }
++                __syncthreads();
+             }
+-            __syncthreads();
+         }
+ 
+         // Calculate tile of KQ:
+@@ -720,6 +740,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+                 for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
+                     T_A_KQ K_A;
+                     load_ldmatrix(K_A, tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
++#ifdef TBQ_MMA_DEBUG_PROBE
++                    if (type_K != GGML_TYPE_F16 && i_KQ_0 == 0 && k_KQ_0 == k0_start && threadIdx.x < 4 && threadIdx.y == 0 && blockIdx.x == 0) {
++                        printf("MMA-KA tx=%d frag=%f %f\n", threadIdx.x, __half2float(K_A.x[0].x), __half2float(K_A.x[0].y));
++                    }
++#endif
+                     if constexpr (cols_per_warp == 8) {
+                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[k_KQ_0/T_A_KQ::J]);
+                     } else {
+@@ -840,6 +865,71 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+         }
+     }
+ 
++    // TBQ 128-block K outlier correction: the top-2 pre-rotation outliers were pulled out of
++    // the WHT residual at quantize time and live as (ol_idx, ol_val) side-band in the block.
++    // They cannot be folded into the WHT-domain tile (the WHT of a 2-sparse vector is dense),
++    // so the exact rank-2 term  scale * (Q_raw[ol0]*v0 + Q_raw[ol1]*v1)  is added per
++    // (KV row, Q column) to the KQ scores. RAW Q rides the Q_wht2 channel. amx3_1 quantized
++    // without outliers has ol_val == 0 -> exact no-op. Reference: fattn-vec.cuh outlier block.
++    if constexpr (DKQ == 128 && (type_K == GGML_TYPE_TBQ3_1 || type_K == GGML_TYPE_AMX3_1)) {
++        if (raw_K_data && Q_raw_tile) {
++            constexpr int ol_idx_off = type_K == GGML_TYPE_TBQ3_1
++                ? (int) offsetof(block_tbq3_1, ol_idx) : (int) offsetof(block_amx3_1, ol_idx);
++            constexpr int ol_val_off = type_K == GGML_TYPE_TBQ3_1
++                ? (int) offsetof(block_tbq3_1, ol_val) : (int) offsetof(block_amx3_1, ol_val);
++
++#if defined(TURING_MMA_AVAILABLE)
++            constexpr int rows_per_frag = cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J;
++            constexpr int kq_stride     = np*rows_per_frag;
++#pragma unroll
++            for (int i_kv0 = 0; i_kv0 < nbatch_fa; i_kv0 += kq_stride) {
++                const int kq_idx = i_kv0 / kq_stride;
++#pragma unroll
++                for (int l = 0; l < T_C_KQ::ne; ++l) {
++                    // fragment element -> (KV row, Q column) coordinates
++                    const int i_loc = cols_per_warp == 8 ? T_C_KQ::get_i(l) : T_C_KQ::get_j(l);
++                    const int j_loc = cols_per_warp == 8 ? T_C_KQ::get_j(l) : T_C_KQ::get_i(l);
++                    const int kv_idx = k_VKQ_0 + i_kv0 + (threadIdx.y % np)*rows_per_frag + i_loc;
++                    if (oob_check && kv_idx - k_VKQ_0 >= k_VKQ_sup) {
++                        continue;
++                    }
++                    const int jc = (threadIdx.y / np)*cols_per_warp + j_loc; // tile-local column
++                    const int j_Q  = jc / ncols2;       // token within this Q tile
++                    const int zt_l = jc % ncols2;       // gqa head within the group
++                    // raw-Q row relative to Q_raw_tile (contiguous Q: row = token + head*n_tokens)
++                    const int64_t q_row = int64_t(zt_l)*int(ne01.z) + (jt*ncols1 + j_Q);
++
++                    const char * blk = raw_K_data + int64_t(kv_idx)*raw_K_stride;
++                    uint8_t ol_idx[2];
++                    half    ol_val[2];
++                    ggml_cuda_memcpy_1<2*sizeof(uint8_t), 2>(ol_idx, blk + ol_idx_off);
++                    ggml_cuda_memcpy_1<2*sizeof(half),    2>(ol_val, blk + ol_val_off);
++
++                    const float v0 = __half2float(ol_val[0]);
++                    const float v1 = __half2float(ol_val[1]);
++                    if (v0 != 0.0f || v1 != 0.0f) {
++                        const float * Q_raw = (const float *)(Q_raw_tile + q_row*(int64_t) Q_wht2_stride);
++                        KQ_C[kq_idx].x[l] += scale*(Q_raw[ol_idx[0]]*v0 + Q_raw[ol_idx[1]]*v1);
++                    }
++                }
++            }
++#endif // defined(TURING_MMA_AVAILABLE)
++        }
++    }
++
++#ifdef TBQ_MMA_DEBUG_PROBE
++    if (type_K != GGML_TYPE_F16 && threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
++        // brute-force tile_Q[col0] . tile_K[row0] over full D; compare to KQ_C[0].x[0]
++        float bf = 0.0f;
++        for (int d = 0; d < DKQ/2; ++d) {
++            const half2 q = tile_Q[0*stride_tile_Q + d];
++            const half2 kk = tile_K[0*stride_tile_K + d];
++            bf += __half2float(q.x)*__half2float(kk.x) + __half2float(q.y)*__half2float(kk.y);
++        }
++        printf("BRUTE q0.k0=%f   KQ_C[0].x[0]=%f  cpw=%d np=%d\n", bf, KQ_C[0].x[0], (int)cols_per_warp, (int)np);
++    }
++#endif
++
+     if (use_logit_softcap) {
+         constexpr int stride = cols_per_warp == 8 ? np*T_C_KQ::I : np*T_C_KQ::J;
+         static_assert(nbatch_fa % stride == 0, "bad loop size");
+@@ -1195,7 +1285,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+         stride_K, stride_V, stride_mask,
+         tile_Q, tile_K, tile_V, tile_mask,
+         Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0,
+-        ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride);
++        ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride, Q_raw_tile);
+     NO_DEVICE_CODE;
+ #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+ }
+@@ -1323,7 +1413,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         const char * const __restrict__ raw_K_data,  // raw TBQP blocks (nullptr if not TBQP)
+         const int raw_K_stride,
+         const char * const __restrict__ Q_wht2_data,
+-        const int Q_wht2_stride) {  // stride in bytes between raw K rows
++        const int Q_wht2_stride,
++        const char * const __restrict__ Q_raw_tile) {  // stride in bytes between raw K rows
+ #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
+     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
+ 
+@@ -1416,6 +1507,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+ 
+                     const float2 tmp = Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k];
+                     tile_Q[jc*stride_tile_Q + k] = scale_h2 * make_half2(tmp.x, tmp.y);
++#ifdef TBQ_MMA_DEBUG_PROBE
++                    if (type_K != GGML_TYPE_F16 && blockIdx.x == 0 && jt == 0 && jc == 0 && zt_gqa == 0 && k < 2) {
++                        printf("MMA-Q k=%d rawQ=%f %f scale=%f tileQ=%f %f\n", k, tmp.x, tmp.y,
++                               __half2float(scale_h2.x), __half2float(tile_Q[jc*stride_tile_Q+k].x), __half2float(tile_Q[jc*stride_tile_Q+k].y));
++                    }
++#endif
+                 }
+             } else {
+ #pragma unroll
+@@ -1468,7 +1565,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
+                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride);
++                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride, Q_raw_tile);
+         }
+         constexpr bool last_iter = true;
+         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
+@@ -1477,7 +1574,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
+             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride);
++             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride, Q_raw_tile);
+     } else {
+         constexpr bool oob_check = false;
+         for (; kb0 < kb0_stop-1; ++kb0) {
+@@ -1488,7 +1585,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
+                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride);
++                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride, Q_raw_tile);
+         }
+         constexpr bool last_iter = true;
+         constexpr int  k_VKQ_sup = nbatch_fa;
+@@ -1497,7 +1594,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
+             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride);
++             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, ne03, nb03, ne13, nb13, stride_Q1, stride_Q2, gqa_ratio, zt_gqa, ne11, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride, Q_raw_tile);
+     }
+ 
+     // With multi-stage loading there is no __syncthreads at the end of the iter,
+@@ -1969,9 +2066,16 @@ static __global__ void flash_attn_ext_f16(
+ 
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+ 
++#ifdef TBQ_MMA_DEBUG_PROBE
++    if (type_K != GGML_TYPE_F16 && blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
++        printf("MMA-HDR K=%llx nb11=%d nb12=%d nb13=%lld ne11=%d ne12=%d\n",
++               (unsigned long long) K, nb11, nb12, (long long) nb13, ne11, ne12);
++    }
++#endif
+     const int stride_Q1   = nb01 / sizeof(float2);
+     const int stride_Q2   = nb02 / sizeof(float2);
+-    const int stride_K    = nb11 / sizeof(half2);
++    // quantized K: stride carries BYTES per row (the dequant tile loader addresses rows by byte)
++    const int stride_K    = type_K == GGML_TYPE_F16 ? nb11 / (int) sizeof(half2) : nb11;
+     const int stride_mask = nb31 / sizeof(half);
+ 
+     // quantized V: stride carries BYTES per row (the dequant tile loader addresses rows by byte)
+@@ -2013,6 +2117,11 @@ static __global__ void flash_attn_ext_f16(
+         // TBQP: V pointer carries raw K data. Compute raw K base for this sequence/head.
+         // TBQP: V carries raw K data (V != K). TBQ: V == K (same f16 buffer), no QJL.
+         const char * raw_K_ptr = raw_K_data ? (raw_K_data + int64_t(raw_K_stride)*ne11*sequence) : nullptr;
++        // TBQ 128-block K: per-tile RAW-Q base for the outlier correction. Raw Q is contiguous
++        // (asserted at launch): row r = token + head*ne01.z (+ sequence*ne02*ne01.z).
++        const char * Q_raw_tile = (type_K == GGML_TYPE_TBQ3_1 || type_K == GGML_TYPE_AMX3_1) && Q_wht2_data
++            ? Q_wht2_data + int64_t(Q_wht2_stride)*int(ne01.z)*(int64_t(sequence)*ne02 + zt_Q)
++            : nullptr;
+         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
+ 
+         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
+@@ -2026,13 +2135,13 @@ static __global__ void flash_attn_ext_f16(
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_K, type_V>
+                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, ne03, nb03, ne13, nb13,
+-                 raw_K_ptr, raw_K_stride, Q_wht2_data, Q_wht2_stride);
++                 raw_K_ptr, raw_K_stride, Q_wht2_data, Q_wht2_stride, Q_raw_tile);
+         } else {
+             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_K, type_V>
+                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, ne03, nb03, ne13, nb13,
+-                 raw_K_ptr, raw_K_stride, Q_wht2_data, Q_wht2_stride);
++                 raw_K_ptr, raw_K_stride, Q_wht2_data, Q_wht2_stride, Q_raw_tile);
+         }
+ 
+         kbc += iter_k;
+@@ -2062,6 +2171,9 @@ static __global__ void flash_attn_ext_f16(
+ 
+     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
+     const char * raw_K_ptr = raw_K_data ? (raw_K_data + int64_t(raw_K_stride)*ne11*sequence) : nullptr;
++    const char * Q_raw_tile = (type_K == GGML_TYPE_TBQ3_1 || type_K == GGML_TYPE_AMX3_1) && Q_wht2_data
++        ? Q_wht2_data + int64_t(Q_wht2_stride)*int(ne01.z)*(int64_t(sequence)*ne02 + zt_Q)
++        : nullptr;
+     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
+ 
+     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
+@@ -2075,7 +2187,7 @@ static __global__ void flash_attn_ext_f16(
+     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_K, type_V>
+         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, ne03, nb03, ne13, nb13,
+-                 raw_K_ptr, raw_K_stride, Q_wht2_data, Q_wht2_stride);
++                 raw_K_ptr, raw_K_stride, Q_wht2_data, Q_wht2_stride, Q_raw_tile);
+ #else
+     GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+@@ -2170,7 +2282,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+     constexpr bool need_f16_V = type_V == GGML_TYPE_F16;
+ 
+     launch_fattn<DV, ncols1, ncols2>
+-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, need_f16_K, need_f16_V, true, warp_size_host);
++        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, need_f16_K, need_f16_V, true, warp_size_host,
++         /*tbq_q_wht128=*/ type_K == GGML_TYPE_TBQ3_1 || type_K == GGML_TYPE_AMX3_1);
+ 
+     // TBQ V accumulates in WHT domain: bring the attention output back to spatial domain.
+     // IWHT is linear, so running it on the final combined dst is equivalent to the vec
+diff --git a/ggml/src/ggml-cuda/fattn-mma-tbq.cu b/ggml/src/ggml-cuda/fattn-mma-tbq.cu
+index 1f3d3bbf7..3718261ec 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-tbq.cu
++++ b/ggml/src/ggml-cuda/fattn-mma-tbq.cu
+@@ -6,14 +6,18 @@
+ // generate_cu_files.py, and keeping the dispatcher next to the instantiations lets them be
+ // implicit (no extern-template bookkeeping).
+ //
+-// S2a scope: D=128, K=F16, V in {TBQ3_1, TBQV3_1, AMXV3_1} (V-side dequant + output IWHT).
+-// K-side (Q-WHT + outlier correction) lands in S2b.
++// S2a: D=128, K=F16, V in {TBQ3_1, TBQV3_1, AMXV3_1} (V-side dequant + output IWHT).
++// S2b: typed K in {TBQ3_1, AMX3_1} — Q moves to WHT domain in launch_fattn, K tiles dequant in
++// the loader, top-2 outliers come back as an exact rank-2 correction on the KQ scores.
+ 
+ #include "common.cuh"
+ #include "fattn-common.cuh"
++#define TBQ_MMA_DEBUG_PROBE 1
+ #include "fattn-mma-f16.cuh"
+ 
+-template <ggml_type type_V, int ncols2>
++#include <type_traits>
++
++template <ggml_type type_K, ggml_type type_V, int ncols2>
+ static void ggml_cuda_fattn_mma_tbq_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const ggml_tensor * Q = dst->src[0];
+@@ -23,25 +27,25 @@ static void ggml_cuda_fattn_mma_tbq_switch_ncols1(ggml_backend_cuda_context & ct
+ 
+     if constexpr (ncols2 <= 8) {
+         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, GGML_TYPE_F16, type_V>(ctx, dst);
++            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, type_K, type_V>(ctx, dst);
+             return;
+         }
+     }
+ 
+     if (Q->ne[1] <= 16/ncols2) {
+-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, GGML_TYPE_F16, type_V>(ctx, dst);
++        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, type_K, type_V>(ctx, dst);
+         return;
+     }
+ 
+     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING)) {
+-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, GGML_TYPE_F16, type_V>(ctx, dst);
++        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, type_K, type_V>(ctx, dst);
+         return;
+     }
+ 
+-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, GGML_TYPE_F16, type_V>(ctx, dst);
++    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, type_K, type_V>(ctx, dst);
+ }
+ 
+-template <ggml_type type_V>
++template <ggml_type type_K, ggml_type type_V>
+ static void ggml_cuda_fattn_mma_tbq_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * KQV  = dst;
+     const ggml_tensor * Q    = dst->src[0];
+@@ -69,18 +73,18 @@ static void ggml_cuda_fattn_mma_tbq_switch_ncols2(ggml_backend_cuda_context & ct
+     const int gqa_ratio = Q->ne[2] / K->ne[2];
+ 
+     if (use_gqa_opt && gqa_ratio % 8 == 0) {
+-        ggml_cuda_fattn_mma_tbq_switch_ncols1<type_V, 8>(ctx, dst);
++        ggml_cuda_fattn_mma_tbq_switch_ncols1<type_K, type_V, 8>(ctx, dst);
+         return;
+     }
+     if (use_gqa_opt && gqa_ratio % 4 == 0) {
+-        ggml_cuda_fattn_mma_tbq_switch_ncols1<type_V, 4>(ctx, dst);
++        ggml_cuda_fattn_mma_tbq_switch_ncols1<type_K, type_V, 4>(ctx, dst);
+         return;
+     }
+     if (use_gqa_opt && gqa_ratio % 2 == 0) {
+-        ggml_cuda_fattn_mma_tbq_switch_ncols1<type_V, 2>(ctx, dst);
++        ggml_cuda_fattn_mma_tbq_switch_ncols1<type_K, type_V, 2>(ctx, dst);
+         return;
+     }
+-    ggml_cuda_fattn_mma_tbq_switch_ncols1<type_V, 1>(ctx, dst);
++    ggml_cuda_fattn_mma_tbq_switch_ncols1<type_K, type_V, 1>(ctx, dst);
+ }
+ 
+ // Returns true when a typed MMA instantiation exists for this op (used by kernel selection —
+@@ -93,10 +97,17 @@ bool ggml_cuda_fattn_mma_tbq_supported(const ggml_tensor * dst) {
+     if (Q->ne[0] != 128 || V->ne[0] != 128) {
+         return false;
+     }
+-    if (K->type != GGML_TYPE_F16) {
+-        return false; // S2b: TBQ K (Q-WHT + outlier correction) not ported yet
++    const bool v_ok = V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQV3_1 || V->type == GGML_TYPE_AMXV3_1;
++    if (K->type == GGML_TYPE_F16) {
++        return v_ok;
++    }
++    if (K->type == GGML_TYPE_TBQ3_1) {
++        return v_ok || V->type == GGML_TYPE_F16; // f16-V: K-side isolation/debug + mixed configs
+     }
+-    return V->type == GGML_TYPE_TBQ3_1 || V->type == GGML_TYPE_TBQV3_1 || V->type == GGML_TYPE_AMXV3_1;
++    if (K->type == GGML_TYPE_AMX3_1) {
++        return V->type == GGML_TYPE_AMXV3_1 || V->type == GGML_TYPE_TBQ3_1;
++    }
++    return false;
+ }
+ 
+ void ggml_cuda_flash_attn_ext_mma_f16_tbq(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -104,17 +115,52 @@ void ggml_cuda_flash_attn_ext_mma_f16_tbq(ggml_backend_cuda_context & ctx, ggml_
+ 
+     GGML_ASSERT(ggml_cuda_fattn_mma_tbq_supported(dst));
+ 
+-    switch (V->type) {
+-        case GGML_TYPE_TBQ3_1:
+-            ggml_cuda_fattn_mma_tbq_switch_ncols2<GGML_TYPE_TBQ3_1>(ctx, dst);
++#ifdef TBQ_MMA_DEBUG_PROBE
++    {
++        static int n_dbg = 0;
++        const ggml_tensor * Kd = dst->src[1];
++        if (n_dbg++ < 4) {
++            fprintf(stderr, "HOST-K data=%p nb=%zu,%zu,%zu ne=%lld,%lld,%lld off_from_buf=%zu\n",
++                    Kd->data, Kd->nb[1], Kd->nb[2], Kd->nb[3],
++                    (long long)Kd->ne[1], (long long)Kd->ne[2], (long long)Kd->ne[3],
++                    Kd->view_src ? (size_t)((const char *)Kd->data - (const char *)Kd->view_src->data) : (size_t)0);
++        }
++    }
++#endif
++
++    const ggml_tensor * K = dst->src[1];
++
++    auto dispatch_v = [&](auto k_tag) {
++        constexpr ggml_type tK = decltype(k_tag)::value;
++        switch (V->type) {
++            case GGML_TYPE_F16:
++                ggml_cuda_fattn_mma_tbq_switch_ncols2<tK, GGML_TYPE_F16>(ctx, dst);
++                break;
++            case GGML_TYPE_TBQ3_1:
++                ggml_cuda_fattn_mma_tbq_switch_ncols2<tK, GGML_TYPE_TBQ3_1>(ctx, dst);
++                break;
++            case GGML_TYPE_TBQV3_1:
++                ggml_cuda_fattn_mma_tbq_switch_ncols2<tK, GGML_TYPE_TBQV3_1>(ctx, dst);
++                break;
++            case GGML_TYPE_AMXV3_1:
++                ggml_cuda_fattn_mma_tbq_switch_ncols2<tK, GGML_TYPE_AMXV3_1>(ctx, dst);
++                break;
++            default:
++                GGML_ABORT("fattn-mma-tbq: unsupported V type %s", ggml_type_name(V->type));
++        }
++    };
++
++    switch (K->type) {
++        case GGML_TYPE_F16:
++            dispatch_v(std::integral_constant<ggml_type, GGML_TYPE_F16>{});
+             break;
+-        case GGML_TYPE_TBQV3_1:
+-            ggml_cuda_fattn_mma_tbq_switch_ncols2<GGML_TYPE_TBQV3_1>(ctx, dst);
++        case GGML_TYPE_TBQ3_1:
++            dispatch_v(std::integral_constant<ggml_type, GGML_TYPE_TBQ3_1>{});
+             break;
+-        case GGML_TYPE_AMXV3_1:
+-            ggml_cuda_fattn_mma_tbq_switch_ncols2<GGML_TYPE_AMXV3_1>(ctx, dst);
++        case GGML_TYPE_AMX3_1:
++            dispatch_v(std::integral_constant<ggml_type, GGML_TYPE_AMX3_1>{});
+             break;
+         default:
+-            GGML_ABORT("fattn-mma-tbq: unsupported V type %s", ggml_type_name(V->type));
++            GGML_ABORT("fattn-mma-tbq: unsupported K type %s", ggml_type_name(K->type));
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index f2b4a9861..ad1b1984a 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -1,4 +1,5 @@
+ #include "common.cuh"
++#define TBQ_VEC_QPROBE 1
+ #include "fattn-common.cuh"
+ 
+ static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
+@@ -547,6 +548,16 @@ static __global__ void flash_attn_ext_vec(
+                 __syncthreads();
+             }
+ 
++#ifdef TBQ_VEC_QPROBE
++            if (threadIdx.x == 0 && threadIdx.y == 0 && j == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
++                static int vc = 0;
++                if (vc++ < 1) {
++                    const float * Qf = (const float *)(Q + 0*nb01);
++                    printf("VEC-RAWQ %f %f %f %f\n", Qf[0], Qf[1], Qf[2], Qf[3]);
++                    printf("VEC-Qwht %f %f %f %f\n", Q_wht[0], Q_wht[1], Q_wht[2], Q_wht[3]);
++                }
++            }
++#endif
+             // Store MSE WHT'd query in Q_reg (scale/D applied)
+             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
+                 const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 8a6a64a43..114138746 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -1130,7 +1130,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+             ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
+             break;
+         case BEST_FATTN_KERNEL_MMA_F16:
+-            if (ggml_is_quantized(dst->src[2]->type) && ggml_cuda_fattn_mma_tbq_supported(dst)) {
++            if ((ggml_is_quantized(dst->src[1]->type) || ggml_is_quantized(dst->src[2]->type)) &&
++                ggml_cuda_fattn_mma_tbq_supported(dst)) {
+                 ggml_cuda_flash_attn_ext_mma_f16_tbq(ctx, dst);
+             } else {
+                 ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
