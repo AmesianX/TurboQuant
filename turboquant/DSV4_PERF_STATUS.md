@@ -178,8 +178,33 @@ MMA port bisects against this hash.
 Baseline: feat/deepseek4 @ fead3634f (audit-clean, production 16 t/s essay / tg peak ~18-20).
 Each item: build + greedy-identity gate + essay/counting t/s A/B + commit. Drive via background.
 
-### Tier 1 — MTP round (biggest lever; round 61ms = GPU 27.8 + CPU ~22 + draft 9.8 + mirror 1.6)
-1. [INFRA LANDED flag-off-safe; flag-on has a numerical bug + needs #2] verify graph phase-uniform reuse.
+### ⛔ PIVOT 2026-06-13 — GRAPH REUSE (#1, #2) IS NOT THE BOTTLENECK. MEASURED. STOP CHASING IT.
+Direct measurement on production (tbq3+MTP, n_max=2, identical 450-tok GPU-essay prompt):
+  - LLAMA_GRAPH_REUSE_DISABLE=1 (graphs reused=0, EVERY step rebuilds) → **19.80 t/s**
+  - reuse ON (single-slot, graphs reused=16)                          → **19.83 t/s**
+  ⇒ rebuilding every step costs ~0. Graph build is OVERLAPPED with the async GPU compute
+    (compute_async dispatches, next graph builds on CPU while GPU runs) → build is OFF the critical
+    path. Reusing it (single OR multi-slot #2) frees CPU work already hidden behind the GPU → no t/s.
+DSV4_MTP_PROF round breakdown (per ~2.4-token MTP round, from 400 process() calls):
+  - **tgt-embd ≈ 25 ms/round** (target verify GPU compute, surfaced as the mirror's sync-wait) — DOMINANT
+  - draft sample ≈ 6.4 ms, draft decode ≈ 3 ms, mirror-decode ≈ 2.3 ms, extract ≈ negligible
+  ⇒ DSV4 decode is **GPU-bound on the target verify forward pass** (attention + 256-expert MoE + HC),
+    with a notable **draft-sample CPU cost (~6.4ms over 129k vocab)** as the #2 lever.
+
+**CONSEQUENCES for the roadmap:**
+  - #1 (verify reuse): CORRECT but OFF-CRITICAL-PATH → ~0 t/s. Keep as committed flag-OFF infra
+    (reuse machinery may matter later if the round becomes CPU-bound); do NOT spend more on enabling it.
+  - #2 (multi-slot cache): **ABANDON** — measured to not help (build is overlapped). Do not implement.
+  - #3 (draft-ahead pipelining), #5 (deferred verify_h): re-evaluate — these target CPU-side round
+    overhead which the data shows is mostly hidden; likely low ROI too. Measure before implementing.
+  - **REAL LEVERS (where the time actually is):** (a) target verify GPU kernels — the iq2_xs 256-expert
+    MoE matvec and the compressed attention (Tier 2 #6/#11/#12 + kernel work), already near the LPDDR
+    bandwidth ceiling per prior notes; (b) the ~6.4ms/round draft-sample over the 129k vocab (CPU/GPU
+    sampler path) — cheaper to attack and not yet looked at. NEXT: profile the target verify GPU kernel
+    breakdown (DSV4_KERNEL_PROF) and the draft sampler, pick the real bottleneck.
+
+### Tier 1 — MTP round (SUPERSEDED by the PIVOT above — budget numbers below were the OLD hypothesis)
+1. [INFRA LANDED flag-off-safe; CORRECT but off-critical-path — see PIVOT] verify graph phase-uniform reuse.
 
   **STATUS 2026-06-13 (commit pending): full uniform-K infra implemented behind `DSV4_VERIFY_REUSE`
   (default OFF). deepseek4.cpp +173/-48.**
