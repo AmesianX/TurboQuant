@@ -58,6 +58,11 @@ static bool feat_cb(struct ggml_tensor * t, bool ask, void * /*user*/) {
     if (it == g_feat.idx.end()) {
         return false;
     }
+    // guard: only capture once reset() has sized g_feat.cur for a real sequence.
+    // the warmup / any empty pre-sequence run fires this cb before reset() -> skip safely.
+    if (g_feat.cur.size() != g_feat.order.size()) {
+        return false;
+    }
     if (ask) {
         return true; // yes, keep this node's data alive for the follow-up call
     }
@@ -135,6 +140,7 @@ int main(int argc, char ** argv) {
     params.cb_eval = feat_cb;
     params.cb_eval_user_data = nullptr;
     params.embedding = false;
+    params.warmup = false; // no empty warmup run (cb fires before reset() otherwise)
     params.n_batch = std::max<int>(params.n_batch, 512);
 
     common_init();
