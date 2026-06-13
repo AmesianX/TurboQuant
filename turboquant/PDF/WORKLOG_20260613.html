@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>업무일지 2026-06-13 · DeepSeek-V4 최적화 스프린트 + v1.8.0</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root {
+    --bg: #fafbfc;
+    --fg: #1a1a2e;
+    --accent: #3b82f6;
+    --accent2: #8b5cf6;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --muted: #64748b;
+    --card-bg: #ffffff;
+    --border: #e2e8f0;
+  }
+  .reveal { font-family: 'Noto Sans KR', sans-serif; font-size: 28px; color: var(--fg); letter-spacing: -0.01em; line-height: 1.55; }
+  .reveal .slides { text-align: left; }
+  .reveal .slides section { padding: 36px 50px; box-sizing: border-box; }
+  .reveal h1, .reveal h2, .reveal h3 { font-family: 'Noto Sans KR', sans-serif; font-weight: 700; color: var(--fg); text-transform: none; letter-spacing: -0.02em; }
+  .reveal h1 { font-size: 2.0em; margin-bottom: 0.2em; }
+  .reveal h2 { font-size: 1.3em; margin-bottom: 0.4em; }
+  .reveal h3 { font-size: 1.0em; margin-bottom: 0.3em; color: var(--accent); }
+  .cover { text-align: center !important; display: flex !important; flex-direction: column; align-items: center; justify-content: center; }
+  .cover h1 { font-size: 2.2em; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin-bottom: 0.1em; }
+  .cover .subtitle { font-size: 1.0em; color: var(--muted); font-weight: 300; margin-bottom: 1.5em; }
+  .cover .meta { font-size: 0.7em; color: var(--muted); line-height: 1.8; }
+  .cover .meta span { display: inline-block; background: #f1f5f9; padding: 4px 14px; border-radius: 20px; margin: 3px 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; }
+  .divider { width: 60px; height: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); border: none; border-radius: 2px; margin: 8px 0 16px 0; }
+  .cover .divider { margin: 10px auto 20px auto; }
+  .tag { display: inline-block; font-size: 0.5em; font-weight: 500; padding: 2px 10px; border-radius: 12px; vertical-align: middle; margin-left: 8px; }
+  .tag-blue { background: #dbeafe; color: #1d4ed8; }
+  .tag-green { background: #d1fae5; color: #065f46; }
+  .tag-red { background: #fee2e2; color: #991b1b; }
+  .tag-yellow { background: #fef3c7; color: #92400e; }
+  .tag-purple { background: #ede9fe; color: #5b21b6; }
+  .items { list-style: none; padding: 0; margin: 0; }
+  .items li { position: relative; padding-left: 20px; margin-bottom: 6px; font-size: 0.7em; line-height: 1.6; word-break: keep-all; }
+  .items li::before { content: ''; position: absolute; left: 0; top: 9px; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); opacity: 0.6; }
+  .items li.check::before { background: var(--success); opacity: 1; border-radius: 50%; }
+  .items li.warn::before { background: var(--warning); opacity: 1; }
+  .items li.fail::before { background: var(--danger); opacity: 1; border-radius: 50%; }
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
+  .card-grid.three { grid-template-columns: 1fr 1fr 1fr; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin: 0 0 5px 0; font-size: 0.7em; font-weight: 700; color: var(--fg); }
+  .card p, .card ul { margin: 0; font-size: 0.6em; line-height: 1.55; color: #475569; word-break: keep-all; }
+  .card ul { padding-left: 16px; }
+  .highlight-box { border-left: 4px solid; border-radius: 6px; padding: 10px 14px; margin: 8px 0; font-size: 0.7em; line-height: 1.6; word-break: keep-all; }
+  .highlight-box.blue { border-color: var(--accent); background: #eff6ff; }
+  .highlight-box.green { border-color: var(--success); background: #ecfdf5; }
+  .highlight-box.red { border-color: var(--danger); background: #fef2f2; }
+  .highlight-box.yellow { border-color: var(--warning); background: #fffbeb; }
+  .highlight-box.purple { border-color: var(--accent2); background: #f5f3ff; }
+  .reveal code { font-family: 'JetBrains Mono', monospace; font-size: 0.88em; background: #f1f5f9; padding: 1px 6px; border-radius: 4px; color: var(--accent2); }
+  .reveal table { width: 100%; border-collapse: collapse; font-size: 0.6em; margin-top: 8px; table-layout: fixed; }
+  .reveal table th { background: #f8fafc; font-weight: 600; text-align: left; padding: 6px 10px; border-bottom: 2px solid var(--border); color: var(--muted); font-size: 0.88em; text-transform: uppercase; letter-spacing: 0.05em; }
+  .reveal table td { padding: 6px 10px; border-bottom: 1px solid var(--border); line-height: 1.45; word-break: keep-all; }
+  .reveal table tr:last-child td { border-bottom: none; }
+  .reveal table .ok { color: var(--success); font-weight: 600; }
+  .reveal table .ng { color: var(--danger); font-weight: 600; }
+  .reveal table .mid { color: var(--warning); font-weight: 600; }
+  @media print { .reveal .slides section { page-break-after: always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>DeepSeek-V4 최적화 스프린트</h1>
+  <p class="subtitle">verify-graph 재사용 인프라 · GPU-바운드 규명 · 정직한 천장 · v1.8.0 릴리스</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-06-13</span>
+    <span>DeepSeek-V4-Flash IQ2_XS-XL</span>
+    <span>GB10 · 128GB</span>
+    <br>
+    <span>#7 랜딩 · #8 기각</span>
+    <span>#1 인프라 (정확·flag-off)</span>
+    <span>#2 폐기 (측정)</span>
+    <span>v1.8.0 released</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>세션 개요</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>목표</h4>
+      <p>DSV4 최적화 스프린트 #1-14. verify-graph 재사용으로 MTP 라운드 가속(<strong>+20-30% 기대</strong>).</p>
+    </div>
+    <div class="card">
+      <h4>결과</h4>
+      <p>측정이 전제를 반전 — <strong>그래프 재사용은 비병목</strong>. DSV4는 메모리-바운드 천장. v1.8.0 릴리스.</p>
+    </div>
+    <div class="card">
+      <h4>핵심 발견</h4>
+      <p>#1은 수학적으로 정확하나 <strong>임계경로 밖</strong>. matmul 52%가 LPDDR 한계. 실용 천장 ~한 자릿수%.</p>
+    </div>
+    <div class="card">
+      <h4>산출물</h4>
+      <p>#7 커밋, #1 인프라(flag-off), 5각 코드리뷰, v1.8.0 릴리스, README 4종, <code>merge -s ours</code>.</p>
+    </div>
+  </div>
+</section>
+
+<!-- SPRINT RESULTS -->
+<section>
+  <h2>최적화 스프린트 #1-14 결과 <span class="tag tag-blue">측정 기반</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:26%"><col style="width:22%"><col style="width:52%"></colgroup>
+    <tr><th>항목</th><th>상태</th><th>비고</th></tr>
+    <tr><td>#7 wq_b q8_0 small_k</td><td class="ok">랜딩</td><td>비트-동일(764/764), marginal — 메모리-바운드</td></tr>
+    <tr><td>#8 iq2_xs occupancy</td><td class="ng">기각</td><td><code>minBlocks=8</code> no-op (REG 80 유지, 컴파일러 무시)</td></tr>
+    <tr><td>#1 verify-graph 재사용</td><td class="mid">인프라 · flag-off</td><td>수학적 정확(증명), 단독 이득 ~0</td></tr>
+    <tr><td>#2 멀티슬롯 캐시</td><td class="ng">폐기</td><td>측정: 빌드가 임계경로 밖 → 무익</td></tr>
+    <tr><td>#3-#5 (MTP CPU)</td><td>보류</td><td>대부분 GPU 뒤에 숨겨짐 (저ROI)</td></tr>
+    <tr><td>#6/#9-#14 (커널)</td><td>보류</td><td>matmul 메모리-바운드 / 셔플 구조적 → 천장</td></tr>
+  </table>
+  <div class="highlight-box blue">
+    스프린트의 실질 성과는 <strong>"헛다리 차단"</strong> — #2라는 고위험 프레임워크 변경을 <strong>측정으로 사전 봉쇄</strong>.
+  </div>
+</section>
+
+<!-- #1 DEBUG -->
+<section>
+  <h2>#1 디버깅: 버그가 아니었다 <span class="tag tag-green">규명</span></h2>
+  <hr class="divider">
+  <div class="highlight-box yellow">
+    flag-ON 그리디 발산 — SHA <code>aac34a0</code> vs baseline <code>a56fd72</code>, 토큰 ~8(abs pos ~21)에서 갈라짐. <strong>topology 변경인데 출력이 다름.</strong>
+  </div>
+  <table>
+    <colgroup><col style="width:42%"><col style="width:24%"><col style="width:34%"></colgroup>
+    <tr><th>bisection 실험</th><th>결과</th><th>결론</th></tr>
+    <tr><td>flag-ON + NO_KREUSE (재사용만 끔)</td><td class="ng">여전히 발산</td><td>빌드 문제, 재사용 아님</td></tr>
+    <tr><td>+ RAWVIEW (raw 압축 뷰 강제)</td><td class="ok">baseline 비트-동일</td><td>압축기·캐시 scatter·마스크 <strong>비트-완벽</strong></td></tr>
+  </table>
+  <div class="highlight-box green">
+    <strong>정체</strong>: 재사용에 필수인 <strong>256-padded 뷰</strong>가 flash-attn online-softmax의 <strong>fp 누적 순서</strong>만 교란 → 박빙 argmax 뒤집힘. 로직 버그 아님 → perplexity 게이트로만 판단 가능.
+  </div>
+</section>
+
+<!-- PIVOT -->
+<section>
+  <h2>⛔ PIVOT: 그래프 재사용은 병목이 아니다 <span class="tag tag-red">측정</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:46%"><col style="width:26%"><col style="width:28%"></colgroup>
+    <tr><th>설정 (동일 프롬프트)</th><th>graphs reused</th><th>t/s</th></tr>
+    <tr><td>재사용 완전 OFF (매 스텝 재빌드)</td><td>0</td><td class="mid">19.80</td></tr>
+    <tr><td>재사용 ON (single-slot)</td><td>16</td><td class="mid">19.83</td></tr>
+  </table>
+  <div class="highlight-box red">
+    매 스텝 재빌드해도 비용 ~0. <strong>그래프 빌드는 async GPU 컴퓨트와 오버랩</strong>(다음 그래프를 CPU에서 빌드하는 동안 GPU가 현재 실행) → <strong>임계경로 밖</strong>. 재사용(single/multi-slot)은 이미 숨겨진 CPU 작업을 줄일 뿐.
+  </div>
+  <div class="highlight-box blue">
+    결과: <strong>#2 폐기</strong>, #1은 정확하지만 flag-off 보존. 진짜 병목은 <strong>타깃 verify GPU 패스(~25ms/라운드)</strong>.
+  </div>
+</section>
+
+<!-- GPU PROFILE -->
+<section>
+  <h2>GPU 프로파일: DSV4는 메모리-바운드 <span class="tag tag-purple">DSV4_KERNEL_PROF</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:50%"><col style="width:16%"><col style="width:34%"></colgroup>
+    <tr><th>GPU op 클래스</th><th>비중</th><th>헤드룸</th></tr>
+    <tr><td>MoE expert matvec (IQ2_XS, 256 expert) + dense 어텐션 투영 (Q8_0)</td><td class="ng">~52%</td><td>LPDDR 한계 근처 — 융합은 런치만 절약</td></tr>
+    <tr><td>데이터 셔플 (CPY/CONT/GET·SET_ROWS/CONCAT)</td><td class="mid">~19%</td><td>진짜 헤드룸이나 구조적(각 op 작고 필요)</td></tr>
+    <tr><td>Flash-attention (D=512 압축 KV)</td><td class="ok">~2.3%</td><td>무시 — 압축 KV 설계가 잘 작동</td></tr>
+  </table>
+  <div class="highlight-box yellow">
+    matmul은 매 토큰 LPDDR에서 양자화 weight를 읽음 → 벽 너머는 <strong>바이트를 덜 읽는 것(품질 트레이드오프)</strong>뿐, 커널 융합이 아님. 어텐션이 2.3%인 건 <strong>압축 KV가 이미 잘 작동</strong>한다는 증거.
+  </div>
+</section>
+
+<!-- JITTER -->
+<section>
+  <h2>t/s 들쭉날쭉의 정체 <span class="tag tag-blue">23 → 16 → 19</span></h2>
+  <hr class="divider">
+  <div class="highlight-box purple">
+    <strong>t/s = (MTP 라운드당 수용 토큰) / (라운드 시간)</strong>. 라운드 시간 ≈ 일정(<code>~25ms</code>, 타깃 verify GPU 지배), 라운드당 토큰이 <strong>수용률(96-100%)</strong>에 따라 1→3 출렁.
+  </div>
+  <ul class="items">
+    <li class="check"><strong>수용률 변동(지배적)</strong> — 예측 쉬운 구간(리스트·흔한 구문) 수용률↑ → ~20 t/s. 새 내용(숫자·고유명사) → ~16. 문장마다 출렁 = spec decode의 <strong>본질</strong>, 버그 아님.</li>
+    <li class="check"><strong>컨텍스트 증가 드리프트</strong> — KV 성장 → 라운드 시간 미세 증가. 256 배수 경계서 계단식 점프.</li>
+    <li class="check"><strong>지표 혼동</strong> — 23(피크) / 16(essay 집계, 프롬프트 포함) / 19(최근 윈도우)는 분모가 다름.</li>
+  </ul>
+</section>
+
+<!-- CODE REVIEW -->
+<section>
+  <h2>최종 코드 리뷰 <span class="tag tag-green">5각 · 라이브 버그 0</span></h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>정합성</h4>
+      <p>flag-off 경로 라이브 버그 0. 지적은 전부 검증된 패턴 재사용 / flag-off 잠재 취약성.</p>
+    </div>
+    <div class="card">
+      <h4>적용한 수정</h4>
+      <p>getenv 사이트에 <strong>fp-divergence 위험 코멘트</strong> 추가(.md에만 있던 경고를 코드로).</p>
+    </div>
+    <div class="card">
+      <h4>위생</h4>
+      <p>진단 도구(NO_KREUSE/RAWVIEW) 제거 확인. mmvq <code>&lt;=</code>는 type-global(주석 과소표현 노트).</p>
+    </div>
+    <div class="card">
+      <h4>남은 빚</h4>
+      <p><strong>load-bearing 불변식 미문서화</strong>(verify 위치 연속성, attn==index n_comp) — #1 켤 때 assert 권고.</p>
+    </div>
+  </div>
+</section>
+
+<!-- GIT + RELEASE -->
+<section>
+  <h2>git 작업 + v1.8.0 릴리스</h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="check"><strong>main FF 머지(27커밋) + origin 푸시</strong> — DSV4 풀 포트 + 세션 작업 전부, merge 커밋 없이 깔끔히.</li>
+    <li class="check"><strong>feat/deepseek4 삭제</strong> — 로컬·원격 (main..branch=0 확인 후).</li>
+    <li class="check"><strong>v1.8.0 릴리스 생성</strong> — 태그를 현재 main으로 이동 + GitHub 릴리스(Latest). 워크플로우가 latest <strong>릴리스</strong>에 바이너리 <code>--clobber</code>.</li>
+    <li class="check"><strong>업스트림 fringe <code>merge -s ours</code></strong> — 8커밋(우리가 앞섬, 2287 vs 1392줄) 코드 0줄로 ancestry만 머지 → "behind 8" 경고 클리어.</li>
+    <li class="check"><strong>README 4종 업데이트</strong>(root+turboquant × EN+KO) — 프로덕션 perf + 메모리-바운드 특성.</li>
+    <li class="check"><strong>CI 위생</strong> — 변경 시 올스톱(취소) → 최종 커밋으로 빌드 fresh. restore.sh 정본 검증=no-op.</li>
+  </ul>
+</section>
+
+<!-- MISSTEPS -->
+<section>
+  <h2>뻘짓 히스토리 <span class="tag tag-yellow">retrospective</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="fail"><strong>PIVOT을 "스프린트 중단"으로 과대 프레이밍</strong> — 측정이 죽인 건 #2 하나뿐인데 전체를 접는 듯 보고. 사용자가 "14개 적용 약속" 상기시켜 정정.</li>
+    <li class="fail"><strong>좀비 모니터로 옛 빌드 붙듦</strong> — a4ab90b6c 빌드를 보존하려 함. CI 위생 위반 → 올스톱+fresh로 교정, 메모리 저장.</li>
+    <li class="fail"><strong>#1 add/add 700줄 디버깅</strong> — 정적 분석으로 못 잡다가 NO_KREUSE→RAWVIEW 런타임 bisection으로 fp-order 규명. 진작 격리했어야.</li>
+    <li class="fail"><strong>릴리스 vs 태그 혼동 위험</strong> — 워크플로우는 latest <strong>릴리스</strong> 타깃인데 v1.8.0 릴리스 없어 바이너리가 v1.7.0行 직전. 사전 포착.</li>
+    <li class="fail"><strong>fringe 머지 add/add 충돌</strong> — 우리 2287줄을 1392줄로 후퇴시킬 뻔. 사용자 경고 + 드라이런으로 직전 차단, 선택적 포팅(=포팅할 것 없음).</li>
+  </ul>
+</section>
+
+<!-- LESSONS -->
+<section>
+  <h2>핵심 교훈</h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="check"><strong>구현 전 측정</strong> — #2 고위험 변경을 측정으로 사전 봉쇄. "건드렸는데 안 오르는" 함정을 데이터로 차단.</li>
+    <li class="check"><strong>그래프 빌드는 async GPU와 오버랩 = 임계경로 밖</strong> — CPU-side 최적화(#1-#5)는 GPU-bound 디코드를 못 올림.</li>
+    <li class="check"><strong>topology 변경 ≠ 비트-동일</strong> — padded 뷰가 fp 누적 순서를 바꿈. "math unchanged"라도 bit-identical은 과한 게이트 → perplexity로 판단.</li>
+    <li class="check"><strong>CI 위생: 올스톱 → 최종 빌드 fresh</strong> — in-flight 빌드 보존 금지. 좀비/큐 오염 방지.</li>
+    <li class="check"><strong><code>merge -s ours</code></strong> — 우월한 fork가 업스트림 발산을 코드 0줄로 정리. 진짜 머지만 워크플로우 복구 필요.</li>
+    <li class="check"><strong>메모리-바운드는 quant/expert만이 레버</strong> — matmul 52%가 LPDDR 벽. 커널 융합은 런치 오버헤드뿐.</li>
+  </ul>
+</section>
+
+<!-- NEXT -->
+<section>
+  <h2>다음 작업 <span class="tag tag-blue">진짜 레버만</span></h2>
+  <hr class="divider">
+  <div class="card-grid three">
+    <div class="card">
+      <h4>#6 gate+up 융합 (gguf 재패킹)</h4>
+      <p>iq2_xs gate+up을 오프라인 concat → 로더 자동 픽업. <strong>~2-3%</strong>(메모리-바운드, 런치만). 80GB 파일.</p>
+    </div>
+    <div class="card">
+      <h4>#11 압축기 셔플 융합</h4>
+      <p>18.6% 셔플 중 절반 회수 시도. 고위험·한 자릿수%. 커스텀 융합 커널.</p>
+    </div>
+    <div class="card">
+      <h4>품질 트레이드오프</h4>
+      <p>expert 수↓ / 더 낮은 quant. t/s 큰 폭 가능하나 모델 품질 하락. 사용자 결정.</p>
+    </div>
+    <div class="card">
+      <h4>#1 enable 시 assert</h4>
+      <p>verify 위치 연속성, attn==index n_comp 불변식을 assert로 박제 + perplexity 게이트.</p>
+    </div>
+    <div class="card">
+      <h4>draft 샘플러</h4>
+      <p>~6.4ms/라운드(129k vocab)가 greedy치곤 높음 — CPU/sampler 경로 점검.</p>
+    </div>
+    <div class="card">
+      <h4>천장 인정</h4>
+      <p>DSV4는 GB10에서 실용적 컴퓨트 한계. 현실적 여지 한 자릿수%.</p>
+    </div>
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash:true, slideNumber:'c/t', width:1280, height:720, margin:0, transition:'fade', transitionSpeed:'fast' });</script>
+</body>
+</html>

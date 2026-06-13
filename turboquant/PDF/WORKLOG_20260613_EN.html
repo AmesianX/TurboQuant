@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Work Log 2026-06-13 · DeepSeek-V4 Optimization Sprint + v1.8.0</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root {
+    --bg: #fafbfc;
+    --fg: #1a1a2e;
+    --accent: #3b82f6;
+    --accent2: #8b5cf6;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --muted: #64748b;
+    --card-bg: #ffffff;
+    --border: #e2e8f0;
+  }
+  .reveal { font-family: 'Noto Sans KR', sans-serif; font-size: 28px; color: var(--fg); letter-spacing: -0.01em; line-height: 1.55; }
+  .reveal .slides { text-align: left; }
+  .reveal .slides section { padding: 36px 50px; box-sizing: border-box; }
+  .reveal h1, .reveal h2, .reveal h3 { font-family: 'Noto Sans KR', sans-serif; font-weight: 700; color: var(--fg); text-transform: none; letter-spacing: -0.02em; }
+  .reveal h1 { font-size: 2.0em; margin-bottom: 0.2em; }
+  .reveal h2 { font-size: 1.3em; margin-bottom: 0.4em; }
+  .reveal h3 { font-size: 1.0em; margin-bottom: 0.3em; color: var(--accent); }
+  .cover { text-align: center !important; display: flex !important; flex-direction: column; align-items: center; justify-content: center; }
+  .cover h1 { font-size: 2.2em; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin-bottom: 0.1em; }
+  .cover .subtitle { font-size: 1.0em; color: var(--muted); font-weight: 300; margin-bottom: 1.5em; }
+  .cover .meta { font-size: 0.7em; color: var(--muted); line-height: 1.8; }
+  .cover .meta span { display: inline-block; background: #f1f5f9; padding: 4px 14px; border-radius: 20px; margin: 3px 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; }
+  .divider { width: 60px; height: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); border: none; border-radius: 2px; margin: 8px 0 16px 0; }
+  .cover .divider { margin: 10px auto 20px auto; }
+  .tag { display: inline-block; font-size: 0.5em; font-weight: 500; padding: 2px 10px; border-radius: 12px; vertical-align: middle; margin-left: 8px; }
+  .tag-blue { background: #dbeafe; color: #1d4ed8; }
+  .tag-green { background: #d1fae5; color: #065f46; }
+  .tag-red { background: #fee2e2; color: #991b1b; }
+  .tag-yellow { background: #fef3c7; color: #92400e; }
+  .tag-purple { background: #ede9fe; color: #5b21b6; }
+  .items { list-style: none; padding: 0; margin: 0; }
+  .items li { position: relative; padding-left: 20px; margin-bottom: 6px; font-size: 0.7em; line-height: 1.6; word-break: keep-all; }
+  .items li::before { content: ''; position: absolute; left: 0; top: 9px; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); opacity: 0.6; }
+  .items li.check::before { background: var(--success); opacity: 1; border-radius: 50%; }
+  .items li.warn::before { background: var(--warning); opacity: 1; }
+  .items li.fail::before { background: var(--danger); opacity: 1; border-radius: 50%; }
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
+  .card-grid.three { grid-template-columns: 1fr 1fr 1fr; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .card h4 { margin: 0 0 5px 0; font-size: 0.7em; font-weight: 700; color: var(--fg); }
+  .card p, .card ul { margin: 0; font-size: 0.6em; line-height: 1.55; color: #475569; word-break: keep-all; }
+  .card ul { padding-left: 16px; }
+  .highlight-box { border-left: 4px solid; border-radius: 6px; padding: 10px 14px; margin: 8px 0; font-size: 0.7em; line-height: 1.6; word-break: keep-all; }
+  .highlight-box.blue { border-color: var(--accent); background: #eff6ff; }
+  .highlight-box.green { border-color: var(--success); background: #ecfdf5; }
+  .highlight-box.red { border-color: var(--danger); background: #fef2f2; }
+  .highlight-box.yellow { border-color: var(--warning); background: #fffbeb; }
+  .highlight-box.purple { border-color: var(--accent2); background: #f5f3ff; }
+  .reveal code { font-family: 'JetBrains Mono', monospace; font-size: 0.88em; background: #f1f5f9; padding: 1px 6px; border-radius: 4px; color: var(--accent2); }
+  .reveal table { width: 100%; border-collapse: collapse; font-size: 0.6em; margin-top: 8px; table-layout: fixed; }
+  .reveal table th { background: #f8fafc; font-weight: 600; text-align: left; padding: 6px 10px; border-bottom: 2px solid var(--border); color: var(--muted); font-size: 0.88em; text-transform: uppercase; letter-spacing: 0.05em; }
+  .reveal table td { padding: 6px 10px; border-bottom: 1px solid var(--border); line-height: 1.45; word-break: keep-all; }
+  .reveal table tr:last-child td { border-bottom: none; }
+  .reveal table .ok { color: var(--success); font-weight: 600; }
+  .reveal table .ng { color: var(--danger); font-weight: 600; }
+  .reveal table .mid { color: var(--warning); font-weight: 600; }
+  @media print { .reveal .slides section { page-break-after: always; } }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- COVER -->
+<section class="cover">
+  <h1>DeepSeek-V4 Optimization Sprint</h1>
+  <p class="subtitle">verify-graph reuse infra · GPU-bound characterization · honest ceiling · v1.8.0 release</p>
+  <hr class="divider">
+  <div class="meta">
+    <span>2026-06-13</span>
+    <span>DeepSeek-V4-Flash IQ2_XS-XL</span>
+    <span>GB10 · 128GB</span>
+    <br>
+    <span>#7 landed · #8 rejected</span>
+    <span>#1 infra (correct · flag-off)</span>
+    <span>#2 abandoned (measured)</span>
+    <span>v1.8.0 released</span>
+    <span>AmesianX</span>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section>
+  <h2>Session Overview</h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>Goal</h4>
+      <p>DSV4 optimization sprint #1-14. Accelerate the MTP round via verify-graph reuse (<strong>+20-30% expected</strong>).</p>
+    </div>
+    <div class="card">
+      <h4>Outcome</h4>
+      <p>Measurement flipped the premise — <strong>graph reuse is not the bottleneck</strong>. DSV4 is at a memory-bound ceiling. v1.8.0 released.</p>
+    </div>
+    <div class="card">
+      <h4>Key finding</h4>
+      <p>#1 is mathematically correct but <strong>off the critical path</strong>. Matmul ~52% near the LPDDR ceiling. Realistic envelope ~single-digit %.</p>
+    </div>
+    <div class="card">
+      <h4>Deliverables</h4>
+      <p>#7 committed, #1 infra (flag-off), 5-angle review, v1.8.0 release, 4 READMEs, <code>merge -s ours</code>.</p>
+    </div>
+  </div>
+</section>
+
+<!-- SPRINT RESULTS -->
+<section>
+  <h2>Optimization Sprint #1-14 Results <span class="tag tag-blue">measurement-driven</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:26%"><col style="width:22%"><col style="width:52%"></colgroup>
+    <tr><th>Item</th><th>Status</th><th>Notes</th></tr>
+    <tr><td>#7 wq_b q8_0 small_k</td><td class="ok">landed</td><td>bit-identical (764/764), marginal — memory-bound</td></tr>
+    <tr><td>#8 iq2_xs occupancy</td><td class="ng">rejected</td><td><code>minBlocks=8</code> no-op (REG stayed 80, compiler ignored)</td></tr>
+    <tr><td>#1 verify-graph reuse</td><td class="mid">infra · flag-off</td><td>mathematically correct (proven), ~0 gain alone</td></tr>
+    <tr><td>#2 multi-slot cache</td><td class="ng">abandoned</td><td>measured: build is off critical path → useless</td></tr>
+    <tr><td>#3-#5 (MTP CPU)</td><td>held</td><td>mostly hidden behind the GPU (low ROI)</td></tr>
+    <tr><td>#6/#9-#14 (kernels)</td><td>held</td><td>matmul memory-bound / shuffle structural → ceiling</td></tr>
+  </table>
+  <div class="highlight-box blue">
+    The sprint's real value was <strong>"blocking a dead end"</strong> — a high-risk framework change (#2) <strong>pre-empted by measurement</strong>.
+  </div>
+</section>
+
+<!-- #1 DEBUG -->
+<section>
+  <h2>#1 Debug: It Was Not a Bug <span class="tag tag-green">resolved</span></h2>
+  <hr class="divider">
+  <div class="highlight-box yellow">
+    flag-ON greedy diverged — SHA <code>aac34a0</code> vs baseline <code>a56fd72</code>, first split at token ~8 (abs pos ~21). <strong>A topology change, yet the output differed.</strong>
+  </div>
+  <table>
+    <colgroup><col style="width:42%"><col style="width:24%"><col style="width:34%"></colgroup>
+    <tr><th>bisection experiment</th><th>result</th><th>conclusion</th></tr>
+    <tr><td>flag-ON + NO_KREUSE (reuse off only)</td><td class="ng">still diverges</td><td>the BUILD, not reuse</td></tr>
+    <tr><td>+ RAWVIEW (force raw compressed-view)</td><td class="ok">baseline bit-identical</td><td>compressor·cache scatter·masks <strong>bit-perfect</strong></td></tr>
+  </table>
+  <div class="highlight-box green">
+    <strong>Root cause</strong>: the <strong>256-padded view</strong> required for reuse only perturbs the flash-attn online-softmax <strong>fp-accumulation order</strong> → flips a near-tie argmax. Not a logic bug → must be perplexity-gated.
+  </div>
+</section>
+
+<!-- PIVOT -->
+<section>
+  <h2>⛔ PIVOT: Graph Reuse Is Not the Bottleneck <span class="tag tag-red">measured</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:46%"><col style="width:26%"><col style="width:28%"></colgroup>
+    <tr><th>config (same prompt)</th><th>graphs reused</th><th>t/s</th></tr>
+    <tr><td>reuse fully OFF (rebuild every step)</td><td>0</td><td class="mid">19.80</td></tr>
+    <tr><td>reuse ON (single-slot)</td><td>16</td><td class="mid">19.83</td></tr>
+  </table>
+  <div class="highlight-box red">
+    Rebuilding every step costs ~0. <strong>Graph build overlaps the async GPU compute</strong> (the next graph builds on CPU while the GPU runs the current one) → <strong>off the critical path</strong>. Reuse only frees CPU work already hidden.
+  </div>
+  <div class="highlight-box blue">
+    Result: <strong>abandon #2</strong>; #1 is correct but kept flag-off. The real bottleneck is the <strong>target verify GPU pass (~25ms/round)</strong>.
+  </div>
+</section>
+
+<!-- GPU PROFILE -->
+<section>
+  <h2>GPU Profile: DSV4 Is Memory-Bound <span class="tag tag-purple">DSV4_KERNEL_PROF</span></h2>
+  <hr class="divider">
+  <table>
+    <colgroup><col style="width:50%"><col style="width:16%"><col style="width:34%"></colgroup>
+    <tr><th>GPU op class</th><th>share</th><th>headroom</th></tr>
+    <tr><td>MoE expert matvec (IQ2_XS, 256 experts) + dense attn projections (Q8_0)</td><td class="ng">~52%</td><td>near LPDDR ceiling — fusion saves launch only</td></tr>
+    <tr><td>data-shuffle (CPY/CONT/GET·SET_ROWS/CONCAT)</td><td class="mid">~19%</td><td>the real headroom, but structural (each op tiny)</td></tr>
+    <tr><td>flash-attention (D=512 compressed KV)</td><td class="ok">~2.3%</td><td>negligible — the compressed-KV design works</td></tr>
+  </table>
+  <div class="highlight-box yellow">
+    The matmuls read quantized weights from LPDDR every token → past that wall lies only <strong>fewer bytes (a quality trade)</strong>, not kernel fusion. Attention at 2.3% proves the <strong>compressed-KV design works</strong>.
+  </div>
+</section>
+
+<!-- JITTER -->
+<section>
+  <h2>Why the t/s Jitters <span class="tag tag-blue">23 → 16 → 19</span></h2>
+  <hr class="divider">
+  <div class="highlight-box purple">
+    <strong>t/s = (tokens accepted per MTP round) / (round time)</strong>. Round time ≈ constant (<code>~25ms</code>, target verify GPU pass); tokens-per-round swing 1→3 with the <strong>acceptance rate (96-100%)</strong>.
+  </div>
+  <ul class="items">
+    <li class="check"><strong>Acceptance variance (dominant)</strong> — predictable spans (lists, common phrasing) accept↑ → ~20 t/s; novel content (numbers, names) → ~16. Sentence-to-sentence swing = the <strong>nature</strong> of speculative decoding, not a bug.</li>
+    <li class="check"><strong>Context-growth drift</strong> — KV grows → round time creeps up. Step-jump at 256-multiple boundaries.</li>
+    <li class="check"><strong>Metric conflation</strong> — 23 (peak) / 16 (essay aggregate, incl. prompt-eval) / 19 (recent window) have different denominators.</li>
+  </ul>
+</section>
+
+<!-- CODE REVIEW -->
+<section>
+  <h2>Final Code Review <span class="tag tag-green">5 angles · 0 live bugs</span></h2>
+  <hr class="divider">
+  <div class="card-grid">
+    <div class="card">
+      <h4>Correctness</h4>
+      <p>0 live bugs in the flag-off path. Findings all reduce to validated-pattern reuse / flag-off latent fragility.</p>
+    </div>
+    <div class="card">
+      <h4>Fix applied</h4>
+      <p>Added the <strong>fp-divergence hazard comment</strong> at the getenv site (the warning lived only in .md).</p>
+    </div>
+    <div class="card">
+      <h4>Hygiene</h4>
+      <p>Diagnostics (NO_KREUSE/RAWVIEW) confirmed removed. mmvq <code>&lt;=</code> is type-global (comment understates scope).</p>
+    </div>
+    <div class="card">
+      <h4>Residual debt</h4>
+      <p><strong>Load-bearing invariants undocumented</strong> (verify-pos contiguity, attn==index n_comp) — assert them if #1 is ever enabled.</p>
+    </div>
+  </div>
+</section>
+
+<!-- GIT + RELEASE -->
+<section>
+  <h2>Git Work + v1.8.0 Release</h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="check"><strong>FF-merge main (27 commits) + push origin</strong> — full DSV4 port + session work, no merge commit, clean.</li>
+    <li class="check"><strong>Delete feat/deepseek4</strong> — local + remote (after confirming main..branch = 0).</li>
+    <li class="check"><strong>Create v1.8.0 release</strong> — moved tag to current main + GitHub release (Latest). The workflow clobbers binaries onto the latest <strong>release</strong>.</li>
+    <li class="check"><strong>Upstream fringe <code>merge -s ours</code></strong> — 8 commits (we're ahead, 2287 vs 1392 lines) recorded as merged with 0 lines of code → clears the "behind by 8" warning.</li>
+    <li class="check"><strong>4 README updates</strong> (root+turboquant × EN+KO) — production perf + memory-bound characterization.</li>
+    <li class="check"><strong>CI hygiene</strong> — on change, all-stop (cancel) → run the final build fresh. restore.sh canonical check = no-op.</li>
+  </ul>
+</section>
+
+<!-- MISSTEPS -->
+<section>
+  <h2>Missteps <span class="tag tag-yellow">retrospective</span></h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="fail"><strong>Over-framed the PIVOT as "abandon the sprint"</strong> — measurement only killed #2, yet I reported as if folding everything. User reminded me of the "apply all 14" commitment; corrected.</li>
+    <li class="fail"><strong>Zombie monitor preserving the old build</strong> — tried to keep the a4ab90b6c build alive. A CI-hygiene violation → fixed with all-stop + fresh, saved to memory.</li>
+    <li class="fail"><strong>#1 add/add 700-line debugging</strong> — static analysis couldn't catch it; only the NO_KREUSE→RAWVIEW runtime bisection pinned it to fp-order. Should have isolated sooner.</li>
+    <li class="fail"><strong>Release-vs-tag confusion risk</strong> — the workflow targets the latest <strong>release</strong>, but no v1.8.0 release existed → binaries were one step from landing on v1.7.0. Caught beforehand.</li>
+    <li class="fail"><strong>fringe merge add/add conflict</strong> — almost regressed our 2287 lines down to 1392. User's warning + a dry-run blocked it just in time; selective port (= nothing to port).</li>
+  </ul>
+</section>
+
+<!-- LESSONS -->
+<section>
+  <h2>Key Lessons</h2>
+  <hr class="divider">
+  <ul class="items">
+    <li class="check"><strong>Measure before implementing</strong> — pre-empted the high-risk #2 change with data. Blocked the "touched it but it didn't go up" trap.</li>
+    <li class="check"><strong>Graph build overlaps async GPU = off critical path</strong> — CPU-side optimizations (#1-#5) can't lift a GPU-bound decode.</li>
+    <li class="check"><strong>Topology change ≠ bit-identical</strong> — a padded view changes fp-accumulation order. Even "math unchanged" makes bit-identity too strict → judge by perplexity.</li>
+    <li class="check"><strong>CI hygiene: all-stop → run the final build fresh</strong> — never preserve in-flight builds. Prevents zombies / queue pollution.</li>
+    <li class="check"><strong><code>merge -s ours</code></strong> — a superior fork reconciles upstream divergence with 0 lines. Only real merges need the workflow-restore.</li>
+    <li class="check"><strong>Memory-bound → only quant/expert count is a lever</strong> — matmul 52% is the LPDDR wall; kernel fusion saves launch overhead only.</li>
+  </ul>
+</section>
+
+<!-- NEXT -->
+<section>
+  <h2>Next Steps <span class="tag tag-blue">real levers only</span></h2>
+  <hr class="divider">
+  <div class="card-grid three">
+    <div class="card">
+      <h4>#6 gate+up fusion (gguf repack)</h4>
+      <p>Offline-concat iq2_xs gate+up → loader auto-picks it up. <strong>~2-3%</strong> (memory-bound, launch only). 80GB file.</p>
+    </div>
+    <div class="card">
+      <h4>#11 compressor shuffle fusion</h4>
+      <p>Recover half of the 18.6% shuffle. High-risk, single-digit %. Custom fused kernel.</p>
+    </div>
+    <div class="card">
+      <h4>Quality trade-off</h4>
+      <p>Fewer experts / lower quant. Big t/s gain possible but model-quality cost. User's call.</p>
+    </div>
+    <div class="card">
+      <h4>Assert on #1 enable</h4>
+      <p>Pin the verify-pos contiguity / attn==index n_comp invariants with asserts + a perplexity gate.</p>
+    </div>
+    <div class="card">
+      <h4>Draft sampler</h4>
+      <p>~6.4ms/round (129k vocab) is high for greedy — inspect the CPU/sampler path.</p>
+    </div>
+    <div class="card">
+      <h4>Accept the ceiling</h4>
+      <p>DSV4 is at its practical compute ceiling on GB10. Realistic envelope single-digit %.</p>
+    </div>
+  </div>
+</section>
+
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>Reveal.initialize({ hash:true, slideNumber:'c/t', width:1280, height:720, margin:0, transition:'fade', transitionSpeed:'fast' });</script>
+</body>
+</html>
