@@ -19,11 +19,26 @@
 |------|---------|------|
 | baseline (f16 KV) | 13.4 | ds4 엔진(13.75)의 97% |
 | + MTP (`--spec-type draft-mtp --spec-draft-p-min 0.75 --spec-draft-n-max 2`) | **15.5 (자유 텍스트) / 17.0 (규칙적 텍스트)** | **+15% / +27%**, accept 98–100% |
+| + MTP + **tbq3 KV** (프로덕션) | **~16–20** (수용률 기반, 아래 참조) | accept 96–100%; tbq3 = KV 메모리 절약(동등 품질), DSV4에서 속도 레버는 아님 |
 
 - **MTP 헤드는 별도 GGUF로 배포됨** — `turboquant/ds4_mtp_to_shard.py`가 `mtp.0.*` 텐서를 `blk.43.nextn.*`로 리네임해 **3번째 split shard**로 변환하고 shard1의 `split.count`를 in-place 패치(6바이트, `--revert` 지원)합니다. 82GB 메인 shard 재양자화 불필요.
 - **draft 헤드의 hidden 입력 = full hyper-connection 상태** (`n_embd_h = n_hc·n_embd = 16384`). 새 `llama_model_n_embd_h()` API로 pre-norm 버퍼/MTP 배치 폭/draft-mtp impl에 배관. **p_min 게이트 필수**: 게이트 없이는 accept 69%로 떨어져 verify+체크포인트 비용이 이득을 역전(baseline보다 느려짐).
 - **`-ctk tbq3 -ctv tbq3`가 DSV4에서 동작** — global(ratio==0) 레이어가 TBQ3_0 @ head_dim 512 (GLM-4.7-Flash 512 커널 재활용), SWA·compressed 사이드 캐시는 품질 정책상 f16 유지. dim≥1 양자화 CUDA concat 추가.
 - **버그픽스:** DSV4 compressed-KV state 복원이 raw 호스트 read를 사용 — ON_DEVICE 체크포인트(스펙 롤백)에서 스트림 어긋남. `read_tensor`로 수정.
+
+#### 성능 특성 (GB10 실측, 프로덕션 설정)
+
+프로덕션 설정은 `-ctk tbq3 -ctv tbq3 --spec-type draft-mtp --spec-draft-p-min 0.75 --spec-draft-n-max 2`. 실측 디코드는 **~16–20 tok/s이고 본질적으로 들쭉날쭉**합니다 — 불안정이 아니라 *수용률 기반*: `t/s = (MTP 라운드당 수용 토큰) / (라운드 시간)`. 라운드 시간은 거의 일정(**~25 ms**, 타깃 verify GPU 패스가 지배)이고, 라운드당 토큰 수가 draft 수용률(실측 **96–100%**)에 따라 1→3으로 출렁입니다. 수용률은 현재 텍스트의 예측가능성에 비례 — 예측 쉬운 구간(리스트·흔한 구문)은 ~20 t/s, 새로운 내용(숫자·고유명사)은 ~16으로 하락. essay 집계(프롬프트 eval 포함)는 ~16, 순간 피크는 ~20–23. 이 폭은 투기적 디코딩의 본질이지 회귀가 아닙니다.
+
+전체 op별 GPU 프로파일(`DSV4_KERNEL_PROF`)은 **DSV4 디코드가 메모리-바운드**(GB10 LPDDR 대역폭 한계 근처)임을 보여줍니다:
+
+| GPU op 클래스 | 비중 | 헤드룸 |
+|---|---|---|
+| MoE expert matvec (IQ2_XS, 256 expert) + dense 어텐션 투영 (Q8_0) | **~52%** | LPDDR 한계 근처 — gate+up 융합해도 런치 오버헤드만 절약, **읽는 바이트는 동일** |
+| 데이터 셔플 (CPY / CONT / GET_ROWS / SET_ROWS / CONCAT — 압축기 state recurrence + hyper-connection expand) | **~19%** | 진짜 헤드룸이나 대부분 구조적 (각 op이 작고 필요) |
+| Flash-attention (D=512 압축 KV) | **~2.3%** | 무시 — 압축 KV 설계가 잘 작동 |
+
+matmul은 매 토큰 LPDDR에서 양자화 weight를 읽습니다. 그 벽 너머는 오직 바이트를 덜 읽는 것(더 낮은 quant / expert 수 = 품질 트레이드오프)뿐, 커널 융합이 아닙니다. 그래프 재빌드는 **임계경로 밖**으로 측정됨 — async GPU 컴퓨트와 오버랩(graphs-reused ON vs OFF: 19.83 vs 19.80 t/s) — 그래서 이번 릴리스의 **verify-graph phase-uniform 재사용 인프라는 정확하지만 기본 OFF**(`DSV4_VERIFY_REUSE`; raw 압축 뷰에서 chunk 경로와 비트-동일, 재사용에 필요한 256-pad 뷰가 flash-attn fp 누적 순서만 교란 → perplexity 게이트 필요, 단독 이득 ~0 t/s)입니다. 정직한 결론: **DSV4는 이 quant에서 GB10의 실용적 컴퓨트 한계에 있고, 현실적 최적화 여지는 한 자릿수 %이며 그것도 matmul이 아닌 ~19% 데이터 셔플에 있습니다.**
 
 ### v1.7.0 — TriAttention 통합 + attn_rot_k 중복 회전 제거
 

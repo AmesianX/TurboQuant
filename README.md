@@ -21,11 +21,26 @@
 |------|---------|-------|
 | baseline (f16 KV) | 13.4 | 97% of the ds4 engine (13.75) |
 | + MTP (`--spec-type draft-mtp --spec-draft-p-min 0.75 --spec-draft-n-max 2`) | **15.5 (free text) / 17.0 (regular text)** | **+15% / +27%**, accept 98–100% |
+| + MTP + **tbq3 KV** (production) | **~16–20** (acceptance-driven, see below) | accept 96–100%; tbq3 = KV-memory saving at parity quality (not a speed lever for DSV4) |
 
 - **The MTP head ships as a separate GGUF** — `turboquant/ds4_mtp_to_shard.py` renames the `mtp.0.*` tensors to `blk.43.nextn.*`, emits them as a **third split shard**, and patches shard 1's `split.count` in place (6 bytes, `--revert` supported). No requantization of the 82GB main shards.
 - **The draft head consumes the full hyper-connection state** (`n_embd_h = n_hc·n_embd = 16384`) as its hidden input — plumbed via the new `llama_model_n_embd_h()` API through the pre-norm buffers, the MTP batch width, and the draft-mtp impl. **The p_min gate is mandatory**: without it acceptance drops to 69% and verify+checkpoint overhead makes it slower than baseline.
 - **`-ctk tbq3 -ctv tbq3` works on DSV4** — global (ratio==0) layers get TBQ3_0 @ head_dim 512 (reusing the GLM-4.7-Flash 512 kernels); the SWA and compressed side caches stay f16 by quality policy. Quantized CUDA concat added for dim≥1.
 - **Bugfix:** DSV4 compressed-KV state restore used raw host reads — desynced ON_DEVICE checkpoints (speculative rollback). Now `read_tensor`.
+
+#### Performance characterization (measured on GB10, production config)
+
+Production config is `-ctk tbq3 -ctv tbq3 --spec-type draft-mtp --spec-draft-p-min 0.75 --spec-draft-n-max 2`. Measured decode is **~16–20 tok/s, and inherently jittery** — not unstable, but *acceptance-driven*: `t/s = (tokens accepted per MTP round) / (round time)`. Round time is roughly constant (**~25 ms**, dominated by the target verify GPU pass); tokens-per-round swing 1→3 with the draft acceptance rate (measured **96–100%**), which tracks how predictable the current text is. Predictable spans (lists, common phrasing) hit ~20 t/s; novel content (numbers, names) dips toward ~16. Essay-aggregate (prompt-eval included) lands ~16; instantaneous peaks reach ~20–23. The spread is the nature of speculative decoding, not a regression.
+
+A full per-op GPU profile (`DSV4_KERNEL_PROF`) shows **DSV4 decode is memory-bound**, near the GB10 LPDDR bandwidth ceiling:
+
+| GPU op class | Share | Headroom |
+|---|---|---|
+| MoE expert matvec (IQ2_XS, 256 experts) + dense attention projections (Q8_0) | **~52%** | near LPDDR ceiling — fusing gate+up saves launch overhead only, **not bytes read** |
+| Data-shuffle (CPY / CONT / GET_ROWS / SET_ROWS / CONCAT — from the compressor state recurrence + hyper-connection expand) | **~19%** | the real headroom, but mostly structural (each op tiny and necessary) |
+| Flash-attention (D=512 compressed KV) | **~2.3%** | negligible — the compressed-KV design works |
+
+The matmuls read quantized weights from LPDDR every token; past that wall lies only fewer bytes (smaller quant / fewer experts = a quality trade), not kernel fusion. Graph rebuild was measured to be **off the critical path** — it overlaps the async GPU compute (graphs-reused ON vs OFF: 19.83 vs 19.80 t/s) — so the **verify-graph phase-uniform reuse infra shipped this release is correct but OFF by default** (`DSV4_VERIFY_REUSE`; it is bit-identical to the chunk path under a raw compressed-view, the 256-padded view it needs for reuse only perturbs flash-attn fp-accumulation order, so it must be perplexity-gated, and it gains ~0 t/s alone). Honest conclusion: **DSV4 on GB10 is at its practical compute ceiling for this quant; the realistic optimization envelope is single-digit %, and it lives in the ~19% data-shuffle, not the matmuls.**
 
 ### v1.7.0 — TriAttention Integration + attn_rot_k Duplicate Rotation Cleanup
 
