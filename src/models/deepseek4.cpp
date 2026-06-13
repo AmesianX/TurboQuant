@@ -1443,6 +1443,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 // reservation) must stay on _chunk or they overflow the graph context (GGML_ASSERT
                 // obj_new). Measured verify widths are {1..4}; 16 leaves headroom and excludes 512.
                 static const int64_t DSV4_VERIFY_MAX = 16;
+                // ⚠ DO NOT enable DSV4_VERIFY_REUSE in production without a PERPLEXITY gate. The uniform-K
+                // verify path is MATHEMATICALLY CORRECT (proven bit-identical to the chunk path under a raw
+                // compressed-view) but the 256-padded view it REQUIRES for reuse changes the flash-attn
+                // online-softmax fp-accumulation ORDER, which flips a near-tie greedy argmax ~8 tokens in.
+                // It is NOT greedy-bit-identical to the default path. Measurement also showed graph reuse is
+                // off the critical path (build overlaps async GPU), so enabling this gains ~0 t/s alone — it
+                // needs the (abandoned) multi-slot cache to matter. Kept as validated infra, default OFF.
+                // See turboquant/DSV4_PERF_STATUS.md #1 + PIVOT.
                 static const bool dsv4_verify_reuse = getenv("DSV4_VERIFY_REUSE") != nullptr;
                 const bool    uniform  = (n_tokens == 1) ||
                         (dsv4_verify_reuse && n_tokens > 1 && n_tokens <= DSV4_VERIFY_MAX &&
