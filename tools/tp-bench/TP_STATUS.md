@@ -54,3 +54,43 @@ libnccl via LD_LIBRARY_PATH for both ranks).
 - Reuse launch_ddp.sh env: NCCL_SOCKET_IFNAME=enp1s0f0np0, do NOT set NCCL_IB_DISABLE.
 
 ## Next: M1.0 = align NCCL versions, then ncclCommInitRank SPMD prototype.
+
+## M1.0 COMPLETE (verified)
+- Source rsynced .66->.67 (NOTE: do NOT `--exclude 'models/'` — it wrongly matches
+  src/models/, dropping dflash.cpp -> llama_model_dflash link error. Use only
+  *.gguf / build/ / .git / *.o / *.so excludes).
+- After source change on .67, MUST `cmake .` (reconfigure) before build, else stale
+  generated Makefiles omit new src/models/*.cpp -> "undefined reference to vtable".
+- NCCL aligned to 2.30.7 on both via ~/nccl-align (LD_LIBRARY_PATH at launch; system
+  untouched). VERIFIED: C-NCCL all-reduce cross-node, all sizes, ~26us@16KB. The
+  earlier torch "16384 hang" was a torch/NCCL-2.28.9 artifact, NOT a transport limit.
+- llama-server builds on BOTH boxes from the synced source.
+
+## M1 DESIGN (the crux: SPMD-ify the meta-backend)
+ggml-backend-meta.cpp implements TP as SINGLE-PROCESS over N local `simple_devs`:
+splits each weight along an axis into N slices (get_split_state callback), allocates
+all N locally, computes, and AllReduces across the local devices (ggml-cuda comm_init
+-> ncclCommInitAll, single process). GB10 = 1 GPU/node, so this can't span nodes.
+
+SPMD conversion = DECOUPLE "logical world size N / my rank R" from "local devices (1)":
+1. comm_init SPMD path (ggml-cuda.cu ~1361): when env GGML_TP_NRANKS>1, use
+   ncclCommInitRank(comm, NRANKS, uniqueId, RANK) instead of ncclCommInitAll. Bootstrap
+   uniqueId: rank0 ncclGetUniqueId -> TCP send to peers (reuse nccl_ar_bench exchange),
+   others recv. comms={1}. try_allreduce_nccl already loops comms -> 1 ncclAllReduce on
+   the single local tensor = cross-rank sum. (verified transport.)
+2. meta-device: build with simple_devs=[local GPU] but split_state n_devices=NRANKS;
+   rank R materializes ONLY slice R locally (loader writes its slice), other slices are
+   remote. The local partial is AllReduced cross-rank. Requires meta-backend to alloc/
+   compute only the local slice (today it does all N). KEY CHANGE.
+3. model loader (llama-model.cpp): tensor_split + set_tensor must write rank R's slice
+   to the local device only. The split math (tensor_split_scan, ~636) already computes
+   per-slice ne; thread global rank through.
+4. server launch: SPMD = 2 processes (one/node), env GGML_TP_RANK/NRANKS/MASTER_ADDR/
+   PORT (+ LD_LIBRARY_PATH=~/nccl-align, NCCL_SOCKET_IFNAME=enp1s0f0np0). rank0 owns
+   tokenizer/sampling/HTTP; rank1 is a compute follower in the decode loop.
+   -> needs a follower run-loop on rank!=0 (no HTTP) driven by the same graph.
+
+RISK: this is a real reimplementation of the execution model (single-process ->
+SPMD), not a small patch. Proceed incrementally: (M1a) comm_init SPMD + a standalone
+2-proc allreduce test through ggml; (M1b) meta-device local-slice-only; (M1c) loader;
+(M1d) follower loop. Search upstream/NCCL docs at each blocker (user directive).
