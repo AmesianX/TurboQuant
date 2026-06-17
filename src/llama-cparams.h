@@ -30,6 +30,7 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_pre_norm;        // also extract the hidden state before the final output norm
     bool embeddings_pre_norm_masked; // extract for only rows where batch.logits != 0
+    bool dflash_capture;             // DFlash: emit stacked n_hc-collapsed hc_ffn_post at target layers (in-graph, no eval cb)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

@@ -918,6 +918,8 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_dflash_feat = nullptr;
+    t_dflash_layers.clear();
 
     params = {};
 

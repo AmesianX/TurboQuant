@@ -3143,6 +3143,23 @@ private:
                 batch.logits   + i,
             };
 
+            {
+                static const bool dbg_bv = getenv("DFLASH_BV") != nullptr;
+                if (dbg_bv) {
+                    int no = 0;
+                    for (int z = 0; z < n_tokens; ++z) no += batch_view.logits[z] ? 1 : 0;
+                    std::string st;
+                    for (auto & s : slots) {
+                        if (!s.is_processing()) continue;
+                        char b[64];
+                        snprintf(b, sizeof(b), " slot%d[state=%d draft=%zu npr=%d]",
+                                 s.id, (int) s.state, s.spec_draft.size(), s.prompt.n_tokens());
+                        st += b;
+                    }
+                    fprintf(stderr, "DFLASH_BV n_tokens=%d n_outputs=%d pos0=%d |%s\n",
+                            n_tokens, no, (int) batch_view.pos[0], st.c_str());
+                }
+            }
             const int ret = llama_decode(ctx_tgt, batch_view);
 
             metrics.on_decoded(slots);

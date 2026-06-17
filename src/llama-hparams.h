@@ -69,6 +69,11 @@ struct llama_hparams {
 
     uint32_t n_shortconv_l_cache  = 0;
 
+    // dflash drafter
+    std::array<int32_t, 5> dflash_target_layer_ids = {};
+    uint32_t dflash_block_size    = 16;
+    uint32_t dflash_mask_token_id = 0;
+
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;

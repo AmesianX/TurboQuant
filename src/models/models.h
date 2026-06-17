@@ -1931,3 +1931,26 @@ struct llama_model_step35 : public llama_model_base {
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
+
+// DFlash drafter (block-diffusion speculative decoding). Graph bodies in src/models/dflash.cpp.
+// encode: fuse target hidden (fc + hidden_norm) -> target_ctx. decode: noise block + KV-injected
+// target_ctx -> predict whole block in one pass (bidirectional). Called from the DFlash spec impl.
+struct llm_build_dflash_encode : public llm_graph_context {
+    llm_build_dflash_encode(const llama_model & model, const llm_graph_params & params);
+private:
+    ggml_tensor * build_inp_embd() const;
+};
+
+struct llm_build_dflash_decode : public llm_graph_context {
+    llm_build_dflash_decode(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llama_model_dflash : public llama_model_base {
+    llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // build_arch_graph returns the DECODE graph; the spec impl builds ENCODE separately to refresh
+    // target_ctx after each accepted block.
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};

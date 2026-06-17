@@ -571,6 +571,12 @@ struct llama_model {
     struct ggml_tensor * output_hc_scale = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
+    // dflash drafter: feature-fusion fc, hidden norm, shared target embed/lm_head
+    struct ggml_tensor * fc                 = nullptr;
+    struct ggml_tensor * dflash_hidden_norm = nullptr;
+    struct ggml_tensor * target_tok_embd    = nullptr;
+    struct ggml_tensor * target_output      = nullptr;
+
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;

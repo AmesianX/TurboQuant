@@ -166,6 +166,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash block-diffusion drafter (single-pass block draft)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -361,10 +362,20 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        // Both MTP and DFlash partial-accept and use the recurrent rollback PLANES (n_rs_seq) instead
+        // of the O(context) per-round checkpoint save/restore. The DSV4 compress-state snapshot
+        // (dsv4_store_rollback_planes) is verified to roll back correctly. [TAG_DFLASH_2DECODE]
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP
+                || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
         });
 
+        // NOTE: DFlash also partial-accepts and would benefit from n_rs_seq=draft.n_max (1 target
+        // forward/round instead of 2). TRIED IT (+ DEEPSEEK4 in llm_arch_supports_rs_rollback): the
+        // 2nd verify DID vanish (1 decode/round) but output broke (empty, accept 37%->6%) — DSV4's
+        // recurrent compress-state graph does NOT write the per-token rollback snapshots that QWEN35
+        // does, so rollback reads stale state. REAL FIX = teach DSV4's compress-state graph to write
+        // rs_idx-addressed snapshots (mirror QWEN35), THEN re-enable both. [TAG_DFLASH_2DECODE]
         return needs_rs_seq ? draft.n_max : 0u;
     }
 };

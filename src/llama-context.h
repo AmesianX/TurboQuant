@@ -114,6 +114,19 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // inject cross-attention context embeddings (host copy) — used by the DFlash drafter to
+    // feed the raw stacked target-layer features that its decode graph fuses (fc) into target_ctx.
+    void set_cross_embd(const float * data, int32_t n_embd, int32_t n_enc);
+
+    // set the per-node evaluation callback after context creation (DFlash uses it on ctx_tgt to
+    // capture hc_ffn_post at the drafter's target layers during normal target decode).
+    void set_eval_callback(ggml_backend_sched_eval_callback cb, void * user);
+
+    // DFlash: enable in-graph capture of stacked n_hc-collapsed hc_ffn_post (no per-op eval cb,
+    // so CUDA graphs stay enabled). Read back via dflash_feat after decode.
+    void set_dflash_capture(bool value);
+    const float * get_dflash_feat_host(int32_t * n_tokens, int32_t * dim);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -275,6 +288,22 @@ private:
     llama_adapter_loras_ptr loras;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+
+    // DFlash feature capture. dflash_raw = raw 5-layer hc_ffn_post read back async (NO sync — drained
+    // by the per-token sampling sync, like MTP). The n_hc SUM-collapse + stack happens lazily in
+    // get_dflash_feat_host (consumer side). dflash_feat = the collapsed result.
+    // IMPORTANT: the raw readback MUST land in a PINNED host buffer (buf_dflash). An async
+    // device->pageable-host copy silently falls back to a *synchronous* blocking copy in CUDA,
+    // which stalls the decode pipeline ~2x (the std::vector path measured 9.8 vs 19.8 t/s).
+    ggml_backend_buffer_ptr buf_dflash;     // pinned host buffer backing dflash_raw_ptr
+    float *  dflash_raw_ptr   = nullptr;    // base of pinned buffer (n_target*per floats)
+    size_t   dflash_raw_cap   = 0;          // capacity in floats currently allocated
+    std::vector<float> dflash_feat;
+    int32_t dflash_feat_dim      = 0;
+    int32_t dflash_feat_n_tokens = 0;
+    int32_t dflash_n_target      = 0;
+    int32_t dflash_ne            = 0;
+    int32_t dflash_nh            = 0;
 
     std::unique_ptr<llama_memory_i> memory;
 

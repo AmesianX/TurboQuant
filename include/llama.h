@@ -998,6 +998,22 @@ extern "C" {
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
+    // Inject cross-attention context embeddings from host memory (DFlash drafter: raw stacked
+    // target-layer features [n_embd, n_enc] that the decode graph fuses into target_ctx).
+    LLAMA_API void llama_set_cross_embd(struct llama_context * ctx, const float * data, int32_t n_embd, int32_t n_enc);
+
+    // Set the per-node eval callback after context creation (DFlash captures hc_ffn_post on ctx_tgt).
+    LLAMA_API void llama_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback cb, void * user_data);
+
+    // DFlash in-graph feature capture on the target context (no per-op eval cb -> CUDA graphs stay on).
+    // After each decode, read the stacked n_hc-collapsed hc_ffn_post via llama_get_dflash_feat.
+    LLAMA_API void          llama_set_dflash_capture(struct llama_context * ctx, bool value);
+    LLAMA_API const float * llama_get_dflash_feat(struct llama_context * ctx, int32_t * n_tokens, int32_t * dim);
+
+    // Wire the DFlash drafter (ctx_dft) to reuse the target model's token-embedding and lm_head
+    // tensors (the drafter gguf omits them). Call once after both models are loaded.
+    LLAMA_API void llama_set_dflash_target(struct llama_context * ctx_dft, const struct llama_context * ctx_tgt);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

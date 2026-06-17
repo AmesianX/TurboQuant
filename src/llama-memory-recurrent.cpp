@@ -183,6 +183,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
+                    { static const bool p = getenv("DFLASH_RBPROBE") && atoi(getenv("DFLASH_RBPROBE"));
+                      if (p) fprintf(stderr, "[RB set ] seq=%d rollback=%d (cell.pos=%d p0=%d)\n",
+                                     seq_id, (int) rollback, (int) cell.pos, (int) p0); }
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -1256,6 +1259,13 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
             idx = mem->rs_idx[seq];
             // reset rollback idx
             mem->rs_idx[seq] = 0;
+            { static const bool p = getenv("DFLASH_RBPROBE") && atoi(getenv("DFLASH_RBPROBE"));
+              static int n = 0, armed = 0;
+              if (p) {
+                  if (idx != 0) armed = 200;          // a rollback just happened: log the following reads
+                  if (armed > 0 && n < 4000) { armed--; n++;
+                      fprintf(stderr, "[RB read] seq=%d idx=%u cell_idx=%d\n", seq, idx, cell_idx); }
+              } }
         }
     }
     return (int32_t)(idx * mem->size) + src0;

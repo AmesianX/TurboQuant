@@ -68,6 +68,7 @@ llama_context::llama_context(
     cparams.embeddings                  = params.embeddings;
     cparams.embeddings_pre_norm         = false;
     cparams.embeddings_pre_norm_masked  = false;
+    cparams.dflash_capture              = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -1134,6 +1135,16 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_dflash_capture(bool value) {
+    if (cparams.dflash_capture == value) {
+        return;
+    }
+    cparams.dflash_capture = value;
+    // NOTE: the capture node is now built UNCONDITIONALLY in the DSV4 graph (deepseek4.cpp), so the
+    // reserve-time graph already contains it and graph reuse is safe — no need to disable reuse.
+    sched_need_reserve = true;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1145,6 +1156,24 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+void llama_context::set_cross_embd(const float * data, int32_t n_embd, int32_t n_enc) {
+    cross.n_embd = n_embd;
+    cross.n_enc  = n_enc;
+    cross.v_embd.resize((size_t) n_embd * n_enc);
+    memcpy(cross.v_embd.data(), data, (size_t) n_embd * n_enc * sizeof(float));
+    // single-sequence cross context — the DFlash decode graph uses full (maskless) attention,
+    // so the per-seq encoder mask is not consulted; still record seq 0 for completeness.
+    cross.seq_ids_enc.assign(1, std::set<llama_seq_id>{ 0 });
+}
+
+void llama_context::set_eval_callback(ggml_backend_sched_eval_callback cb, void * user) {
+    cparams.cb_eval           = cb;
+    cparams.cb_eval_user_data = user;
+    if (sched) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cb, user);
+    }
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -1498,6 +1527,21 @@ int llama_context::encode(const llama_batch & batch_inp) {
         const uint32_t n_embd = hparams.n_embd_h();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_pre_norm.size);
         ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
+    }
+
+    // extract DFlash stacked features (in-graph capture; replaces the per-op eval callback)
+    if (cparams.dflash_capture) {
+        auto * t_feat = res->get_dflash_feat();
+        if (t_feat) {
+            ggml_backend_t backend_f = ggml_backend_sched_get_tensor_backend(sched.get(), t_feat);
+            GGML_ASSERT(backend_f != nullptr);
+            const int64_t dim = t_feat->ne[0];
+            const int64_t nt  = t_feat->ne[1];
+            dflash_feat_dim      = (int32_t) dim;
+            dflash_feat_n_tokens = (int32_t) nt;
+            dflash_feat.resize((size_t) dim * nt);
+            ggml_backend_tensor_get_async(backend_f, t_feat, dflash_feat.data(), 0, (size_t) dim * nt * sizeof(float));
+        }
     }
 
     // TODO: hacky solution
@@ -1863,6 +1907,43 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
+        }
+
+        // extract DFlash features on the HOST (PR#22105 style). The target graph only marks the 5
+        // hc_ffn_post tensors as outputs (no extra graph ops); here we read them back and do the
+        // n_hc SUM-collapse + 5-layer stack on the CPU. Layout: [token][layer*n_embd] (fc input order).
+        if (cparams.dflash_capture) {
+            const auto & layers = res->get_dflash_layers();
+            if (!layers.empty()) {
+                const int     n_target = (int) layers.size();
+                const int64_t ne       = layers[0]->ne[0];   // n_embd
+                const int64_t nh       = layers[0]->ne[1];   // n_hc
+                const int64_t nt       = layers[0]->ne[2];   // n_tokens
+                dflash_n_target      = n_target;
+                dflash_ne            = (int32_t) ne;
+                dflash_nh            = (int32_t) nh;
+                dflash_feat_n_tokens = (int32_t) nt;
+                const size_t per   = (size_t) ne * nh * nt;
+                const size_t total = (size_t) n_target * per;
+                // (re)allocate the PINNED host buffer if it grew. Async device->pinned-host copies stay
+                // truly asynchronous; a pageable std::vector would force a synchronous blocking copy.
+                if (!buf_dflash || dflash_raw_cap < total) {
+                    auto * dev   = model.dev_output();
+                    auto * hbuft = dev ? ggml_backend_dev_host_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+                    if (!hbuft) hbuft = ggml_backend_cpu_buffer_type();
+                    buf_dflash.reset(ggml_backend_buft_alloc_buffer(hbuft, total * sizeof(float)));
+                    GGML_ASSERT(buf_dflash != nullptr);
+                    dflash_raw_ptr = (float *) ggml_backend_buffer_get_base(buf_dflash.get());
+                    dflash_raw_cap = total;
+                }
+                // async readback only — NO sync here. The per-token sampling sync (server) drains it
+                // before the consumer reads it. Collapse is deferred to get_dflash_feat_host.
+                for (int l = 0; l < n_target; ++l) {
+                    ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), layers[l]);
+                    GGML_ASSERT(be != nullptr);
+                    ggml_backend_tensor_get_async(be, layers[l], dflash_raw_ptr + (size_t) l * per, 0, per * sizeof(float));
+                }
+            }
         }
 
         // extract logits
@@ -3841,6 +3922,65 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_cross_embd(llama_context * ctx, const float * data, int32_t n_embd, int32_t n_enc) {
+    ctx->set_cross_embd(data, n_embd, n_enc);
+}
+
+void llama_set_eval_callback(llama_context * ctx, ggml_backend_sched_eval_callback cb, void * user_data) {
+    ctx->set_eval_callback(cb, user_data);
+}
+
+const float * llama_context::get_dflash_feat_host(int32_t * n_tokens, int32_t * dim) {
+    // NO synchronize() — the raw readback was queued in decode() and is drained by the per-token
+    // sampling sync (server), exactly like MTP's sync-free getter. Here we just do the cheap host
+    // SUM-collapse over n_hc + stack into [token][layer*n_embd]. (1-token lag is acceptable.)
+    const int     n_target = dflash_n_target;
+    const int64_t ne       = dflash_ne;
+    const int64_t nh       = dflash_nh;
+    const int64_t nt       = dflash_feat_n_tokens;
+    if (dflash_raw_ptr == nullptr || n_target == 0) {
+        if (n_tokens) *n_tokens = 0;
+        if (dim)      *dim      = 0;
+        return nullptr;
+    }
+    const int64_t featdim = (int64_t) n_target * ne;
+    const size_t  per     = (size_t) ne * nh * nt;
+    dflash_feat.resize((size_t) featdim * nt);
+    for (int l = 0; l < n_target; ++l) {
+        const float * lbase = dflash_raw_ptr + (size_t) l * per;
+        for (int64_t tok = 0; tok < nt; ++tok) {
+            float * dst = dflash_feat.data() + (size_t) tok * featdim + (size_t) l * ne;
+            const float * base = lbase + (size_t) tok * ne * nh;
+            for (int64_t e = 0; e < ne; ++e) {
+                float s = 0.0f;
+                for (int64_t h = 0; h < nh; ++h) s += base[(size_t) h * ne + e];
+                dst[e] = s;
+            }
+        }
+    }
+    dflash_feat_dim = (int32_t) featdim;
+    if (n_tokens) *n_tokens = (int32_t) nt;
+    if (dim)      *dim      = (int32_t) featdim;
+    return dflash_feat.data();
+}
+
+void llama_set_dflash_capture(llama_context * ctx, bool value) {
+    ctx->set_dflash_capture(value);
+}
+
+const float * llama_get_dflash_feat(llama_context * ctx, int32_t * n_tokens, int32_t * dim) {
+    return ctx->get_dflash_feat_host(n_tokens, dim);
+}
+
+void llama_set_dflash_target(llama_context * ctx_dft, const llama_context * ctx_tgt) {
+    // the drafter model object is non-const underneath (owned by the loader); the context only
+    // holds it by const ref, so const_cast here is well-defined.
+    llama_model       & dft = const_cast<llama_model &>(*llama_get_model(ctx_dft));
+    const llama_model & tgt = *llama_get_model(ctx_tgt);
+    dft.target_tok_embd = tgt.tok_embd;
+    dft.target_output   = tgt.output;
 }
 
 void llama_synchronize(llama_context * ctx) {

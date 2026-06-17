@@ -387,13 +387,42 @@ static void dsv4_store_state_segment(
         ggml_tensor  * dst,
         int64_t        state_size,
         int64_t        head,
-        int64_t        offset) {
+        int64_t        offset,
+        int64_t        mem_size   = 0,   // # of recurrent cells (plane stride); only needed if cache_slot>0
+        int64_t        cache_slot = 0) { // recurrent rollback snapshot plane (0 = current state)
     const int64_t n = ggml_nelements(src);
     src = ggml_cont(ctx, src);
     src = ggml_reshape_1d(ctx, src, n);
 
-    ggml_tensor * view = ggml_view_1d(ctx, dst, n, (head*state_size + offset)*ggml_element_size(dst));
+    const int64_t row = cache_slot * mem_size + head;
+    ggml_tensor * view = ggml_view_1d(ctx, dst, n, (row*state_size + offset)*ggml_element_size(dst));
     ggml_build_forward_expand(gf, ggml_cpy(ctx, src, view));
+}
+
+// Store recurrent ROLLBACK SNAPSHOT planes 1..min(n_rs_seq, n_tokens-1) for one state segment.
+// snaps = the per-token intermediate states s_1..s_{n_tokens} captured by the chunk compressor.
+// Plane r holds the compress-state "as of (n_tokens - r) tokens" = snaps[n_tokens-r-1], so that after
+// a partial draft acceptance, seq_rm(rollback=r) reads a valid older state instead of a 2nd target
+// verify. Plane 0 (current/final) is written by the normal dsv4_store_state_segment call. A rollback
+// can never exceed n_tokens-1 (>=1 token is always accepted), so k=n_tokens-r is always >=1 and every
+// readable plane is covered by this batch's intermediates — no cross-batch shifting needed.
+static void dsv4_store_rollback_planes(
+        ggml_context * ctx, ggml_cgraph * gf,
+        ggml_tensor  * r_dst, ggml_tensor * s_dst,
+        const std::vector<dsv4_state_pair> & snaps,
+        int64_t state_size, int64_t head, int64_t offset,
+        int64_t mem_size, int64_t n_rs_seq, int64_t n_tokens) {
+    const int64_t r_max = std::min<int64_t>(n_rs_seq, n_tokens - 1);
+    static const bool rbprobe = [](){ const char* e = getenv("DFLASH_RBPROBE"); return e && atoi(e); }();
+    if (rbprobe && head == 0 && offset == 0) {
+        fprintf(stderr, "[RB store] n_tokens=%lld n_rs_seq=%lld r_max=%lld\n",
+                (long long) n_tokens, (long long) n_rs_seq, (long long) r_max);
+    }
+    for (int64_t r = 1; r <= r_max; ++r) {
+        const dsv4_state_pair & s = snaps[(n_tokens - r) - 1]; // s_{n_tokens-r}
+        dsv4_store_state_segment(ctx, gf, s.kv,    r_dst, state_size, head, offset, mem_size, r);
+        dsv4_store_state_segment(ctx, gf, s.score, s_dst, state_size, head, offset, mem_size, r);
+    }
 }
 
 static void dsv4_store_cache_rows(
@@ -961,7 +990,8 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk(
         int64_t              compress_ratio,
         int                  rope_type,
         const dsv4_rope_cfg & rope_cfg,
-        float                norm_eps) {
+        float                norm_eps,
+        std::vector<dsv4_state_pair> * out_snaps = nullptr) {
     const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
 
     ggml_tensor * kv_all = ggml_mul_mat(ctx, wkv,   x); // [width, n_tokens]
@@ -999,6 +1029,8 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk(
         if (dec.kv_comp != nullptr) {
             kv_comp = kv_comp == nullptr ? dec.kv_comp : ggml_concat(ctx, kv_comp, dec.kv_comp, 2);
         }
+        // capture the post-token-i state (s_{i+1}) for recurrent rollback snapshots
+        if (out_snaps) out_snaps->push_back({ kv_state, score_state });
     }
 
     return { kv_state, score_state, kv_comp };
@@ -1030,7 +1062,8 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk_uniform(
         int64_t              compress_ratio,
         int                  rope_type,
         const dsv4_rope_cfg & rope_cfg,
-        float                norm_eps) {
+        float                norm_eps,
+        std::vector<dsv4_state_pair> * out_snaps = nullptr) {
     ggml_tensor * kv_state    = prev_kv_state;
     ggml_tensor * score_state = prev_score_state;
     ggml_tensor * kv_comp     = nullptr;
@@ -1053,6 +1086,8 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk_uniform(
         kv_state    = dec.kv_state;
         score_state = dec.score_state;
         kv_comp = kv_comp == nullptr ? dec.kv_comp : ggml_concat(ctx, kv_comp, dec.kv_comp, 2);
+        // capture the post-token-i state (s_{i+1}) for recurrent rollback snapshots
+        if (out_snaps) out_snaps->push_back({ kv_state, score_state });
     }
 
     return { kv_state, score_state, kv_comp };
@@ -1204,6 +1239,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     // the trailing NextN/MTP layer(s) are not part of the main decoder graph
     const int n_main_layers = n_layer - (int) hparams.nextn_predict_layers;
+
+    // DFlash in-graph feature capture: the set of target layers whose n_hc-collapsed hc_ffn_post is
+    // stacked into res->t_dflash_feat (avoids a per-op eval callback that would disable CUDA graphs).
+    static const std::set<int> dflash_layers = []{
+        std::set<int> s; const char * e = getenv("DFLASH_TARGET_LAYERS");
+        std::string str = e ? e : "2,12,22,32,40"; size_t p = 0;
+        while (p < str.size()) { size_t c = str.find(',', p);
+            s.insert(std::atoi(str.substr(p, c == std::string::npos ? c : c - p).c_str()));
+            if (c == std::string::npos) break; p = c + 1; }
+        return s; }();
 
     for (int il = 0; il < n_main_layers; ++il) {
         const auto & layer = model.layers[il];
@@ -1491,6 +1536,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             n_tokens);
                 }
 
+                std::vector<dsv4_state_pair> attn_snaps; // per-token states for rollback planes
                 dsv4_decode_compressor dec =
                       n_tokens == 1 ? dsv4_build_compressor_decode_uniform(ctx0, cur,
                             prev_attn_kv_state,
@@ -1526,7 +1572,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             compress_ratio,
                             rope_type,
                             rope_cfg,
-                            norm_rms_eps)
+                            norm_rms_eps, &attn_snaps)
                     : dsv4_build_compressor_decode_chunk(ctx0, cur,
                             prev_attn_kv_state,
                             prev_attn_sc_state,
@@ -1541,10 +1587,15 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             compress_ratio,
                             rope_type,
                             rope_cfg,
-                            norm_rms_eps);
+                            norm_rms_eps, &attn_snaps);
 
                 dsv4_store_state_segment(ctx0, gf, dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
                 dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
+                if (cparams.n_rs_seq > 0) {
+                    dsv4_store_rollback_planes(ctx0, gf, inp_rs->mctx->get_r_l(il), inp_rs->mctx->get_s_l(il),
+                            attn_snaps, state_size, inp_rs->head, 0,
+                            inp_rs->mctx->get_size(), cparams.n_rs_seq, n_tokens);
+                }
 
                 if (uniform) {
                     ggml_tensor * kv_comp_q = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
@@ -1573,6 +1624,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         ggml_tensor * prev_index_sc_state = dsv4_view_state_segment(ctx0, prev_sc_state_all,
                                 attn_state_layout.elems, index_state_layout.width, index_state_layout.rows);
 
+                        std::vector<dsv4_state_pair> index_snaps; // per-token states for rollback planes
                         dsv4_decode_compressor index_dec =
                               n_tokens == 1 ? dsv4_build_compressor_decode_uniform(ctx0, cur,
                                     prev_index_kv_state,
@@ -1608,7 +1660,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                     compress_ratio,
                                     rope_type,
                                     rope_cfg,
-                                    norm_rms_eps)
+                                    norm_rms_eps, &index_snaps)
                             : dsv4_build_compressor_decode_chunk(ctx0, cur,
                                     prev_index_kv_state,
                                     prev_index_sc_state,
@@ -1623,10 +1675,15 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                     compress_ratio,
                                     rope_type,
                                     rope_cfg,
-                                    norm_rms_eps);
+                                    norm_rms_eps, &index_snaps);
 
                         dsv4_store_state_segment(ctx0, gf, index_dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems);
                         dsv4_store_state_segment(ctx0, gf, index_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems);
+                        if (cparams.n_rs_seq > 0) {
+                            dsv4_store_rollback_planes(ctx0, gf, inp_rs->mctx->get_r_l(il), inp_rs->mctx->get_s_l(il),
+                                    index_snaps, state_size, inp_rs->head, attn_state_layout.elems,
+                                    inp_rs->mctx->get_size(), cparams.n_rs_seq, n_tokens);
+                        }
 
                         if (uniform) {
                             store_index_cache_rows_idx(index_dec.kv_comp, in_cache_row);
@@ -1809,6 +1866,15 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cb(cur, "ffn_out", il);
         inpL = dsv4_hc_post(ctx0, cur, residual, mix.post, mix.comb, n_embd, n_hc, n_tokens);
         cb(inpL, "hc_ffn_post", il);
+
+        if (dflash_layers.count(il)) {
+            // DFlash capture (PR#22105 style): NO extra graph ops. Just mark the existing hc_ffn_post
+            // tensor as a graph output and stash its pointer. The n_hc SUM-collapse + 5-layer stack is
+            // done on the HOST after decode (llama-context.cpp). This keeps the target graph identical
+            // to plain inference — no per-token kernel launches, no graph-reuse breakage.
+            ggml_set_output(inpL);
+            res->t_dflash_layers.push_back(inpL);
+        }
     }
     if (cparams.embeddings_pre_norm && !cparams.embeddings_pre_norm_masked) {
         // expose the full hyper-connection state to the MTP draft head —
