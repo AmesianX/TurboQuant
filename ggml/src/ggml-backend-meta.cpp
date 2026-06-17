@@ -2229,7 +2229,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+        // SPMD: one local backend per node; the per-subgraph reduction is a single cross-rank
+        // NCCL AllReduce on this rank's local partial (no local butterfly). [tp-2node-dsv4]
+        if ((n_backends > 1 || backend_ctx->is_spmd()) && i < backend_ctx->n_subgraphs - 1) {
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
@@ -2240,6 +2242,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+            }
+            // In SPMD the butterfly fallback (local cross-device copies) is invalid; the NCCL
+            // comm must succeed. allreduce_fallback only runs for the multi-local-device case.
+            if (backend_ctx->is_spmd() && !backend_allreduce_success) {
+                GGML_LOG_ERROR("[tp] SPMD cross-rank AllReduce failed (no NCCL comm?)\n");
+                return GGML_STATUS_FAILED;
             }
 
             if (!backend_allreduce_success) {
