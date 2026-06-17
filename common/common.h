@@ -362,21 +362,38 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
-        // Both MTP and DFlash partial-accept and use the recurrent rollback PLANES (n_rs_seq) instead
-        // of the O(context) per-round checkpoint save/restore. The DSV4 compress-state snapshot
-        // (dsv4_store_rollback_planes) is verified to roll back correctly. [TAG_DFLASH_2DECODE]
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP
-                || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
-        });
-
-        // NOTE: DFlash also partial-accepts and would benefit from n_rs_seq=draft.n_max (1 target
-        // forward/round instead of 2). TRIED IT (+ DEEPSEEK4 in llm_arch_supports_rs_rollback): the
-        // 2nd verify DID vanish (1 decode/round) but output broke (empty, accept 37%->6%) — DSV4's
-        // recurrent compress-state graph does NOT write the per-token rollback snapshots that QWEN35
-        // does, so rollback reads stale state. REAL FIX = teach DSV4's compress-state graph to write
-        // rs_idx-addressed snapshots (mirror QWEN35), THEN re-enable both. [TAG_DFLASH_2DECODE]
-        return needs_rs_seq ? draft.n_max : 0u;
+        // Speculative decoding partial-accepts: after the target verifies a drafted block only a
+        // prefix is accepted, and the DSV4 recurrent compress-state must be rolled back by
+        // (drafted - accepted) tokens. With n_rs_seq>0 the compress-state graph keeps per-token
+        // rollback PLANES (dsv4_store_rollback_planes, ~1.4ms/round) instead of the O(context)
+        // on-device checkpoint save/restore (~89ms/round). The plane mechanism is arch-level and
+        // spec-agnostic; it is verified correct for MTP/DFlash (HEAD: store/set/read consistent).
+        //
+        // n_rs_seq MUST cover the largest draft block an active method can emit in one round, else
+        // rollback reads stale state (the [TAG_DFLASH_2DECODE] breakage). Only types whose per-round
+        // draft depth is bounded here are routed to planes; any other type contributes 0 and keeps
+        // the safe (slower) checkpoint path. The lookup methods (ngram) were previously NOT in this
+        // set, so their misses paid the 89ms checkpoint — that is what dragged partial-accept
+        // workloads (code/RAG) below baseline. [TAG_DFLASH_2DECODE]
+        uint32_t depth = 0;
+        for (auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                    // draft block bounded by the global draft.n_max
+                    depth = std::max<uint32_t>(depth, (uint32_t) draft.n_max);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                    // PLD emits up to size_m (mgram length) tokens per round
+                    depth = std::max<uint32_t>(depth, std::max<uint32_t>((uint32_t) draft.n_max, ngram_simple.size_m));
+                    break;
+                default:
+                    // unsized type: leave at checkpoint path (do not route to planes)
+                    break;
+            }
+        }
+        return depth;
     }
 };
 
