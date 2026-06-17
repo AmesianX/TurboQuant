@@ -94,3 +94,24 @@ RISK: this is a real reimplementation of the execution model (single-process ->
 SPMD), not a small patch. Proceed incrementally: (M1a) comm_init SPMD + a standalone
 2-proc allreduce test through ggml; (M1b) meta-device local-slice-only; (M1c) loader;
 (M1d) follower loop. Search upstream/NCCL docs at each blocker (user directive).
+
+## M1a DONE (both boxes, compiles+links)
+ggml-cuda.cu: ggml_backend_cuda_comm_init_nccl_spmd() — GGML_TP_NRANKS>1 -> ncclCommInitRank
+over global world (1 local GPU/rank), uniqueId via TCP bootstrap (GGML_TP_MASTER_ADDR/PORT).
+try_allreduce_nccl reused (1 comm -> 1 ncclAllReduce on the single local tensor = cross-rank sum).
+
+## M1b SCOPE confirmed at code level (ggml-backend-meta.cpp, 2262 lines)
+- Reduction: n_reduce_steps=ceil(log2(n_devs)) butterfly, but when NCCL comm is up it calls
+  comm_allreduce(comm_ctx, nodes) at ~line 2204 with the per-device tensor array.
+- comm_init(simple_backends, n) at ~1636-1639 with ALL LOCAL backends. With 1 local backend
+  n_devs=1 => meta-backend is a no-op passthrough (no split/reduce).
+- THEREFORE M1b = decouple LOGICAL split (NRANKS, for weight sharding) from PHYSICAL local
+  backends (=1). Everywhere the meta-backend iterates simple_backends/n_devs for alloc + graph
+  build + compute, SPMD must: shard weights into NRANKS, allocate/compute ONLY my rank's slice
+  on the local GPU, and reduce via the cross-rank comm_allreduce (M1a, ready) on the single
+  local partial. This is a STRUCTURAL change to the meta-backend execution/alloc model, spread
+  across buffer alloc (backend_config/bufs), per-device cgraphs (~1983-1993), and split-state
+  application. Largest single piece of the project.
+- Key edit anchors: ctx ctor ~1598-1646 (n_reduce_steps, comm_init), reduce path ~1983-2204.
+- Then M1c (loader writes only slice R, llama-model.cpp tensor_split_scan ~636) and M1d
+  (rank!=0 follower decode loop, no HTTP) and M3 (DSV4 hybrid correctness) and M4 (test+0.0.0.0).
