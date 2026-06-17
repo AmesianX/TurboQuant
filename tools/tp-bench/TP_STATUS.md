@@ -115,3 +115,21 @@ try_allreduce_nccl reused (1 comm -> 1 ncclAllReduce on the single local tensor 
 - Key edit anchors: ctx ctor ~1598-1646 (n_reduce_steps, comm_init), reduce path ~1983-2204.
 - Then M1c (loader writes only slice R, llama-model.cpp tensor_split_scan ~636) and M1d
   (rank!=0 follower decode loop, no HTTP) and M3 (DSV4 hybrid correctness) and M4 (test+0.0.0.0).
+
+## M1b REFINED (code-level, more tractable than first feared)
+Executor (ggml-backend-meta.cpp ~2185-2214): per-subgraph, computes each LOCAL backend's
+cgraph, then `if (n_backends>1)` gathers each backend's last node and comm_allreduce's them.
+- SPMD: n_backends=1 (one local GPU) so (a) the allreduce gate never fires, and (b) with
+  n_devs=1 the split-state produces NO split -> the single backend computes the FULL matmul
+  (no TP). Both must change together.
+- SMALL part: gate the allreduce on LOGICAL n_split>1 (cross-rank), passing the single local
+  partial (cgraph last node) to comm_allreduce -> M1a NCCL does ncclAllReduce = cross-rank sum.
+- MEAT: make the local backend build/alloc/compute ONLY slice=my_rank. The split-state infra
+  (get_split_state, tensor_split_scan) already computes per-slice ne for n_devices slices; drive
+  it with n_devices=n_split and FIX the slice index to my_rank instead of iterating local devs.
+  Centered in the graph-build section (~1660-1990) + buffer alloc.
+- COHERENCE: split+alloc+executor+reduce must change as ONE unit; partial scaffolding (gate on
+  but full tensor computed) double-counts via allreduce. So M1b is committed only when it builds
+  AND passes a 2-node correctness test (lossless vs single-node), not as isolated sub-commits.
+- Decouple to add to ggml_backend_meta_context: n_split (logical, =GGML_TP_NRANKS), tp_rank
+  (=GGML_TP_RANK); when >1, simple_backends stays [local], split index fixed to tp_rank.
