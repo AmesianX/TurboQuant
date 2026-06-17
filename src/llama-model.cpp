@@ -403,11 +403,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             rotation = hparams.n_layer % ud->n_devices;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
-        if (tensor_axis_0 == nullptr) {
-            GGML_ASSERT(!suffix_fallback.empty());
+        if (tensor_axis_0 == nullptr && !suffix_fallback.empty()) {
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
-        GGML_ASSERT(tensor_axis_0 != nullptr);
+        if (tensor_axis_0 == nullptr) {
+            // MLA archs (DeepSeek MLA / GLM-DSA): attention tensors have non-standard names
+            // (q_a/q_b/kv_a/kv_b...) and no per-block attn_output.weight to reference. We
+            // tensor-split only the experts/FFN (which dominate the weights) and MIRROR the
+            // attention, so any unresolved reference here means "mirror it". [tp-2node-dsv4]
+            if (ud->model->arch == LLM_ARCH_DEEPSEEK2 || ud->model->arch == LLM_ARCH_DEEPSEEK32 ||
+                ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_GLM_DSA) {
+                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, il, rotation};
+            }
+            GGML_ASSERT(tensor_axis_0 != nullptr);
+        }
         return {axis, tensor_axis_0, il, rotation};
     };
 
@@ -429,6 +438,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
+            // MLA archs (DeepSeek MLA / GLM-DSA) compress KV into a shared low-rank latent
+            // that is NOT head-split; their attention weights fall through to MIRRORED, and
+            // they have no per-block attn_output.weight to reference. Mirror the cache to
+            // match (replicated KV is correct when attention is replicated). [tp-2node-dsv4]
+            if (ud->model->arch == LLM_ARCH_DEEPSEEK2 || ud->model->arch == LLM_ARCH_DEEPSEEK32 ||
+                ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_GLM_DSA) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {

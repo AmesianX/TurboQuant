@@ -529,6 +529,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
         }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            GGML_LOG_ERROR("[tp] handle_generic UNKNOWN: op=%s tensor=%s scalar_only=%d\n",
+                           ggml_op_name(tensor->op), tensor->name, (int) scalar_only);
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                if (tensor->src[i] == nullptr || tensor->src[i] == tensor) continue;
+                GGML_LOG_ERROR("[tp]   src[%zu]=%s axis=%d\n", i, tensor->src[i]->name, (int) src_ss[i].axis);
+            }
+        }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
     };
@@ -759,6 +767,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // MLA / mirrored attention (DeepSeek, GLM-DSA): Q,K,V are replicated on every device
+        // (only experts/FFN are tensor-split), so flash-attn runs fully on each device and its
+        // output is mirrored too -- no head split. [tp-2node-dsv4]
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
@@ -956,7 +972,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL:
-            case GGML_OP_ARANGE:
+            case GGML_OP_ARANGE: {
+                // ARANGE has no inputs: it generates a deterministic range, identical on every
+                // device -> MIRRORED. (handle_generic can't infer a split with no srcs.) [tp-2node-dsv4]
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+            } break;
             case GGML_OP_TIMESTEP_EMBEDDING: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1614,9 +1634,27 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // Cross-node SPMD tensor parallelism (feat/tp-2node-dsv4): when GGML_TP_NRANKS>1,
+    // this process owns ONE local backend but the weights are split into tp_nranks
+    // LOGICAL slices; this rank materializes/computes only slice tp_rank, and the
+    // per-subgraph reduction is a single cross-rank NCCL AllReduce (M1a) instead of a
+    // local butterfly. tp_nranks==1 => ordinary single-process behavior (unchanged).
+    int tp_nranks = 1;
+    int tp_rank   = 0;
+    bool is_spmd() const { return tp_nranks > 1; }
+    // Number of LOGICAL split slices (global ranks in SPMD, else local device count).
+    size_t n_split = 0;
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
-        n_reduce_steps = std::ceil(std::log2(n_devs));
+        {
+            const char * e = getenv("GGML_TP_NRANKS");
+            tp_nranks = e ? atoi(e) : 1;
+            tp_rank   = getenv("GGML_TP_RANK") ? atoi(getenv("GGML_TP_RANK")) : 0;
+        }
+        n_split = is_spmd() ? (size_t) tp_nranks : n_devs;
+        // SPMD reduces across ranks via one comm AllReduce; no local butterfly steps.
+        n_reduce_steps = is_spmd() ? 1 : (size_t) std::ceil(std::log2(n_devs));
         name = "Meta(";
         std::vector<ggml_backend_t> simple_backends;
         backend_configs.reserve(n_devs);
