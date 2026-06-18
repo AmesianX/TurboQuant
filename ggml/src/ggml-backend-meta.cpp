@@ -5,6 +5,28 @@
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
+// [tp-2node-dsv4] crash-localization: with GGML_TP_DBG set, print a backtrace on segfault/abort
+// so SPMD crashes (which otherwise die silently behind the loader spinner) reveal their location.
+#include <execinfo.h>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+static void tp_crash_handler(int sig) {
+    void * bt[80];
+    int n = backtrace(bt, 80);
+    fprintf(stderr, "\n[tp] ==== CRASH signal=%d, backtrace (%d frames) ====\n", sig, n);
+    backtrace_symbols_fd(bt, n, 2);
+    fflush(stderr);
+    _exit(128 + sig);
+}
+__attribute__((constructor)) static void tp_install_crash_handler() {
+    if (getenv("GGML_TP_DBG")) {
+        signal(SIGSEGV, tp_crash_handler);
+        signal(SIGBUS,  tp_crash_handler);
+        signal(SIGABRT, tp_crash_handler);
+    }
+}
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1477,14 +1499,17 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;
-                ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                if (ggml_meta_tp_buf_is_local(j)) { // SPMD: only this rank's slice has data
+                    ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                }
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            // TODO other simple backend may be better
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+            // SPMD: read from the LOCAL buffer (tp_rank), not hardcoded 0 (remote on rank>0). [tp-2node-dsv4]
+            const size_t idx = ggml_meta_tp_is_spmd() ? (size_t) ggml_meta_tp_rank() : 0;
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, idx);
             ggml_backend_tensor_get(simple_tensor, data, offset, size);
         } break;
         default: {
@@ -1822,16 +1847,20 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
-                    i_stop - i_start, chunk_size_j, chunk_size_full);
+                if (ggml_meta_tp_buf_is_local(j)) { // SPMD: only this rank's slice has data (others are remote)
+                    ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
+                        i_stop - i_start, chunk_size_j, chunk_size_full);
+                }
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            // TODO other simple backend may be better
-            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+            // SPMD: read from the LOCAL buffer (tp_rank), not a hardcoded index 0 (which is remote
+            // on rank>0 and would copy from a NULL device pointer). [tp-2node-dsv4]
+            const size_t idx = ggml_meta_tp_is_spmd() ? (size_t) ggml_meta_tp_rank() : 0;
+            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, idx);
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, idx);
             ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
         } break;
         default: {
