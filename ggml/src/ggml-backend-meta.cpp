@@ -600,6 +600,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (getenv("GGML_TP_DBG2")) { // [tp-2node-dsv4] why no PARTIAL: log expert/mat axes
+            fprintf(stderr, "[tp-mm] op=%s node=%s src0=%s(%s) src1=%s(%s)\n", ggml_op_name(tensor->op), tensor->name,
+                tensor->src[0]?tensor->src[0]->name:"", ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                tensor->src[1]?tensor->src[1]->name:"", ggml_backend_meta_split_axis_name(src_ss[1].axis));
+            fflush(stderr);
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
         }
@@ -1716,6 +1722,11 @@ struct ggml_backend_meta_context {
         n_split = is_spmd() ? (size_t) tp_nranks : n_devs;
         // SPMD reduces across ranks via one comm AllReduce; no local butterfly steps.
         n_reduce_steps = is_spmd() ? 1 : (size_t) std::ceil(std::log2(n_devs));
+        if (getenv("GGML_TP_DBG")) {
+            fprintf(stderr, "[tp] meta-context ctor: n_devs=%zu tp_nranks=%d tp_rank=%d is_spmd=%d n_split=%zu\n",
+                n_devs, tp_nranks, tp_rank, (int) is_spmd(), n_split);
+            fflush(stderr);
+        }
         name = "Meta(";
         std::vector<ggml_backend_t> simple_backends;
         backend_configs.reserve(n_devs);
@@ -2290,6 +2301,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    if (getenv("GGML_TP_DBG")) { // unconditional (not is_spmd-gated): confirm the executor is even invoked
+        fprintf(stderr, "[tp] executor CALLED: is_spmd=%d n_subgraphs=%zu n_backends=%zu comm_ctx=%p\n",
+            (int) backend_ctx->is_spmd(), backend_ctx->n_subgraphs, n_backends, (void *) backend_ctx->comm_ctx);
+        fflush(stderr);
+    }
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             if (!ggml_meta_tp_buf_is_local(j)) { continue; } // SPMD: this rank only runs its own slice
@@ -2315,13 +2331,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
+                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
                 if (backend_ctx->is_spmd() && getenv("GGML_TP_DBG")) {
                     ggml_tensor * nd = nodes.empty() ? nullptr : nodes[0];
-                    GGML_LOG_INFO("[tp] rank=%d subgraph=%zu/%zu allreduce node=%s ne=[%lld,%lld] op=%s\n",
+                    fprintf(stderr, "[tp] rank=%d subgraph=%zu/%zu allreduce node=%s ne=[%lld,%lld] nodes=%zu ok=%d\n",
                         ggml_meta_tp_rank(), i, backend_ctx->n_subgraphs, nd?nd->name:"NULL",
-                        nd?(long long)nd->ne[0]:0, nd?(long long)nd->ne[1]:0, nd?ggml_op_name(nd->op):"NULL");
+                        nd?(long long)nd->ne[0]:0, nd?(long long)nd->ne[1]:0, nodes.size(), (int) backend_allreduce_success);
+                    fflush(stderr);
                 }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
             }
             // In SPMD the butterfly fallback (local cross-device copies) is invalid; the NCCL
             // comm must succeed. allreduce_fallback only runs for the multi-local-device case.

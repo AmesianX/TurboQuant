@@ -495,14 +495,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL);
         }
 
-        // output
-        if (std::regex_match(tensor_name, pattern_output_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
-        }
-        if (std::regex_match(tensor_name, pattern_output_bias)) {
-            const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
-            GGML_ASSERT(output_weight != nullptr);
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+        // output (lm_head). SPMD cross-node TP: splitting the vocab (AXIS_1) leaves each rank with
+        // only half the logits and no following AllReduce (final subgraph), so the two ranks sample
+        // divergent tokens. MIRROR it so every rank computes the FULL logits from the (already
+        // AllReduce-synced => mirrored) final hidden state -> identical, correct sampling. [tp-2node-dsv4]
+        {
+            const char * e = getenv("GGML_TP_NRANKS");
+            const bool spmd = e && atoi(e) > 1;
+            if (std::regex_match(tensor_name, pattern_output_weight)) {
+                return get_tensor_config_impl(spmd ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1);
+            }
+            if (std::regex_match(tensor_name, pattern_output_bias)) {
+                const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
+                GGML_ASSERT(output_weight != nullptr);
+                return get_tensor_config_impl(spmd ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_0);
+            }
         }
 
         // everything else
