@@ -2270,6 +2270,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
+                if (backend_ctx->is_spmd() && getenv("GGML_TP_DBG")) {
+                    ggml_tensor * nd = nodes.empty() ? nullptr : nodes[0];
+                    GGML_LOG_INFO("[tp] rank=%d subgraph=%zu/%zu allreduce node=%s ne=[%lld,%lld] op=%s\n",
+                        ggml_meta_tp_rank(), i, backend_ctx->n_subgraphs, nd?nd->name:"NULL",
+                        nd?(long long)nd->ne[0]:0, nd?(long long)nd->ne[1]:0, nd?ggml_op_name(nd->op):"NULL");
+                }
                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
             }
             // In SPMD the butterfly fallback (local cross-device copies) is invalid; the NCCL
