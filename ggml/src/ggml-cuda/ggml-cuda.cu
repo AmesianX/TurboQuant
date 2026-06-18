@@ -1394,7 +1394,10 @@ static bool tp_bootstrap_uniqueid(int rank, int nranks, const char * master_addr
         close(s);
     } else {
         int s = -1;
-        for (int attempt = 0; attempt < 200; ++attempt) {
+        // The NCCL rendezvous happens AFTER each rank loads its (multi-GB) shard, and the two
+        // nodes can finish loading minutes apart. Retry for up to ~20 min so the faster rank waits
+        // out the slower rank's model load instead of timing out. [tp-2node-dsv4]
+        for (int attempt = 0; attempt < 18000; ++attempt) {
             s = socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port);
             inet_pton(AF_INET, master_addr, &a.sin_addr);
@@ -1422,9 +1425,18 @@ static bool ggml_backend_cuda_comm_init_nccl_spmd(ggml_backend_cuda_comm_context
     const char * master = getenv("GGML_TP_MASTER_ADDR") ? getenv("GGML_TP_MASTER_ADDR") : "127.0.0.1";
     const int port = getenv("GGML_TP_MASTER_PORT") ? atoi(getenv("GGML_TP_MASTER_PORT")) : 29600;
 
-    if (ret->dev_ids.size() != 1) {
-        GGML_LOG_ERROR("TP SPMD: expected exactly 1 local CUDA device, got %zu\n", ret->dev_ids.size());
+    // In SPMD the meta device lists n_split copies of the single LOCAL GPU (so n_bufs matches the
+    // split-state layout); they are all the same physical device. Use dev_ids[0] for the one NCCL
+    // rank this process owns. Reject only if they are not actually identical.
+    if (ret->dev_ids.empty()) {
+        GGML_LOG_ERROR("TP SPMD: no local CUDA device\n");
         return false;
+    }
+    for (size_t i = 1; i < ret->dev_ids.size(); i++) {
+        if (ret->dev_ids[i] != ret->dev_ids[0]) {
+            GGML_LOG_ERROR("TP SPMD: meta device must list one local GPU per process, got mixed ids\n");
+            return false;
+        }
     }
 
     ncclUniqueId id;

@@ -179,6 +179,23 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
+            // SPMD cross-node tensor parallelism (feat/tp-2node-dsv4): one process per node, one
+            // local GPU each, joined into a global NCCL world of GGML_TP_NRANKS ranks. The weights
+            // are split GGML_TP_NRANKS ways; this rank realizes only slice tp_rank on its local GPU
+            // (the meta-backend skips the other buffers) and reduces via cross-rank NCCL. We present
+            // the meta device with NRANKS "devices" all pointing at the single local GPU so the
+            // existing per-buffer machinery is preserved; buf_is_local() gates real alloc/compute.
+            {
+                const char * e = getenv("GGML_TP_NRANKS");
+                const int nranks = e ? atoi(e) : 1;
+                if (nranks > 1) {
+                    GGML_ASSERT(devs.size() == 1 && "SPMD TP expects exactly one local GPU per node");
+                    ggml_backend_dev_t local = devs[0];
+                    devs.assign((size_t) nranks, local);
+                    LLAMA_LOG_INFO("%s: SPMD TP: %d ranks, local GPU %s replicated as the meta device list\n",
+                                   __func__, nranks, ggml_backend_dev_name(local));
+                }
+            }
             model->get_split_state_ud.n_devices = devs.size();
             model->get_split_state_ud.model     = model;
             gpus.push_back({

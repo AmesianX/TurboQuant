@@ -1513,6 +1513,24 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }
 
+// SPMD cross-node tensor parallelism (feat/tp-2node-dsv4): n_devices == n_bufs == NRANKS
+// keeps the split-state ne layout consistent, but each process physically realizes only the
+// buffer for its own rank (GGML_TP_RANK). tp_buf_is_local(i) == false => allocate 0 bytes for
+// that slice, skip its set/get/compute; the cross-rank reduction (NCCL) brings in the others.
+static inline bool ggml_meta_tp_is_spmd() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_TP_NRANKS"); v = (e && atoi(e) > 1) ? 1 : 0; }
+    return v != 0;
+}
+static inline int ggml_meta_tp_rank() {
+    static int r = -2;
+    if (r == -2) { const char * e = getenv("GGML_TP_RANK"); r = e ? atoi(e) : 0; }
+    return r;
+}
+static inline bool ggml_meta_tp_buf_is_local(size_t index) {
+    return !ggml_meta_tp_is_spmd() || (int) index == ggml_meta_tp_rank();
+}
+
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
@@ -1529,7 +1547,9 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     std::vector<ggml_backend_buffer_t> bufs;
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
+        // SPMD: only this rank's slice gets real memory; other slices live on other nodes.
+        const size_t alloc_sz = ggml_meta_tp_buf_is_local(i) ? size : 0;
+        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), alloc_sz));
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
@@ -1737,14 +1757,19 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
-                    i_stop - i_start, chunk_size_j, chunk_size_full);
+                // SPMD: every rank reads the full weight from its local gguf but writes only its
+                // own slice; keep accumulating offset_j so this rank's slice lands at the right offset.
+                if (ggml_meta_tp_buf_is_local(j)) {
+                    ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
+                        i_stop - i_start, chunk_size_j, chunk_size_full);
+                }
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_backends; j++) {
+                if (!ggml_meta_tp_buf_is_local(j)) { continue; } // SPMD: mirrored tensor lives on the local buffer only
                 ggml_backend_tensor_set_async(
                     ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
             }
@@ -2222,6 +2247,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
+            if (!ggml_meta_tp_buf_is_local(j)) { continue; } // SPMD: this rank only runs its own slice
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
@@ -2237,6 +2263,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::vector<ggml_tensor *> nodes;
                 nodes.reserve(n_backends);
                 for (size_t j = 0; j < n_backends; j++) {
+                    // SPMD: only this rank's local partial participates; comm_allreduce (1 NCCL comm)
+                    // reduces it across ranks. Skip the non-local (unrealized) slices.
+                    if (!ggml_meta_tp_buf_is_local(j)) { continue; }
                     auto & bcj = backend_ctx->backend_configs[j];
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
