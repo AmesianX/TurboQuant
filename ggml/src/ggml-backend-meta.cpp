@@ -1274,6 +1274,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
+// fwd decls (definitions below near alloc_buffer) -- SPMD slice-locality, used in set/get/compute
+static inline bool ggml_meta_tp_is_spmd();
+static inline int  ggml_meta_tp_rank();
+static inline bool ggml_meta_tp_buf_is_local(size_t index);
+
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     GGML_ASSERT(ggml_is_contiguous(tensor));
@@ -1302,9 +1307,11 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                     GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
                     const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
-                    ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
-                        simple_offsets[j] + r_start * simple_tensor->nb[1], nbytes,
-                        r_count, simple_tensor->nb[1], tensor->nb[1]);
+                    if (ggml_meta_tp_buf_is_local(j)) { // SPMD: write only this rank's slice
+                        ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
+                            simple_offsets[j] + r_start * simple_tensor->nb[1], nbytes,
+                            r_count, simple_tensor->nb[1], tensor->nb[1]);
+                    }
                     offset_data       += nbytes;
                     simple_offsets[j] += nbytes;
                 }
@@ -1325,9 +1332,11 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 const size_t nbytes = split_state.ne[s*n_bufs + j] * tensor->nb[1];
-                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
-                    simple_offsets[j] + r_start * simple_tensor->nb[2], nbytes,
-                    r_count, simple_tensor->nb[2], tensor->nb[2]);
+                if (ggml_meta_tp_buf_is_local(j)) { // SPMD: write only this rank's slice
+                    ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
+                        simple_offsets[j] + r_start * simple_tensor->nb[2], nbytes,
+                        r_count, simple_tensor->nb[2], tensor->nb[2]);
+                }
                 offset_data       += nbytes;
                 simple_offsets[j] += nbytes;
             }
@@ -1354,13 +1363,16 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;
-                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                if (ggml_meta_tp_buf_is_local(j)) { // SPMD: write only this rank's slice
+                    ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                }
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
+                if (!ggml_meta_tp_buf_is_local(j)) { continue; } // SPMD: mirrored copy on local buffer only
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
             }
@@ -1374,6 +1386,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 tmp.push_back(((const float *) data)[i] / n_bufs);
             }
             for (size_t j = 0; j < n_bufs; j++) {
+                if (!ggml_meta_tp_buf_is_local(j)) { continue; } // SPMD: local buffer only
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 ggml_backend_tensor_set(simple_tensor, tmp.data(), offset, size);
             }
@@ -1598,7 +1611,10 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
                 break;
             }
         }
-        if (any_nonzero_slice) {
+        // SPMD: only this rank's slice gets real weight memory; non-local slices get a 0-byte
+        // dummy buffer (their data lives on the other node). This is what actually halves the
+        // per-node footprint -- the model-weight allocation path, distinct from alloc_buffer. [tp-2node-dsv4]
+        if (any_nonzero_slice && ggml_meta_tp_buf_is_local(i)) {
             meta_buf_ctx->bufs[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, simple_buft));
         } else {
             meta_buf_ctx->bufs[i].reset(ggml_backend_buft_alloc_buffer(simple_buft, 0));

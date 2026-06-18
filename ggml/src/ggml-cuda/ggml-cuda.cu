@@ -1192,6 +1192,26 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         return true;
     }
 
+    // SPMD cross-node tensor parallelism (feat/tp-2node-dsv4): this process holds ONE local GPU
+    // and ONE NCCL comm spanning all ranks. The executor passes a single local partial (tensors[0]);
+    // reduce it once across the global world. (The multi-local-backend loop below assumes
+    // backends.size() local tensors+comms, which does not hold in SPMD.) [tp-2node-dsv4]
+    {
+        const char * e = getenv("GGML_TP_NRANKS");
+        if (e && atoi(e) > 1) {
+            GGML_ASSERT(!comm_ctx->comms.empty() && !comm_ctx->backends.empty());
+            GGML_ASSERT(tensors[0] != nullptr && ggml_is_contiguously_allocated(tensors[0]));
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[0]->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            const ncclDataType_t dt = tensors[0]->type == GGML_TYPE_F16  ? ncclHalf
+                                    : tensors[0]->type == GGML_TYPE_BF16 ? ncclBfloat16
+                                    : ncclFloat;
+            NCCL_CHECK(ncclAllReduce(tensors[0]->data, tensors[0]->data, ne, dt, ncclSum,
+                                     comm_ctx->comms[0], cuda_ctx->stream()));
+            return true;
+        }
+    }
+
     const size_t n_backends = comm_ctx->backends.size();
 
     for (size_t i = 0; i < n_backends; ++i) {
