@@ -1201,7 +1201,13 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         if (e && atoi(e) > 1) {
             GGML_ASSERT(!comm_ctx->comms.empty() && !comm_ctx->backends.empty());
             GGML_ASSERT(tensors[0] != nullptr && ggml_is_contiguously_allocated(tensors[0]));
-            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[0]->context;
+            // Use the LOCAL rank's backend stream: the partial (tensors[0]) was computed on
+            // backend[tp_rank]'s stream and the next subgraph reads the reduced result on that
+            // same stream. Enqueuing on backend[0] (a different stream on rank>0) races the
+            // compute -> garbage output unless CUDA_LAUNCH_BLOCKING serializes it. [tp-2node-dsv4]
+            const int tp_rank = getenv("GGML_TP_RANK") ? atoi(getenv("GGML_TP_RANK")) : 0;
+            const size_t bidx = (size_t) tp_rank < comm_ctx->backends.size() ? (size_t) tp_rank : 0;
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[bidx]->context;
             ggml_cuda_set_device(cuda_ctx->device);
             const ncclDataType_t dt = tensors[0]->type == GGML_TYPE_F16  ? ncclHalf
                                     : tensors[0]->type == GGML_TYPE_BF16 ? ncclBfloat16
