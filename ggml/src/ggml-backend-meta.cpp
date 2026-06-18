@@ -600,12 +600,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        if (getenv("GGML_TP_DBG2")) { // [tp-2node-dsv4] why no PARTIAL: log expert/mat axes
-            fprintf(stderr, "[tp-mm] op=%s node=%s src0=%s(%s) src1=%s(%s)\n", ggml_op_name(tensor->op), tensor->name,
-                tensor->src[0]?tensor->src[0]->name:"", ggml_backend_meta_split_axis_name(src_ss[0].axis),
-                tensor->src[1]?tensor->src[1]->name:"", ggml_backend_meta_split_axis_name(src_ss[1].axis));
-            fflush(stderr);
-        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
         }
@@ -1453,9 +1447,11 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
                     const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                     GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
                     const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
-                    ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
-                        simple_offsets[j] + r_start * simple_tensor->nb[1], nbytes,
-                        r_count, simple_tensor->nb[1], tensor->nb[1]);
+                    if (ggml_meta_tp_buf_is_local(j)) { // SPMD: only this rank's slice has data
+                        ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
+                            simple_offsets[j] + r_start * simple_tensor->nb[1], nbytes,
+                            r_count, simple_tensor->nb[1], tensor->nb[1]);
+                    }
                     offset_data       += nbytes;
                     simple_offsets[j] += nbytes;
                 }
@@ -1476,9 +1472,11 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             for (size_t j = 0; j < n_bufs; j++) {
                 const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 const size_t nbytes = split_state.ne[s*n_bufs + j] * tensor->nb[1];
-                ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
-                    simple_offsets[j] + r_start * simple_tensor->nb[2], nbytes,
-                    r_count, simple_tensor->nb[2], tensor->nb[2]);
+                if (ggml_meta_tp_buf_is_local(j)) { // SPMD: only this rank's slice has data
+                    ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
+                        simple_offsets[j] + r_start * simple_tensor->nb[2], nbytes,
+                        r_count, simple_tensor->nb[2], tensor->nb[2]);
+                }
                 offset_data       += nbytes;
                 simple_offsets[j] += nbytes;
             }

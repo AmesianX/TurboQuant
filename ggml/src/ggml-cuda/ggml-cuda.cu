@@ -1197,18 +1197,25 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     // reduce it once across the global world. (The multi-local-backend loop below assumes
     // backends.size() local tensors+comms, which does not hold in SPMD.) [tp-2node-dsv4]
     {
-        const char * e = getenv("GGML_TP_NRANKS");
-        if (e && atoi(e) > 1) {
+        // Cache the SPMD env once (no getenv in the per-subgraph hot path). [tp-2node-dsv4]
+        static const int tp_nranks = getenv("GGML_TP_NRANKS") ? atoi(getenv("GGML_TP_NRANKS")) : 1;
+        static const int tp_rank   = getenv("GGML_TP_RANK")   ? atoi(getenv("GGML_TP_RANK"))   : 0;
+        if (tp_nranks > 1) {
             GGML_ASSERT(!comm_ctx->comms.empty() && !comm_ctx->backends.empty());
             GGML_ASSERT(tensors[0] != nullptr && ggml_is_contiguously_allocated(tensors[0]));
             // Use the LOCAL rank's backend stream: the partial (tensors[0]) was computed on
             // backend[tp_rank]'s stream and the next subgraph reads the reduced result on that
             // same stream. Enqueuing on backend[0] (a different stream on rank>0) races the
             // compute -> garbage output unless CUDA_LAUNCH_BLOCKING serializes it. [tp-2node-dsv4]
-            const int tp_rank = getenv("GGML_TP_RANK") ? atoi(getenv("GGML_TP_RANK")) : 0;
             const size_t bidx = (size_t) tp_rank < comm_ctx->backends.size() ? (size_t) tp_rank : 0;
             ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[bidx]->context;
             ggml_cuda_set_device(cuda_ctx->device);
+            // If this rank's slice was zero-sized, its compute was disabled and tensors[0] holds
+            // uninitialized memory; zero it so the cross-rank sum doesn't fold in garbage (the
+            // multi-local-device path below memsets such slices too). [tp-2node-dsv4]
+            if ((tensors[0]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                CUDA_CHECK(cudaMemsetAsync(tensors[0]->data, 0, ggml_nbytes(tensors[0]), cuda_ctx->stream()));
+            }
             const ncclDataType_t dt = tensors[0]->type == GGML_TYPE_F16  ? ncclHalf
                                     : tensors[0]->type == GGML_TYPE_BF16 ? ncclBfloat16
                                     : ncclFloat;

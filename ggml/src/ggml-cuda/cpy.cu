@@ -381,12 +381,6 @@ static void ggml_cpy_f32_iq4_nl_cuda(
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
-    if (getenv("GGML_TP_DBG")) { // [tp-2node-dsv4] last line before a crash = the offending cpy
-        fprintf(stderr, "[tp-cpy] src=%s(%p ne=%ld,%ld,%ld) -> dst=%s(%p ne=%ld,%ld,%ld)\n",
-            src0->name, src0->data, (long)src0->ne[0],(long)src0->ne[1],(long)src0->ne[2],
-            src1->name, src1->data, (long)src1->ne[0],(long)src1->ne[1],(long)src1->ne[2]);
-        fflush(stderr);
-    }
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
 
