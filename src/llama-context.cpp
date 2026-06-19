@@ -1183,6 +1183,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
+    // NOTE [tp-2node-dsv4]: relaxing this for SPMD (output MIRRORED) to put draft sampling on the GPU was
+    // tried + MEASURED: backend sampling engages fine (with the meta-backend 0-element->MIRRORED fix), but
+    // gives ~0 t/s gain -- the MTP draft is NOT sampler-bound, it's bound by its mirrored full-vocab lm_head
+    // matmul. So we keep upstream PR #23287's CPU fallback as-is. (Left here so nobody re-chases this lever.)
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         static bool warned = false;
         if (!warned) {

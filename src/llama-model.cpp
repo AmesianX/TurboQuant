@@ -451,6 +451,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
+            // [tp-2node-dsv4] The NextN/MTP draft layer's KV cache MUST mirror to match its MIRRORED
+            // weights (see the NextN early-return above). The draft runs SOLO and LOCAL on the leader
+            // (off the TP critical path, zero cross-rank traffic); its set_rows write feeds MIRRORED
+            // data, so the cache must be MIRRORED too or split_states_equal aborts -- the old "B" crash
+            // on non-MLA archs (Qwen3.x MTP) whose cache would otherwise head-split to AXIS_0.
+            if (hparams.nextn_predict_layers > 0) {
+                const size_t lp = tensor_name.rfind("_l");
+                if (lp != std::string::npos && lp + 2 < tensor_name.size() &&
+                        tensor_name.find_first_not_of("0123456789", lp + 2) == std::string::npos) {
+                    const uint32_t il = (uint32_t) std::stoul(tensor_name.substr(lp + 2));
+                    if (il >= hparams.n_layer - hparams.nextn_predict_layers) {
+                        return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    }
+                }
+            }
             // MLA archs (DeepSeek MLA / GLM-DSA) compress KV into a shared low-rank latent
             // that is NOT head-split; their attention weights fall through to MIRRORED, and
             // they have no per-block attn_output.weight to reference. Mirror the cache to
