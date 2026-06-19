@@ -2064,6 +2064,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
                 const int i_delayed = get_i_delayed(i);
 
+                if (getenv("GGML_TP_DBG2") && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && i_delayed == i
+                        && strstr(node->name, "ffn_moe_down-0")) {
+                    // [tp-perf] dump the exact MoE-combine node sequence after ffn_moe_down (layer 0 only).
+                    fprintf(stderr, "[tp-delay] PARTIAL node=%s ne=[%lld,%lld,%lld] use_count=%d -- next 10 nodes:\n",
+                        node->name, (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2],
+                        ggml_node_get_use_count(cgraph, i));
+                    for (int k = 1; k <= 10 && i + k < cgraph->n_nodes; k++) {
+                        ggml_tensor * nx = cgraph->nodes[i + k];
+                        fprintf(stderr, "    +%d %s op=%s axis=%s ne=[%lld,%lld] vsrc=%s voff=%lld uc=%d\n",
+                            k, nx->name, ggml_op_name(nx->op),
+                            ggml_backend_meta_split_axis_name(ggml_backend_meta_get_split_state(nx, false).axis),
+                            (long long)nx->ne[0], (long long)nx->ne[1],
+                            nx->view_src ? nx->view_src->name : "-", (long long)nx->view_offs,
+                            ggml_node_get_use_count(cgraph, i + k));
+                    }
+                    fflush(stderr);
+                }
+
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
                 //     its compute flag disabled and thus gets its data zeroed out.

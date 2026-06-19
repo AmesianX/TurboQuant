@@ -1053,6 +1053,13 @@ private:
             ctx_dft.reset();
         }
 
+        // [tp-2node-dsv4] register TP contexts so the SPMD follower mirrors decodes/KV ops on the
+        // matching one: ctx_tgt=0, the MTP draft ctx_dft=1 (if present). Identical order on both ranks.
+        if (tpserve::tp_enabled()) {
+            tpserve::tp_register_ctx(ctx_tgt);
+            if (ctx_dft) { tpserve::tp_register_ctx(ctx_dft.get()); }
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -3161,8 +3168,7 @@ private:
                             n_tokens, no, (int) batch_view.pos[0], st.c_str());
                 }
             }
-            tpserve::tp_bcast_decode(batch_view); // [tp-2node-dsv4] mirror this decode on the follower
-            const int ret = llama_decode(ctx_tgt, batch_view);
+            const int ret = tpserve::tp_decode(ctx_tgt, batch_view); // [tp-2node-dsv4] mirror on follower
 
             metrics.on_decoded(slots);
 

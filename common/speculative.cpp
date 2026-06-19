@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "tp-serve.h" // [tp-2node-dsv4] mirror MTP draft decodes to the follower
 
 #include "common.h"
 #include "ggml.h"
@@ -257,7 +258,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
     bool process(const llama_batch & batch) override {
         auto * ctx_dft = params.ctx_dft;
 
-        const int ret = llama_decode(ctx_dft, batch);
+        const int ret = tpserve::tp_decode(ctx_dft, batch);
 
         if (ret != 0) {
             LOG_ERR("%s: failed to decode draft batch, ret = %d\n", __func__, ret);
@@ -291,7 +292,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
         }
 
-        int ret = llama_decode(ctx_dft, batch);
+        int ret = tpserve::tp_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -355,7 +356,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             }
 
             // evaluate the drafted tokens on the draft model
-            ret = llama_decode(ctx_dft, batch);
+            ret = tpserve::tp_decode(ctx_dft, batch);
             if (ret != 0) {
                 LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
                 break;
@@ -632,10 +633,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int64_t tp1 = prof_on ? ggml_time_us() : 0;
-        const int32_t rc = llama_decode(ctx_dft, batch);
+        const int32_t rc = tpserve::tp_decode(ctx_dft, batch);
         const int64_t tp2 = prof_on ? ggml_time_us() : 0;
         if (rc != 0) {
-            LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
+            LOG_ERR("%s: tpserve::tp_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
             return false;
         }
 
@@ -709,7 +710,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int64_t t_dec0 = prof_on ? ggml_time_us() : 0;
-        int ret = llama_decode(ctx_dft, batch);
+        int ret = tpserve::tp_decode(ctx_dft, batch);
         if (prof_on) { mtp_prof.t_decode += (ggml_time_us() - t_dec0)*1e-3; mtp_prof.n_decodes++; }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
@@ -779,7 +780,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // evaluate the drafted tokens on the draft model
             const int64_t t_dec1 = prof_on ? ggml_time_us() : 0;
-            ret = llama_decode(ctx_dft, batch);
+            ret = tpserve::tp_decode(ctx_dft, batch);
             if (prof_on) { mtp_prof.t_decode += (ggml_time_us() - t_dec1)*1e-3; mtp_prof.n_decodes++; }
             if (ret != 0) {
                 LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
@@ -1111,7 +1112,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 common_batch_add(batch, mask_id, j, { seq_id }, true);
             }
 
-            if (llama_decode(ctx_dft, batch) != 0) {
+            if (tpserve::tp_decode(ctx_dft, batch) != 0) {
                 LOG_WRN("%s: drafter decode failed (seq=%d)\n", __func__, (int) seq_id);
                 continue;
             }

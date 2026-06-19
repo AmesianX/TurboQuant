@@ -1800,7 +1800,7 @@ done:
 }
 
 void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    tpserve::tp_bcast_seq_op(tpserve::TP_OP_SEQ_RM, seq_id, 0, p0, p1, 0); // mirror on SPMD follower
+    tpserve::tp_bcast_seq_op(tpserve::tp_ctx_id(ctx), tpserve::TP_OP_SEQ_RM, seq_id, 0, p0, p1, 0); // mirror on SPMD follower
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
@@ -1808,13 +1808,13 @@ void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p
 }
 
 void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    tpserve::tp_bcast_seq_op(tpserve::TP_OP_SEQ_CP, seq_id_src, seq_id_dst, p0, p1, 0); // mirror on SPMD follower
+    tpserve::tp_bcast_seq_op(tpserve::tp_ctx_id(ctx), tpserve::TP_OP_SEQ_CP, seq_id_src, seq_id_dst, p0, p1, 0); // mirror on SPMD follower
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 }
 
 void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
-    tpserve::tp_bcast_seq_op(tpserve::TP_OP_SEQ_ADD, seq_id, 0, p0, p1, delta); // mirror on SPMD follower
+    tpserve::tp_bcast_seq_op(tpserve::tp_ctx_id(ctx), tpserve::TP_OP_SEQ_ADD, seq_id, 0, p0, p1, delta); // mirror on SPMD follower
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
 }
@@ -2400,7 +2400,7 @@ bool common_prompt_checkpoint::update_tgt(
 
     // [tp-2node-dsv4] mirror this snapshot on the SPMD serving follower (it snapshots its own KV).
     tp_key = tpserve::tp_next_state_key();
-    tpserve::tp_bcast_state_op(tpserve::TP_OP_STATE_SAVE, tp_key, seq_id, (int32_t) flags);
+    tpserve::tp_bcast_state_op(tpserve::tp_ctx_id(ctx), tpserve::TP_OP_STATE_SAVE, tp_key, seq_id, (int32_t) flags);
 
     return true;
 }
@@ -2424,6 +2424,9 @@ bool common_prompt_checkpoint::update_dft(
         return false;
     }
 
+    tp_key_dft = tpserve::tp_next_state_key(); // [tp-2node-dsv4] mirror the MTP draft snapshot
+    tpserve::tp_bcast_state_op(tpserve::tp_ctx_id(ctx), tpserve::TP_OP_STATE_SAVE, tp_key_dft, seq_id, (int32_t) flags);
+
     return true;
 }
 
@@ -2441,7 +2444,7 @@ bool common_prompt_checkpoint::load_tgt(
 
     // [tp-2node-dsv4] mirror the restore on the SPMD serving follower BEFORE we restore locally, so
     // the follower's KV jumps to the same snapshot and the next decode's NCCL collectives line up.
-    tpserve::tp_bcast_state_op(tpserve::TP_OP_STATE_RESTORE, tp_key, seq_id, (int32_t) flags);
+    tpserve::tp_bcast_state_op(tpserve::tp_ctx_id(ctx), tpserve::TP_OP_STATE_RESTORE, tp_key, seq_id, (int32_t) flags);
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
     if (n != data_tgt.size()) {
@@ -2463,6 +2466,8 @@ bool common_prompt_checkpoint::load_dft(
     if (data_dft.empty()) {
         return true;
     }
+
+    tpserve::tp_bcast_state_op(tpserve::tp_ctx_id(ctx), tpserve::TP_OP_STATE_RESTORE, tp_key_dft, seq_id, (int32_t) flags);
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
     if (n != data_dft.size()) {

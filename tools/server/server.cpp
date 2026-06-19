@@ -325,7 +325,7 @@ int llama_server(int argc, char ** argv) {
             SRV_INF("%s", "TP follower: connecting to leader control channel...\n");
             tpserve::tp_follower_connect();
             SRV_INF("%s", "TP follower: connected; entering decode-follower loop\n");
-            tpserve::tp_follower_loop(ctx_server.get_llama_context());
+            tpserve::tp_follower_loop();
             SRV_INF("%s", "TP follower: leader closed the stream; exiting\n");
             clean_up();
             return 0;
