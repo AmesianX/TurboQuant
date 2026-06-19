@@ -20,6 +20,9 @@
 #include <cstring>
 #include <vector>
 #include <string>
+#include <map>
+#include <atomic>
+#include <mutex>
 
 #include <unistd.h>
 #include <sys/socket.h>
@@ -30,14 +33,21 @@
 namespace tpserve {
 
 enum op_type : int32_t {
-    TP_OP_DECODE  = 1,
-    TP_OP_SEQ_RM  = 2,
-    TP_OP_SEQ_ADD = 3,
-    TP_OP_SEQ_CP  = 4,
-    TP_OP_SEQ_KEEP= 5,
-    TP_OP_CLEAR   = 6,
-    TP_OP_STOP    = 99,
+    TP_OP_DECODE        = 1,
+    TP_OP_SEQ_RM        = 2,
+    TP_OP_SEQ_ADD       = 3,
+    TP_OP_SEQ_CP        = 4,
+    TP_OP_SEQ_KEEP      = 5,
+    TP_OP_CLEAR         = 6,
+    TP_OP_STATE_SAVE    = 7, // mirror a KV snapshot (checkpoint / prompt-cache save)
+    TP_OP_STATE_RESTORE = 8, // restore a previously mirrored KV snapshot
+    TP_OP_STOP          = 99,
 };
+
+// Monotonic key naming each mirrored KV snapshot. The leader assigns it at save time and replays
+// it at restore time; the follower keeps a parallel store keyed by it. Data is NEVER sent (the
+// follower snapshots its own mirrored KV) -- only the small key/seq/flags. [tp-2node-dsv4]
+inline uint64_t tp_next_state_key() { static std::atomic<uint64_t> k{1}; return k.fetch_add(1); }
 
 inline int  tp_nranks() { static const int v = getenv("GGML_TP_NRANKS") ? atoi(getenv("GGML_TP_NRANKS")) : 1; return v; }
 inline int  tp_rank()   { static const int v = getenv("GGML_TP_RANK")   ? atoi(getenv("GGML_TP_RANK"))   : 0; return v; }
@@ -47,6 +57,11 @@ inline bool tp_is_follower() { return tp_enabled() && tp_rank() != 0; }
 
 // The single control socket (leader: one accepted fd; follower: the connected fd).
 inline int & tp_fd() { static int fd = -1; return fd; }
+
+// Serializes the multi-write op records on the leader: the server broadcasts from several threads
+// (HTTP handlers + the main decode loop), and interleaved tp_send_all sequences would garble the
+// stream and desync the follower. Each tp_bcast_* takes this lock for its whole record. [tp-2node-dsv4]
+inline std::mutex & tp_send_mtx() { static std::mutex m; return m; }
 
 inline void tp_send_all(int fd, const void * buf, size_t n) {
     const char * p = (const char *) buf;
@@ -107,8 +122,10 @@ inline void tp_follower_connect() {
 // Serialize+send a batch (token path only; the server never uses batch.embd).
 inline void tp_bcast_decode(const llama_batch & b) {
     if (!tp_is_leader() || tp_fd() < 0) { return; }
+    std::lock_guard<std::mutex> lk(tp_send_mtx());
     const int32_t op = TP_OP_DECODE;
     const int32_t nt = b.n_tokens;
+    if (getenv("GGML_TP_DBG")) { fprintf(stderr, "[tp-op] SEND DECODE nt=%d logits=%p\n", nt, (void*)b.logits); fflush(stderr); }
     tp_send_all(tp_fd(), &op, sizeof(op));
     tp_send_all(tp_fd(), &nt, sizeof(nt));
     tp_send_all(tp_fd(), b.token, sizeof(llama_token) * nt);
@@ -122,6 +139,8 @@ inline void tp_bcast_decode(const llama_batch & b) {
 
 inline void tp_bcast_seq_op(int32_t op, llama_seq_id s0, llama_seq_id s1, llama_pos p0, llama_pos p1, llama_pos d) {
     if (!tp_is_leader() || tp_fd() < 0) { return; }
+    std::lock_guard<std::mutex> lk(tp_send_mtx());
+    if (getenv("GGML_TP_DBG")) { fprintf(stderr, "[tp-op] SEND SEQ op=%d s0=%d s1=%d p0=%d p1=%d d=%d\n", op, s0, s1, p0, p1, d); fflush(stderr); }
     tp_send_all(tp_fd(), &op, sizeof(op));
     tp_send_all(tp_fd(), &s0, sizeof(s0));
     tp_send_all(tp_fd(), &s1, sizeof(s1));
@@ -130,8 +149,21 @@ inline void tp_bcast_seq_op(int32_t op, llama_seq_id s0, llama_seq_id s1, llama_
     tp_send_all(tp_fd(), &d,  sizeof(d));
 }
 
+// Mirror a KV snapshot save/restore. `op` is TP_OP_STATE_SAVE or TP_OP_STATE_RESTORE; the follower
+// snapshots/restores ITS OWN (mirrored) KV for `seq_id` under `key` -- no data crosses the wire.
+inline void tp_bcast_state_op(int32_t op, uint64_t key, llama_seq_id seq_id, int32_t flags) {
+    if (!tp_is_leader() || tp_fd() < 0) { return; }
+    std::lock_guard<std::mutex> lk(tp_send_mtx());
+    if (getenv("GGML_TP_DBG")) { fprintf(stderr, "[tp-op] SEND STATE op=%d key=%llu seq=%d\n", op, (unsigned long long)key, seq_id); fflush(stderr); }
+    tp_send_all(tp_fd(), &op,     sizeof(op));
+    tp_send_all(tp_fd(), &key,    sizeof(key));
+    tp_send_all(tp_fd(), &seq_id, sizeof(seq_id));
+    tp_send_all(tp_fd(), &flags,  sizeof(flags));
+}
+
 inline void tp_bcast_stop() {
     if (!tp_is_leader() || tp_fd() < 0) { return; }
+    std::lock_guard<std::mutex> lk(tp_send_mtx());
     const int32_t op = TP_OP_STOP;
     tp_send_all(tp_fd(), &op, sizeof(op));
 }
@@ -142,6 +174,7 @@ inline void tp_bcast_stop() {
 inline void tp_follower_loop(llama_context * ctx) {
     llama_memory_t mem = llama_get_memory(ctx);
     const int fd = tp_fd();
+    std::map<uint64_t, std::vector<uint8_t>> state_store; // mirrored KV snapshots, keyed by leader's key
     std::vector<llama_token>   toks;
     std::vector<llama_pos>     pos;
     std::vector<int32_t>       nsid;
@@ -150,10 +183,12 @@ inline void tp_follower_loop(llama_context * ctx) {
     while (true) {
         int32_t op;
         if (!tp_recv_all(fd, &op, sizeof(op))) { break; }
+        if (getenv("GGML_TP_DBG")) { fprintf(stderr, "[tp-op] RECV op=%d\n", op); fflush(stderr); }
         if (op == TP_OP_STOP) { break; }
         if (op == TP_OP_DECODE) {
             int32_t nt;
             if (!tp_recv_all(fd, &nt, sizeof(nt))) { break; }
+            if (getenv("GGML_TP_DBG")) { fprintf(stderr, "[tp-op] RECV DECODE nt=%d\n", nt); fflush(stderr); }
             toks.resize(nt); pos.resize(nt); nsid.resize(nt); logits.resize(nt);
             if (!tp_recv_all(fd, toks.data(), sizeof(llama_token) * nt)) break;
             if (!tp_recv_all(fd, pos.data(),  sizeof(llama_pos)   * nt)) break;
@@ -176,6 +211,23 @@ inline void tp_follower_loop(llama_context * ctx) {
             }
             llama_decode(ctx, b);
             llama_batch_free(b);
+        } else if (op == TP_OP_STATE_SAVE || op == TP_OP_STATE_RESTORE) {
+            uint64_t key; llama_seq_id seq_id; int32_t flags;
+            if (!tp_recv_all(fd, &key,    sizeof(key)))    break;
+            if (!tp_recv_all(fd, &seq_id, sizeof(seq_id))) break;
+            if (!tp_recv_all(fd, &flags,  sizeof(flags)))  break;
+            if (op == TP_OP_STATE_SAVE) {
+                // Snapshot THIS rank's mirrored KV for seq_id under key (no data on the wire).
+                const size_t sz = llama_state_seq_get_size_ext(ctx, seq_id, (llama_state_seq_flags) flags);
+                std::vector<uint8_t> & dst = state_store[key];
+                dst.resize(sz);
+                llama_state_seq_get_data_ext(ctx, dst.data(), sz, seq_id, (llama_state_seq_flags) flags);
+            } else {
+                auto it = state_store.find(key);
+                if (it != state_store.end() && !it->second.empty()) {
+                    llama_state_seq_set_data_ext(ctx, it->second.data(), it->second.size(), seq_id, (llama_state_seq_flags) flags);
+                }
+            }
         } else {
             llama_seq_id s0, s1; llama_pos p0, p1, d;
             if (!tp_recv_all(fd, &s0, sizeof(s0))) break;
@@ -183,6 +235,7 @@ inline void tp_follower_loop(llama_context * ctx) {
             if (!tp_recv_all(fd, &p0, sizeof(p0))) break;
             if (!tp_recv_all(fd, &p1, sizeof(p1))) break;
             if (!tp_recv_all(fd, &d,  sizeof(d)))  break;
+            if (getenv("GGML_TP_DBG")) { fprintf(stderr, "[tp-op] RECV SEQ op=%d s0=%d s1=%d p0=%d p1=%d\n", op, s0, s1, p0, p1); fflush(stderr); }
             switch (op) {
                 case TP_OP_SEQ_RM:   llama_memory_seq_rm  (mem, s0, p0, p1);     break;
                 case TP_OP_SEQ_ADD:  llama_memory_seq_add (mem, s0, p0, p1, d);  break;

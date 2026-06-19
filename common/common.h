@@ -1091,6 +1091,8 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
+    uint64_t tp_key = 0; // [tp-2node-dsv4] names this snapshot for the SPMD serving follower to mirror
+
     size_t size() const;
 
     bool empty() const;
