@@ -421,6 +421,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // [tp-2node-dsv4] (direction B) MIRROR the whole NextN/MTP draft layer (the appended last
+        // block) so the MTP draft forward has NO cross-rank AllReduce. The draft then runs SOLO on
+        // rank 0 -- off the TP critical path -- which is the only design where MTP nets a speedup
+        // on cross-node TP (the per-layer-split verify still amortizes its barriers over the batch).
+        if (ud->model->arch == LLM_ARCH_DEEPSEEK4 && hparams.nextn_predict_layers > 0 &&
+                tensor_name.compare(0, 4, "blk.") == 0) {
+            const size_t dot = tensor_name.find('.', 4);
+            if (dot != std::string::npos) {
+                const uint32_t blk = (uint32_t) std::stoul(tensor_name.substr(4, dot - 4));
+                if (blk >= hparams.n_layer - hparams.nextn_predict_layers) {
+                    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, blk, 0};
+                }
+            }
+        }
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");

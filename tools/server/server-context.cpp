@@ -1057,7 +1057,11 @@ private:
         // matching one: ctx_tgt=0, the MTP draft ctx_dft=1 (if present). Identical order on both ranks.
         if (tpserve::tp_enabled()) {
             tpserve::tp_register_ctx(ctx_tgt);
-            if (ctx_dft) { tpserve::tp_register_ctx(ctx_dft.get()); }
+            // [tp-2node-dsv4] (direction B) do NOT register ctx_dft: the MTP draft runs on a fully
+            // MIRRORED NextN layer (no AllReduce) SOLO on rank 0, off the TP critical path. Its
+            // decodes are not broadcast; the follower idles during draft and only mirrors the
+            // batched verify on ctx_tgt. This removes the serial cross-node draft round-trips that
+            // made MTP regress (11.1 t/s) and should let the verify-batch amortization net a win.
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
