@@ -5,6 +5,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "tp-serve.h" // [tp-2node-dsv4] SPMD serving: broadcast decodes to the follower
 
 #include "build-info.h"
 #include "common.h"
@@ -3160,6 +3161,7 @@ private:
                             n_tokens, no, (int) batch_view.pos[0], st.c_str());
                 }
             }
+            tpserve::tp_bcast_decode(batch_view); // [tp-2node-dsv4] mirror this decode on the follower
             const int ret = llama_decode(ctx_tgt, batch_view);
 
             metrics.on_decoded(slots);

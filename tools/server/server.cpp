@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-tools.h"
+#include "tp-serve.h" // [tp-2node-dsv4] SPMD serving control plane
 
 #include "arg.h"
 #include "build-info.h"
@@ -315,6 +316,25 @@ int llama_server(int argc, char ** argv) {
         ctx_http.is_ready.store(true);
 
         SRV_INF("%s", "model loaded\n");
+
+        // [tp-2node-dsv4] SPMD serving: rank>0 has no HTTP driver. It becomes a compute follower
+        // replaying rank 0's context ops (decode + KV mutations) so the replicated KV caches stay
+        // in lockstep and the per-layer NCCL AllReduces line up. rank 0 waits for the follower to
+        // connect before it starts serving, so the very first decode is synchronized.
+        if (tpserve::tp_is_follower()) {
+            SRV_INF("%s", "TP follower: connecting to leader control channel...\n");
+            tpserve::tp_follower_connect();
+            SRV_INF("%s", "TP follower: connected; entering decode-follower loop\n");
+            tpserve::tp_follower_loop(ctx_server.get_llama_context());
+            SRV_INF("%s", "TP follower: leader closed the stream; exiting\n");
+            clean_up();
+            return 0;
+        }
+        if (tpserve::tp_is_leader()) {
+            SRV_INF("%s", "TP leader: waiting for follower to connect...\n");
+            tpserve::tp_leader_accept();
+            SRV_INF("%s", "TP leader: follower connected; serving\n");
+        }
 
         shutdown_handler = [&](int) {
             // this will unblock start_loop()
