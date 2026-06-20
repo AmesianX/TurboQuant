@@ -1695,6 +1695,12 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+    // [tp-dsv4-mtp] Identity signature of the cgraph that built the cached per-backend node lists.
+    // The uid alone is NOT a reliable "same graph" key when multiple contexts (e.g. the MTP draft
+    // ctx_dft + the trunk ctx_tgt) share this meta backend and interleave: a uid match can still
+    // pair with a different node layout, leaving stale bcj.nodes (mirrored NextN MoE src0 then
+    // resolves to the wrong tensor). Rebuild whenever this signature changes, even if uid matches.
+    uint64_t                    last_sig      = 0;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -1891,7 +1897,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    //
+    // [tp-dsv4-mtp] BUT the uid is not a sufficient "same graph" key here. With MTP speculation two
+    // llama contexts (the trunk/verify ctx_tgt and the NextN draft ctx_dft) share this single meta
+    // backend and interleave their graph_compute calls. A uid match can then pair with a different
+    // node layout (the autoregressive draft rebuilds its small graph each step; a reused trunk graph
+    // can change the verify batch width). Skipping the rebuild on a uid match leaves the cached
+    // per-backend node lists (bcj.nodes) stale, and the mirrored NextN MoE expert mul_mat_id then
+    // resolves its src to the wrong simple tensor -> a CPU-fallback ids-size assert / wrong results.
+    // Guard the skip with a cheap identity signature (node count + sampled node pointers + their
+    // shapes) and rebuild whenever it changes, even if the uid matches.
+    uint64_t sig = (uint64_t) (uint32_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
+    if (cgraph->n_nodes > 0) {
+        const int s_i[5] = { 0, cgraph->n_nodes / 4, cgraph->n_nodes / 2,
+                             (3 * cgraph->n_nodes) / 4, cgraph->n_nodes - 1 };
+        for (int k = 0; k < 5; ++k) {
+            const ggml_tensor * nd = cgraph->nodes[s_i[k]];
+            sig ^= (uint64_t) (uintptr_t) nd;
+            sig *= 0x100000001B3ull;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                sig ^= (uint64_t) nd->ne[d] + 0x9E3779B9ull + (sig << 6) + (sig >> 2);
+            }
+        }
+    }
+    const bool sig_changed = sig != backend_ctx->last_sig;
+    const bool needs_rebuild = sig_changed || (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2110,6 +2140,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         backend_ctx->uid         = cgraph->uid;
+        backend_ctx->last_sig    = sig; // [tp-dsv4-mtp] remember which graph built the cached node lists
         backend_ctx->n_subgraphs = n_subgraphs;
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
