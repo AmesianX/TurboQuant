@@ -53,7 +53,9 @@ env_common() {
 }
 
 stop_local() {
-    local pids; pids="$(ps -C llama-server -o pid= | tr -d ' ')"
+    # `ps -C` exits 1 when nothing matches; under `set -e` + pipefail a bare assignment from it would
+    # abort the script, so swallow the status (|| true) — empty output then means "nothing running".
+    local pids; pids="$(ps -C llama-server -o pid= | tr -d ' ' || true)"
     if [ -z "$pids" ]; then echo "[$ROLE] STOP: nothing running"; return 0; fi
     for p in $(ps -C llama-server -o pid=); do kill "$p" 2>/dev/null || true; done
     # give it a moment, then hard-kill any survivor
@@ -87,7 +89,7 @@ start_local() {
 }
 
 status_local() {
-    local pids; pids="$(ps -C llama-server -o pid=,etime= | tr '\n' ';')"
+    local pids; pids="$(ps -C llama-server -o pid=,etime= | tr '\n' ';' || true)"  # || true: see stop_local
     echo "[$ROLE] STATUS: ${pids:-(not running)}"
 }
 
@@ -104,7 +106,8 @@ case "${1:-}" in
         ssh "$SLAVE_SSH" "$SELF STOP" || true
         stop_local
         echo "== ALLRESTART: starting slave then master =="
-        ssh "$SLAVE_SSH" "$SELF START"
+        # don't let a slave-side failure abort under set -e before the master is started — warn and go on
+        ssh "$SLAVE_SSH" "$SELF START" || echo "[WARN] slave START failed ($SLAVE_SSH) — starting master anyway"
         sleep 3
         start_local ;;
     *)
