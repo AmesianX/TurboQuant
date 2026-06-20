@@ -41,6 +41,13 @@ __attribute__((constructor)) static void tp_install_crash_handler() {
 #include <utility>
 #include <vector>
 
+// [tp-dsv4-mtp] depth of the compute simple-tensor container ring (was a fixed 2-deep double-buffer).
+// Must exceed the number of structurally-distinct graphs that can be computed back-to-back without a
+// reuse in between; MTP interleaves variable-length draft graphs with the verify graph.
+#ifndef GGML_META_STC_RING
+#define GGML_META_STC_RING 64
+#endif
+
 struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
@@ -438,9 +445,21 @@ struct ggml_backend_meta_buffer_context {
     // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
     //     currently not possible due to graph-external operations in the backend scheduler.
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute[2];
+    // [tp-dsv4-mtp] Ring of compute containers. A 2-deep double-buffer is insufficient when 3+
+    // structurally-distinct graphs are computed back-to-back without a reuse in between (this happens
+    // with MTP: the variable-length autoregressive draft graphs interleave with the verify graph and
+    // break the regular rebuild/rebuild/skip cadence). With only 2 buffers the 3rd graph clobbers the
+    // 1st still-referenced container and the mirrored NextN MoE expert resolves to the wrong tensor.
+    // A deeper ring keeps enough recent containers alive.
+    std::vector<ggml_backend_meta_simple_tensor_container> stc_compute;
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
+    // [tp-dsv4-mtp] set when the graph allocator (re)builds compute simple-tensors for this buffer,
+    // i.e. the graph genuinely changed. This is the reliable "rebuild the per-backend node lists"
+    // signal — more precise than a uid/signature compare, which can collide for the variable-length
+    // MTP draft graphs (collision -> stale bcj.nodes -> wrong MoE src) or miss a reuse (force rebuild
+    // -> the reused graph's simple-tensors get recycled out of the ring -> null nodes).
+    bool compute_dirty = false;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     // FIXME
@@ -453,10 +472,9 @@ struct ggml_backend_meta_buffer_context {
 
     ggml_backend_meta_buffer_context(
             ggml_backend_meta_simple_tensor_container & stc_static,
-            ggml_backend_meta_simple_tensor_container & stc_compute_0,
-            ggml_backend_meta_simple_tensor_container & stc_compute_1,
+            std::vector<ggml_backend_meta_simple_tensor_container> & stc_compute_ring,
             const std::vector<ggml_backend_buffer_t> & bufs)
-            : stc_static(std::move(stc_static)), stc_compute{std::move(stc_compute_0), std::move(stc_compute_1)} {
+            : stc_static(std::move(stc_static)), stc_compute(std::move(stc_compute_ring)) {
         this->bufs.reserve(bufs.size());
         for (ggml_backend_buffer_t buf : bufs) {
             this->bufs.emplace_back(buf);
@@ -499,10 +517,24 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
-    if (it == stc.simple_tensors.end()) {
-        return nullptr;
+    if (it != stc.simple_tensors.end()) {
+        return it->second[index];
     }
-    return it->second[index];
+    // [tp-dsv4-mtp] The committed compute container index can get out of step with the one the graph
+    // allocator populated for this tensor (the swap in graph_compute advances the ring while init was
+    // done against the pre-swap slot; with the variable-length MTP draft this leaves the current slot
+    // empty -> a missing tensor). Fall back to searching the whole compute ring (most-recent first) so
+    // a tensor built in any live slot is still found, instead of returning null / a stale resolution.
+    const int n_ring = (int) buf_ctx->stc_compute.size();
+    for (int k = 0; k < n_ring; ++k) {
+        const int slot = ((buf_ctx->stc_compute_index - k) % n_ring + n_ring) % n_ring;
+        auto & sk = buf_ctx->stc_compute[slot];
+        auto itk = sk.simple_tensors.find(tensor);
+        if (itk != sk.simple_tensors.end()) {
+            return itk->second[index];
+        }
+    }
+    return nullptr;
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
@@ -1293,7 +1325,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
-    return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+    ggml_backend_meta_simple_tensor_container & cont = buf_ctx->get_simple_tensor_container(tensor);
+    if (&cont != &buf_ctx->stc_static) {
+        buf_ctx->compute_dirty = true; // [tp-dsv4-mtp] a compute tensor was (re)allocated -> graph changed
+    }
+    return ggml_backend_meta_buffer_init_tensor_impl(cont, tensor);
 }
 
 // fwd decls (definitions below near alloc_buffer) -- SPMD slice-locality, used in set/get/compute
@@ -1582,8 +1618,11 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
+    std::vector<ggml_backend_meta_simple_tensor_container> stc_compute_ring;
+    stc_compute_ring.reserve(GGML_META_STC_RING);
+    for (int r = 0; r < GGML_META_STC_RING; ++r) {
+        stc_compute_ring.emplace_back(params, n_simple_bufts);
+    }
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -1595,7 +1634,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
-    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_ring, bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
@@ -1615,11 +1654,14 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static   (params_static,  n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params_compute, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
+    std::vector<ggml_backend_meta_simple_tensor_container> stc_compute_ring;
+    stc_compute_ring.reserve(GGML_META_STC_RING);
+    for (int r = 0; r < GGML_META_STC_RING; ++r) {
+        stc_compute_ring.emplace_back(params_compute, n_simple_bufts);
+    }
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
-    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_ring, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -1678,6 +1720,11 @@ struct ggml_backend_meta_context {
 
         std::vector<cgraph_config>           cgraphs;
         std::vector<ggml_tensor *>           nodes;
+        // [tp-dsv4-mtp] per-graph cache of the resolved node list, keyed by cgraph uid. `nodes` is a
+        // single live array overwritten on every rebuild; when an earlier graph (e.g. an MTP draft) is
+        // reused after other graphs rebuilt, its list is gone. Cache per uid and restore it on reuse so
+        // a skipped rebuild gets ITS nodes back instead of a stale neighbour's.
+        std::map<uint64_t, std::vector<ggml_tensor *>> nodes_by_uid;
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
@@ -1695,12 +1742,6 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
-    // [tp-dsv4-mtp] Identity signature of the cgraph that built the cached per-backend node lists.
-    // The uid alone is NOT a reliable "same graph" key when multiple contexts (e.g. the MTP draft
-    // ctx_dft + the trunk ctx_tgt) share this meta backend and interleave: a uid match can still
-    // pair with a different node layout, leaving stale bcj.nodes (mirrored NextN MoE src0 then
-    // resolves to the wrong tensor). Rebuild whenever this signature changes, even if uid matches.
-    uint64_t                    last_sig      = 0;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -1896,32 +1937,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
-    // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
+    // Decide whether the per-simple-backend node lists must be rebuilt for this cgraph.
     //
-    // [tp-dsv4-mtp] BUT the uid is not a sufficient "same graph" key here. With MTP speculation two
-    // llama contexts (the trunk/verify ctx_tgt and the NextN draft ctx_dft) share this single meta
-    // backend and interleave their graph_compute calls. A uid match can then pair with a different
-    // node layout (the autoregressive draft rebuilds its small graph each step; a reused trunk graph
-    // can change the verify batch width). Skipping the rebuild on a uid match leaves the cached
-    // per-backend node lists (bcj.nodes) stale, and the mirrored NextN MoE expert mul_mat_id then
-    // resolves its src to the wrong simple tensor -> a CPU-fallback ids-size assert / wrong results.
-    // Guard the skip with a cheap identity signature (node count + sampled node pointers + their
-    // shapes) and rebuild whenever it changes, even if the uid matches.
-    uint64_t sig = (uint64_t) (uint32_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
-    if (cgraph->n_nodes > 0) {
-        const int s_i[5] = { 0, cgraph->n_nodes / 4, cgraph->n_nodes / 2,
-                             (3 * cgraph->n_nodes) / 4, cgraph->n_nodes - 1 };
-        for (int k = 0; k < 5; ++k) {
-            const ggml_tensor * nd = cgraph->nodes[s_i[k]];
-            sig ^= (uint64_t) (uintptr_t) nd;
-            sig *= 0x100000001B3ull;
-            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-                sig ^= (uint64_t) nd->ne[d] + 0x9E3779B9ull + (sig << 6) + (sig >> 2);
-            }
+    // [tp-dsv4-mtp] The original heuristic (skip the rebuild whenever cgraph->uid matched the previous
+    // one) is unsafe under MTP speculation: the trunk/verify (ctx_tgt) and NextN draft (ctx_dft) llama
+    // contexts share this single meta backend and interleave their graph_compute calls, and the
+    // autoregressive draft produces a different small graph each step. A uid match can then pair with a
+    // different node layout, leaving the cached node lists (bcj.nodes) stale -> the mirrored NextN MoE
+    // expert mul_mat_id resolves its src to the wrong simple tensor (CPU-fallback ids-size assert).
+    //
+    // Use the graph allocator as the source of truth instead: it sets compute_dirty on a meta buffer
+    // exactly when it (re)built that buffer's compute tensors this round, i.e. the graph genuinely
+    // changed. Rebuild when dirty (or when we have no cached list for this uid); otherwise this is a
+    // real reuse and we restore the per-uid cached node list below — no signature/force-rebuild needed.
+    bool compute_dirty = false;
+    for (int i = 0; i < cgraph->n_nodes && !compute_dirty; i++) {
+        const ggml_tensor * nd = cgraph->nodes[i];
+        if (nd->buffer && ggml_backend_buffer_is_meta(nd->buffer)) {
+            compute_dirty = ((ggml_backend_meta_buffer_context *) nd->buffer->context)->compute_dirty;
         }
     }
-    const bool sig_changed = sig != backend_ctx->last_sig;
-    const bool needs_rebuild = sig_changed || (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    const bool uid_cached = cgraph->uid != 0 &&
+        backend_ctx->backend_configs[0].nodes_by_uid.find(cgraph->uid) != backend_ctx->backend_configs[0].nodes_by_uid.end();
+    const bool needs_rebuild = compute_dirty || (cgraph->uid == 0) || !uid_cached;
+    // [tp-dsv4-mtp] genuine reuse: restore THIS graph's cached node list (the live `nodes` array may
+    // have been overwritten by an interleaved graph since this uid was last built).
+    if (!needs_rebuild) {
+        for (size_t j = 0; j < n_backends; j++) {
+            backend_ctx->backend_configs[j].nodes = backend_ctx->backend_configs[j].nodes_by_uid[cgraph->uid];
+        }
+    }
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -1949,12 +1994,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
-            buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
-            ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
-            for (ggml_context_ptr & ctx : stc.ctxs) {
-                ggml_reset(ctx.get());
+            // [tp-dsv4-mtp] only advance/clear the ring for a buffer whose compute tensors actually
+            // changed this round; a reused graph keeps its still-valid container (no recycle -> no null).
+            if (buf_ctx->compute_dirty) {
+                buf_ctx->stc_compute_index_next = (buf_ctx->stc_compute_index + 1) % (int) buf_ctx->stc_compute.size();
+                ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
+                for (ggml_context_ptr & ctx : stc.ctxs) {
+                    ggml_reset(ctx.get());
+                }
+                stc.simple_tensors.clear();
             }
-            stc.simple_tensors.clear();
+            buf_ctx->compute_dirty = false;
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
@@ -1972,6 +2022,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 GGML_ASSERT(bcj.nodes[i]);
+            }
+        }
+        // [tp-dsv4-mtp] cache the freshly resolved node lists under this graph's uid so a later reuse
+        // can restore them instead of inheriting whatever the next rebuild leaves in `nodes`. Keep the
+        // cache bounded to recent uids: graph uids are monotonic, and a cached list is only valid while
+        // its simple-tensors still live in the compute ring (the last GGML_META_STC_RING distinct
+        // graphs), so evict anything older than that window — this also prevents unbounded growth.
+        if (cgraph->uid != 0) {
+            const uint64_t keep_from = cgraph->uid > GGML_META_STC_RING ? cgraph->uid - GGML_META_STC_RING : 0;
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & cache = backend_ctx->backend_configs[j].nodes_by_uid;
+                cache[cgraph->uid] = backend_ctx->backend_configs[j].nodes;
+                cache.erase(cache.begin(), cache.lower_bound(keep_from));
             }
         }
 
@@ -2140,7 +2203,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         backend_ctx->uid         = cgraph->uid;
-        backend_ctx->last_sig    = sig; // [tp-dsv4-mtp] remember which graph built the cached node lists
         backend_ctx->n_subgraphs = n_subgraphs;
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
