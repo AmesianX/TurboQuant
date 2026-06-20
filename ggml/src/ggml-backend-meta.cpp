@@ -517,24 +517,10 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
-    if (it != stc.simple_tensors.end()) {
-        return it->second[index];
+    if (it == stc.simple_tensors.end()) {
+        return nullptr;
     }
-    // [tp-dsv4-mtp] The committed compute container index can get out of step with the one the graph
-    // allocator populated for this tensor (the swap in graph_compute advances the ring while init was
-    // done against the pre-swap slot; with the variable-length MTP draft this leaves the current slot
-    // empty -> a missing tensor). Fall back to searching the whole compute ring (most-recent first) so
-    // a tensor built in any live slot is still found, instead of returning null / a stale resolution.
-    const int n_ring = (int) buf_ctx->stc_compute.size();
-    for (int k = 0; k < n_ring; ++k) {
-        const int slot = ((buf_ctx->stc_compute_index - k) % n_ring + n_ring) % n_ring;
-        auto & sk = buf_ctx->stc_compute[slot];
-        auto itk = sk.simple_tensors.find(tensor);
-        if (itk != sk.simple_tensors.end()) {
-            return itk->second[index];
-        }
-    }
-    return nullptr;
+    return it->second[index];
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
@@ -1720,11 +1706,6 @@ struct ggml_backend_meta_context {
 
         std::vector<cgraph_config>           cgraphs;
         std::vector<ggml_tensor *>           nodes;
-        // [tp-dsv4-mtp] per-graph cache of the resolved node list, keyed by cgraph uid. `nodes` is a
-        // single live array overwritten on every rebuild; when an earlier graph (e.g. an MTP draft) is
-        // reused after other graphs rebuilt, its list is gone. Cache per uid and restore it on reuse so
-        // a skipped rebuild gets ITS nodes back instead of a stale neighbour's.
-        std::map<uint64_t, std::vector<ggml_tensor *>> nodes_by_uid;
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
@@ -1939,17 +1920,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     // Decide whether the per-simple-backend node lists must be rebuilt for this cgraph.
     //
-    // [tp-dsv4-mtp] The original heuristic (skip the rebuild whenever cgraph->uid matched the previous
-    // one) is unsafe under MTP speculation: the trunk/verify (ctx_tgt) and NextN draft (ctx_dft) llama
-    // contexts share this single meta backend and interleave their graph_compute calls, and the
-    // autoregressive draft produces a different small graph each step. A uid match can then pair with a
-    // different node layout, leaving the cached node lists (bcj.nodes) stale -> the mirrored NextN MoE
-    // expert mul_mat_id resolves its src to the wrong simple tensor (CPU-fallback ids-size assert).
+    // [tp-dsv4-mtp] The original "skip the rebuild whenever cgraph->uid matches the previous one"
+    // heuristic is unsafe under MTP speculation: the trunk/verify (ctx_tgt) and NextN draft (ctx_dft)
+    // llama contexts share this single meta backend and interleave their graph_compute calls, and the
+    // autoregressive draft produces a different small graph each step. A uid match could then pair with
+    // a different node layout, leaving the cached node lists (bcj.nodes) stale -> the mirrored NextN MoE
+    // expert mul_mat_id resolved its src to the wrong simple tensor (CPU-fallback ids-size assert).
     //
-    // Use the graph allocator as the source of truth instead: it sets compute_dirty on a meta buffer
-    // exactly when it (re)built that buffer's compute tensors this round, i.e. the graph genuinely
-    // changed. Rebuild when dirty (or when we have no cached list for this uid); otherwise this is a
-    // real reuse and we restore the per-uid cached node list below — no signature/force-rebuild needed.
+    // Fix: add the graph allocator as a second, authoritative "graph changed" signal. It sets
+    // compute_dirty on a meta buffer exactly when it (re)built that buffer's compute tensors this round.
+    // Rebuild the node lists when dirty (or on a uid change / uid 0); a clean reuse (same uid, nothing
+    // reallocated) keeps the prior compiled subgraphs. This pairs with a compute-container ring deep
+    // enough (GGML_META_STC_RING) to keep every still-in-flight graph's simple tensors alive across the
+    // MTP interleave — a 2-deep double buffer is NOT enough and reintroduces the ids-size assert.
     bool compute_dirty = false;
     for (int i = 0; i < cgraph->n_nodes && !compute_dirty; i++) {
         const ggml_tensor * nd = cgraph->nodes[i];
@@ -1957,16 +1940,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             compute_dirty = ((ggml_backend_meta_buffer_context *) nd->buffer->context)->compute_dirty;
         }
     }
-    const bool uid_cached = cgraph->uid != 0 &&
-        backend_ctx->backend_configs[0].nodes_by_uid.find(cgraph->uid) != backend_ctx->backend_configs[0].nodes_by_uid.end();
-    const bool needs_rebuild = compute_dirty || (cgraph->uid == 0) || !uid_cached;
-    // [tp-dsv4-mtp] genuine reuse: restore THIS graph's cached node list (the live `nodes` array may
-    // have been overwritten by an interleaved graph since this uid was last built).
-    if (!needs_rebuild) {
-        for (size_t j = 0; j < n_backends; j++) {
-            backend_ctx->backend_configs[j].nodes = backend_ctx->backend_configs[j].nodes_by_uid[cgraph->uid];
-        }
-    }
+    const bool needs_rebuild = compute_dirty || (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2022,19 +1996,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 GGML_ASSERT(bcj.nodes[i]);
-            }
-        }
-        // [tp-dsv4-mtp] cache the freshly resolved node lists under this graph's uid so a later reuse
-        // can restore them instead of inheriting whatever the next rebuild leaves in `nodes`. Keep the
-        // cache bounded to recent uids: graph uids are monotonic, and a cached list is only valid while
-        // its simple-tensors still live in the compute ring (the last GGML_META_STC_RING distinct
-        // graphs), so evict anything older than that window — this also prevents unbounded growth.
-        if (cgraph->uid != 0) {
-            const uint64_t keep_from = cgraph->uid > GGML_META_STC_RING ? cgraph->uid - GGML_META_STC_RING : 0;
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & cache = backend_ctx->backend_configs[j].nodes_by_uid;
-                cache[cgraph->uid] = backend_ctx->backend_configs[j].nodes;
-                cache.erase(cache.begin(), cache.lower_bound(keep_from));
             }
         }
 
