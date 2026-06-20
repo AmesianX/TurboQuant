@@ -63,13 +63,20 @@ inline int & tp_fd() { static int fd = -1; return fd; }
 // stream and desync the follower. Each tp_bcast_* takes this lock for its whole record. [tp-2node-dsv4]
 inline std::mutex & tp_send_mtx() { static std::mutex m; return m; }
 
-// Registry of the contexts that participate in TP (e.g. ctx_tgt=0 and the MTP draft ctx_dft=1).
-// Both leader and follower register the SAME contexts in the SAME order during load. Every op
-// record carries this id so the follower replays it on the matching context. [tp-2node-dsv4]
+// Registry of the contexts that participate in TP. In the current MTP design only ctx_tgt is
+// registered (id 0); the NextN draft ctx_dft is intentionally NOT registered (direction B — it runs
+// mirrored/solo on rank 0, see server-context.cpp). Both leader and follower register the SAME
+// contexts in the SAME order during load. Every op record carries this id so the follower replays it
+// on the matching context. [tp-2node-dsv4]
 inline std::vector<llama_context *> & tp_ctxs() { static std::vector<llama_context *> v; return v; }
 inline int tp_register_ctx(llama_context * ctx) {
-    tp_ctxs().push_back(ctx);
-    return (int) tp_ctxs().size() - 1;
+    // Idempotent: load_model() re-runs on resume-from-sleep, so a plain push_back would re-register the
+    // same context every wake — growing the registry unbounded and shifting the leader/follower id map.
+    // Return the existing id if already registered; only a genuinely new context is appended.
+    auto & v = tp_ctxs();
+    for (size_t i = 0; i < v.size(); i++) { if (v[i] == ctx) { return (int) i; } }
+    v.push_back(ctx);
+    return (int) v.size() - 1;
 }
 inline int tp_ctx_id(const llama_context * ctx) {
     auto & v = tp_ctxs();
@@ -133,7 +140,7 @@ inline void tp_follower_connect() {
 
 // ---- leader: broadcast ops ----------------------------------------------------------------
 
-// Every record is prefixed with the target context id (ctx_tgt=0, ctx_dft=1, ...) so the follower
+// Every record is prefixed with the target context id (ctx_tgt=0; only registered contexts) so the follower
 // replays it on the matching context. [tp-2node-dsv4]
 // Serialize+send a batch (token path only; the server never uses batch.embd).
 inline void tp_bcast_decode(int32_t ctx_id, const llama_batch & b) {
@@ -196,8 +203,9 @@ inline void tp_bcast_stop() {
 
 // ---- follower: receive+replay loop --------------------------------------------------------
 
-// Drives ALL registered follower contexts (ctx_tgt + the MTP draft ctx_dft) from the leader's op
-// stream until TP_OP_STOP / EOF. Each record names its target context by id. [tp-2node-dsv4]
+// Drives ALL registered follower contexts (currently just ctx_tgt; the NextN draft ctx_dft is not
+// registered) from the leader's op stream until TP_OP_STOP / EOF. Each record names its target
+// context by id. [tp-2node-dsv4]
 inline void tp_follower_loop() {
     const int fd = tp_fd();
     std::map<uint64_t, std::vector<uint8_t>> state_store; // mirrored KV snapshots, keyed by leader's key
