@@ -2160,6 +2160,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 n_subgraphs++;
                 i_start = i + 1;
             }
+            // Close any trailing nodes into a final reduction-free subgraph. Normally the last node
+            // closes the final subgraph via the (i+1==n_nodes) boundary above, but that is bypassed
+            // when the graph ends with host-view nodes skipped by the `continue` near the loop top.
+            // Multi-slot DSV4 decode (n_seqs>1) ends with zero-sized recurrent extra-state copies
+            // (build_rs's n_rs-n_seqs==0 view, split axis UNKNOWN). Any nodes after the last AllReduce
+            // are non-PARTIAL by construction (a PARTIAL would have forced a boundary), so they need no
+            // collective and form one final mirrored subgraph [i_start, n_nodes) -- identical in shape
+            // to the normal last subgraph, just emitted explicitly when the last node was skipped.
+            if (i_start < cgraph->n_nodes) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    backend_ctx->backend_configs[j].cgraphs[n_subgraphs].offset = i_start;
+                }
+                n_subgraphs++;
+                i_start = cgraph->n_nodes;
+            }
             GGML_ASSERT(i_start == cgraph->n_nodes);
         }
 
