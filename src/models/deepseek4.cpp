@@ -43,6 +43,9 @@ enum class dsv4_mask_kind {
     RAW_WINDOW,
     COMPRESS_CAUSAL,
     ATTN_STATIC,
+    COMPRESS_CAUSAL_BLOCKDIAG,  // multi-slot: query token t (sequence s) sees ONLY its own
+                                // sequence's compressed block [s*block, s*block+block) with
+                                // compress-causal visibility; every other sequence's block is -inf.
 };
 
 // position-derived i32 graph inputs for the phase-uniform decode path (n_tokens == 1).
@@ -190,6 +193,10 @@ public:
                     fill_raw_window(data, n0, n1, mask.window, ubatch);
                     fill_compress_causal(data, n0, n1, mask.ratio, mask.n_raw, ubatch);
                     break;
+                case dsv4_mask_kind::COMPRESS_CAUSAL_BLOCKDIAG:
+                    // multi-slot: n_comp holds the per-sequence block stride (n_comp_view)
+                    fill_compress_causal_blockdiag(data, n0, n1, mask.n_comp, mask.ratio, ubatch);
+                    break;
             }
 
             ggml_backend_tensor_set(mask.tensor, data.data(), 0, data.size()*sizeof(float));
@@ -263,6 +270,35 @@ private:
 
             for (int64_t ic = 0; ic < std::min<int64_t>(n_comp, n_visible); ++ic) {
                 data[iq*n0 + offset + ic] = 0.0f;
+            }
+        }
+    }
+
+    // Multi-slot block-diagonal compress-causal mask: the compressed-KV columns are the per-sequence
+    // caches concatenated in ubatch-sequence order, each `block` rows wide (block == n_comp_view).
+    // split_equal lays the ubatch out sequence-major ([seq0 tokens..][seq1 tokens..]..), so token iq
+    // belongs to sequence ordinal (iq / n_seq_tokens), whose cache occupies block [ord*block, +block).
+    // The query may attend only that block, and only its compress-causal-visible rows; every other
+    // sequence's block stays -inf — this is what separates concurrent requests at attention time.
+    // (n_seq_tokens==1 today => ord==iq; the /n_seq_tokens keeps it correct for future K-token-per-seq
+    // batched speculative decode, where the cache concat is still one block per sequence ordinal.)
+    static void fill_compress_causal_blockdiag(
+            std::vector<float> & data,
+            int64_t              n0,      // n_seqs * block
+            int64_t              n1,      // n_tokens (== n_seqs * n_seq_tokens)
+            int64_t              block,   // per-sequence compressed-cache stride (n_comp_view)
+            int64_t              ratio,
+            const llama_ubatch * ubatch) {
+        GGML_ASSERT(ratio > 0 && block > 0);
+        const int64_t nst = ubatch->n_seq_tokens > 0 ? (int64_t) ubatch->n_seq_tokens : 1;
+
+        for (int64_t iq = 0; iq < n1; ++iq) {
+            const llama_pos p1 = ubatch->pos ? ubatch->pos[iq] : (llama_pos) iq;
+            const int64_t n_visible = (p1 + 1) / ratio;
+            const int64_t base = (iq / nst) * block;   // this query's own sequence block
+
+            for (int64_t ic = 0; ic < std::min<int64_t>(block, n_visible); ++ic) {
+                data[iq*n0 + base + ic] = 0.0f;
             }
         }
     }
@@ -419,6 +455,46 @@ static void dsv4_store_state_segment(
 
     const int64_t row = cache_slot * mem_size + head;
     ggml_tensor * view = ggml_view_1d(ctx, dst, n, (row*state_size + offset)*ggml_element_size(dst));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, src, view));
+}
+
+// Multi-slot (n_seqs>1) view of ONE state segment across the per-sequence recurrent cells.
+// build_rs returns [state_size, n_seqs] with one contiguous cell per sequence (cells laid out
+// at stride state_size, in ubatch-seq order — same layout mamba's contiguous store relies on).
+// This views the [width, rows] segment at `offset` within each cell as a batched [width, rows, n_seqs]
+// tensor (column stride = state->nb[1] = state_size). For n_seqs==1 it is the 2D segment with a
+// trailing dim of 1 — the single-slot path keeps using dsv4_view_state_segment (2D) untouched.
+static ggml_tensor * dsv4_view_state_segment_3d(
+        ggml_context * ctx,
+        ggml_tensor  * state,
+        int64_t        offset,
+        int64_t        width,
+        int64_t        rows,
+        int64_t        n_seqs) {
+    return ggml_view_3d(ctx, state, width, rows, n_seqs,
+            width*state->nb[0], state->nb[1], offset*state->nb[0]);
+}
+
+// Multi-slot store: write src [width, rows, n_seqs] back so plane s lands in the recurrent cell
+// (head + s) at byte `offset` within that cell. DSV4 packs two segments (attn, index) per cell,
+// so a single segment across sequences is a strided [width*rows, n_seqs] region (cell stride =
+// state_size) — the strided generalization of mamba's contiguous y_ssm store. n_rs_seq==0 in the
+// multi-slot regime (the split-equal gate excludes rollback), so no snapshot planes are needed.
+static void dsv4_store_state_segment_multi(
+        ggml_context * ctx,
+        ggml_cgraph  * gf,
+        ggml_tensor  * src,   // [width, rows, n_seqs]
+        ggml_tensor  * dst,
+        int64_t        state_size,
+        int64_t        head,
+        int64_t        offset,
+        int64_t        n_seqs) {
+    const int64_t seg = ggml_nelements(src) / n_seqs;   // width*rows per sequence
+    src = ggml_cont(ctx, src);
+    src = ggml_reshape_2d(ctx, src, seg, n_seqs);
+    ggml_tensor * view = ggml_view_2d(ctx, dst, seg, n_seqs,
+            state_size*ggml_element_size(dst),
+            (head*state_size + offset)*ggml_element_size(dst));
     ggml_build_forward_expand(gf, ggml_cpy(ctx, src, view));
 }
 
@@ -854,16 +930,20 @@ static ggml_tensor * dsv4_pool_decode_state(
         const dsv4_rope_cfg & rope_cfg,
         float          norm_eps) {
     const int64_t n_rows = kv->ne[1];
-    kv    = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, kv)),    n_rows, head_dim, 1);
-    score = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, score)), n_rows, head_dim, 1);
+    // batch dim (trailing): n_seqs==1 for single-slot decode (kv 2D -> ne[2]==1, byte-identical);
+    // multi-slot batched decode passes kv [head_dim, n_rows, n_seqs] so each sequence pools its own
+    // window independently. softmax/sum_rows/rms_norm all run per-column, broadcasting over the batch.
+    const int64_t n_seqs = kv->ne[2];
+    kv    = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, kv)),    n_rows, head_dim, n_seqs);
+    score = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, score)), n_rows, head_dim, n_seqs);
 
     ggml_tensor * pooled = dsv4_softmax_pool_ratio(ctx, kv, score);
     pooled = ggml_rms_norm(ctx, pooled, norm_eps);
     pooled = ggml_mul(ctx, pooled, norm);
-    pooled = ggml_reshape_3d(ctx, pooled, head_dim, 1, 1);
+    pooled = ggml_reshape_3d(ctx, pooled, head_dim, 1, n_seqs);
 
     return dsv4_apply_rope_tail(ctx, pooled, pos,
-            head_dim, 1, 1, n_rot, rope_type,
+            head_dim, 1, n_seqs, n_rot, rope_type,
             rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
             rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
 }
@@ -938,6 +1018,84 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_uniform(
     if (state_perm != nullptr) {
         kv_state    = ggml_get_rows(ctx, kv_state,    state_perm);
         score_state = ggml_get_rows(ctx, score_state, state_perm);
+    }
+
+    return { kv_state, score_state, kv_comp };
+}
+
+// Multi-slot batched decode compressor (n_seqs>1, one token per sequence). Identical math to
+// dsv4_build_compressor_decode_uniform, lifted into a trailing n_seqs batch dim so N independent
+// sequences advance their OWN recurrent state in one graph (no chaining between sequences — unlike
+// the MTP chunk path which chains K tokens of ONE sequence through a single 2D state).
+//   x              [n_embd, n_seqs]          one token per sequence
+//   prev_*_state   [width,  rows, n_seqs]    per-sequence recurrent state (build_rs -> 3D segment)
+//   row_idx        [n_seqs]                  per-seq state write row (set_rows index ne1 = n_seqs)
+//   state_perm     [rows*n_seqs] or nullptr  per-seq boundary column permutation (ratio==4)
+//   comp_pos       [n_seqs]                  per-seq compressed-row rope position
+//   ape_phase      [n_seqs]                  per-seq ape column
+// Every op is a stock ggml primitive whose batch semantics are defined for the trailing dim:
+// ggml_set_rows broadcasts the index over ne2 (ne2 % ne11 == 0), ggml_get_rows indexes per ne2
+// plane, soft_max/sum_rows/rms_norm/rope all run per-column. No custom kernel, no architecture
+// change — the single-slot uniform path above is left byte-identical and still used for n_seqs==1.
+static dsv4_decode_compressor dsv4_build_compressor_decode_multislot(
+        ggml_context       * ctx,
+        ggml_tensor        * x,
+        ggml_tensor        * prev_kv_state,
+        ggml_tensor        * prev_score_state,
+        ggml_tensor        * wkv,
+        ggml_tensor        * wgate,
+        ggml_tensor        * ape,
+        ggml_tensor        * norm,
+        ggml_tensor        * row_idx,
+        ggml_tensor        * state_perm,  // nullptr for ratio != 4
+        ggml_tensor        * comp_pos,
+        ggml_tensor        * ape_phase,
+        int64_t              head_dim,
+        int64_t              n_rot,
+        int64_t              compress_ratio,
+        int64_t              n_seqs,
+        int                  rope_type,
+        const dsv4_rope_cfg & rope_cfg,
+        float                norm_eps) {
+    const int64_t width = prev_kv_state->ne[0];
+    const int64_t rows  = prev_kv_state->ne[1];
+
+    ggml_tensor * kv_cur = ggml_mul_mat(ctx, wkv,   x);    // [width, n_seqs]
+    ggml_tensor * sc_cur = ggml_mul_mat(ctx, wgate, x);
+    ggml_tensor * ape_f  = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
+    sc_cur = ggml_add(ctx, sc_cur, ggml_get_rows(ctx, ape_f, ape_phase));   // [width, n_seqs]
+
+    // per-seq state write: src plane s -> dst[:, row_idx[s], s]
+    ggml_tensor * kv_cur_b   = ggml_reshape_3d(ctx, kv_cur, width, 1, n_seqs);
+    ggml_tensor * sc_cur_b   = ggml_reshape_3d(ctx, sc_cur, width, 1, n_seqs);
+    ggml_tensor * row_idx_b  = ggml_reshape_2d(ctx, row_idx, 1, n_seqs);
+    ggml_tensor * kv_state    = ggml_set_rows(ctx, prev_kv_state,    kv_cur_b, row_idx_b);  // [width, rows, n_seqs]
+    ggml_tensor * score_state = ggml_set_rows(ctx, prev_score_state, sc_cur_b, row_idx_b);
+
+    ggml_tensor * kv_pool;
+    ggml_tensor * score_pool;
+    if (compress_ratio == 4) {
+        const int64_t nb0 = kv_state->nb[0], nb1 = kv_state->nb[1], nb2 = kv_state->nb[2];
+        const int64_t off_curr = compress_ratio*nb1 + head_dim*nb0;
+        ggml_tensor * kv_prev = ggml_view_3d(ctx, kv_state,    head_dim, compress_ratio, n_seqs, nb1, nb2, 0);
+        ggml_tensor * kv_curr = ggml_view_3d(ctx, kv_state,    head_dim, compress_ratio, n_seqs, nb1, nb2, off_curr);
+        ggml_tensor * sc_prev = ggml_view_3d(ctx, score_state, head_dim, compress_ratio, n_seqs, nb1, nb2, 0);
+        ggml_tensor * sc_curr = ggml_view_3d(ctx, score_state, head_dim, compress_ratio, n_seqs, nb1, nb2, off_curr);
+
+        kv_pool    = ggml_concat(ctx, kv_prev, kv_curr, 1);   // [head_dim, 2*ratio, n_seqs]
+        score_pool = ggml_concat(ctx, sc_prev, sc_curr, 1);
+    } else {
+        kv_pool    = kv_state;       // [width(=head_dim), rows, n_seqs]
+        score_pool = score_state;
+    }
+
+    ggml_tensor * kv_comp = dsv4_pool_decode_state(ctx, kv_pool, score_pool, norm, comp_pos,
+            head_dim, n_rot, rope_type, rope_cfg, norm_eps);   // [head_dim, 1, n_seqs]
+
+    if (state_perm != nullptr) {
+        ggml_tensor * perm_b = ggml_reshape_2d(ctx, state_perm, rows, n_seqs);  // per-seq row gather
+        kv_state    = ggml_get_rows(ctx, kv_state,    perm_b);
+        score_state = ggml_get_rows(ctx, score_state, perm_b);
     }
 
     return { kv_state, score_state, kv_comp };
@@ -1278,14 +1436,29 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
         const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
         const bool is_prefill = ubatch.pos == nullptr || ubatch.pos[0] == 0;
+        // Multi-slot batched decode (DSV4_MULTISLOT): the splitter emits n_seqs>1 decode ubatches
+        // (one token per sequence). The compressed-layer build below carries a per-sequence batch
+        // dimension through the recurrent compressor and a block-diagonal compressed-cache attention.
+        // n_seqs==1 (single-slot / prefill chunks) keeps the original byte-identical path.
+        const int64_t n_seqs    = ubatch.n_seqs;
+        const bool    multislot = n_seqs > 1;
 
         if (compress_ratio != 0) {
             if (compress_ratio != 4 && compress_ratio != 128) {
                 throw std::runtime_error("DeepSeek V4 unsupported attention compression ratio " + std::to_string(compress_ratio));
             }
-            // The hybrid memory splitter emits one sequence set per ubatch
-            // for compressed DeepSeek V4 attention.
-            GGML_ASSERT(ubatch.n_seqs == 1);
+            // Single sequence per ubatch, OR a pure multi-slot decode batch (one token per sequence).
+            // Mixed prefill+decode multi-sequence ubatches are never emitted for compressed DSV4.
+            // n_seqs>1 is only ever a pure multi-slot decode batch (one new token per sequence);
+            // the splitter guarantees this via its pure-decode test (llama-memory-hybrid-iswa.cpp).
+            const bool ms_ok = ubatch.n_seqs == 1 || (multislot && !is_prefill && ubatch.n_seq_tokens == 1);
+            static const bool ms_dbg = getenv("DSV4_MS_DBG") != nullptr;
+            if (!ms_ok || ms_dbg) {
+                fprintf(stderr, "[DSV4_MS] il=%d n_seqs=%d n_seq_tokens=%d n_tokens=%d is_prefill=%d pos0=%d pos_last=%d\n",
+                        il, (int) ubatch.n_seqs, (int) ubatch.n_seq_tokens, (int) ubatch.n_tokens, (int) is_prefill,
+                        ubatch.pos ? (int) ubatch.pos[0] : -1, ubatch.pos ? (int) ubatch.pos[ubatch.n_tokens-1] : -1);
+            }
+            GGML_ASSERT(ms_ok);
         }
 
         ggml_tensor * residual = inpL;
@@ -1376,8 +1549,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
             ggml_tensor * prev_kv_state_all = build_rs(inp_rs, inp_rs->mctx->get_r_l(il), state_size, ubatch.n_seqs);
             ggml_tensor * prev_sc_state_all = build_rs(inp_rs, inp_rs->mctx->get_s_l(il), state_size, ubatch.n_seqs);
-            ggml_tensor * prev_attn_kv_state = dsv4_view_state_segment(ctx0, prev_kv_state_all, 0, attn_state_layout.width, attn_state_layout.rows);
-            ggml_tensor * prev_attn_sc_state = dsv4_view_state_segment(ctx0, prev_sc_state_all, 0, attn_state_layout.width, attn_state_layout.rows);
+            ggml_tensor * prev_attn_kv_state = multislot
+                ? dsv4_view_state_segment_3d(ctx0, prev_kv_state_all, 0, attn_state_layout.width, attn_state_layout.rows, n_seqs)
+                : dsv4_view_state_segment(ctx0, prev_kv_state_all, 0, attn_state_layout.width, attn_state_layout.rows);
+            ggml_tensor * prev_attn_sc_state = multislot
+                ? dsv4_view_state_segment_3d(ctx0, prev_sc_state_all, 0, attn_state_layout.width, attn_state_layout.rows, n_seqs)
+                : dsv4_view_state_segment(ctx0, prev_sc_state_all, 0, attn_state_layout.width, attn_state_layout.rows);
 
             const int64_t n_comp = n_tokens / compress_ratio;
             if (is_prefill) {
@@ -1500,7 +1677,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             il, (int) n_tokens, (int) first_pos, (int) last_pos, compress_ratio);
                 }
                 const int64_t n_comp_before  = first_pos / compress_ratio;
-                const int64_t n_comp_visible = (last_pos + 1) / compress_ratio;
+                int64_t n_comp_visible = (last_pos + 1) / compress_ratio;
+                if (multislot && ubatch.pos) {
+                    // sequences sit at independent positions; the shared compressed-cache block width
+                    // must cover the furthest-along sequence. Each query is still limited to its OWN
+                    // visible count by the block-diagonal mask, so over-wide blocks add only -inf cols.
+                    llama_pos max_pos = 0;
+                    for (int64_t s = 0; s < n_tokens; ++s) {
+                        max_pos = std::max<llama_pos>(max_pos, ubatch.pos[s]);
+                    }
+                    n_comp_visible = (max_pos + 1) / compress_ratio;
+                }
                 const int64_t n_comp_cache = mctx_dsv4->get_dsv4_n_comp(il);
                 GGML_ASSERT(n_comp_visible <= n_comp_cache);
 
@@ -1525,7 +1712,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 // needs the (abandoned) multi-slot cache to matter. Kept as validated infra, default OFF.
                 // See turboquant/DSV4_PERF_STATUS.md #1 + PIVOT.
                 static const bool dsv4_verify_reuse = getenv("DSV4_VERIFY_REUSE") != nullptr;
-                const bool    uniform  = (n_tokens == 1) ||
+                const bool    uniform  = (n_tokens == 1) || multislot ||
                         (dsv4_verify_reuse && n_tokens > 1 && n_tokens <= DSV4_VERIFY_MAX &&
                          n_comp_visible <= (int64_t) hparams.indexer_top_k);
                 const int64_t ivec_len = uniform ? n_tokens : 1;
@@ -1566,7 +1753,25 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
                 std::vector<dsv4_state_pair> attn_snaps; // per-token states for rollback planes
                 dsv4_decode_compressor dec =
-                      n_tokens == 1 ? dsv4_build_compressor_decode_uniform(ctx0, cur,
+                      multislot ? dsv4_build_compressor_decode_multislot(ctx0, cur,
+                            prev_attn_kv_state,
+                            prev_attn_sc_state,
+                            layer.attn_compressor_kv,
+                            layer.attn_compressor_gate,
+                            layer.attn_compressor_ape,
+                            layer.attn_compressor_norm,
+                            in_row_idx,
+                            in_state_perm,
+                            in_comp_pos,
+                            in_ape_phase,
+                            n_embd_head_k,
+                            n_rot,
+                            compress_ratio,
+                            n_seqs,
+                            rope_type,
+                            rope_cfg,
+                            norm_rms_eps)
+                    : n_tokens == 1 ? dsv4_build_compressor_decode_uniform(ctx0, cur,
                             prev_attn_kv_state,
                             prev_attn_sc_state,
                             layer.attn_compressor_kv,
@@ -1617,15 +1822,29 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             rope_cfg,
                             norm_rms_eps, &attn_snaps);
 
-                dsv4_store_state_segment(ctx0, gf, dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
-                dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
-                if (cparams.n_rs_seq > 0) {
-                    dsv4_store_rollback_planes(ctx0, gf, inp_rs->mctx->get_r_l(il), inp_rs->mctx->get_s_l(il),
-                            attn_snaps, state_size, inp_rs->head, 0,
-                            inp_rs->mctx->get_size(), cparams.n_rs_seq, n_tokens);
+                if (multislot) {
+                    dsv4_store_state_segment_multi(ctx0, gf, dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0, n_seqs);
+                    dsv4_store_state_segment_multi(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0, n_seqs);
+                } else {
+                    dsv4_store_state_segment(ctx0, gf, dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
+                    dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
+                    if (cparams.n_rs_seq > 0) {
+                        dsv4_store_rollback_planes(ctx0, gf, inp_rs->mctx->get_r_l(il), inp_rs->mctx->get_s_l(il),
+                                attn_snaps, state_size, inp_rs->head, 0,
+                                inp_rs->mctx->get_size(), cparams.n_rs_seq, n_tokens);
+                    }
                 }
 
-                if (uniform) {
+                if (multislot) {
+                    // each sequence writes its OWN compressed attn row to its OWN cache at its own CACHE_ROW
+                    ggml_tensor * kv_comp_q = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
+                    for (int64_t s = 0; s < n_seqs; ++s) {
+                        const llama_seq_id sid = ubatch.seq_id[s][0];
+                        ggml_tensor * row_s  = ggml_view_1d(ctx0, in_cache_row, 1, s*ggml_element_size(in_cache_row));
+                        ggml_tensor * comp_s = ggml_view_2d(ctx0, kv_comp_q, kv_comp_q->ne[0], 1, kv_comp_q->nb[1], s*kv_comp_q->nb[2]);
+                        dsv4_store_cache_rows_idx(ctx0, gf, mctx_dsv4->get_dsv4_attn_k(ctx0, il, sid), comp_s, row_s);
+                    }
+                } else if (uniform) {
                     ggml_tensor * kv_comp_q = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
                     store_attn_cache_rows_idx(kv_comp_q, in_cache_row);
                 } else if (dec.kv_comp != nullptr) {
@@ -1640,11 +1859,83 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 attn_mask = inp_attn->self_kq_mask_swa;
 
                 if (n_comp_visible > 0 || uniform) {
+                    ggml_tensor * comp_mask = nullptr;
+                    if (multislot) {
+                        // ===== multi-slot: concat each sequence's OWN compressed cache; separate the
+                        // concurrent requests with a block-diagonal compress-causal mask. =====
+                        ggml_tensor * kv_comp_all = nullptr;
+                        for (int64_t s = 0; s < n_seqs; ++s) {
+                            const llama_seq_id sid = ubatch.seq_id[s][0];
+                            ggml_tensor * cache_s = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, sid), n_comp_view);
+                            kv_comp_all = (s == 0) ? cache_s : ggml_concat(ctx0, kv_comp_all, cache_s, 2);
+                        }
+                        k_all = ggml_concat(ctx0, k_raw, kv_comp_all, 2); // [hd,1, n_raw + n_seqs*n_comp_view]
+                        v_all = k_all;
+
+                        ggml_tensor * block_mask = get_dsv4_inputs()->add_mask(ctx0,
+                                dsv4_mask_kind::COMPRESS_CAUSAL_BLOCKDIAG,
+                                n_seqs*n_comp_view, n_tokens,
+                                0, n_comp_view, 0, compress_ratio,
+                                "dsv4_attn_compress_blockdiag_mask");
+
+                        if (compress_ratio == 4) {
+                            const dsv4_state_layout index_state_layout = dsv4_make_state_layout(compress_ratio, hparams.indexer_head_size);
+                            ggml_tensor * prev_index_kv_state = dsv4_view_state_segment_3d(ctx0, prev_kv_state_all,
+                                    attn_state_layout.elems, index_state_layout.width, index_state_layout.rows, n_seqs);
+                            ggml_tensor * prev_index_sc_state = dsv4_view_state_segment_3d(ctx0, prev_sc_state_all,
+                                    attn_state_layout.elems, index_state_layout.width, index_state_layout.rows, n_seqs);
+
+                            dsv4_decode_compressor index_dec = dsv4_build_compressor_decode_multislot(ctx0, cur,
+                                    prev_index_kv_state, prev_index_sc_state,
+                                    layer.indexer_compressor_kv, layer.indexer_compressor_gate,
+                                    layer.indexer_compressor_ape, layer.indexer_compressor_norm,
+                                    in_row_idx, in_state_perm, in_comp_pos, in_ape_phase,
+                                    hparams.indexer_head_size, n_rot, compress_ratio, n_seqs,
+                                    rope_type, rope_cfg, norm_rms_eps);
+
+                            dsv4_store_state_segment_multi(ctx0, gf, index_dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
+                            dsv4_store_state_segment_multi(ctx0, gf, index_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
+
+                            // each sequence's compressed index row -> its own index cache at its CACHE_ROW
+                            ggml_tensor * index_comp_q = index_dec.kv_comp;
+                            for (int64_t s = 0; s < n_seqs; ++s) {
+                                const llama_seq_id sid = ubatch.seq_id[s][0];
+                                ggml_tensor * row_s  = ggml_view_1d(ctx0, in_cache_row, 1, s*ggml_element_size(in_cache_row));
+                                ggml_tensor * comp_s = ggml_view_2d(ctx0, index_comp_q, index_comp_q->ne[0], 1, index_comp_q->nb[1], s*index_comp_q->nb[2]);
+                                dsv4_store_cache_rows_idx(ctx0, gf, mctx_dsv4->get_dsv4_index_k(ctx0, il, sid), comp_s, row_s);
+                            }
+
+                            if (n_comp_visible <= (int64_t) hparams.indexer_top_k) {
+                                // every sequence within indexer budget: attend all visible comps (no top-k)
+                                comp_mask = block_mask;
+                            } else {
+                                // per-query top-k over its OWN block: force off-block (and pad) to -inf first,
+                                // then top-k naturally selects only within the query's sequence block.
+                                ggml_tensor * index_cache_all = nullptr;
+                                for (int64_t s = 0; s < n_seqs; ++s) {
+                                    const llama_seq_id sid = ubatch.seq_id[s][0];
+                                    ggml_tensor * ic = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, sid), n_comp_view);
+                                    ic = ggml_reshape_2d(ctx0, ic, hparams.indexer_head_size, n_comp_view);
+                                    index_cache_all = (s == 0) ? ic : ggml_concat(ctx0, index_cache_all, ic, 1);
+                                }
+                                ggml_tensor * index_scores = dsv4_build_indexer_scores_decode(ctx0,
+                                        cur, qr, index_cache_all,
+                                        layer.indexer_attn_q_b, layer.indexer_proj, inp_pos,
+                                        hparams.indexer_n_head, hparams.indexer_head_size,
+                                        n_seqs*n_comp_view, n_rot, rope_type, rope_cfg);
+                                index_scores = ggml_add(ctx0, index_scores, block_mask);
+                                const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_view);
+                                ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
+                                comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                            }
+                        } else {
+                            comp_mask = block_mask;
+                        }
+                    } else {
                     ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_view);
                     k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
                     v_all = k_all;
 
-                    ggml_tensor * comp_mask = nullptr;
                     if (compress_ratio == 4) {
                         const dsv4_state_layout index_state_layout = dsv4_make_state_layout(compress_ratio, hparams.indexer_head_size);
                         ggml_tensor * prev_index_kv_state = dsv4_view_state_segment(ctx0, prev_kv_state_all,
@@ -1785,6 +2076,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                 0, n_comp_view, 0, compress_ratio,
                                 "dsv4_attn_compress_mask");
                     }
+                    } // end single-slot branch (else of multislot)
 
                     // newer upstream returns the standard kq_mask as F16 when flash-attn is on;
                     // the freshly built comp_mask is F32 — normalize before the concat

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -288,13 +289,53 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 const auto & batch = balloc.get_batch();
                 const bool first_split = balloc.get_n_used() == 0;
                 const bool starts_at_zero = batch.pos == nullptr || batch.pos[0] == 0;
-                if (!first_split || !starts_at_zero) {
+                const bool decode_regime = !first_split || !starts_at_zero;
+                if (decode_regime) {
                     // Non-prefill compressed-attention chunks build one
                     // compressor update per token and can otherwise exhaust the
                     // graph metadata arena on long contexts.
                     n_ubatch_dsv4 = std::min<uint32_t>(n_ubatch_dsv4, DSV4_COMPRESSED_DECODE_UBATCH_MAX);
                 }
-                ubatch = balloc.split_seq(n_ubatch_dsv4);
+                // Phase 2 multi-slot: batch multiple in-flight sequences into ONE ubatch (n_seqs>1)
+                // instead of serializing them one sequence per ubatch. The compressed-layer build
+                // path handles n_seqs>1 (per-seq recurrent state + block-diagonal masks); everything
+                // else (MoE/dense/norm/lm_head) batches over n_tokens. Gated by DSV4_MULTISLOT and
+                // restricted to the non-rollback regime (n_rs_seq==0): recurrent state rollback
+                // [TAG_RECURRENT_ROLLBACK_SPLITS] does not support equal splits.
+                //
+                // CRITICAL: only PURE-DECODE batches (every token at pos>0, one new token per
+                // sequence) may take split_equal — the compressed build asserts !is_prefill for
+                // n_seqs>1. A batch containing any pos==0 (prefill) token, or a mixed prefill+decode
+                // batch, falls back to split_seq (correct, just serialized). Default OFF -> byte-
+                // identical single-slot behaviour (split_seq).
+                static const bool dsv4_multislot = getenv("DSV4_MULTISLOT") != nullptr;
+                // PURE-DECODE test: split_equal is only safe when every token is a fresh
+                // single-token continuation — i.e. all positions > 0 (no prefill token) AND each
+                // sequence contributes exactly one token (so split_equal yields n_seq_tokens==1).
+                // A prefill batch (even one resuming at pos>0 from a prompt-cache hit, which has
+                // multiple tokens for one sequence) must take split_seq, or the compressed build's
+                // n_seqs>1 => n_seq_tokens==1 invariant is violated. Robust against mixed/continuous
+                // batching: any pos==0, repeated sequence, or multi-seq-id token => not pure decode.
+                bool pure_decode = (batch.pos != nullptr) && (batch.n_tokens > 0);
+                {
+                    std::set<llama_seq_id> seen_seqs;
+                    for (int32_t i = 0; pure_decode && i < batch.n_tokens; ++i) {
+                        if (batch.pos[i] == 0) { pure_decode = false; break; }
+                        if (batch.n_seq_id && batch.n_seq_id[i] != 1) { pure_decode = false; break; }
+                        const llama_seq_id sid = batch.seq_id ? batch.seq_id[i][0] : (llama_seq_id) i;
+                        if (!seen_seqs.insert(sid).second) { pure_decode = false; break; } // seq has >1 token
+                    }
+                }
+                const bool can_batch_seqs = dsv4_multislot && pure_decode && mem_recr->n_rs_seq == 0;
+                if (can_batch_seqs) {
+                    // unified attention KV (n_stream==1) -> non-sequential equal split,
+                    // matching the standard unified path; sequences are separated by the
+                    // block-diagonal masks, not by per-stream KV partitions.
+                    const bool unified = (mem_attn->get_base()->get_n_stream() == 1);
+                    ubatch = balloc.split_equal(n_ubatch_dsv4, !unified);
+                } else {
+                    ubatch = balloc.split_seq(n_ubatch_dsv4);
+                }
             } else if (embd_all) {
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
