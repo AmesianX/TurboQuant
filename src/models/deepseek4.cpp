@@ -124,7 +124,15 @@ public:
         // phase-uniform path generalized to width K (K==1 decode, K>1 MTP verify): each ivec is
         // K*per_step long, step s deriving its values from pos[s] via the identical single-step
         // formula. K==1 is byte-identical to the original decode-only fill (base=0, per_step=len).
-        const int64_t K = ubatch->n_tokens;
+        //
+        // STEP-MAJOR layout: a token at ubatch index s = (seq q = s/nst, step r = s%nst) is written
+        // to logical token (r*n_seqs + q). For the multi-slot+MTP case (n_seqs>1 AND nst>1) this lets
+        // dsv4_build_compressor_decode_chunk_multislot take each step's n_seqs values as a CONTIGUOUS
+        // offset view of the input ivec — no transpose/cont, which the TP/meta graph splitter chokes
+        // on. When n_seqs==1 OR nst==1 (every non-MTP path) step-major == seq-major -> byte-identical.
+        const int64_t K     = ubatch->n_tokens;
+        const int64_t nst   = ubatch->n_seq_tokens > 0 ? (int64_t) ubatch->n_seq_tokens : 1;
+        const int64_t nseqs = ubatch->n_seqs > 0 ? (int64_t) ubatch->n_seqs : 1;
         for (const auto & v : ivecs) {
             if (v.tensor->buffer == nullptr) {
                 continue;
@@ -139,7 +147,8 @@ public:
             for (int64_t s = 0; s < K; ++s) {
                 const llama_pos pos      = ubatch->pos ? ubatch->pos[s] : (llama_pos) s;
                 const bool      boundary = ((pos + 1) % v.ratio) == 0;
-                const int64_t   base     = s * per_step;
+                const int64_t   tok_out  = (s % nst) * nseqs + (s / nst); // step-major (== s when n_seqs==1 || nst==1)
+                const int64_t   base     = tok_out * per_step;
                 switch (v.kind) {
                     case dsv4_ivec_kind::ROW_IDX:
                         data[base] = (int32_t) (v.ratio == 4 ? v.ratio + pos % v.ratio : pos % v.ratio);
@@ -1157,20 +1166,20 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk_multislot(
     ggml_tensor * score_state = prev_score_state;
     ggml_tensor * kv_comp     = nullptr;
 
+    // The ivecs are filled STEP-MAJOR (see dsv4_graph_inputs::set_input): step k's n_seqs values occupy
+    // the contiguous block [k*n_seqs, (k+1)*n_seqs). So each step is a CONTIGUOUS offset view of the input
+    // ivec directly -- no transpose/cont. This matters for TP/meta: (1) contiguous -> set_tensor across a
+    // split is fine; (2) view_src is the host NONE-leaf input -> the meta splitter's host-leaf-view special
+    // case handles it (a cont/transpose would instead add compute nodes the splitter's ring logic drops).
+    // x is the hidden state (compute buffer, ubatch-order/seq-major columns) -> strided view + cont is ok.
+    const size_t es = ggml_element_size(row_idx);
     for (int64_t k = 0; k < K; ++k) {
-        // k-th token of every sequence: stride-K gather (cont -> contiguous [.., n_seqs])
-        ggml_tensor * x_k    = ggml_cont(ctx, ggml_view_2d(ctx, x,         x->ne[0], n_seqs, K*x->nb[1],         k*x->nb[1]));
-        ggml_tensor * row_k  = ggml_cont(ctx, ggml_view_2d(ctx, row_idx,   1,        n_seqs, K*row_idx->nb[0],   k*row_idx->nb[0]));
-        ggml_tensor * cpos_k = ggml_cont(ctx, ggml_view_2d(ctx, comp_pos,  1,        n_seqs, K*comp_pos->nb[0],  k*comp_pos->nb[0]));
-        ggml_tensor * aph_k  = ggml_cont(ctx, ggml_view_2d(ctx, ape_phase, 1,        n_seqs, K*ape_phase->nb[0], k*ape_phase->nb[0]));
-        row_k  = ggml_reshape_1d(ctx, row_k,  n_seqs);
-        cpos_k = ggml_reshape_1d(ctx, cpos_k, n_seqs);
-        aph_k  = ggml_reshape_1d(ctx, aph_k,  n_seqs);
-        ggml_tensor * perm_k = nullptr;
-        if (state_perm != nullptr) {
-            perm_k = ggml_cont(ctx, ggml_view_2d(ctx, state_perm, rows, n_seqs, K*rows*state_perm->nb[0], k*rows*state_perm->nb[0]));
-            perm_k = ggml_reshape_1d(ctx, perm_k, rows*n_seqs);
-        }
+        ggml_tensor * x_k    = ggml_cont(ctx, ggml_view_2d(ctx, x, x->ne[0], n_seqs, K*x->nb[1], k*x->nb[1]));
+        ggml_tensor * row_k  = ggml_view_1d(ctx, row_idx,   n_seqs, k*n_seqs*es);
+        ggml_tensor * cpos_k = ggml_view_1d(ctx, comp_pos,  n_seqs, k*n_seqs*es);
+        ggml_tensor * aph_k  = ggml_view_1d(ctx, ape_phase, n_seqs, k*n_seqs*es);
+        ggml_tensor * perm_k = state_perm == nullptr ? nullptr
+            : ggml_view_1d(ctx, state_perm, rows*n_seqs, k*rows*n_seqs*es);
 
         dsv4_decode_compressor dec = dsv4_build_compressor_decode_multislot(ctx, x_k,
                 kv_state, score_state, wkv, wgate, ape, norm,
@@ -1948,14 +1957,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
                 if (multislot) {
                     // each (step k, seq s) compressed attn row -> seq s's cache at its own CACHE_ROW.
-                    // kv_comp is step-major (plane k*n_seqs+s); in_cache_row is seq-major (CACHE_ROW is
-                    // filled in ubatch token order = s*K+k). Off-boundary steps route to the scratch row.
+                    // both kv_comp (plane) and the step-major CACHE_ROW ivec index are k*n_seqs+s.
+                    // Off-boundary steps route to the scratch row (K==1 byte-identical to plain multislot).
                     ggml_tensor * kv_comp_q = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
                     const int64_t K = ubatch.n_seq_tokens;
                     for (int64_t k = 0; k < K; ++k) {
                         for (int64_t s = 0; s < n_seqs; ++s) {
-                            const int64_t      plane  = chunk_ms ? (k*n_seqs + s) : s;
-                            const int64_t      cr_idx = s*K + k;
+                            const int64_t      plane  = k*n_seqs + s;
+                            const int64_t      cr_idx = k*n_seqs + s;
                             const llama_seq_id sid    = ubatch.seq_id[s*K][0];
                             ggml_tensor * row_s  = ggml_view_1d(ctx0, in_cache_row, 1, cr_idx*ggml_element_size(in_cache_row));
                             ggml_tensor * comp_s = ggml_view_2d(ctx0, kv_comp_q, kv_comp_q->ne[0], 1, kv_comp_q->nb[1], plane*kv_comp_q->nb[2]);
@@ -2029,13 +2038,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             }
 
                             // each (step k, seq s) compressed index row -> seq s's index cache at its CACHE_ROW
-                            // (step-major kv_comp plane k*n_seqs+s -> seq-major CACHE_ROW s*K+k; same routing as attn)
+                            // (both kv_comp plane and step-major CACHE_ROW index are k*n_seqs+s; same as attn)
                             ggml_tensor * index_comp_q = index_dec.kv_comp;
                             const int64_t K = ubatch.n_seq_tokens;
                             for (int64_t k = 0; k < K; ++k) {
                                 for (int64_t s = 0; s < n_seqs; ++s) {
-                                    const int64_t      plane  = chunk_ms ? (k*n_seqs + s) : s;
-                                    const int64_t      cr_idx = s*K + k;
+                                    const int64_t      plane  = k*n_seqs + s;
+                                    const int64_t      cr_idx = k*n_seqs + s;
                                     const llama_seq_id sid    = ubatch.seq_id[s*K][0];
                                     ggml_tensor * row_s  = ggml_view_1d(ctx0, in_cache_row, 1, cr_idx*ggml_element_size(in_cache_row));
                                     ggml_tensor * comp_s = ggml_view_2d(ctx0, index_comp_q, index_comp_q->ne[0], 1, index_comp_q->nb[1], plane*index_comp_q->nb[2]);
