@@ -478,8 +478,8 @@ static ggml_tensor * dsv4_view_state_segment_3d(
 // Multi-slot store: write src [width, rows, n_seqs] back so plane s lands in the recurrent cell
 // (head + s) at byte `offset` within that cell. DSV4 packs two segments (attn, index) per cell,
 // so a single segment across sequences is a strided [width*rows, n_seqs] region (cell stride =
-// state_size) — the strided generalization of mamba's contiguous y_ssm store. n_rs_seq==0 in the
-// multi-slot regime (the split-equal gate excludes rollback), so no snapshot planes are needed.
+// state_size) — the strided generalization of mamba's contiguous y_ssm store. With MTP (n_rs_seq>0)
+// rollback snapshot planes are written per-seq via dsv4_store_rollback_planes_multi (cache_slot>0).
 static void dsv4_store_state_segment_multi(
         ggml_context * ctx,
         ggml_cgraph  * gf,
@@ -1531,11 +1531,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             if (compress_ratio != 4 && compress_ratio != 128) {
                 throw std::runtime_error("DeepSeek V4 unsupported attention compression ratio " + std::to_string(compress_ratio));
             }
-            // Single sequence per ubatch, OR a pure multi-slot decode batch (one token per sequence).
-            // Mixed prefill+decode multi-sequence ubatches are never emitted for compressed DSV4.
-            // n_seqs>1 is only ever a pure multi-slot decode batch (one new token per sequence);
-            // the splitter guarantees this via its pure-decode test (llama-memory-hybrid-iswa.cpp).
-            const bool ms_ok = ubatch.n_seqs == 1 || (multislot && !is_prefill && ubatch.n_seq_tokens == 1);
+            // Single sequence per ubatch, OR a multi-slot decode batch (n_seqs>1, each seq carrying
+            // K==n_seq_tokens new tokens — K==1 plain multi-slot, K>1 multi-slot+MTP verify). Mixed
+            // prefill+decode multi-sequence ubatches are never emitted for compressed DSV4; the
+            // splitter guarantees !is_prefill and uniform-K via split_equal (llama-memory-hybrid-iswa.cpp).
+            const bool ms_ok = ubatch.n_seqs == 1 || (multislot && !is_prefill);
             static const bool ms_dbg = getenv("DSV4_MS_DBG") != nullptr;
             if (!ms_ok || ms_dbg) {
                 fprintf(stderr, "[DSV4_MS] il=%d n_seqs=%d n_seq_tokens=%d n_tokens=%d is_prefill=%d pos0=%d pos_last=%d\n",
@@ -1836,8 +1836,30 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 }
 
                 std::vector<dsv4_state_pair> attn_snaps; // per-token states for rollback planes
+                // multi-slot + MTP: n_seqs sequences each verifying K>1 tokens -> chunk the K steps
+                // through the batched single-step multislot build. K==1 keeps the plain multislot path.
+                const bool chunk_ms = multislot && ubatch.n_seq_tokens > 1;
                 dsv4_decode_compressor dec =
-                      multislot ? dsv4_build_compressor_decode_multislot(ctx0, cur,
+                      chunk_ms ? dsv4_build_compressor_decode_chunk_multislot(ctx0, cur,
+                            prev_attn_kv_state,
+                            prev_attn_sc_state,
+                            layer.attn_compressor_kv,
+                            layer.attn_compressor_gate,
+                            layer.attn_compressor_ape,
+                            layer.attn_compressor_norm,
+                            in_row_idx,
+                            in_state_perm,
+                            in_comp_pos,
+                            in_ape_phase,
+                            n_embd_head_k,
+                            n_rot,
+                            compress_ratio,
+                            n_seqs,
+                            ubatch.n_seq_tokens,
+                            rope_type,
+                            rope_cfg,
+                            norm_rms_eps, &attn_snaps)
+                    : multislot ? dsv4_build_compressor_decode_multislot(ctx0, cur,
                             prev_attn_kv_state,
                             prev_attn_sc_state,
                             layer.attn_compressor_kv,
@@ -1909,6 +1931,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 if (multislot) {
                     dsv4_store_state_segment_multi(ctx0, gf, dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0, n_seqs);
                     dsv4_store_state_segment_multi(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0, n_seqs);
+                    if (chunk_ms && cparams.n_rs_seq > 0) {
+                        dsv4_store_rollback_planes_multi(ctx0, gf, inp_rs->mctx->get_r_l(il), inp_rs->mctx->get_s_l(il),
+                                attn_snaps, state_size, inp_rs->head, 0,
+                                inp_rs->mctx->get_size(), cparams.n_rs_seq, ubatch.n_seq_tokens, n_seqs);
+                    }
                 } else {
                     dsv4_store_state_segment(ctx0, gf, dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
                     dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
@@ -1920,13 +1947,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 }
 
                 if (multislot) {
-                    // each sequence writes its OWN compressed attn row to its OWN cache at its own CACHE_ROW
+                    // each (step k, seq s) compressed attn row -> seq s's cache at its own CACHE_ROW.
+                    // kv_comp is step-major (plane k*n_seqs+s); in_cache_row is seq-major (CACHE_ROW is
+                    // filled in ubatch token order = s*K+k). Off-boundary steps route to the scratch row.
                     ggml_tensor * kv_comp_q = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
-                    for (int64_t s = 0; s < n_seqs; ++s) {
-                        const llama_seq_id sid = ubatch.seq_id[s][0];
-                        ggml_tensor * row_s  = ggml_view_1d(ctx0, in_cache_row, 1, s*ggml_element_size(in_cache_row));
-                        ggml_tensor * comp_s = ggml_view_2d(ctx0, kv_comp_q, kv_comp_q->ne[0], 1, kv_comp_q->nb[1], s*kv_comp_q->nb[2]);
-                        dsv4_store_cache_rows_idx(ctx0, gf, mctx_dsv4->get_dsv4_attn_k(ctx0, il, sid), comp_s, row_s);
+                    const int64_t K = ubatch.n_seq_tokens;
+                    for (int64_t k = 0; k < K; ++k) {
+                        for (int64_t s = 0; s < n_seqs; ++s) {
+                            const int64_t      plane  = chunk_ms ? (k*n_seqs + s) : s;
+                            const int64_t      cr_idx = s*K + k;
+                            const llama_seq_id sid    = ubatch.seq_id[s*K][0];
+                            ggml_tensor * row_s  = ggml_view_1d(ctx0, in_cache_row, 1, cr_idx*ggml_element_size(in_cache_row));
+                            ggml_tensor * comp_s = ggml_view_2d(ctx0, kv_comp_q, kv_comp_q->ne[0], 1, kv_comp_q->nb[1], plane*kv_comp_q->nb[2]);
+                            dsv4_store_cache_rows_idx(ctx0, gf, mctx_dsv4->get_dsv4_attn_k(ctx0, il, sid), comp_s, row_s);
+                        }
                     }
                 } else if (uniform) {
                     ggml_tensor * kv_comp_q = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
@@ -1949,7 +1983,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         // concurrent requests with a block-diagonal compress-causal mask. =====
                         ggml_tensor * kv_comp_all = nullptr;
                         for (int64_t s = 0; s < n_seqs; ++s) {
-                            const llama_seq_id sid = ubatch.seq_id[s][0];
+                            const llama_seq_id sid = ubatch.seq_id[s*ubatch.n_seq_tokens][0];
                             ggml_tensor * cache_s = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, sid), n_comp_view);
                             kv_comp_all = (s == 0) ? cache_s : ggml_concat(ctx0, kv_comp_all, cache_s, 2);
                         }
@@ -1969,7 +2003,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             ggml_tensor * prev_index_sc_state = dsv4_view_state_segment_3d(ctx0, prev_sc_state_all,
                                     attn_state_layout.elems, index_state_layout.width, index_state_layout.rows, n_seqs);
 
-                            dsv4_decode_compressor index_dec = dsv4_build_compressor_decode_multislot(ctx0, cur,
+                            std::vector<dsv4_state_pair> index_snaps; // per-step index states for rollback
+                            dsv4_decode_compressor index_dec = chunk_ms
+                                ? dsv4_build_compressor_decode_chunk_multislot(ctx0, cur,
+                                    prev_index_kv_state, prev_index_sc_state,
+                                    layer.indexer_compressor_kv, layer.indexer_compressor_gate,
+                                    layer.indexer_compressor_ape, layer.indexer_compressor_norm,
+                                    in_row_idx, in_state_perm, in_comp_pos, in_ape_phase,
+                                    hparams.indexer_head_size, n_rot, compress_ratio, n_seqs, ubatch.n_seq_tokens,
+                                    rope_type, rope_cfg, norm_rms_eps, &index_snaps)
+                                : dsv4_build_compressor_decode_multislot(ctx0, cur,
                                     prev_index_kv_state, prev_index_sc_state,
                                     layer.indexer_compressor_kv, layer.indexer_compressor_gate,
                                     layer.indexer_compressor_ape, layer.indexer_compressor_norm,
@@ -1979,14 +2022,25 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
                             dsv4_store_state_segment_multi(ctx0, gf, index_dec.kv_state,    inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
                             dsv4_store_state_segment_multi(ctx0, gf, index_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
+                            if (chunk_ms && cparams.n_rs_seq > 0) {
+                                dsv4_store_rollback_planes_multi(ctx0, gf, inp_rs->mctx->get_r_l(il), inp_rs->mctx->get_s_l(il),
+                                        index_snaps, state_size, inp_rs->head, attn_state_layout.elems,
+                                        inp_rs->mctx->get_size(), cparams.n_rs_seq, ubatch.n_seq_tokens, n_seqs);
+                            }
 
-                            // each sequence's compressed index row -> its own index cache at its CACHE_ROW
+                            // each (step k, seq s) compressed index row -> seq s's index cache at its CACHE_ROW
+                            // (step-major kv_comp plane k*n_seqs+s -> seq-major CACHE_ROW s*K+k; same routing as attn)
                             ggml_tensor * index_comp_q = index_dec.kv_comp;
-                            for (int64_t s = 0; s < n_seqs; ++s) {
-                                const llama_seq_id sid = ubatch.seq_id[s][0];
-                                ggml_tensor * row_s  = ggml_view_1d(ctx0, in_cache_row, 1, s*ggml_element_size(in_cache_row));
-                                ggml_tensor * comp_s = ggml_view_2d(ctx0, index_comp_q, index_comp_q->ne[0], 1, index_comp_q->nb[1], s*index_comp_q->nb[2]);
-                                dsv4_store_cache_rows_idx(ctx0, gf, mctx_dsv4->get_dsv4_index_k(ctx0, il, sid), comp_s, row_s);
+                            const int64_t K = ubatch.n_seq_tokens;
+                            for (int64_t k = 0; k < K; ++k) {
+                                for (int64_t s = 0; s < n_seqs; ++s) {
+                                    const int64_t      plane  = chunk_ms ? (k*n_seqs + s) : s;
+                                    const int64_t      cr_idx = s*K + k;
+                                    const llama_seq_id sid    = ubatch.seq_id[s*K][0];
+                                    ggml_tensor * row_s  = ggml_view_1d(ctx0, in_cache_row, 1, cr_idx*ggml_element_size(in_cache_row));
+                                    ggml_tensor * comp_s = ggml_view_2d(ctx0, index_comp_q, index_comp_q->ne[0], 1, index_comp_q->nb[1], plane*index_comp_q->nb[2]);
+                                    dsv4_store_cache_rows_idx(ctx0, gf, mctx_dsv4->get_dsv4_index_k(ctx0, il, sid), comp_s, row_s);
+                                }
                             }
 
                             if (n_comp_visible <= (int64_t) hparams.indexer_top_k) {
@@ -1997,7 +2051,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                 // then top-k naturally selects only within the query's sequence block.
                                 ggml_tensor * index_cache_all = nullptr;
                                 for (int64_t s = 0; s < n_seqs; ++s) {
-                                    const llama_seq_id sid = ubatch.seq_id[s][0];
+                                    const llama_seq_id sid = ubatch.seq_id[s*ubatch.n_seq_tokens][0];
                                     ggml_tensor * ic = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, sid), n_comp_view);
                                     ic = ggml_reshape_2d(ctx0, ic, hparams.indexer_head_size, n_comp_view);
                                     index_cache_all = (s == 0) ? ic : ggml_concat(ctx0, index_cache_all, ic, 1);

@@ -309,24 +309,35 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 // batch, falls back to split_seq (correct, just serialized). Default OFF -> byte-
                 // identical single-slot behaviour (split_seq).
                 static const bool dsv4_multislot = getenv("DSV4_MULTISLOT") != nullptr;
-                // PURE-DECODE test: split_equal is only safe when every token is a fresh
-                // single-token continuation — i.e. all positions > 0 (no prefill token) AND each
-                // sequence contributes exactly one token (so split_equal yields n_seq_tokens==1).
-                // A prefill batch (even one resuming at pos>0 from a prompt-cache hit, which has
-                // multiple tokens for one sequence) must take split_seq, or the compressed build's
-                // n_seqs>1 => n_seq_tokens==1 invariant is violated. Robust against mixed/continuous
-                // batching: any pos==0, repeated sequence, or multi-seq-id token => not pure decode.
+                // MULTI-DECODE test: split_equal lays the batch out sequence-major with a UNIFORM
+                // token count K per sequence, and the compressed build requires every token be a
+                // fresh continuation. Two regimes batch into one decode:
+                //   - plain multi-slot (K==1, n_rs_seq==0): one new token per sequence
+                //   - multi-slot + MTP verify (K>1, n_rs_seq>0): each seq verifies 1 accept + draft
+                // Both require: all pos>0 (no prefill token), every token n_seq_id==1, >1 distinct
+                // sequence, and an EQUAL token count K across all sequences. A prefill batch, a single
+                // sequence, or RAGGED per-seq counts (split_equal would mis-align) fall back to
+                // split_seq (correct, just serialized). n_rs_seq>0 is now allowed: the compressed
+                // build writes per-seq rollback snapshot planes (dsv4_store_rollback_planes_multi).
                 bool pure_decode = (batch.pos != nullptr) && (batch.n_tokens > 0);
                 {
-                    std::set<llama_seq_id> seen_seqs;
+                    std::map<llama_seq_id, int64_t> seq_counts;
                     for (int32_t i = 0; pure_decode && i < batch.n_tokens; ++i) {
                         if (batch.pos[i] == 0) { pure_decode = false; break; }
                         if (batch.n_seq_id && batch.n_seq_id[i] != 1) { pure_decode = false; break; }
                         const llama_seq_id sid = batch.seq_id ? batch.seq_id[i][0] : (llama_seq_id) i;
-                        if (!seen_seqs.insert(sid).second) { pure_decode = false; break; } // seq has >1 token
+                        seq_counts[sid]++;
+                    }
+                    if (pure_decode) {
+                        if (seq_counts.size() < 2) { pure_decode = false; } // single slot -> normal path
+                        int64_t k_uniform = -1;
+                        for (const auto & kv : seq_counts) {
+                            if (k_uniform < 0)            { k_uniform = kv.second; }
+                            else if (kv.second != k_uniform) { pure_decode = false; break; } // ragged -> split_seq
+                        }
                     }
                 }
-                const bool can_batch_seqs = dsv4_multislot && pure_decode && mem_recr->n_rs_seq == 0;
+                const bool can_batch_seqs = dsv4_multislot && pure_decode;
                 // Step C observation: log the pre-split batch shape so we can see whether the server
                 // batches multiple slots' MTP-verify tokens into one decode (n_distinct_seqs>1) or
                 // serializes them (the upstream n_parallel==1 MTP limit). Gated by DSV4_MS_DBG.
