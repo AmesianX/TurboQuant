@@ -197,6 +197,23 @@ public:
     }
 
 private:
+    // query token a and key token b may attend only if they share a sequence id.
+    // For n_seqs==1 (every token in one sequence) this is always true -> no-op,
+    // so single-sequence output is byte-identical to before this gate was added.
+    static bool dsv4_tokens_share_seq(const llama_ubatch * ubatch, int64_t a, int64_t b) {
+        if (ubatch->seq_id == nullptr) {
+            return true;
+        }
+        for (int32_t ia = 0; ia < ubatch->n_seq_id[a]; ++ia) {
+            for (int32_t ib = 0; ib < ubatch->n_seq_id[b]; ++ib) {
+                if (ubatch->seq_id[a][ia] == ubatch->seq_id[b][ib]) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     static void fill_raw_window(
             std::vector<float> & data,
             int64_t              n0,
@@ -216,6 +233,12 @@ private:
                 }
 
                 if (window > 0 && p1 - p0 >= window) {
+                    continue;
+                }
+
+                // block-diagonal across sequences: a raw-window key is visible to a
+                // query only when they belong to the same sequence (multi-slot correctness).
+                if (!dsv4_tokens_share_seq(ubatch, iq, ik)) {
                     continue;
                 }
 
@@ -1310,7 +1333,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
         if (compress_ratio == 0) {
             ggml_tensor * k_cache = mctx_swa->get_k(ctx0, il);
-            k_cache = ggml_reshape_3d(ctx0, k_cache, n_embd_head_k, 1, k_cache->ne[2]);
+            // get_k returns [n_embd_head_k, n_head_kv(=1 for MLA), n_kv, n_stream]. Preserve the
+            // per-stream dim (ne[3]) so build_attn_mha (which reads n_stream = k->ne[3] and splits
+            // q accordingly) attends each sequence against its own KV stream. Collapsing to 3D
+            // discards n_stream and only works for a single stream; for n_stream==1 reshape_4d
+            // here is byte-identical to the previous reshape_3d (trailing dim == 1).
+            k_cache = ggml_reshape_4d(ctx0, k_cache, n_embd_head_k, 1, k_cache->ne[2], k_cache->ne[3]);
             cur = build_attn_mha(q, k_cache, k_cache, nullptr, inp_attn->get_kq_mask_swa(),
                     layer.attn_sinks, nullptr, kq_scale, il);
             cb(cur, "kqv_out", il);

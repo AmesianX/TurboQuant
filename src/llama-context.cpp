@@ -187,6 +187,19 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    // [tp-2node-dsv4 / multi-slot] DeepSeek-V4 uses MLA + a compressed-attention recurrent
+    // state with no per-stream (non-unified) multi-sequence layout: concurrent sequences must
+    // share a unified KV cache and be separated by seq-id masks (the production DP-attention
+    // mode for MLA). With a non-unified cache, --parallel >1 builds a multi-stream graph the
+    // compressed attention cannot express and aborts at startup (the auto-fgdn reserve probe).
+    // Auto-enable unified for multi-slot DeepSeek-V4 so --parallel works without an explicit
+    // --kv-unified. Single-slot (n_seq_max == 1) is byte-identical / untouched.
+    if (!cparams.kv_unified && cparams.n_seq_max > 1 && model.arch == LLM_ARCH_DEEPSEEK4) {
+        cparams.kv_unified = true;
+        LLAMA_LOG_WARN("%s: DeepSeek-V4 multi-slot serving requires a unified KV cache -- enabling kv_unified=true "
+                       "(MLA has no non-unified multi-sequence layout)\n", __func__);
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
 
