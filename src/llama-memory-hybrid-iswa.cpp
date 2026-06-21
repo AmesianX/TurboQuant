@@ -327,6 +327,20 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                     }
                 }
                 const bool can_batch_seqs = dsv4_multislot && pure_decode && mem_recr->n_rs_seq == 0;
+                // Step C observation: log the pre-split batch shape so we can see whether the server
+                // batches multiple slots' MTP-verify tokens into one decode (n_distinct_seqs>1) or
+                // serializes them (the upstream n_parallel==1 MTP limit). Gated by DSV4_MS_DBG.
+                if (getenv("DSV4_MS_DBG")) {
+                    std::set<llama_seq_id> ds; int64_t maxpos = -1;
+                    for (int32_t i = 0; batch.pos && i < batch.n_tokens; ++i) {
+                        ds.insert(batch.seq_id ? batch.seq_id[i][0] : (llama_seq_id) i);
+                        maxpos = std::max<int64_t>(maxpos, batch.pos[i]);
+                    }
+                    fprintf(stderr, "[MS_SPLIT] n_tokens=%d distinct_seqs=%zu maxpos=%lld n_rs_seq=%d pure_decode=%d can_batch=%d -> %s\n",
+                            batch.n_tokens, ds.size(), (long long) maxpos, (int) mem_recr->n_rs_seq,
+                            (int) pure_decode, (int) can_batch_seqs, can_batch_seqs ? "split_equal" : "split_seq");
+                    fflush(stderr);
+                }
                 if (can_batch_seqs) {
                     // unified attention KV (n_stream==1) -> non-sequential equal split,
                     // matching the standard unified path; sequences are separated by the
