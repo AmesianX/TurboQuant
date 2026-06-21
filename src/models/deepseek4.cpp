@@ -488,14 +488,36 @@ static void dsv4_store_state_segment_multi(
         int64_t        state_size,
         int64_t        head,
         int64_t        offset,
-        int64_t        n_seqs) {
+        int64_t        n_seqs,
+        int64_t        mem_size   = 0,   // # of recurrent cells (rollback plane stride); only if cache_slot>0
+        int64_t        cache_slot = 0) { // rollback snapshot plane (0 = current state)
     const int64_t seg = ggml_nelements(src) / n_seqs;   // width*rows per sequence
     src = ggml_cont(ctx, src);
     src = ggml_reshape_2d(ctx, src, seg, n_seqs);
+    // plane `cache_slot` of sequence s lives at cell (cache_slot*mem_size + head + s); the n_seqs cells
+    // are contiguous so one strided [seg, n_seqs] view (stride = state_size) covers them all.
+    const int64_t row = cache_slot*mem_size + head;
     ggml_tensor * view = ggml_view_2d(ctx, dst, seg, n_seqs,
             state_size*ggml_element_size(dst),
-            (head*state_size + offset)*ggml_element_size(dst));
+            (row*state_size + offset)*ggml_element_size(dst));
     ggml_build_forward_expand(gf, ggml_cpy(ctx, src, view));
+}
+
+// Multi-slot rollback planes: like dsv4_store_rollback_planes but each snapshot is [width,rows,n_seqs]
+// and is scattered across the n_seqs cells per plane. n_seq_tokens (K) per sequence; plane r holds the
+// per-seq state "as of (K-r) tokens".
+static void dsv4_store_rollback_planes_multi(
+        ggml_context * ctx, ggml_cgraph * gf,
+        ggml_tensor  * r_dst, ggml_tensor * s_dst,
+        const std::vector<dsv4_state_pair> & snaps,  // K entries, each {kv,score} = [width,rows,n_seqs]
+        int64_t state_size, int64_t head, int64_t offset,
+        int64_t mem_size, int64_t n_rs_seq, int64_t n_seq_tokens, int64_t n_seqs) {
+    const int64_t r_max = std::min<int64_t>(n_rs_seq, n_seq_tokens - 1);
+    for (int64_t r = 1; r <= r_max; ++r) {
+        const dsv4_state_pair & s = snaps[(n_seq_tokens - r) - 1]; // s_{K-r}
+        dsv4_store_state_segment_multi(ctx, gf, s.kv,    r_dst, state_size, head, offset, n_seqs, mem_size, r);
+        dsv4_store_state_segment_multi(ctx, gf, s.score, s_dst, state_size, head, offset, n_seqs, mem_size, r);
+    }
 }
 
 // Store recurrent ROLLBACK SNAPSHOT planes 1..min(n_rs_seq, n_tokens-1) for one state segment.
@@ -1096,6 +1118,68 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_multislot(
         ggml_tensor * perm_b = ggml_reshape_2d(ctx, state_perm, rows, n_seqs);  // per-seq row gather
         kv_state    = ggml_get_rows(ctx, kv_state,    perm_b);
         score_state = ggml_get_rows(ctx, score_state, perm_b);
+    }
+
+    return { kv_state, score_state, kv_comp };
+}
+
+// Multi-slot + MTP: N sequences (n_seqs) each verifying K tokens (n_seq_tokens). The split_equal
+// ubatch is sequence-major ([s0t0..s0t(K-1)][s1t0..]), so token (s,k) is column s*K+k -> the k-th
+// token of every sequence is a stride-K view. Chain K steps through the per-seq 3D state (like
+// chunk_uniform chains K steps through a 2D state), reusing the batched single-step multislot build.
+// kv_comp is concatenated step-major [head_dim,1,K*n_seqs]; the caller routes each (step,seq)
+// compressed row to its sequence's cache via the matching stride-K CACHE_ROW slice.
+static dsv4_decode_compressor dsv4_build_compressor_decode_chunk_multislot(
+        ggml_context       * ctx,
+        ggml_tensor        * x,             // [n_embd, n_seqs*n_seq_tokens] sequence-major
+        ggml_tensor        * prev_kv_state, // [width, rows, n_seqs]
+        ggml_tensor        * prev_score_state,
+        ggml_tensor        * wkv,
+        ggml_tensor        * wgate,
+        ggml_tensor        * ape,
+        ggml_tensor        * norm,
+        ggml_tensor        * row_idx,    // [n_seqs*n_seq_tokens]
+        ggml_tensor        * state_perm, // [n_seqs*n_seq_tokens * rows] or nullptr
+        ggml_tensor        * comp_pos,   // [n_seqs*n_seq_tokens]
+        ggml_tensor        * ape_phase,  // [n_seqs*n_seq_tokens]
+        int64_t              head_dim,
+        int64_t              n_rot,
+        int64_t              compress_ratio,
+        int64_t              n_seqs,
+        int64_t              n_seq_tokens,
+        int                  rope_type,
+        const dsv4_rope_cfg & rope_cfg,
+        float                norm_eps,
+        std::vector<dsv4_state_pair> * out_snaps = nullptr) {
+    const int64_t K    = n_seq_tokens;
+    const int64_t rows = prev_kv_state->ne[1];
+    ggml_tensor * kv_state    = prev_kv_state;
+    ggml_tensor * score_state = prev_score_state;
+    ggml_tensor * kv_comp     = nullptr;
+
+    for (int64_t k = 0; k < K; ++k) {
+        // k-th token of every sequence: stride-K gather (cont -> contiguous [.., n_seqs])
+        ggml_tensor * x_k    = ggml_cont(ctx, ggml_view_2d(ctx, x,         x->ne[0], n_seqs, K*x->nb[1],         k*x->nb[1]));
+        ggml_tensor * row_k  = ggml_cont(ctx, ggml_view_2d(ctx, row_idx,   1,        n_seqs, K*row_idx->nb[0],   k*row_idx->nb[0]));
+        ggml_tensor * cpos_k = ggml_cont(ctx, ggml_view_2d(ctx, comp_pos,  1,        n_seqs, K*comp_pos->nb[0],  k*comp_pos->nb[0]));
+        ggml_tensor * aph_k  = ggml_cont(ctx, ggml_view_2d(ctx, ape_phase, 1,        n_seqs, K*ape_phase->nb[0], k*ape_phase->nb[0]));
+        row_k  = ggml_reshape_1d(ctx, row_k,  n_seqs);
+        cpos_k = ggml_reshape_1d(ctx, cpos_k, n_seqs);
+        aph_k  = ggml_reshape_1d(ctx, aph_k,  n_seqs);
+        ggml_tensor * perm_k = nullptr;
+        if (state_perm != nullptr) {
+            perm_k = ggml_cont(ctx, ggml_view_2d(ctx, state_perm, rows, n_seqs, K*rows*state_perm->nb[0], k*rows*state_perm->nb[0]));
+            perm_k = ggml_reshape_1d(ctx, perm_k, rows*n_seqs);
+        }
+
+        dsv4_decode_compressor dec = dsv4_build_compressor_decode_multislot(ctx, x_k,
+                kv_state, score_state, wkv, wgate, ape, norm,
+                row_k, perm_k, cpos_k, aph_k,
+                head_dim, n_rot, compress_ratio, n_seqs, rope_type, rope_cfg, norm_eps);
+        kv_state    = dec.kv_state;
+        score_state = dec.score_state;
+        kv_comp = kv_comp == nullptr ? dec.kv_comp : ggml_concat(ctx, kv_comp, dec.kv_comp, 2);
+        if (out_snaps) out_snaps->push_back({ kv_state, score_state }); // s_{k+1} per sequence (3D) for rollback
     }
 
     return { kv_state, score_state, kv_comp };
