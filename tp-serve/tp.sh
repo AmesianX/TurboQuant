@@ -28,7 +28,11 @@ MASTER_IP="10.0.1.1"
 SLAVE_IP="10.0.1.2"
 MASTER_PORT=29655                            # NCCL bootstrap; control channel = +1
 SLAVE_SSH="10.0.1.2"                         # ssh target for the slave box
-SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.75"
+# draft-mtp with a LOW p-min: the draft always proposes the full window so the verify batch is a fixed
+# width every round. A high p-min (e.g. 0.75) makes the draft length vary with confidence, which makes
+# the meta/CUDA graph re-capture every round (graphs reused = 0) and is a net slowdown — measured 6.5 t/s
+# at p-min 0.75 vs 10.3 t/s at p-min 0.0 on DSV4 Q4 2-box. 0.0 also matches the model's standard sampling.
+SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
