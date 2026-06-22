@@ -1310,6 +1310,365 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk(
     return { kv_state, score_state, kv_comp };
 }
 
+// ============================================================================================
+// BATCHED chunk compressor (roadmap item ③).  Same signature/return as
+// dsv4_build_compressor_decode_chunk, producing NUMERICALLY IDENTICAL kv_comp and carry-out
+// {kv_state, score_state} for the out_snaps==null case (the crashing long-prefill-chunk case).
+//
+// The unrolled _chunk loops n_tokens times, each step building a full windowed-state update
+// (~tens of ggml objects) -> for a 512-wide non-prefill chunk over 43 layers this is ~1M graph
+// objects -> ggml_new_object arena exhaustion (ggml.c assert).  This builds the SAME compression
+// in O(1) graph objects (independent of n_tokens), reusing the proven batched math of
+// dsv4_build_compressor_prefill.
+//
+// THE RECURRENCE IS A FIXED-SIZE SLIDING WINDOW (dsv4_make_state_layout): each token writes one
+// state row at residue pos%ratio; every `ratio` tokens the window is pooled -> one kv_comp.  So
+// compression = strided pooling of consecutive ratio-token blocks.  Positions in a chunk are
+// CONTIGUOUS (first_pos..first_pos+n_tokens-1), so the block structure is:
+//   r0  = first_pos % ratio                         (carry-in phase)
+//   b0  = (r0==0) ? 0 : ratio - r0                  (#tokens completing the carry-in block)
+//   the carry-in block (output #0, only if r0!=0) pools: carry-IN state rows [0,r0) (already
+//     ape'd when stored by a previous chunk) ++ this chunk's tokens [0,b0);
+//   the BULK is the block-aligned region [b0, b0 + n_full*ratio) pooled exactly like _prefill;
+//   the trailing tokens after the last full block are written to the carry-OUT state, no output.
+//
+// ape phase alignment (matches _chunk line ~1285 which adds ape_f[:, pos%ratio]): within the bulk
+// the residue equals the in-block row j (block-aligned) so we reuse _prefill's repeat-ape; the
+// carry-in tokens [0,b0) sit at residues r0..ratio-1 so we add ape_f[:, r0..ratio-1]; trailing
+// tokens [.., n_tokens) sit at residues 0..rem-1 so we add ape_f[:, 0..rem-1].
+//
+// comp_pos (matches _chunk's dsv4_arange at line ~1243: comp_pos = pos+1-ratio per output): the
+// k-th output (k=0..n_out-1) is block n_comp_before+k, whose first token is at global position
+// (n_comp_before+k)*ratio, i.e. comp_pos = (n_comp_before+k)*ratio.
+//
+// Only handles out_snaps==null.  The caller keeps the unrolled path for out_snaps!=null (MTP
+// verify, small K, no explosion) and for irregular/non-contiguous positions.
+static dsv4_decode_compressor dsv4_build_compressor_decode_chunk_batched(
+        ggml_context       * ctx,
+        ggml_tensor        * x,
+        ggml_tensor        * prev_kv_state,
+        ggml_tensor        * prev_score_state,
+        ggml_tensor        * wkv,
+        ggml_tensor        * wgate,
+        ggml_tensor        * ape,
+        ggml_tensor        * norm,
+        const llama_ubatch & ubatch,
+        int64_t              head_dim,
+        int64_t              n_rot,
+        int64_t              n_tokens,
+        int64_t              compress_ratio,
+        int                  rope_type,
+        const dsv4_rope_cfg & rope_cfg,
+        float                norm_eps) {
+    const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
+    const int64_t width = layout.width;   // ratio!=4: head_dim ; ratio==4: 2*head_dim
+    (void) layout;
+
+    const llama_pos first_pos = ubatch.pos ? ubatch.pos[0]            : (llama_pos) 0;
+    const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : (llama_pos) (n_tokens - 1);
+
+    const int64_t r0 = first_pos % compress_ratio;                 // carry-in phase
+    // tokens completing the carry-in block. CAP at n_tokens: a short chunk may not even reach the
+    // first boundary (n_tokens < compress_ratio - r0), in which case ALL tokens stay in the carry-in
+    // block (no boundary crossed, n_out==0). Without the cap, n_after_b0 = n_tokens - b0 goes negative,
+    // n_full/n_trail truncate to 0, and the carry-in ape run over-counts -> ape_tok->ne[1] (== b0) != n_tokens.
+    const int64_t b0 = (r0 == 0) ? 0 : std::min<int64_t>(compress_ratio - r0, n_tokens);
+
+    const int64_t n_comp_before  = first_pos / compress_ratio;
+    const int64_t n_comp_visible = (last_pos + 1) / compress_ratio;
+    const int64_t n_out          = n_comp_visible - n_comp_before;  // == #boundaries crossed
+
+    // project + ape (ape added per-token at residue (first_pos+i)%ratio, matching _chunk).
+    ggml_tensor * kv_all = ggml_mul_mat(ctx, wkv,   x);   // [width, n_tokens]
+    ggml_tensor * sc_all = ggml_mul_mat(ctx, wgate, x);
+    ggml_tensor * ape_f  = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
+
+    // Build a per-token ape tensor [width, n_tokens] phase-aligned to first_pos by assembling the
+    // three contiguous residue runs (carry-in run r0.., full repeated blocks, trailing run ..rem).
+    const int64_t n_after_b0  = n_tokens - b0;
+    const int64_t n_full      = n_after_b0 / compress_ratio;
+    const int64_t cutoff      = b0 + n_full * compress_ratio;       // first index past last full block
+    const int64_t n_trail     = n_tokens - cutoff;                  // trailing partial block (carry-out)
+
+    auto ape_cols = [&](int64_t col0, int64_t ncol) -> ggml_tensor * {
+        return ggml_view_2d(ctx, ape_f, width, ncol, ape_f->nb[1], col0 * ape_f->nb[1]);
+    };
+
+    ggml_tensor * ape_tok = nullptr;
+    if (b0 > 0) {
+        ape_tok = ggml_cont(ctx, ape_cols(r0, b0));                 // residues r0..ratio-1
+    }
+    if (n_full > 0) {
+        // repeat the full [width, ratio] ape n_full times -> [width, n_full*ratio]
+        ggml_tensor * full = ggml_repeat(ctx, ape_f,
+                ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_full * compress_ratio));
+        ape_tok = ape_tok == nullptr ? full : ggml_concat(ctx, ape_tok, full, 1);
+    }
+    if (n_trail > 0) {
+        ggml_tensor * tail = ape_cols(0, n_trail);                 // residues 0..rem-1
+        ape_tok = ape_tok == nullptr ? ggml_cont(ctx, tail) : ggml_concat(ctx, ape_tok, tail, 1);
+    }
+    GGML_ASSERT(ape_tok != nullptr && ape_tok->ne[1] == n_tokens);
+    sc_all = ggml_add(ctx, sc_all, ape_tok);                       // [width, n_tokens], post-ape
+
+    // ---- carry-out state: rows the trailing tokens [cutoff, n_tokens) write, in residue order ----
+    // The unrolled path writes token i to state row (ratio==4 ? ratio + pos%ratio : pos%ratio).
+    // Trailing tokens cover residues 0..n_trail-1 (cutoff is block-aligned, so residue==col index).
+    // Their state form must match prev_*_state layout exactly so the next chunk reads it correctly.
+    // We reconstruct the same final state the unrolled recurrence leaves.
+    ggml_tensor * out_kv_state;
+    ggml_tensor * out_sc_state;
+
+    if (compress_ratio == 4) {
+        // ---- ratio==4 double-window, mirroring dsv4_build_compressor_prefill (lines ~838-863) ----
+        // n_kv = 2*head_dim. Each output c pools 8 rows = block c's curr (upper-half proj) +
+        // block (c-1)'s prev (lower-half proj). The decode state reconstructs exactly this: the
+        // "prev" of bulk block 0 is the carry-in block (this chunk's tokens [0,b0) completing it,
+        // or, if r0==0, the previous chunk's last block held in prev_*_state).
+        const int64_t n_kv = 2 * head_dim;
+
+        // Build the projection stream that feeds the pool, INCLUDING the carry-in block so block 0's
+        // "prev" picks up real data (not the zero-pad _prefill uses for a fresh sequence).
+        //   carry-in block lower-half "prev" data lives in prev_kv_state rows [0,4) dim0[0,head_dim).
+        //   We assemble an augmented [n_kv, (n_out)*ratio] curr stream + a matching prev stream.
+        //
+        // curr stream (upper half, dim0 [head_dim,2hd)) for output blocks 0..n_out-1:
+        //   block k's curr = the ratio tokens at chunk indices [b0 + (k-?)...]. Output block k is
+        //   global block n_comp_before+k; its tokens are chunk indices [k*ratio + b0 - 0 ...]. Since
+        //   output 0 is the carry-in block (chunk tokens [0,b0)) plus carry-in state when r0!=0, we
+        //   special-case it; outputs >=1 (or all, when r0==0) are bulk blocks of full ratio tokens.
+        //
+        // To keep this provably equal to the unrolled recurrence we build each output's two windows
+        // explicitly from contiguous views and pool them in ONE batched dsv4_pool_decode_state.
+
+        // kv_all/sc_all viewed as [n_kv, ratio, *] blocks. Bulk blocks start at chunk index b0.
+        // We materialize, for every output k, the curr window [head_dim, ratio] (upper proj) and the
+        // prev window [head_dim, ratio] (lower proj of the previous block).
+        //
+        // Assemble a "block tokens" tensor of shape [n_kv, ratio, n_out] where slice k holds the
+        // ratio tokens of output block k (carry-in block for k==0 when r0!=0, else bulk blocks).
+        ggml_tensor * blk_kv;   // [n_kv, ratio, n_out]
+        ggml_tensor * blk_sc;
+
+        // bulk blocks (chunk indices [b0, cutoff)) reshape directly.
+        ggml_tensor * bulk_kv = n_full > 0
+            ? ggml_view_3d(ctx, kv_all, n_kv, compress_ratio, n_full,
+                    kv_all->nb[1], kv_all->nb[1]*compress_ratio, b0*kv_all->nb[1])
+            : nullptr;
+        ggml_tensor * bulk_sc = n_full > 0
+            ? ggml_view_3d(ctx, sc_all, n_kv, compress_ratio, n_full,
+                    sc_all->nb[1], sc_all->nb[1]*compress_ratio, b0*sc_all->nb[1])
+            : nullptr;
+
+        if (r0 != 0) {
+            // output #0 = carry-in block: its ratio rows = carry-in state rows [0,r0) ++ chunk
+            // tokens [0,b0). The carry-in state rows hold the (already-ape'd, full-width) projections
+            // of the block's first r0 tokens, stored at prev_kv_state dim1[ratio + (0..r0-1)] = the
+            // "curr" region rows the unrolled path wrote them to. Read them as full width [n_kv, r0].
+            ggml_tensor * ci_kv = ggml_view_2d(ctx, prev_kv_state, n_kv, r0,
+                    prev_kv_state->nb[1], compress_ratio*prev_kv_state->nb[1]);
+            ggml_tensor * ci_sc = ggml_view_2d(ctx, prev_score_state, n_kv, r0,
+                    prev_score_state->nb[1], compress_ratio*prev_score_state->nb[1]);
+            ggml_tensor * t0_kv = ggml_view_2d(ctx, kv_all, n_kv, b0, kv_all->nb[1], 0);
+            ggml_tensor * t0_sc = ggml_view_2d(ctx, sc_all, n_kv, b0, sc_all->nb[1], 0);
+            ggml_tensor * c0_kv = ggml_reshape_3d(ctx, ggml_concat(ctx, ci_kv, t0_kv, 1), n_kv, compress_ratio, 1);
+            ggml_tensor * c0_sc = ggml_reshape_3d(ctx, ggml_concat(ctx, ci_sc, t0_sc, 1), n_kv, compress_ratio, 1);
+            blk_kv = bulk_kv ? ggml_concat(ctx, c0_kv, bulk_kv, 2) : c0_kv;
+            blk_sc = bulk_sc ? ggml_concat(ctx, c0_sc, bulk_sc, 2) : c0_sc;
+        } else {
+            blk_kv = bulk_kv;   // r0==0: all outputs are bulk blocks
+            blk_sc = bulk_sc;
+        }
+        GGML_ASSERT(blk_kv && blk_kv->ne[2] == n_out);
+
+        // curr window = upper half (dim0 [head_dim, 2hd)) of each block.
+        ggml_tensor * kv_curr = ggml_view_3d(ctx, blk_kv, head_dim, compress_ratio, n_out,
+                blk_kv->nb[1], blk_kv->nb[2], head_dim*blk_kv->nb[0]);
+        ggml_tensor * sc_curr = ggml_view_3d(ctx, blk_sc, head_dim, compress_ratio, n_out,
+                blk_sc->nb[1], blk_sc->nb[2], head_dim*blk_sc->nb[0]);
+
+        // prev window = lower half (dim0 [0, head_dim)) of the PREVIOUS block, shifted by one with a
+        // pad block first. For block 0 the "previous block" is the carry-in held in prev_*_state's
+        // prev region (dim1[0,ratio), dim0[0,head_dim)) when r0==0 we still must seed it from state;
+        // when r0!=0 block 0's prev is the previous-previous block, also living in that same state
+        // region (the unrolled shift copies curr->prev each boundary). So the pad/seed for block 0 is
+        // ALWAYS prev_*_state's lower-half prev region.
+        ggml_tensor * kv_lower = ggml_view_3d(ctx, blk_kv, head_dim, compress_ratio, n_out,
+                blk_kv->nb[1], blk_kv->nb[2], 0);                  // lower half of each block
+        ggml_tensor * sc_lower = ggml_view_3d(ctx, blk_sc, head_dim, compress_ratio, n_out,
+                blk_sc->nb[1], blk_sc->nb[2], 0);
+
+        // seed (block 0's prev) = prev_kv_state lower-half prev region [head_dim, ratio].
+        ggml_tensor * seed_kv = ggml_cont(ctx, ggml_view_2d(ctx, prev_kv_state, head_dim, compress_ratio,
+                prev_kv_state->nb[1], 0));
+        ggml_tensor * seed_sc = ggml_cont(ctx, ggml_view_2d(ctx, prev_score_state, head_dim, compress_ratio,
+                prev_score_state->nb[1], 0));
+        seed_kv = ggml_reshape_3d(ctx, seed_kv, head_dim, compress_ratio, 1);
+        seed_sc = ggml_reshape_3d(ctx, seed_sc, head_dim, compress_ratio, 1);
+
+        // prev stream = [seed, lower[0..n_out-1)] -> [head_dim, ratio, n_out]
+        ggml_tensor * kv_prev = (n_out > 1)
+            ? ggml_concat(ctx, seed_kv, ggml_view_3d(ctx, kv_lower, head_dim, compress_ratio, n_out-1,
+                    kv_lower->nb[1], kv_lower->nb[2], 0), 2)
+            : seed_kv;
+        ggml_tensor * sc_prev = (n_out > 1)
+            ? ggml_concat(ctx, seed_sc, ggml_view_3d(ctx, sc_lower, head_dim, compress_ratio, n_out-1,
+                    sc_lower->nb[1], sc_lower->nb[2], 0), 2)
+            : seed_sc;
+
+        // permute to [ratio, head_dim, n_out] and concat prev||curr on dim0 -> [2*ratio, head_dim, n_out]
+        kv_prev = ggml_cont(ctx, ggml_permute(ctx, kv_prev, 1, 0, 2, 3));
+        sc_prev = ggml_cont(ctx, ggml_permute(ctx, sc_prev, 1, 0, 2, 3));
+        ggml_tensor * kv_currp = ggml_cont(ctx, ggml_permute(ctx, kv_curr, 1, 0, 2, 3));
+        ggml_tensor * sc_currp = ggml_cont(ctx, ggml_permute(ctx, sc_curr, 1, 0, 2, 3));
+
+        ggml_tensor * kv_pool = ggml_concat(ctx, kv_prev, kv_currp, 0);   // [2*ratio, head_dim, n_out]
+        ggml_tensor * sc_pool = ggml_concat(ctx, sc_prev, sc_currp, 0);
+
+        // comp_pos[k] = (n_comp_before + k) * ratio  (step == ratio)
+        ggml_tensor * comp_pos = ggml_cast(ctx, ggml_arange(ctx, (float)(n_comp_before*compress_ratio),
+                (float)((n_comp_before + n_out)*compress_ratio), (float) compress_ratio), GGML_TYPE_I32);
+
+        // pool: dsv4_pool_decode_state expects kv [head_dim_arg, n_rows, n_seqs]; here we have the
+        // transposed [2*ratio, head_dim, n_out] form already matching _prefill's call into
+        // dsv4_softmax_pool_ratio -> reshape. Reuse the same body as _prefill: softmax-pool then norm+rope.
+        ggml_tensor * pooled = dsv4_softmax_pool_ratio(ctx, kv_pool, sc_pool);  // [head_dim, n_out]
+        pooled = ggml_rms_norm(ctx, pooled, norm_eps);
+        pooled = ggml_mul(ctx, pooled, norm);
+        pooled = ggml_reshape_3d(ctx, pooled, head_dim, 1, n_out);
+        ggml_tensor * kv_comp = dsv4_apply_rope_tail(ctx, pooled, comp_pos,
+                head_dim, 1, n_out, n_rot, rope_type,
+                rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
+
+        // ---- carry-out state ----
+        // Replay the unrolled recurrence's FINAL state. After the last boundary, the unrolled shift set
+        // BOTH dim1 halves of the state to the last completed block's "curr" region (dim1[ratio,2ratio)).
+        // Then the n_trail trailing tokens were written full-width into rows ratio + (0..n_trail-1).
+        // Equivalent reconstruction:
+        //   last completed block's curr region = blk's last slice curr = upper proj of last full block.
+        //   For the "prev" half after shift we need the full-width (n_kv) curr region of the last block.
+        // We get the last completed block tokens (full width n_kv): if n_out>0 it's blk_kv slice (n_out-1).
+        if (n_out > 0) {
+            ggml_tensor * last_blk_kv = ggml_view_2d(ctx, blk_kv, n_kv, compress_ratio,
+                    blk_kv->nb[1], (n_out-1)*blk_kv->nb[2]);   // [n_kv, ratio]
+            ggml_tensor * last_blk_sc = ggml_view_2d(ctx, blk_sc, n_kv, compress_ratio,
+                    blk_sc->nb[1], (n_out-1)*blk_sc->nb[2]);
+            // shifted state = concat(last_blk, last_blk) on dim1 -> [n_kv, 2*ratio] (matches _projected)
+            ggml_tensor * st_kv = ggml_concat(ctx, last_blk_kv, last_blk_kv, 1);
+            ggml_tensor * st_sc = ggml_concat(ctx, last_blk_sc, last_blk_sc, 1);
+            // write trailing tokens (residues 0..n_trail-1) into rows ratio + (0..n_trail-1).
+            if (n_trail > 0) {
+                ggml_tensor * tr_kv = ggml_view_2d(ctx, kv_all, n_kv, n_trail, kv_all->nb[1], cutoff*kv_all->nb[1]);
+                ggml_tensor * tr_sc = ggml_view_2d(ctx, sc_all, n_kv, n_trail, sc_all->nb[1], cutoff*sc_all->nb[1]);
+                ggml_tensor * tr_rows = dsv4_arange_i32(ctx, compress_ratio, compress_ratio + n_trail);
+                st_kv = ggml_set_rows(ctx, st_kv, tr_kv, tr_rows);
+                st_sc = ggml_set_rows(ctx, st_sc, tr_sc, tr_rows);
+            }
+            out_kv_state = st_kv;
+            out_sc_state = st_sc;
+        } else {
+            // No boundary crossed in this chunk: just write all tokens into the carry-in state at their
+            // residue rows ratio + (r0 .. r0+n_tokens-1). residues are r0..r0+n_tokens-1 (< ratio here).
+            ggml_tensor * rws = dsv4_arange_i32(ctx, compress_ratio + r0, compress_ratio + r0 + n_tokens);
+            out_kv_state = ggml_set_rows(ctx, prev_kv_state,    kv_all, rws);
+            out_sc_state = ggml_set_rows(ctx, prev_score_state, sc_all, rws);
+        }
+
+        return { out_kv_state, out_sc_state, kv_comp };
+    }
+
+    // ---- ratio != 4 (==128): single window [head_dim(=width), ratio] ----
+    // Each output pools one block of `ratio` consecutive tokens, in residue (row) order. comp_pos =
+    // block_start. Carry-in: output 0 (if r0!=0) = carry-in state rows [0,r0) ++ tokens [0,b0).
+    {
+        ggml_tensor * blk_kv;   // [width, ratio, n_out]
+        ggml_tensor * blk_sc;
+
+        ggml_tensor * bulk_kv = n_full > 0
+            ? ggml_view_3d(ctx, kv_all, width, compress_ratio, n_full,
+                    kv_all->nb[1], kv_all->nb[1]*compress_ratio, b0*kv_all->nb[1])
+            : nullptr;
+        ggml_tensor * bulk_sc = n_full > 0
+            ? ggml_view_3d(ctx, sc_all, width, compress_ratio, n_full,
+                    sc_all->nb[1], sc_all->nb[1]*compress_ratio, b0*sc_all->nb[1])
+            : nullptr;
+
+        if (r0 != 0) {
+            ggml_tensor * ci_kv = ggml_view_2d(ctx, prev_kv_state, width, r0, prev_kv_state->nb[1], 0);
+            ggml_tensor * ci_sc = ggml_view_2d(ctx, prev_score_state, width, r0, prev_score_state->nb[1], 0);
+            ggml_tensor * t0_kv = ggml_view_2d(ctx, kv_all, width, b0, kv_all->nb[1], 0);
+            ggml_tensor * t0_sc = ggml_view_2d(ctx, sc_all, width, b0, sc_all->nb[1], 0);
+            ggml_tensor * c0_kv = ggml_reshape_3d(ctx, ggml_concat(ctx, ci_kv, t0_kv, 1), width, compress_ratio, 1);
+            ggml_tensor * c0_sc = ggml_reshape_3d(ctx, ggml_concat(ctx, ci_sc, t0_sc, 1), width, compress_ratio, 1);
+            blk_kv = bulk_kv ? ggml_concat(ctx, c0_kv, bulk_kv, 2) : c0_kv;
+            blk_sc = bulk_sc ? ggml_concat(ctx, c0_sc, bulk_sc, 2) : c0_sc;
+        } else {
+            blk_kv = bulk_kv;
+            blk_sc = bulk_sc;
+        }
+
+        ggml_tensor * kv_comp = nullptr;
+        if (n_out > 0) {
+            GGML_ASSERT(blk_kv && blk_kv->ne[2] == n_out);
+            // permute to [ratio, head_dim, n_out] (width==head_dim here) -> softmax-pool over ratio rows.
+            ggml_tensor * kv_pool = ggml_cont(ctx, ggml_permute(ctx, blk_kv, 1, 0, 2, 3));
+            ggml_tensor * sc_pool = ggml_cont(ctx, ggml_permute(ctx, blk_sc, 1, 0, 2, 3));
+            ggml_tensor * pooled  = dsv4_softmax_pool_ratio(ctx, kv_pool, sc_pool);  // [head_dim, n_out]
+            pooled = ggml_rms_norm(ctx, pooled, norm_eps);
+            pooled = ggml_mul(ctx, pooled, norm);
+            pooled = ggml_reshape_3d(ctx, pooled, head_dim, 1, n_out);
+
+            ggml_tensor * comp_pos = ggml_cast(ctx, ggml_arange(ctx,
+                    (float)(n_comp_before*compress_ratio),
+                    (float)((n_comp_before + n_out)*compress_ratio), (float) compress_ratio), GGML_TYPE_I32);
+            kv_comp = dsv4_apply_rope_tail(ctx, pooled, comp_pos,
+                    head_dim, 1, n_out, n_rot, rope_type,
+                    rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                    rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
+        }
+
+        // ---- carry-out state: write trailing tokens [cutoff, n_tokens) into rows 0..n_trail-1; if no
+        // boundary crossed, write all tokens into rows r0..r0+n_tokens-1 of the carry-in state. The
+        // single-window state's other rows are stale-but-unused (next pool overwrites all `ratio` rows
+        // before the next boundary) — exactly the unrolled recurrence's invariant.
+        if (n_out > 0) {
+            // After a boundary the unrolled path leaves the window rows as-is (no shift for ratio!=4);
+            // the trailing tokens then overwrite rows 0..n_trail-1. Reconstruct: start from prev_state
+            // (its rows will be overwritten as the recurrence advanced), write the LAST full block's
+            // rows 0..ratio-1, then the trailing rows. Equivalent: take prev_state, set rows for the
+            // tokens of the last full block at residues 0..ratio-1, then set trailing rows 0..n_trail-1.
+            // Simpler exact form: the final state rows 0..ratio-1 hold the most-recent token written at
+            // each residue. After the last boundary (block-aligned), residues fill 0,1,.. as tokens
+            // arrive; trailing tokens [cutoff,n_tokens) cover residues 0..n_trail-1. Residues
+            // n_trail..ratio-1 still hold the LAST full block's tokens (written at cutoff-ratio..cutoff-1).
+            ggml_tensor * st_kv = prev_kv_state;
+            ggml_tensor * st_sc = prev_score_state;
+            // last full block tokens -> residues 0..ratio-1
+            ggml_tensor * lb_kv = ggml_view_2d(ctx, kv_all, width, compress_ratio, kv_all->nb[1], (cutoff-compress_ratio)*kv_all->nb[1]);
+            ggml_tensor * lb_sc = ggml_view_2d(ctx, sc_all, width, compress_ratio, sc_all->nb[1], (cutoff-compress_ratio)*sc_all->nb[1]);
+            ggml_tensor * lb_rows = dsv4_arange_i32(ctx, 0, compress_ratio);
+            st_kv = ggml_set_rows(ctx, st_kv, lb_kv, lb_rows);
+            st_sc = ggml_set_rows(ctx, st_sc, lb_sc, lb_rows);
+            if (n_trail > 0) {
+                ggml_tensor * tr_kv = ggml_view_2d(ctx, kv_all, width, n_trail, kv_all->nb[1], cutoff*kv_all->nb[1]);
+                ggml_tensor * tr_sc = ggml_view_2d(ctx, sc_all, width, n_trail, sc_all->nb[1], cutoff*sc_all->nb[1]);
+                ggml_tensor * tr_rows = dsv4_arange_i32(ctx, 0, n_trail);
+                st_kv = ggml_set_rows(ctx, st_kv, tr_kv, tr_rows);
+                st_sc = ggml_set_rows(ctx, st_sc, tr_sc, tr_rows);
+            }
+            out_kv_state = st_kv;
+            out_sc_state = st_sc;
+        } else {
+            ggml_tensor * rws = dsv4_arange_i32(ctx, r0, r0 + n_tokens);
+            out_kv_state = ggml_set_rows(ctx, prev_kv_state,    kv_all, rws);
+            out_sc_state = ggml_set_rows(ctx, prev_score_state, sc_all, rws);
+        }
+
+        return { out_kv_state, out_sc_state, kv_comp };
+    }
+}
+
 // phase-uniform multi-token (MTP verify, n_tokens == K) compressor: the K-step state recurrence of
 // dsv4_build_compressor_decode_chunk, but each step calls the input-driven _uniform builder (not the
 // pos-baked _projected) on the i-th slice of the K-wide i32 ivecs. Pooling runs unconditionally every
@@ -1848,6 +2207,18 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 // multi-slot + MTP: n_seqs sequences each verifying K>1 tokens -> chunk the K steps
                 // through the batched single-step multislot build. K==1 keeps the plain multislot path.
                 const bool chunk_ms = multislot && ubatch.n_seq_tokens > 1;
+                // roadmap ③: O(1)-graph batched chunk compressor, replacing the unrolled per-token
+                // _chunk recurrence that explodes the graph arena on long multi-turn prefill chunks.
+                // Gated by DSV4_BATCHED_COMPRESSOR. Only used when the plain (non-multislot, non-uniform,
+                // n_tokens>1) _chunk would run AND out_snaps would be unused (cparams.n_rs_seq==0, the
+                // crashing prefill-chunk case) — MTP rollback (n_rs_seq>0) keeps the unrolled snaps path.
+                static const bool dsv4_batched_comp = getenv("DSV4_BATCHED_COMPRESSOR") != nullptr;
+                // Batched path only pays off (and is only worth its edge-case surface) for genuinely
+                // large chunks where the unrolled per-token graph-object explosion bites. Small chunks
+                // (< 64 tokens) stay on the proven unrolled _chunk: cheap, no explosion, and it already
+                // handles every short/edge phase (incl. n_tokens < compress_ratio - r0) directly.
+                const bool use_batched_chunk = dsv4_batched_comp && !multislot && !uniform &&
+                        n_tokens >= 64 && cparams.n_rs_seq == 0;
                 dsv4_decode_compressor dec =
                       chunk_ms ? dsv4_build_compressor_decode_chunk_multislot(ctx0, cur,
                             prev_attn_kv_state,
@@ -1921,6 +2292,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             rope_type,
                             rope_cfg,
                             norm_rms_eps, &attn_snaps)
+                    : use_batched_chunk ? dsv4_build_compressor_decode_chunk_batched(ctx0, cur,
+                            prev_attn_kv_state,
+                            prev_attn_sc_state,
+                            layer.attn_compressor_kv,
+                            layer.attn_compressor_gate,
+                            layer.attn_compressor_ape,
+                            layer.attn_compressor_norm,
+                            ubatch,
+                            n_embd_head_k,
+                            n_rot,
+                            n_tokens,
+                            compress_ratio,
+                            rope_type,
+                            rope_cfg,
+                            norm_rms_eps)
                     : dsv4_build_compressor_decode_chunk(ctx0, cur,
                             prev_attn_kv_state,
                             prev_attn_sc_state,
@@ -2127,6 +2513,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                     rope_type,
                                     rope_cfg,
                                     norm_rms_eps, &index_snaps)
+                            : use_batched_chunk ? dsv4_build_compressor_decode_chunk_batched(ctx0, cur,
+                                    prev_index_kv_state,
+                                    prev_index_sc_state,
+                                    layer.indexer_compressor_kv,
+                                    layer.indexer_compressor_gate,
+                                    layer.indexer_compressor_ape,
+                                    layer.indexer_compressor_norm,
+                                    ubatch,
+                                    hparams.indexer_head_size,
+                                    n_rot,
+                                    n_tokens,
+                                    compress_ratio,
+                                    rope_type,
+                                    rope_cfg,
+                                    norm_rms_eps)
                             : dsv4_build_compressor_decode_chunk(ctx0, cur,
                                     prev_index_kv_state,
                                     prev_index_sc_state,
@@ -2578,10 +2979,16 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 }
 
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+    // [dsv4-fp4] The nsparks DeepSeek-V4 native F8_E4M3/MXFP4 gguf (ftype 41) is the SAME
+    // architecture as our converter's output but omits several metadata keys (and renames ~21
+    // tensors, handled in the loader). These are DeepSeek-V4-Flash architectural constants; supply
+    // them as defaults when the key is absent so the proven graph loads unchanged. Gated on the F8
+    // ftype => our own gguf files (which always carry these keys, required=true) are untouched.
+    const bool nsparks_f8 = (ml.ftype == LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
-    ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,  hparams.n_lora_o);
-    ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,hparams.n_attn_out_groups);
+    if (!ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,   hparams.n_lora_o,           !nsparks_f8)) { hparams.n_lora_o = 1024; }
+    if (!ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT, hparams.n_attn_out_groups,  !nsparks_f8)) { hparams.n_attn_out_groups = 8; }
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
@@ -2599,18 +3006,25 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
     }
     ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.compress_rope_freq_base, false);
+    if (nsparks_f8 && hparams.compress_rope_freq_base == 0.0f) { hparams.compress_rope_freq_base = 160000.0f; }
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,      hparams.indexer_n_head, false);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,      hparams.indexer_head_size, false);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,           hparams.indexer_top_k, false);
-    ml.get_key(LLM_KV_HASH_LAYER_COUNT,                  hparams.n_hash_layers);
+    if (!ml.get_key(LLM_KV_HASH_LAYER_COUNT,             hparams.n_hash_layers,      !nsparks_f8)) { hparams.n_hash_layers = 3; }
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,              hparams.nextn_predict_layers, false);
-    ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,            hparams.n_hc);
-    ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS,   hparams.hc_sinkhorn_iters);
-    ml.get_key(LLM_KV_HYPER_CONNECTION_EPS,              hparams.hc_eps);
+    if (!ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,          hparams.n_hc,             !nsparks_f8)) { hparams.n_hc = 4; }
+    if (!ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS, hparams.hc_sinkhorn_iters,!nsparks_f8)) { hparams.hc_sinkhorn_iters = 20; }
+    if (!ml.get_key(LLM_KV_HYPER_CONNECTION_EPS,            hparams.hc_eps,           !nsparks_f8)) { hparams.hc_eps = 1e-6f; }
     ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,           hparams.swiglu_clamp_exp, hparams.n_layer, false);
 
     std::vector<uint32_t> compress_ratios;
-    ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios);
+    if (!ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios, !nsparks_f8) && nsparks_f8) {
+        // DeepSeek-V4-Flash per-layer compress ratio (43 main layers): layers 0-1 dense (0),
+        // then alternating 4 / 128 (indexer vs sliding-window compressors). Identical to our
+        // converter's array for the same base model; the nsparks gguf simply omits the key.
+        compress_ratios = {0,0,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,
+                           4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4};
+    }
     if (compress_ratios.size() < hparams.n_layer) {
         throw std::runtime_error(format("DeepSeek V4 compress ratio count mismatch: got %zu, expected %u",
                     compress_ratios.size(), hparams.n_layer));

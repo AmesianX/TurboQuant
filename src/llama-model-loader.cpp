@@ -44,6 +44,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q8_0:     return "Q8_0";
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return "MXFP4 MoE";
         case LLAMA_FTYPE_MOSTLY_NVFP4:    return "NVFP4";
+        case LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4: return "F8_E4M3 + MXFP4";
         case LLAMA_FTYPE_MOSTLY_Q2_K:     return "Q2_K - Medium";
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:   return "Q2_K - Small";
         case LLAMA_FTYPE_MOSTLY_Q3_K_S:   return "Q3_K - Small";
@@ -761,6 +762,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
+            case GGML_TYPE_F8_E4M3_B128: ftype = LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4; break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -844,8 +846,62 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
     return *weight;
 }
 
+// [dsv4-fp4] The nsparks DeepSeek-V4 native F8_E4M3/MXFP4 gguf names ~21 tensors differently from
+// our converter for the SAME architecture (compressor->compress, dropped .weight/.bias suffix,
+// output_hc_*->hc_head_*, attn_kv->attn_kv_latent, indexer_compressor->indexer.compress). Translate
+// OUR expected name -> theirs so the existing loader/graph resolves them unchanged. Caller gates this
+// on ftype == LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4, so non-FP4 models never take this path.
+static std::string dsv4_fp4_tensor_alias(const char * name) {
+    static const std::unordered_map<std::string, std::string> whole_map = {
+        {"output_hc_base.weight",  "hc_head_base"},
+        {"output_hc_fn.weight",    "hc_head_fn"},
+        {"output_hc_scale.weight", "hc_head_scale"},
+    };
+    static const std::unordered_map<std::string, std::string> suffix_map = {
+        {"attn_compressor_ape.weight",     "attn_compress_ape"},
+        {"attn_compressor_gate.weight",    "attn_compress_gate.weight"},
+        {"attn_compressor_kv.weight",      "attn_compress_kv.weight"},
+        {"attn_compressor_norm.weight",    "attn_compress_norm.weight"},
+        {"attn_kv.weight",                 "attn_kv_latent.weight"},
+        {"attn_sinks.weight",              "attn_sinks"},
+        {"exp_probs_b.bias",               "exp_probs_b"},
+        {"ffn_gate_tid2eid.weight",        "ffn_gate_tid2eid"},
+        {"hc_attn_base.weight",            "hc_attn_base"},
+        {"hc_attn_fn.weight",              "hc_attn_fn"},
+        {"hc_attn_scale.weight",           "hc_attn_scale"},
+        {"hc_ffn_base.weight",             "hc_ffn_base"},
+        {"hc_ffn_fn.weight",               "hc_ffn_fn"},
+        {"hc_ffn_scale.weight",            "hc_ffn_scale"},
+        {"indexer_compressor_ape.weight",  "indexer.compress_ape"},
+        {"indexer_compressor_gate.weight", "indexer.compress_gate.weight"},
+        {"indexer_compressor_kv.weight",   "indexer.compress_kv.weight"},
+        {"indexer_compressor_norm.weight", "indexer.compress_norm.weight"},
+    };
+    const std::string s(name);
+    auto w = whole_map.find(s);
+    if (w != whole_map.end()) {
+        return w->second;
+    }
+    if (s.compare(0, 4, "blk.") == 0) {
+        const size_t dot = s.find('.', 4);
+        if (dot != std::string::npos) {
+            auto it = suffix_map.find(s.substr(dot + 1));
+            if (it != suffix_map.end()) {
+                return s.substr(0, dot + 1) + it->second;
+            }
+        }
+    }
+    return std::string();
+}
+
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
     const auto * weight = get_weight(name);
+    if (!weight && ftype == LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4) {
+        const std::string alt = dsv4_fp4_tensor_alias(name);
+        if (!alt.empty()) {
+            weight = get_weight(alt.c_str());
+        }
+    }
     if (!weight) {
         return nullptr;
     }

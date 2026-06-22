@@ -1786,7 +1786,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
-    const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
+    // [dsv4-fp4] "one split per node" is a wild over-bound: real graphs split only at backend
+    // transitions (cross-node AllReduce in TP => ~n_layers, a few hundred at most). Sizing
+    // context_buffer (line below) by graph_size made it ~20KB/node => 21GB at 1M nodes, blocking
+    // any arena bump needed for long DSV4 prefills. Cap the split provisioning at a hugely generous
+    // 65536 (>> any real split count) so context_buffer decouples from graph_size; the gf_res graph
+    // arena (~8B/node, cheap) can then grow freely. The splits[] array itself grows dynamically.
+    const size_t ggml_sched_max_splits = graph_size < 65536 ? graph_size : 65536; // capped from graph_size
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));

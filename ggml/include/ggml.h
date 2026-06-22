@@ -429,7 +429,7 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TBQ3_0  = 42, // TurboQuant 3-bit (rotation + Lloyd-Max)
+        GGML_TYPE_F8_E4M3_B128 = 42, // FP8 E4M3, 128-blk + E8M0 scale (DeepSeek-V4 native; was TBQ3_0 → moved to 65)
         GGML_TYPE_TBQ4_0  = 43, // TurboQuant 4-bit (rotation + Lloyd-Max)
         GGML_TYPE_TBQP3_0 = 44, // TurboQuant_prod 3-bit (2-bit Lloyd-Max + 1-bit QJL)
         GGML_TYPE_TBQP4_0 = 45, // TurboQuant_prod 4-bit (3-bit Lloyd-Max + 1-bit QJL)
@@ -452,7 +452,8 @@ extern "C" {
         GGML_TYPE_AMX3_1   = 62, // AMX K-side 3r+4φ polar, 128-WHT + cosine-optimal (head_dim=128)
         GGML_TYPE_AMXV3_1  = 63, // AMX V-side 3-bit (tbq3_1 동치; optimization 후추가)
         GGML_TYPE_TBQV3_1  = 64, // TurboQuant V-side 3-bit, blck_size=128 (head_dim=128; tbq3 set V, MSE plain)
-        GGML_TYPE_COUNT    = 65,
+        GGML_TYPE_TBQ3_0   = 65, // TurboQuant 3-bit (rotation + Lloyd-Max) — relocated from 42 to free that slot for F8_E4M3_B128
+        GGML_TYPE_COUNT    = 66,
     };
 
     // precision
@@ -496,6 +497,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 28, // except 1d tensors
     };
 
     // available tensor operations:

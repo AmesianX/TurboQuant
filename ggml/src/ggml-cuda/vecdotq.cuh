@@ -357,6 +357,248 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 
     return sum;
 }
+
+// F8 E4M3FN value LUT, indexed by the raw 8-bit code (256 entries).
+static const __device__ float kvalues_f8_e4m3fn[256] = {
+    0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
+    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
+    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
+    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,
+    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,
+    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,
+    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,
+    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,
+    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,
+    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,
+    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,
+    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,
+    256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, NAN,
+    0.0f, -0.001953125f, -0.00390625f, -0.005859375f, -0.0078125f, -0.009765625f, -0.01171875f, -0.013671875f,
+    -0.015625f, -0.017578125f, -0.01953125f, -0.021484375f, -0.0234375f, -0.025390625f, -0.02734375f, -0.029296875f,
+    -0.03125f, -0.03515625f, -0.0390625f, -0.04296875f, -0.046875f, -0.05078125f, -0.0546875f, -0.05859375f,
+    -0.0625f, -0.0703125f, -0.078125f, -0.0859375f, -0.09375f, -0.1015625f, -0.109375f, -0.1171875f,
+    -0.125f, -0.140625f, -0.15625f, -0.171875f, -0.1875f, -0.203125f, -0.21875f, -0.234375f,
+    -0.25f, -0.28125f, -0.3125f, -0.34375f, -0.375f, -0.40625f, -0.4375f, -0.46875f,
+    -0.5f, -0.5625f, -0.625f, -0.6875f, -0.75f, -0.8125f, -0.875f, -0.9375f,
+    -1.0f, -1.125f, -1.25f, -1.375f, -1.5f, -1.625f, -1.75f, -1.875f,
+    -2.0f, -2.25f, -2.5f, -2.75f, -3.0f, -3.25f, -3.5f, -3.75f,
+    -4.0f, -4.5f, -5.0f, -5.5f, -6.0f, -6.5f, -7.0f, -7.5f,
+    -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,
+    -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f,
+    -32.0f, -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f,
+    -64.0f, -72.0f, -80.0f, -88.0f, -96.0f, -104.0f, -112.0f, -120.0f,
+    -128.0f, -144.0f, -160.0f, -176.0f, -192.0f, -208.0f, -224.0f, -240.0f,
+    -256.0f, -288.0f, -320.0f, -352.0f, -384.0f, -416.0f, -448.0f, NAN,
+};
+
+// Approximate int8 LUT for the F8 E4M3FN value table (kvalues_f8_e4m3fn * 127/448, rounded).
+// Used only by the LOSSY approx-dp4a path (env GGML_CUDA_F8_APPROX_DP4A). Indexed by raw 8-bit code.
+static const __device__ int8_t kvalues_f8_e4m3fn_i8_approx[256] = {
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    1,
+       1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    2,    2,    2,    2,    2,
+       2,    3,    3,    3,    3,    4,    4,    4,    5,    5,    6,    6,    7,    7,    8,    9,
+       9,   10,   11,   12,   14,   15,   16,   17,   18,   20,   23,   25,   27,   29,   32,   34,
+      36,   41,   45,   50,   54,   59,   64,   68,   73,   82,   91,  100,  109,  118,  127,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,   -1,
+      -1,   -1,   -1,   -1,   -1,   -1,   -1,   -1,   -1,   -1,   -1,   -2,   -2,   -2,   -2,   -2,
+      -2,   -3,   -3,   -3,   -3,   -4,   -4,   -4,   -5,   -5,   -6,   -6,   -7,   -7,   -8,   -9,
+      -9,  -10,  -11,  -12,  -14,  -15,  -16,  -17,  -18,  -20,  -23,  -25,  -27,  -29,  -32,  -34,
+     -36,  -41,  -45,  -50,  -54,  -59,  -64,  -68,  -73,  -82,  -91, -100, -109, -118, -127,    0,
+};
+
+#define VDR_F8_E4M3_B128_Q8_1_MMVQ 2
+
+template <int vdr> static __device__ __forceinline__ float vec_dot_f8_e4m3_b128_q8_1_impl(
+    const int * v, const int * u, const float & d8, const half & d_q8_1) {
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t q = (uint32_t(v[i]) >> (8*j)) & 0xFF;
+            const int8_t  y = (uint32_t(u[i]) >> (8*j)) & 0xFF;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            const float x = kvalues_f8_e4m3fn[q];
+#else
+            const float x = __ldg(&kvalues_f8_e4m3fn[q]);
+#endif
+            sum += x * y;
+        }
+    }
+
+    return d8 * __half2float(d_q8_1) * sum;
+}
+
+// Shared-LUT exact variant: numerically identical to vec_dot_f8_e4m3_b128_q8_1_impl, but reads the
+// 256-entry float LUT from a caller-provided __shared__ buffer instead of global/__ldg.
+template <int vdr> static __device__ __forceinline__ float vec_dot_f8_e4m3_b128_q8_1_impl_shared_lut(
+    const int * v, const int * u, const float & d8, const half & d_q8_1, const float * __restrict__ values) {
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t q = (uint32_t(v[i]) >> (8*j)) & 0xFF;
+            const int8_t  y = (uint32_t(u[i]) >> (8*j)) & 0xFF;
+            sum += values[q] * y;
+        }
+    }
+
+    return d8 * __half2float(d_q8_1) * sum;
+}
+
+// LOSSY approx-dp4a variant: maps F8 codes to an int8 LUT and uses dp4a, scaled by 448/127.
+template <int vdr> static __device__ __forceinline__ float vec_dot_f8_e4m3_b128_q8_1_impl_approx_dp4a(
+    const int * v, const int * u, const float & d8, const half & d_q8_1) {
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        int x_i8 = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t q = (uint32_t(v[i]) >> (8*j)) & 0xFF;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            const int8_t x = kvalues_f8_e4m3fn_i8_approx[q];
+#else
+            const int8_t x = __ldg(&kvalues_f8_e4m3fn_i8_approx[q]);
+#endif
+            x_i8 |= (uint8_t) x << (8*j);
+        }
+        sumi = ggml_cuda_dp4a(x_i8, u[i], sumi);
+    }
+
+    return (448.0f / 127.0f) * d8 * __half2float(d_q8_1) * sumi;
+}
+
+// LOSSY approx-dp4a variant reading the int8 LUT from __shared__.
+template <int vdr> static __device__ __forceinline__ float vec_dot_f8_e4m3_b128_q8_1_impl_approx_dp4a_shared_lut(
+    const int * v, const int * u, const float & d8, const half & d_q8_1, const int8_t * __restrict__ values) {
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        int x_i8 = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t q = (uint32_t(v[i]) >> (8*j)) & 0xFF;
+            const int8_t  x = values[q];
+            x_i8 |= (uint8_t) x << (8*j);
+        }
+        sumi = ggml_cuda_dp4a(x_i8, u[i], sumi);
+    }
+
+    return (448.0f / 127.0f) * d8 * __half2float(d_q8_1) * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_f8_e4m3_b128_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_f8_e4m3_b128 * bq = (const block_f8_e4m3_b128 *) vbq + kbx;
+
+    static_assert(VDR_F8_E4M3_B128_Q8_1_MMVQ <= QI8_1, "VDR must not span multiple Q8_1 blocks");
+    const int y_block = iqs / QI8_1;
+    const int y_iqs   = iqs % QI8_1;
+
+    int v[VDR_F8_E4M3_B128_Q8_1_MMVQ];
+    int u[VDR_F8_E4M3_B128_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_F8_E4M3_B128_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b1(bq->qs, iqs + i);
+        u[i] = get_int_b4(bq8_1[y_block].qs, y_iqs + i);
+    }
+
+    return vec_dot_f8_e4m3_b128_q8_1_impl<VDR_F8_E4M3_B128_Q8_1_MMVQ>(
+        v, u, ggml_cuda_e8m0_to_fp32(bq->e), __low2half(bq8_1[y_block].ds));
+}
+
+// Shared-LUT exact wrapper: same as vec_dot_f8_e4m3_b128_q8_1 but the float LUT lives in __shared__.
+static __device__ __forceinline__ float vec_dot_f8_e4m3_b128_q8_1_shared_lut(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const float * __restrict__ values) {
+
+    const block_f8_e4m3_b128 * bq = (const block_f8_e4m3_b128 *) vbq + kbx;
+
+    static_assert(VDR_F8_E4M3_B128_Q8_1_MMVQ <= QI8_1, "VDR must not span multiple Q8_1 blocks");
+    const int y_block = iqs / QI8_1;
+    const int y_iqs   = iqs % QI8_1;
+
+    int v[VDR_F8_E4M3_B128_Q8_1_MMVQ];
+    int u[VDR_F8_E4M3_B128_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_F8_E4M3_B128_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b1(bq->qs, iqs + i);
+        u[i] = get_int_b4(bq8_1[y_block].qs, y_iqs + i);
+    }
+
+    return vec_dot_f8_e4m3_b128_q8_1_impl_shared_lut<VDR_F8_E4M3_B128_Q8_1_MMVQ>(
+        v, u, ggml_cuda_e8m0_to_fp32(bq->e), __low2half(bq8_1[y_block].ds), values);
+}
+
+// LOSSY approx-dp4a wrapper (global int8 LUT).
+static __device__ __forceinline__ float vec_dot_f8_e4m3_b128_q8_1_approx_dp4a(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_f8_e4m3_b128 * bq = (const block_f8_e4m3_b128 *) vbq + kbx;
+
+    static_assert(VDR_F8_E4M3_B128_Q8_1_MMVQ <= QI8_1, "VDR must not span multiple Q8_1 blocks");
+    const int y_block = iqs / QI8_1;
+    const int y_iqs   = iqs % QI8_1;
+
+    int v[VDR_F8_E4M3_B128_Q8_1_MMVQ];
+    int u[VDR_F8_E4M3_B128_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_F8_E4M3_B128_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b1(bq->qs, iqs + i);
+        u[i] = get_int_b4(bq8_1[y_block].qs, y_iqs + i);
+    }
+
+    return vec_dot_f8_e4m3_b128_q8_1_impl_approx_dp4a<VDR_F8_E4M3_B128_Q8_1_MMVQ>(
+        v, u, ggml_cuda_e8m0_to_fp32(bq->e), __low2half(bq8_1[y_block].ds));
+}
+
+// LOSSY approx-dp4a wrapper (shared int8 LUT).
+static __device__ __forceinline__ float vec_dot_f8_e4m3_b128_q8_1_approx_dp4a_shared_lut(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const int8_t * __restrict__ values) {
+
+    const block_f8_e4m3_b128 * bq = (const block_f8_e4m3_b128 *) vbq + kbx;
+
+    static_assert(VDR_F8_E4M3_B128_Q8_1_MMVQ <= QI8_1, "VDR must not span multiple Q8_1 blocks");
+    const int y_block = iqs / QI8_1;
+    const int y_iqs   = iqs % QI8_1;
+
+    int v[VDR_F8_E4M3_B128_Q8_1_MMVQ];
+    int u[VDR_F8_E4M3_B128_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_F8_E4M3_B128_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b1(bq->qs, iqs + i);
+        u[i] = get_int_b4(bq8_1[y_block].qs, y_iqs + i);
+    }
+
+    return vec_dot_f8_e4m3_b128_q8_1_impl_approx_dp4a_shared_lut<VDR_F8_E4M3_B128_Q8_1_MMVQ>(
+        v, u, ggml_cuda_e8m0_to_fp32(bq->e), __low2half(bq8_1[y_block].ds), values);
+}
+
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4
 

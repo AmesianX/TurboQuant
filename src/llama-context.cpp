@@ -2360,9 +2360,13 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         // count is much smaller than the number of GGML objects allocated while
         // building those graphs, so reserve a larger metadata arena than the
         // generic tensor-count heuristic would provide.
-        // n_tokens*768: the chunked (non-prefill) compressor decode builds
+        // n_tokens*1024: the chunked (non-prefill) compressor decode builds
         // O(n_tokens) objects per r4 layer; 192/token overflows at -ub 1024.
-        return std::max<uint32_t>(524288u, n_tokens * 768 + 64u * model.n_tensors());
+        // Floor bumped 524288 -> 1048576: the 768/token estimate under-counted on
+        // some decode inputs (e.g. Hangul-decomposition prompts) and exhausted the
+        // arena (ggml_new_object assert at ggml.c:1925). ~50GB GPU headroom absorbs
+        // the larger sched context_buffer. [dsv4-fp4]
+        return std::max<uint32_t>(2097152u, n_tokens * 1024 + 64u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {

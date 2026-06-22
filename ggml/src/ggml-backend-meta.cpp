@@ -1655,7 +1655,11 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
 
     constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
     const ggml_init_params params_static = {
-        /*.mem_size   =*/ ggml_get_mem_size(ctx),
+        // [dsv4-fp4] 1x the input ctx size left ZERO headroom for the per-split t_ij tensors the meta
+        // backend materializes during alloc -> on large DSV4 prefill graphs (long multi-turn context)
+        // this overflowed by ~1 tensor (ggml_new_object assert at ggml.c:1925, meta line 1256). 2x
+        // scales with the graph, so any graph size gets full headroom; no_alloc metadata, ~352B/tensor.
+        /*.mem_size   =*/ 2 * ggml_get_mem_size(ctx),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
