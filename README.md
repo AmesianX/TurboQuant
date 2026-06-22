@@ -45,8 +45,8 @@ python3 turboquant/ds4_fp4_bake_mtp.py \
   DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
   DeepSeek-V4-Flash-FP4-FP8-native-MTP.gguf      # add --dry-run to validate metadata only
 
-# 2) Mirror the combined GGUF to the second Spark (4-NIC parallel copy)
-python3 ~/scp_dgx_spark.py ~/Models/DeepSeek-V4-Flash-GGUF/FP4
+# 2) Mirror the combined GGUF to the second Spark (4-NIC parallel copy; edit INTERFACES for your cluster)
+python3 turboquant/scp_dgx_spark.py ~/Models/DeepSeek-V4-Flash-GGUF/FP4
 
 # 3) Serve the 2-node TP + multi-slot + MTP stack
 bash fp4ctl.sh start                 # start | stop | restart | status  (pid-only kill, GPU-reclaim wait)
