@@ -9,6 +9,48 @@
 - 📗 [**TurboQuant in Practice: Implementing 3-Bit KV Cache Compression in a Production LLM Inference Engine**](turboquant/paper/turboquant_impl.pdf) — original TBQ v1 implementation paper (WHT + Lloyd-Max + QJL)
 - 📕 [한국어판 — TurboQuant 구현](turboquant/paper/turboquant_impl_ko.pdf)
 
+### 🆕 v1.9.0 — DeepSeek-V4-Flash **FP4** on 2× DGX Spark: Tensor-Parallel + Multi-Slot + MTP
+
+**The full serving stack on native FP4, all at once: 2-node tensor parallelism across two DGX Sparks, concurrent multi-slot batching, and MTP self-speculative decoding — on the FP4/FP8-native checkpoint with no requantization.**
+
+**Environment:** 2× NVIDIA DGX Spark (GB10, 128GB) over RoCE · `DeepSeek-V4-Flash-FP4-FP8-native` (nsparks lineage: F8_E4M3 dense + MXFP4 experts, 146GB) · ctx=8192.
+
+| Config (single stream) | gen t/s |
+|---|---|
+| FP4 PLAIN (2-node TP) | ~15 |
+| **FP4 + MTP + verify-reuse** | **16.6** (beats no-MTP) |
+
+Concurrent multi-slot requests batch on top of this for ~2× aggregate throughput.
+
+**What landed:**
+- **FP4/FP8-native loading without requant** — ported `GGML_TYPE_F8_E4M3_B128` (E4M3 values + E8M0 128-block scale; bit-exact CPU codec, CUDA dequant + MMVQ shared-LUT) and a **load-time adapter** (gated on `ftype 41`) that translates the nsparks tensor names and fills the metadata keys our `deepseek4` loader expects. The 146GB checkpoint loads as-is.
+- **MTP baked into FP4 (not a side-GGUF)** — the standalone MTP head has no embd/output, so `turboquant/ds4_fp4_bake_mtp.py` writes one combined GGUF = FP4 tensors (byte-identical) + the MTP head renamed to `blk.43.nextn.*` + `nextn_predict_layers=1`. **The speed key is graph reuse:** MTP first measured **2.27 t/s** with `graphs reused=0` (every round rebuilds the DSV4 graph); enabling `DSV4_VERIFY_REUSE` restores reuse (0 → 100+) → **16.6 t/s, beating the no-MTP baseline** (lossless: greedy + Hangul-decomposition multi-turn verified).
+- **Long-context graph-arena crash fixed** — the DSV4 compressor built `O(context)` graph objects on long multi-turn prefills, exhausting the metadata arena. `DSV4_BATCHED_COMPRESSOR` makes the chunk compressor `O(1)`; plus sched-context decoupling (`max_splits` cap, 21GB → ~1.3GB) and `-ub 256` keep every arena bounded.
+
+#### Usage
+
+```bash
+# 1) Bake the MTP head into the FP4 checkpoint → one combined GGUF (~5 min, no requant)
+python3 turboquant/ds4_fp4_bake_mtp.py \
+  DeepSeek-V4-Flash-FP4-FP8-native.gguf \
+  DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
+  DeepSeek-V4-Flash-FP4-FP8-native-MTP.gguf      # add --dry-run to validate metadata only
+
+# 2) Mirror the combined GGUF to the second Spark (4-NIC parallel copy)
+python3 ~/scp_dgx_spark.py ~/Models/DeepSeek-V4-Flash-GGUF/FP4
+
+# 3) Serve the 2-node TP + multi-slot + MTP stack
+bash fp4ctl.sh start                 # start | stop | restart | status  (pid-only kill, GPU-reclaim wait)
+
+# raw two-box launch (master on box A 10.0.1.1, slave on box B 10.0.1.2):
+#   bash run_tp_MASTER_DSV4-FP4-MTP.sh   # serves http://0.0.0.0:8080
+#   bash run_tp_SLAVE_DSV4-FP4-MTP.sh    # follower, no HTTP
+```
+
+Key env baked into the launch scripts: `DSV4_MULTISLOT=1` (concurrent slot batching), `DSV4_VERIFY_REUSE=1` (MTP verify-graph reuse — the speed key), `DSV4_BATCHED_COMPRESSOR=1` (long-context safety), with `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0`. Master and slave must run identical env (SPMD).
+
+---
+
 ### 🆕 v1.8.0 — DeepSeek-V4-Flash Full CUDA Port + MTP Self-Speculative Decoding
 
 **DeepSeek-V4-Flash (`deepseek4`) runs end-to-end on the TurboQuant fork — CSA/HCA compressed attention, hyper-connections, the DSA lightning indexer, and a phase-uniform decode graph with CUDA-graph capture — at ds4-reference-engine parity (13.4 t/s on GB10). On top of that: MTP self-speculative decoding from antirez's side GGUF, and tbq3 KV on the global attention layers.**
