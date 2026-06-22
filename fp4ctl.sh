@@ -13,8 +13,8 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 SLAVE_HOST="10.0.1.2"
-MASTER_SH="run_tp_MASTER_DSV4-FP4-PLAIN.sh"
-SLAVE_SH="run_tp_SLAVE_DSV4-FP4-PLAIN.sh"
+MASTER_SH="run_tp_MASTER_DSV4-FP4-MTP.sh"
+SLAVE_SH="run_tp_SLAVE_DSV4-FP4-MTP.sh"
 MLOG="/tmp/fp4_master.log"
 SLOG="/tmp/fp4_slave.log"
 
