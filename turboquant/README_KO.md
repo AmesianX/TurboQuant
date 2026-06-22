@@ -9,6 +9,60 @@
 - 📗 [**TurboQuant 구현: 프로덕션 LLM 추론 엔진에서의 3비트 KV 캐시 압축**](paper/turboquant_impl_ko.pdf) — 원본 TBQ v1 구현 논문 (WHT + Lloyd-Max + QJL)
 - 📕 [English — TurboQuant Impl](paper/turboquant_impl.pdf)
 
+### 🆕 v1.9.0 — DeepSeek-V4-Flash **FP4** on 2× DGX Spark: 텐서 병렬 + 멀티슬롯 + MTP
+
+**네이티브 FP4 위에서 풀 서빙 스택을 한 번에: DGX Spark 두 대에 걸친 2-노드 텐서 병렬, 동시 멀티슬롯 배칭, MTP 셀프-스펙 디코딩 — FP4/FP8-native 체크포인트를 재양자화 없이.**
+
+**환경:** 2× NVIDIA DGX Spark (GB10, 128GB) over RoCE · `DeepSeek-V4-Flash-FP4-FP8-native` (nsparks 계보: F8_E4M3 dense + MXFP4 expert, 146GB) · ctx=8192.
+
+| 설정 (단일 스트림) | gen t/s |
+|---|---|
+| FP4 PLAIN (2-노드 TP) | ~15 |
+| **FP4 + MTP + verify-reuse** | **16.6** (MTP 없는 것보다 빠름) |
+
+동시 멀티슬롯 요청은 이 위에 배칭되어 aggregate ~2× 처리량.
+
+**구현한 것:**
+
+- **신규 `GGML_TYPE_F8_E4M3_B128` 양자화 타입, end-to-end.** FP8 dense weight를 위한 전체 기계장치: 블록 구조(128× E4M3 값 + E8M0 거듭제곱 블록 스케일 1개), **비트-정확 CPU 코덱**(E4M3FN 디코드 — subnormal/NaN/±448 saturation + E8M0 `2^(e−127)` 스케일), CUDA dequant(cuBLAS GEMM 경로용 `to_fp16`)와 CUDA **MMVQ GEMV** 커널. MMVQ는 `__shared__`에 적재한 256-엔트리 LUT를 기본 사용(스칼라 dequant와 비트-동일); `int8 dp4a` 근사는 있지만 **env로 OFF**(`GGML_CUDA_F8_APPROX_DP4A`, 손실 있음). CPU↔CUDA↔LUT 디코드 테이블은 256개 코드 전부 일치 검증. 타입 슬롯 확보를 위해 `GGML_TYPE_TBQ3_0`을 `42 → 65`로 이전(그에 의존하던 range-guard도 수정 — 아래 감사 참조).
+- **재양자화 없이 FP4/FP8-native 로딩, 로드타임 어댑터로.** 146GB `nsparks` 체크포인트(F8_E4M3 dense + MXFP4 expert, `ftype 41`)를 그대로 서빙. 어댑터는 `ftype 41`에서만 켜져(**업스트림 모델은 모든 키 required 유지**) ~21개 nsparks 텐서명을 우리 `deepseek4` 스키마로 통역(`compressor→compress`, `attn_kv→attn_kv_latent`, `output_hc→hc_head`, `.weight` 접미사 제거)하고 nsparks가 빠뜨린 메타데이터 키(`output_lora_rank`, `n_hc`, `hc_sinkhorn`, 43개 `compress_ratios`, `compress_rope_freq_base`, …)를 아키텍처 기본값으로 채웁니다.
+- **MTP를 FP4 파일에 구워 넣음(사이드-shard 아님).** 단독 MTP 헤드(arch `deepseek4_mtp_support`, `mtp.0.*`)는 `tok_embd`/`output`이 없어 단독 draft로 못 뜹니다. `turboquant/ds4_fp4_bake_mtp.py`가 mmap으로 스트리밍(150GB를 RAM에 안 올림)해 결합 GGUF 1개 = 모든 FP4 텐서 바이트-동일 + `blk.43.nextn.*`로 리네임된 MTP 헤드 + `nextn_predict_layers=1`, `file_type 41` 유지(FP4 어댑터 계속 적용). 그 후 `--spec-type draft-mtp`가 바로 소비.
+- **`DSV4_VERIFY_REUSE`가 잠금 해제 열쇠 — v1.8.0의 정직한 반전.** v1.8.0에선 이 verify-graph-reuse 인프라가 **OFF**였습니다(그래프 재빌드가 async GPU와 오버랩돼 이득 ~0). FP4 + MTP 스택에선 상황이 역전 — MTP 첫 실측이 **2.27 t/s, `graphs reused = 0`**(매 스펙 라운드가 풀 DSV4 그래프 재빌드, ~1초/라운드)이고 *그 재빌드*가 이제 병목입니다. `DSV4_VERIFY_REUSE`를 켜면 재사용이 살아나(`0 → 100+/요청`) → **16.6 t/s, MTP 없는 baseline(~15)을 능가**. perplexity 민감(256-pad 뷰가 flash-attn fp 누적 순서를 교란)이라 게이트 유지하며, 여기선 무손실 검증(greedy `France→Paris`/`수도→서울`, 한글 자모 분해 멀티턴 repro, 양박스 안정).
+- **2-노드 TP + 멀티슬롯 + MTP, 합성.** 두 Spark에 걸친 SPMD 텐서 병렬(출력 미러, NCCL all-reduce), 멀티슬롯 디코드 배칭 경로(`DSV4_MULTISLOT`, 동시 요청 → ~2× aggregate), MTP가 전부 함께 돕니다. 가능케 한 수정은 메타-백엔드의 **graph-scoped 메타데이터 재빌드** — 멀티슬롯 + MTP verify 그래프가 TP split을 넘어 더는 오염되지 않습니다.
+- **긴 컨텍스트 그래프-arena 크래시 수정.** DSV4 chunk 압축기가 긴 멀티턴 prefill에서 `O(context)`개 그래프 객체를 만들어 메타데이터 arena를 고갈시킴(N턴 후 `"괭"` 크래시). `DSV4_BATCHED_COMPRESSOR`가 chunk 압축기를 고정 `O(1)` op 수로 재작성(carry-in / bulk-pool / carry-out, 언롤된 recurrence와 수치 동일); sched-context 분리(`max_splits` cap, 21GB → ~1.3GB 메타데이터)와 `-ub 256`이 모든 arena를 유계로 유지.
+- **푸시 전 코드 감사(병렬 심층 리뷰 4건 + 수동 검증).** 릴리스 전 잠복 **critical 2건**을 잡아 수정: (1) 신규 배치 압축기의 carry-out이 carry-in 블록이 유일한 완료 블록일 때(`n_full==0`, 예: 비정렬 `ratio==128` prefill chunk) **음수 텐서 오프셋**을 읽음; (2) `TBQ3_0 42→65` 이전으로 세 개의 `>=TBQ3_0 && <=TBQP4_4` range-guard(`65..61` = 항상 false)가 조용히 깨져 TBQ KV 캐시의 GB10 SoC-freeze 보호를 무력화 → `==TBQ3_0 || (TBQ4_0..TBQP4_4)`로 복원. 추가로 레이어×토큰마다 도는 `stderr` 디버그 flood를 런치 스크립트에서 제거. F8 코덱 / sched cap / 로더 alias / 굽기 툴은 감사 통과(조치 불필요).
+
+#### 성능 특성
+
+단일 스트림 디코드는 **~16.6 t/s**(MTP+reuse) vs **~15**(plain) — FP4 자체는 Q4 대비 디코드 속도 레버가 *아닙니다*(디코드는 메모리-바운드 GEMV; 네이티브 FP4 텐서코어는 GEMM/prefill엔 도움, 토큰당 GEMV엔 아님). 그래서 여기서의 승리는 quant가 아니라 **그래프 재사용으로 살려낸 MTP**입니다. 구조적 천장은 v1.8.0이 기록한 것과 동일 — DSV4 디코드는 LPDDR 대역폭 바운드(matmul ~52%, 데이터 셔플 ~19%, 어텐션 ~2.3%)이고 MoE 투기는 distinct-expert 바이트 증가로 상한이 걸립니다. 즉 MTP의 plain 대비 우위는 설계상 완만하고, 진짜 결과는 **풀 TP + 멀티슬롯 + MTP 스택이 네이티브 FP4 체크포인트 위에서 안정적·무손실로** parity-이상 처리량으로 돈다는 것입니다. 멀티슬롯은 *단일* MTP 스트림을 배칭하지 않습니다(`pure_decode=0`, recurrent-state 롤백 ⇒ `split_seq`); ~2×는 동시 부하에서의 aggregate.
+
+#### 사용법
+
+```bash
+# 1) MTP 헤드를 FP4 체크포인트에 굽기 → 결합 GGUF 1개 (~5분, 재양자화 없음)
+python3 turboquant/ds4_fp4_bake_mtp.py \
+  DeepSeek-V4-Flash-FP4-FP8-native.gguf \
+  DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
+  DeepSeek-V4-Flash-FP4-FP8-native-MTP.gguf      # --dry-run 으로 메타데이터만 검증 가능
+
+# 2) 결합 GGUF를 두 번째 Spark로 미러 (4-NIC 병렬 복사; 자기 클러스터에 맞게 INTERFACES 편집)
+python3 turboquant/scp_dgx_spark.py ~/Models/DeepSeek-V4-Flash-GGUF/FP4
+
+# 3) 2-노드 TP + 멀티슬롯 + MTP 스택 서빙
+bash fp4ctl.sh start                 # start | stop | restart | status  (pid-only kill, GPU 회수 대기)
+
+# raw 2-박스 런치 (마스터 = 박스 A 10.0.1.1, 슬레이브 = 박스 B 10.0.1.2):
+#   bash run_tp_MASTER_DSV4-FP4-MTP.sh   # http://0.0.0.0:8080 서빙
+#   bash run_tp_SLAVE_DSV4-FP4-MTP.sh    # 팔로워, HTTP 없음
+```
+
+런치 스크립트에 박힌 핵심 env: `DSV4_MULTISLOT=1`(동시 슬롯 배칭), `DSV4_VERIFY_REUSE=1`(MTP verify-graph 재사용 — 속도 열쇠), `DSV4_BATCHED_COMPRESSOR=1`(긴 컨텍스트 안전), 그리고 `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0`. 마스터와 슬레이브는 동일 env로 돌아야 함(SPMD).
+
+> 🛠️ **개발 기간.** 주말 프로젝트가 아닙니다. FP4 + 2-노드 TP + 멀티슬롯 + MTP 스택은 거의 쉬지 않은 ~5일 스프린트(**2026년 6/18–22, ~46커밋**)에 들어왔고, 그것은 **~2주 DeepSeek-V4-Flash 마라톤**(**~140 DSV4 관련 커밋**, 6/9–22 거의 매일)의 끝자락입니다. 개발자 1명, DGX Spark 2대, 잠 거의 없이 — 타입 포팅, 로더 어댑터, 굽기 파이프라인, 긴 컨텍스트 크래시 추적, graphs-reused-0 → verify-reuse 돌파, 푸시 전 전수 감사까지 전부 수작업.
+
+
+---
+
 ### 🆕 v1.8.0 — DeepSeek-V4-Flash 풀 CUDA 포팅 + MTP 셀프-스펙 디코딩
 
 **DeepSeek-V4-Flash(`deepseek4`)가 TurboQuant 포크에서 end-to-end로 돌아갑니다 — CSA/HCA 압축 attention, hyper-connection, DSA lightning indexer, phase-uniform decode graph(CUDA-graph capture)까지 포함, GB10에서 ds4 레퍼런스 엔진 parity(13.4 t/s). 그 위에 antirez의 사이드 GGUF로부터 MTP 셀프-스펙 디코딩, 그리고 global attention 레이어의 tbq3 KV까지.**

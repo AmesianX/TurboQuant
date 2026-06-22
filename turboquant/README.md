@@ -9,6 +9,59 @@
 - 📗 [**TurboQuant in Practice: Implementing 3-Bit KV Cache Compression in a Production LLM Inference Engine**](paper/turboquant_impl.pdf) — original TBQ v1 implementation paper (WHT + Lloyd-Max + QJL)
 - 📕 [한국어판 — TurboQuant 구현](paper/turboquant_impl_ko.pdf)
 
+### 🆕 v1.9.0 — DeepSeek-V4-Flash **FP4** on 2× DGX Spark: Tensor-Parallel + Multi-Slot + MTP
+
+**The full serving stack on native FP4, all at once: 2-node tensor parallelism across two DGX Sparks, concurrent multi-slot batching, and MTP self-speculative decoding — on the FP4/FP8-native checkpoint with no requantization.**
+
+**Environment:** 2× NVIDIA DGX Spark (GB10, 128GB) over RoCE · `DeepSeek-V4-Flash-FP4-FP8-native` (nsparks lineage: F8_E4M3 dense + MXFP4 experts, 146GB) · ctx=8192.
+
+| Config (single stream) | gen t/s |
+|---|---|
+| FP4 PLAIN (2-node TP) | ~15 |
+| **FP4 + MTP + verify-reuse** | **16.6** (beats no-MTP) |
+
+Concurrent multi-slot requests batch on top of this for ~2× aggregate throughput.
+
+**What landed:**
+
+- **A new `GGML_TYPE_F8_E4M3_B128` quant type, end to end.** Full machinery for the FP8 dense weights: the block struct (128× E4M3 values + one E8M0 power-of-two block scale), a **bit-exact CPU codec** (E4M3FN decode with subnormals/NaN/±448 saturation + E8M0 `2^(e−127)` scale), CUDA dequant (`to_fp16` for the cuBLAS GEMM path) and a CUDA **MMVQ GEMV** kernel. MMVQ defaults to a `__shared__`-staged 256-entry LUT (bit-identical to the scalar dequant); an `int8 dp4a` approximation is available but **env-gated OFF** (`GGML_CUDA_F8_APPROX_DP4A`, lossy). The CPU↔CUDA↔LUT decode tables were verified identical across all 256 codes. To free the type slot, `GGML_TYPE_TBQ3_0` was relocated `42 → 65` (with the range-guards that depend on it fixed — see audit below).
+- **FP4/FP8-native loads with no requantization, via a load-time adapter.** The 146GB `nsparks` checkpoint (F8_E4M3 dense + MXFP4 experts, `ftype 41`) is served as-is. A loader adapter — gated strictly on `ftype 41` so **upstream models keep every key required** — translates ~21 nsparks tensor names to our `deepseek4` schema (`compressor→compress`, `attn_kv→attn_kv_latent`, `output_hc→hc_head`, dropped `.weight` suffixes) and fills the metadata keys nsparks omits (`output_lora_rank`, `n_hc`, `hc_sinkhorn`, the 43-entry `compress_ratios`, `compress_rope_freq_base`, …) with the architecture's defaults.
+- **MTP baked into the FP4 file (not a side-shard).** The standalone MTP head (arch `deepseek4_mtp_support`, `mtp.0.*`) has no `tok_embd`/`output`, so it can't load as a draft on its own. `turboquant/ds4_fp4_bake_mtp.py` streams (via mmap — no 150GB in RAM) one combined GGUF = every FP4 tensor byte-identical + the MTP head renamed to `blk.43.nextn.*` + `nextn_predict_layers=1`, keeping `file_type 41` so the FP4 adapter still applies. Then `--spec-type draft-mtp` consumes it directly.
+- **`DSV4_VERIFY_REUSE` is the unlock — an honest reversal from v1.8.0.** In v1.8.0 this verify-graph-reuse infra shipped but **OFF** because graph rebuild overlapped the async GPU and it gained ~0 t/s. On the FP4 + MTP stack the situation inverts: MTP first measured **2.27 t/s with `graphs reused = 0`** — every speculative round rebuilds the full DSV4 graph (~1 s/round), and *that* rebuild is now the bottleneck. Turning `DSV4_VERIFY_REUSE` on restores reuse (`0 → 100+/req`) → **16.6 t/s, beating the no-MTP baseline (~15).** It is perplexity-sensitive (the 256-padded view perturbs flash-attn fp-accumulation order), so it stays gated and was verified lossless here (greedy `France→Paris` / `수도→서울`, plus a Hangul-jamo-decomposition multi-turn repro, stable across both boxes).
+- **2-node TP + multi-slot + MTP, composed.** SPMD tensor parallelism across two Sparks over RoCE (mirrored output, NCCL all-reduce), the multi-slot decode-batching path (`DSV4_MULTISLOT`, concurrent requests → ~2× aggregate), and MTP all run together. The enabling fix is a **graph-scoped metadata rebuild** in the meta-backend so the multi-slot + MTP verify graph no longer corrupts across TP splits.
+- **Long-context graph-arena crash fixed.** The DSV4 chunk compressor built `O(context)` graph objects on long multi-turn prefills, exhausting the metadata arena (the `"괭"`-after-N-turns crash). `DSV4_BATCHED_COMPRESSOR` rewrites the chunk compressor to a fixed `O(1)` op count (carry-in / bulk-pool / carry-out, numerically equal to the unrolled recurrence); sched-context decoupling (`max_splits` cap, 21GB → ~1.3GB metadata) and `-ub 256` keep every arena bounded.
+- **Pre-push code audit (4 parallel deep reviews + manual verify).** Caught and fixed two **critical** latent bugs before release: (1) the new batched compressor's carry-out read a **negative tensor offset** when the carry-in block was the only completed block (`n_full==0`, e.g. a non-aligned `ratio==128` prefill chunk); (2) the `TBQ3_0 42→65` relocation silently broke three `>=TBQ3_0 && <=TBQP4_4` range-guards (`65..61` = always false) that gate the GB10 SoC-freeze protections for TBQ KV caches — restored to `==TBQ3_0 || (TBQ4_0..TBQP4_4)`. Plus a per-layer-per-token `stderr` debug flood removed from the launch scripts. F8 codec / sched cap / loader alias / bake tool audited clean.
+
+#### Performance characterization
+
+Single-stream decode is **~16.6 t/s** (MTP+reuse) vs **~15** plain — FP4 by itself is *not* a decode-speed lever over Q4 (decode is memory-bound GEMV; native FP4 tensor cores help GEMM/prefill, not per-token GEMV), so the win here is **MTP made viable by graph reuse**, not the quant. The structural ceiling is the same one v1.8.0 documented: DSV4 decode is LPDDR-bandwidth-bound (matmuls ~52%, data-shuffle ~19%, attention ~2.3%), and MoE speculation is capped by distinct-expert byte growth — so MTP's edge over plain is modest by design, and the real result is that **the full TP + multi-slot + MTP stack runs stably and losslessly on the native FP4 checkpoint** at parity-or-better throughput. Multi-slot does not batch a *single* MTP stream (`pure_decode=0`, recurrent-state rollback ⇒ `split_seq`); its ~2× is aggregate, under concurrent load.
+
+#### Usage
+
+```bash
+# 1) Bake the MTP head into the FP4 checkpoint → one combined GGUF (~5 min, no requant)
+python3 turboquant/ds4_fp4_bake_mtp.py \
+  DeepSeek-V4-Flash-FP4-FP8-native.gguf \
+  DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
+  DeepSeek-V4-Flash-FP4-FP8-native-MTP.gguf      # add --dry-run to validate metadata only
+
+# 2) Mirror the combined GGUF to the second Spark (4-NIC parallel copy; edit INTERFACES for your cluster)
+python3 turboquant/scp_dgx_spark.py ~/Models/DeepSeek-V4-Flash-GGUF/FP4
+
+# 3) Serve the 2-node TP + multi-slot + MTP stack
+bash fp4ctl.sh start                 # start | stop | restart | status  (pid-only kill, GPU-reclaim wait)
+
+# raw two-box launch (master on box A 10.0.1.1, slave on box B 10.0.1.2):
+#   bash run_tp_MASTER_DSV4-FP4-MTP.sh   # serves http://0.0.0.0:8080
+#   bash run_tp_SLAVE_DSV4-FP4-MTP.sh    # follower, no HTTP
+```
+
+Key env baked into the launch scripts: `DSV4_MULTISLOT=1` (concurrent slot batching), `DSV4_VERIFY_REUSE=1` (MTP verify-graph reuse — the speed key), `DSV4_BATCHED_COMPRESSOR=1` (long-context safety), with `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0`. Master and slave must run identical env (SPMD).
+
+> 🛠️ **Development effort.** This was not a weekend project. The FP4 + 2-node TP + multi-slot + MTP stack landed in a ~5-day near-continuous sprint (**Jun 18–22 2026, ~46 commits**), the tail end of a **~2-week DeepSeek-V4-Flash marathon** (**~140 DSV4-related commits**, near-daily Jun 9–22). One developer, two DGX Sparks, very little sleep — the type port, the loader adapter, the bake pipeline, the long-context crash hunt, the graphs-reused-0 → verify-reuse breakthrough, and a full pre-push audit, all by hand.
+
+---
+
 ### 🆕 v1.8.0 — DeepSeek-V4-Flash Full CUDA Port + MTP Self-Speculative Decoding
 
 **DeepSeek-V4-Flash (`deepseek4`) runs end-to-end on the TurboQuant fork — CSA/HCA compressed attention, hyper-connections, the DSA lightning indexer, and a phase-uniform decode graph with CUDA-graph capture — at ds4-reference-engine parity (13.4 t/s on GB10). On top of that: MTP self-speculative decoding from antirez's side GGUF, and tbq3 KV on the global attention layers.**
