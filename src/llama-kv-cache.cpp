@@ -1901,7 +1901,7 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
     // failure on GB10 unified memory manifests as silent host SoC freeze.
     // Skip RoPE shift for TBQ caches — independent queries unaffected; single
     // response rarely wraps context. See memory project_qwen3_14b_crash.md.
-    if (cur->type >= GGML_TYPE_TBQ3_0 && cur->type <= GGML_TYPE_TBQP4_4) {
+    if (cur->type == GGML_TYPE_TBQ3_0 || (cur->type >= GGML_TYPE_TBQ4_0 && cur->type <= GGML_TYPE_TBQP4_4)) {
         return cur;
     }
 

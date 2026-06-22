@@ -25,7 +25,6 @@ export GGML_TP_MASTER_PORT="$MASTER_PORT"
 export DSV4_BATCHED_COMPRESSOR=1  # 배치 compressor (b0 cap 수정)
 export DSV4_MULTISLOT=1        # 동시 슬롯 배치 → 집계 처리량
 export DSV4_VERIFY_REUSE=1     # MTP verify graph 재사용 (graphs reused=0 해결)
-export DSV4_MS_DBG=1
 
 echo "=============================================================="
 echo " TP SLAVE (rank 1)  DSV4-FP4  PLAIN -- follower (no HTTP)"

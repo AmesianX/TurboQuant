@@ -2362,7 +2362,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         // generic tensor-count heuristic would provide.
         // n_tokens*1024: the chunked (non-prefill) compressor decode builds
         // O(n_tokens) objects per r4 layer; 192/token overflows at -ub 1024.
-        // Floor bumped 524288 -> 1048576: the 768/token estimate under-counted on
+        // Floor bumped 524288 -> 2097152: the 768/token estimate under-counted on
         // some decode inputs (e.g. Hangul-decomposition prompts) and exhausted the
         // arena (ggml_new_object assert at ggml.c:1925). ~50GB GPU headroom absorbs
         // the larger sched context_buffer. [dsv4-fp4]

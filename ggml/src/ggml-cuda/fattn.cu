@@ -1034,8 +1034,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 // SoC freeze around K≈2048. VEC kernel reads TBQ blocks natively.
                 // See memory project_qwen3_14b_crash.md.
                 const bool tbq_K_or_V =
-                    (K->type >= GGML_TYPE_TBQ3_0 && K->type <= GGML_TYPE_TBQP4_4) ||
-                    (V->type >= GGML_TYPE_TBQ3_0 && V->type <= GGML_TYPE_TBQP4_4);
+                    (K->type == GGML_TYPE_TBQ3_0 || (K->type >= GGML_TYPE_TBQ4_0 && K->type <= GGML_TYPE_TBQP4_4)) ||
+                    (V->type == GGML_TYPE_TBQ3_0 || (V->type >= GGML_TYPE_TBQ4_0 && V->type <= GGML_TYPE_TBQP4_4));
                 if (tbq_K_or_V) {
                     return BEST_FATTN_KERNEL_VEC;
                 }

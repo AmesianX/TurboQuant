@@ -24,7 +24,6 @@ export GGML_TP_RANK=0
 export GGML_TP_MASTER_ADDR="$MASTER_ADDR"
 export GGML_TP_MASTER_PORT="$MASTER_PORT"
 export DSV4_MULTISLOT=1        # Step C: batch concurrent slots' MTP-verify into one decode
-export DSV4_MS_DBG=1
 
 echo "=============================================================="
 echo " TP MASTER (rank 0)  DSV4-Q4 + MTP + MULTISLOT"

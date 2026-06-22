@@ -23,7 +23,6 @@ export GGML_TP_RANK=1
 export GGML_TP_MASTER_ADDR="$MASTER_ADDR"
 export GGML_TP_MASTER_PORT="$MASTER_PORT"
 export DSV4_MULTISLOT=1        # must match leader so the SPMD follower builds the identical graph
-export DSV4_MS_DBG=1
 
 echo "=============================================================="
 echo " TP SLAVE (rank 1)  DSV4-Q4 + MTP + MULTISLOT -- follower (no HTTP)"

@@ -1644,12 +1644,25 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk_batched(
             // n_trail..ratio-1 still hold the LAST full block's tokens (written at cutoff-ratio..cutoff-1).
             ggml_tensor * st_kv = prev_kv_state;
             ggml_tensor * st_sc = prev_score_state;
-            // last full block tokens -> residues 0..ratio-1
-            ggml_tensor * lb_kv = ggml_view_2d(ctx, kv_all, width, compress_ratio, kv_all->nb[1], (cutoff-compress_ratio)*kv_all->nb[1]);
-            ggml_tensor * lb_sc = ggml_view_2d(ctx, sc_all, width, compress_ratio, sc_all->nb[1], (cutoff-compress_ratio)*sc_all->nb[1]);
-            ggml_tensor * lb_rows = dsv4_arange_i32(ctx, 0, compress_ratio);
-            st_kv = ggml_set_rows(ctx, st_kv, lb_kv, lb_rows);
-            st_sc = ggml_set_rows(ctx, st_sc, lb_sc, lb_rows);
+            // last completed block tokens -> residues 0..ratio-1.
+            // [dsv4-fp4 AUDIT FIX] n_full>=1: the last full block is the contiguous slice
+            // kv_all[cutoff-ratio, cutoff). n_full==0 (carry-in block is the only/last completed
+            // block, e.g. ratio==128, non-aligned first_pos, short chunk): cutoff-ratio would be
+            // NEGATIVE (OOB view). The carry-in block's NEW tokens are kv_all[0,b0) at residues
+            // r0..ratio-1; residues 0..r0-1 already hold prev_state. Don't touch the latter.
+            if (n_full >= 1) {
+                ggml_tensor * lb_kv = ggml_view_2d(ctx, kv_all, width, compress_ratio, kv_all->nb[1], (cutoff-compress_ratio)*kv_all->nb[1]);
+                ggml_tensor * lb_sc = ggml_view_2d(ctx, sc_all, width, compress_ratio, sc_all->nb[1], (cutoff-compress_ratio)*sc_all->nb[1]);
+                ggml_tensor * lb_rows = dsv4_arange_i32(ctx, 0, compress_ratio);
+                st_kv = ggml_set_rows(ctx, st_kv, lb_kv, lb_rows);
+                st_sc = ggml_set_rows(ctx, st_sc, lb_sc, lb_rows);
+            } else {
+                ggml_tensor * ci_kv = ggml_view_2d(ctx, kv_all, width, b0, kv_all->nb[1], 0);
+                ggml_tensor * ci_sc = ggml_view_2d(ctx, sc_all, width, b0, sc_all->nb[1], 0);
+                ggml_tensor * ci_rows = dsv4_arange_i32(ctx, r0, r0 + b0);   // r0..ratio-1
+                st_kv = ggml_set_rows(ctx, st_kv, ci_kv, ci_rows);
+                st_sc = ggml_set_rows(ctx, st_sc, ci_sc, ci_rows);
+            }
             if (n_trail > 0) {
                 ggml_tensor * tr_kv = ggml_view_2d(ctx, kv_all, width, n_trail, kv_all->nb[1], cutoff*kv_all->nb[1]);
                 ggml_tensor * tr_sc = ggml_view_2d(ctx, sc_all, width, n_trail, sc_all->nb[1], cutoff*sc_all->nb[1]);
