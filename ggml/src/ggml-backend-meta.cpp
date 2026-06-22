@@ -460,6 +460,17 @@ struct ggml_backend_meta_buffer_context {
     // MTP draft graphs (collision -> stale bcj.nodes -> wrong MoE src) or miss a reuse (force rebuild
     // -> the reused graph's simple-tensors get recycled out of the ring -> null nodes).
     bool compute_dirty = false;
+    // [tp-dsv4-mtp graph-scoped redesign] Authoritative per-graph_compute node container. The ring above
+    // caches simple-tensors keyed by POINTER and bakes each one's src[] pointers in at build time; with
+    // structurally-distinct graphs interleaving (single-slot / variable MTP draft / multi-slot verify) and
+    // ctx-reset address reuse, a looked-up node could carry STALE baked srcs (a mul_mat_id resolving to the
+    // wrong weight -> graph corruption). Instead, graph_compute REBUILDS every current-cgraph node FRESH
+    // into stc_graph in topological order, so each node's srcs resolve to this same fresh build (or static
+    // weights / ring-held input leaves). `rebuilding` routes simple_tensor() to stc_graph for the whole
+    // graph_compute (build + subgraph execution); gallocr/set_tensor/get_tensor outside it keep using the
+    // ring (leaves only, no node-src chains -> no staleness). stc_graph is cleared each needs_rebuild.
+    ggml_backend_meta_simple_tensor_container stc_graph;
+    bool rebuilding = false;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     // FIXME
@@ -473,8 +484,9 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_buffer_context(
             ggml_backend_meta_simple_tensor_container & stc_static,
             std::vector<ggml_backend_meta_simple_tensor_container> & stc_compute_ring,
+            ggml_backend_meta_simple_tensor_container & stc_graph,
             const std::vector<ggml_backend_buffer_t> & bufs)
-            : stc_static(std::move(stc_static)), stc_compute(std::move(stc_compute_ring)) {
+            : stc_static(std::move(stc_static)), stc_compute(std::move(stc_compute_ring)), stc_graph(std::move(stc_graph)) {
         this->bufs.reserve(bufs.size());
         for (ggml_backend_buffer_t buf : bufs) {
             this->bufs.emplace_back(buf);
@@ -515,6 +527,18 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
 
+    // During a graph_compute (rebuilding) the authoritative source is stc_graph (freshly rebuilt nodes,
+    // no stale baked srcs). Static weights live in stc_static; input LEAVES are not rebuilt into stc_graph
+    // so they fall back to the ring (where gallocr registered them — leaves carry no node-src chains, so no
+    // staleness). Outside graph_compute, the ring is authoritative (original behaviour).
+    if (buf_ctx->rebuilding) {
+        if (buf_ctx->stc_static.simple_tensors.find(tensor) == buf_ctx->stc_static.simple_tensors.end()) {
+            auto itg = buf_ctx->stc_graph.simple_tensors.find(tensor);
+            if (itg != buf_ctx->stc_graph.simple_tensors.end()) {
+                return itg->second[index];
+            }
+        }
+    }
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
     if (it == stc.simple_tensors.end()) {
@@ -1609,6 +1633,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     for (int r = 0; r < GGML_META_STC_RING; ++r) {
         stc_compute_ring.emplace_back(params, n_simple_bufts);
     }
+    ggml_backend_meta_simple_tensor_container stc_graph(params, n_simple_bufts);
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -1620,7 +1645,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
-    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_ring, bufs);
+    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_ring, stc_graph, bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
@@ -1645,9 +1670,10 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
     for (int r = 0; r < GGML_META_STC_RING; ++r) {
         stc_compute_ring.emplace_back(params_compute, n_simple_bufts);
     }
+    ggml_backend_meta_simple_tensor_container stc_graph(params_compute, n_simple_bufts);
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
-    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_ring, bufs);
+    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_ring, stc_graph, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -1942,6 +1968,29 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
     const bool needs_rebuild = compute_dirty || (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
 
+    // [graph-scoped redesign] Route simple_tensor() to each touched buffer's stc_graph for the WHOLE
+    // graph_compute (node rebuild below + subgraph execution), resetting on every exit path via RAII.
+    std::set<ggml_backend_buffer_t> used_buffers;
+    for (int i = 0; i < cgraph->n_leafs; i++) {
+        if (ggml_backend_buffer_is_meta(cgraph->leafs[i]->buffer)) {
+            used_buffers.emplace(cgraph->leafs[i]->buffer);
+        }
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (ggml_backend_buffer_is_meta(cgraph->nodes[i]->buffer)) {
+            used_buffers.emplace(cgraph->nodes[i]->buffer);
+        }
+    }
+    struct meta_rebuild_guard {
+        std::vector<ggml_backend_meta_buffer_context *> ctxs;
+        ~meta_rebuild_guard() { for (auto * c : ctxs) { c->rebuilding = false; } }
+    } rb_guard;
+    for (ggml_backend_buffer_t buf : used_buffers) {
+        auto * bc = (ggml_backend_meta_buffer_context *) buf->context;
+        bc->rebuilding = true;
+        rb_guard.ctxs.push_back(bc);
+    }
+
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
         for (size_t j = 0; j < n_backends; j++) {
@@ -1955,17 +2004,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     if (needs_rebuild) {
-        std::set<ggml_backend_buffer_t> used_buffers;
-        for (int i = 0; i < cgraph->n_leafs; i++) {
-            if (ggml_backend_buffer_is_meta(cgraph->leafs[i]->buffer)) {
-                used_buffers.emplace(cgraph->leafs[i]->buffer);
-            }
-        }
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            if (ggml_backend_buffer_is_meta(cgraph->nodes[i]->buffer)) {
-                used_buffers.emplace(cgraph->nodes[i]->buffer);
-            }
-        }
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             // [tp-dsv4-mtp] only advance/clear the ring for a buffer whose compute tensors actually
@@ -1979,6 +2017,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 stc.simple_tensors.clear();
             }
             buf_ctx->compute_dirty = false;
+            // [graph-scoped] clear this buffer's authoritative per-graph node container, then rebuild every
+            // current node into stc_graph fresh just below. NOTE: do NOT clear split_state_cache here — it is
+            // populated incrementally in topological order by gallocr's init_tensor pass (each tensor's srcs
+            // already cached -> O(1) per call) and self-invalidates a reused pointer via its own memcmp guard.
+            // Clearing it cold makes the first deep node's get_split_state recurse the full graph depth -> stack
+            // overflow. The warm cache makes the rebuild's get_split_state calls O(1).
+            for (ggml_context_ptr & ctx : buf_ctx->stc_graph.ctxs) {
+                ggml_reset(ctx.get());
+            }
+            buf_ctx->stc_graph.simple_tensors.clear();
+        }
+        // Rebuild every node FRESH into its buffer's stc_graph, in cgraph topological order, so each node's
+        // src[]/view_src resolve to this same fresh build (stc_graph) — or to static weights / ring-held
+        // input leaves — never to a stale baked pointer. (rebuilding=true routes simple_tensor to stc_graph.)
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (!node->buffer || !ggml_backend_buffer_is_meta(node->buffer)) {
+                continue;
+            }
+            if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                continue; // s_copy_main host-leaf view: handled directly in the bcj loop, not via simple_tensor
+            }
+            ggml_backend_meta_buffer_context * nb = (ggml_backend_meta_buffer_context *) node->buffer->context;
+            ggml_backend_meta_buffer_init_tensor_impl(nb->stc_graph, node);
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
