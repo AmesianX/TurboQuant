@@ -22,11 +22,14 @@ REPO="$HOME/work/TurboQuant"                 # repo root (has build/bin/llama-se
 MODEL="$HOME/Models/DeepSeek-V4-Flash-GGUF/Q4mtp/DSV4-Q4-00001-of-00002.gguf"
 PORT=8080
 API_KEY="tbq-dsv4"                           # required because we bind 0.0.0.0
-CTX=131072      # production: plain decode, fast (allocation-independent) + accurate
-GRAPH_SLOTS=1   # MTP graph-reuse pool (1=off). >1 + VERIFY_REUSE = MTP reuse (moderate ctx win)
+CTX=0           # 1M MTP ckpt prof
+GRAPH_SLOTS=16  # TEST
 SLOT_PROBE=     # diag: DSV4_SLOT_PROBE (pool slot actions)
 RESULT_DEBUG=
-VERIFY_REUSE=   # DSV4_VERIFY_REUSE (NOT greedy-bit-identical; needs pool>1)
+VERIFY_REUSE=1
+KERNEL_PROF=
+GRAPH_PROBE=
+STAGE_PROF=
                 #  quant KV now allowed under -sm tensor for MLA (mirrored KV) — see llama-context.cpp guard.
 IFACE="enp1s0f0np0"                          # RoCE interface
 MASTER_IP="10.0.1.1"
@@ -37,7 +40,7 @@ SLAVE_SSH="10.0.1.2"                         # ssh target for the slave box
 # width every round. A high p-min (e.g. 0.75) makes the draft length vary with confidence, which makes
 # the meta/CUDA graph re-capture every round (graphs reused = 0) and is a net slowdown — measured 6.5 t/s
 # at p-min 0.75 vs 10.3 t/s at p-min 0.0 on DSV4 Q4 2-box. 0.0 also matches the model's standard sampling.
-SPEC=""   # plain (fastest+accurate at any ctx). MTP line below for ≤64k speculative.
+SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"
 # MTP (≤64k): SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"; set GRAPH_SLOTS=16 VERIFY_REUSE=1 for graph reuse (disabled-default)
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
@@ -65,6 +68,9 @@ env_common() {
     if [ -n "${SLOT_PROBE:-}" ]; then export DSV4_SLOT_PROBE=1; fi
     if [ -n "${RESULT_DEBUG:-}" ]; then export LLAMA_GRAPH_RESULT_DEBUG="$RESULT_DEBUG"; fi
     if [ -n "${VERIFY_REUSE:-}" ]; then export DSV4_VERIFY_REUSE=1; fi
+    if [ -n "${KERNEL_PROF:-}" ]; then export DSV4_KERNEL_PROF=1; fi
+    if [ -n "${GRAPH_PROBE:-}" ]; then export DSV4_GRAPH_PROBE=1; fi
+    if [ -n "${STAGE_PROF:-}" ]; then export DSV4_STAGE_PROF=1; fi
 }
 
 stop_local() {

@@ -461,10 +461,13 @@ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_p
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
+    // Clear the compressed rows BEFORE mem_attn trims the window: dsv4_clear_rows derives the
+    // written high-water from mem_attn->seq_pos_max to bound the zeroed range, so it must read it
+    // while still pre-trim. (The validity pre-check above guarantees this tail removal succeeds.)
+    dsv4_seq_rm(seq_id, p0, p1);
     if (!mem_attn->seq_rm(seq_id, p0, p1)) {
         return false;
     }
-    dsv4_seq_rm(seq_id, p0, p1);
     return true;
 }
 
@@ -628,8 +631,21 @@ void llama_memory_hybrid_iswa::dsv4_clear_rows(llama_seq_id seq_id, int32_t il, 
     const auto & layer = dsv4_cache_layers[il];
     const auto range = dsv4_make_row_range(layer.n_comp, ratio, p0, p1);
 
-    dsv4_zero_cache_rows(layer.attn_k,  seq_id, range.begin, range.size());
-    dsv4_zero_cache_rows(layer.index_k, seq_id, range.begin, range.size());
+    // Open-ended tail removals (p1 = max, every MTP rollback) make dsv4_make_row_range run the
+    // range out to layer.n_comp. Only rows below the written high-water actually hold data; the
+    // empty tail [high-water, n_comp) needs no zeroing. Without this clamp, seq_rm zeros the full
+    // allocated compressed cache every round — O(n_comp) per layer (~630 ms at 1M ctx) and the
+    // dominant cost of MTP at large context. Clamping makes it O(rejected rows). Requires the
+    // pre-trim high-water, hence dsv4_seq_rm runs before mem_attn->seq_rm (see seq_rm()).
+    const uint32_t n_written = dsv4_n_state_rows(il, seq_id);
+    const uint32_t row_end   = std::min<uint32_t>(range.begin + range.size(), n_written);
+    if (row_end <= range.begin) {
+        return;
+    }
+    const uint32_t n_rows = row_end - range.begin;
+
+    dsv4_zero_cache_rows(layer.attn_k,  seq_id, range.begin, n_rows);
+    dsv4_zero_cache_rows(layer.index_k, seq_id, range.begin, n_rows);
 }
 
 void llama_memory_hybrid_iswa::dsv4_copy_rows(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, int32_t il, llama_pos p0, llama_pos p1) {

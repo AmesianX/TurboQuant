@@ -428,7 +428,12 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // Only used cell indices can match (every cell with a sequence is < used_max_p1).
+        // Scanning the full allocated cells.size() makes seq_rm O(n_ctx) — catastrophic at large
+        // context where MTP speculative decode calls seq_rm every round to drop rejected draft
+        // tokens (plain decode never rejects, which is why it stays fast at 1M while MTP collapses).
+        const uint32_t scan_end = cells.used_max_p1();
+        for (uint32_t i = 0; i < scan_end; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
@@ -452,7 +457,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            const uint32_t scan_end = cells.used_max_p1();   // skip the unused tail (O(used) not O(n_ctx))
+            for (uint32_t i = 0; i < scan_end; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }

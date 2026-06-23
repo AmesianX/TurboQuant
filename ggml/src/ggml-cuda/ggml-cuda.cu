@@ -3458,7 +3458,20 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Key the per-context CUDA-graph cache by BOTH the first-node pointer AND the node count.
+    // MTP speculative decode interleaves graphs of different shapes every step (verify width K
+    // vs draft width 1, plus variable accept widths) that all share the same first node — a
+    // stable input tensor — so keying on nodes[0] alone collides them onto ONE cache slot. The
+    // node-count mismatch (graph->node_props.size() != cgraph->n_nodes) then forces a graph
+    // update every step and CUDA-graph warmup never completes -> graphs run via direct
+    // execution -> the tensor-parallel per-op dispatch overhead dominates and large-context
+    // generation collapses (1M MTP 0.8 t/s while GPU kernels are identical to 32k). Folding in
+    // n_nodes gives each distinct shape its own cache slot so each warms up and gets replayed;
+    // any residual same-(nodes[0],n_nodes) collision is still caught correctly by the per-node
+    // property comparison below (just a warmup reset, never wrong output).
+    uintptr_t k = (uintptr_t) cgraph->nodes[0];
+    k ^= (uintptr_t) (uint32_t) cgraph->n_nodes * (uintptr_t) 0x9E3779B97F4A7C15ull;
+    return (const void *) k;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
