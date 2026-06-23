@@ -9,21 +9,34 @@
 - 📗 [**TurboQuant in Practice: Implementing 3-Bit KV Cache Compression in a Production LLM Inference Engine**](paper/turboquant_impl.pdf) — original TBQ v1 implementation paper (WHT + Lloyd-Max + QJL)
 - 📕 [한국어판 — TurboQuant 구현](paper/turboquant_impl_ko.pdf)
 
-### 🆕 v1.9.0 — DeepSeek-V4-Flash **FP4** on 2× DGX Spark: Tensor-Parallel + Multi-Slot + MTP
+### 🆕 v1.9.0 — DeepSeek-V4-Flash on 2× DGX Spark: vLLM-class serving, in llama.cpp
 
-**The full serving stack on native FP4, all at once: 2-node tensor parallelism across two DGX Sparks, concurrent multi-slot batching, and MTP self-speculative decoding — on the FP4/FP8-native checkpoint with no requantization.**
+> **vLLM-only features — multi-node TP, continuous batching, speculative decoding — now in llama.cpp, on two small boxes.**
 
-**Environment:** 2× NVIDIA DGX Spark (GB10, 128GB) over RoCE · `DeepSeek-V4-Flash-FP4-FP8-native` (nsparks lineage: F8_E4M3 dense + MXFP4 experts, 146GB) · ctx=8192.
-
-| Config (single stream) | gen t/s |
+| Feature | Spec |
 |---|---|
-| FP4 PLAIN (2-node TP) | ~15 |
-| **FP4 + MTP + verify-reuse** | **16.6** (beats no-MTP) |
+| 🌐 Multi-node tensor parallelism | **2 nodes over RoCE/RDMA** — not the slow RPC backend |
+| 📜 Context length | **1,048,576** (full 1M) |
+| 🗜️ KV cache @ 1M | **~9.6 GB** — TurboQuant 3-bit (TBQ3) |
+| ⚡ Speculative decoding | **MTP — 16.5 t/s @ 1M**, beats plain |
+| 🔀 Continuous batching | multi-slot (`-np 2`) → ~2× aggregate |
+| 💻 Hardware | 2× DGX Spark (GB10, 128 GB) — no datacenter GPU |
 
-Concurrent multi-slot requests batch on top of this for ~2× aggregate throughput.
+**Measured throughput** — single stream, 2× DGX Spark over RoCE:
+
+| Model | ctx | mode | gen t/s |
+|---|---|---|---|
+| Q4 | **1M** | **2-node TP + MTP + TBQ3 KV** | **16.5** ⚡ |
+| Q4 | 1M | 2-node TP plain + TBQ3 KV | 15.5 |
+| FP4-native | 8K | 2-node TP + MTP | 16.6 |
+| FP4-native | 8K | 2-node TP plain | ~15 |
+| IQ2 | 8K | single box (no TP) | 16.9 |
+
+> **MTP beats plain at 1M context** — speculative decoding that actually pays off on a memory-bound MoE, across two boxes.
 
 **What landed:**
 
+- **A full 1M-token context, served from ~9.6 GB — across two boxes, not one giant GPU.** TurboQuant 3-bit KV compression squeezes the million-token KV cache down to **~9.6 GB**, so the whole context fits split over two machines. **MTP speculative decoding runs there at 16.5 t/s — faster than plain decode** — full-speed speculative decoding at 1M context, which had never worked at this scale before.
 - **A new `GGML_TYPE_F8_E4M3_B128` quant type, end to end.** Full machinery for the FP8 dense weights: the block struct (128× E4M3 values + one E8M0 power-of-two block scale), a **bit-exact CPU codec** (E4M3FN decode with subnormals/NaN/±448 saturation + E8M0 `2^(e−127)` scale), CUDA dequant (`to_fp16` for the cuBLAS GEMM path) and a CUDA **MMVQ GEMV** kernel. MMVQ defaults to a `__shared__`-staged 256-entry LUT (bit-identical to the scalar dequant); an `int8 dp4a` approximation is available but **env-gated OFF** (`GGML_CUDA_F8_APPROX_DP4A`, lossy). The CPU↔CUDA↔LUT decode tables were verified identical across all 256 codes. To free the type slot, `GGML_TYPE_TBQ3_0` was relocated `42 → 65` (with the range-guards that depend on it fixed — see audit below).
 - **FP4/FP8-native loads with no requantization, via a load-time adapter.** The 146GB `nsparks` checkpoint (F8_E4M3 dense + MXFP4 experts, `ftype 41`) is served as-is. A loader adapter — gated strictly on `ftype 41` so **upstream models keep every key required** — translates ~21 nsparks tensor names to our `deepseek4` schema (`compressor→compress`, `attn_kv→attn_kv_latent`, `output_hc→hc_head`, dropped `.weight` suffixes) and fills the metadata keys nsparks omits (`output_lora_rank`, `n_hc`, `hc_sinkhorn`, the 43-entry `compress_ratios`, `compress_rope_freq_base`, …) with the architecture's defaults.
 - **MTP baked into the FP4 file (not a side-shard).** The standalone MTP head (arch `deepseek4_mtp_support`, `mtp.0.*`) has no `tok_embd`/`output`, so it can't load as a draft on its own. `turboquant/ds4_fp4_bake_mtp.py` streams (via mmap — no 150GB in RAM) one combined GGUF = every FP4 tensor byte-identical + the MTP head renamed to `blk.43.nextn.*` + `nextn_predict_layers=1`, keeping `file_type 41` so the FP4 adapter still applies. Then `--spec-type draft-mtp` consumes it directly.

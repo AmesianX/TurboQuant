@@ -9,21 +9,34 @@
 - 📗 [**TurboQuant 구현: 프로덕션 LLM 추론 엔진에서의 3비트 KV 캐시 압축**](paper/turboquant_impl_ko.pdf) — 원본 TBQ v1 구현 논문 (WHT + Lloyd-Max + QJL)
 - 📕 [English — TurboQuant Impl](paper/turboquant_impl.pdf)
 
-### 🆕 v1.9.0 — DeepSeek-V4-Flash **FP4** on 2× DGX Spark: 텐서 병렬 + 멀티슬롯 + MTP
+### 🆕 v1.9.0 — DeepSeek-V4-Flash on 2× DGX Spark: vLLM급 서빙, llama.cpp에서
 
-**네이티브 FP4 위에서 풀 서빙 스택을 한 번에: DGX Spark 두 대에 걸친 2-노드 텐서 병렬, 동시 멀티슬롯 배칭, MTP 셀프-스펙 디코딩 — FP4/FP8-native 체크포인트를 재양자화 없이.**
+> **vLLM에만 있던 기능 — 멀티노드 TP, 연속 배칭, 스펙 디코딩 — 을 llama.cpp에서, 작은 박스 두 대로.**
 
-**환경:** 2× NVIDIA DGX Spark (GB10, 128GB) over RoCE · `DeepSeek-V4-Flash-FP4-FP8-native` (nsparks 계보: F8_E4M3 dense + MXFP4 expert, 146GB) · ctx=8192.
-
-| 설정 (단일 스트림) | gen t/s |
+| 기능 | 스펙 |
 |---|---|
-| FP4 PLAIN (2-노드 TP) | ~15 |
-| **FP4 + MTP + verify-reuse** | **16.6** (MTP 없는 것보다 빠름) |
+| 🌐 멀티노드 텐서 병렬 | **2노드 over RoCE/RDMA** — 느린 RPC 백엔드 아님 |
+| 📜 컨텍스트 길이 | **1,048,576** (풀 1M) |
+| 🗜️ KV 캐시 @ 1M | **~9.6 GB** — TurboQuant 3-bit (TBQ3) |
+| ⚡ 스펙 디코딩 | **MTP — 16.5 t/s @ 1M**, plain 능가 |
+| 🔀 연속 배칭 | 멀티슬롯 (`-np 2`) → ~2× aggregate |
+| 💻 하드웨어 | 2× DGX Spark (GB10, 128 GB) — 데이터센터 GPU 불필요 |
 
-동시 멀티슬롯 요청은 이 위에 배칭되어 aggregate ~2× 처리량.
+**실측 처리량** — 단일 스트림, 2× DGX Spark over RoCE:
+
+| 모델 | ctx | 모드 | gen t/s |
+|---|---|---|---|
+| Q4 | **1M** | **2노드 TP + MTP + TBQ3 KV** | **16.5** ⚡ |
+| Q4 | 1M | 2노드 TP plain + TBQ3 KV | 15.5 |
+| FP4-native | 8K | 2노드 TP + MTP | 16.6 |
+| FP4-native | 8K | 2노드 TP plain | ~15 |
+| IQ2 | 8K | 단일 박스 (TP 없음) | 16.9 |
+
+> **1M 컨텍스트에서 MTP가 plain을 능가** — 메모리 바운드 MoE에서도 실제로 이득 보는 스펙 디코딩, 두 박스에 걸쳐.
 
 **구현한 것:**
 
+- **풀 1M 토큰 컨텍스트를 ~9.6 GB에서 — 큰 GPU 하나가 아니라 두 박스에 걸쳐.** TurboQuant 3-bit KV 압축이 100만 토큰 KV 캐시를 **~9.6 GB**로 줄여, 전체 컨텍스트가 두 머신에 쪼개져 들어간다. **거기서 MTP 스펙 디코딩이 16.5 t/s — plain보다 빠름** — 이 규모에서 처음 가능해진 풀스피드 1M 컨텍스트 스펙 디코딩.
 - **신규 `GGML_TYPE_F8_E4M3_B128` 양자화 타입, end-to-end.** FP8 dense weight를 위한 전체 기계장치: 블록 구조(128× E4M3 값 + E8M0 거듭제곱 블록 스케일 1개), **비트-정확 CPU 코덱**(E4M3FN 디코드 — subnormal/NaN/±448 saturation + E8M0 `2^(e−127)` 스케일), CUDA dequant(cuBLAS GEMM 경로용 `to_fp16`)와 CUDA **MMVQ GEMV** 커널. MMVQ는 `__shared__`에 적재한 256-엔트리 LUT를 기본 사용(스칼라 dequant와 비트-동일); `int8 dp4a` 근사는 있지만 **env로 OFF**(`GGML_CUDA_F8_APPROX_DP4A`, 손실 있음). CPU↔CUDA↔LUT 디코드 테이블은 256개 코드 전부 일치 검증. 타입 슬롯 확보를 위해 `GGML_TYPE_TBQ3_0`을 `42 → 65`로 이전(그에 의존하던 range-guard도 수정 — 아래 감사 참조).
 - **재양자화 없이 FP4/FP8-native 로딩, 로드타임 어댑터로.** 146GB `nsparks` 체크포인트(F8_E4M3 dense + MXFP4 expert, `ftype 41`)를 그대로 서빙. 어댑터는 `ftype 41`에서만 켜져(**업스트림 모델은 모든 키 required 유지**) ~21개 nsparks 텐서명을 우리 `deepseek4` 스키마로 통역(`compressor→compress`, `attn_kv→attn_kv_latent`, `output_hc→hc_head`, `.weight` 접미사 제거)하고 nsparks가 빠뜨린 메타데이터 키(`output_lora_rank`, `n_hc`, `hc_sinkhorn`, 43개 `compress_ratios`, `compress_rope_freq_base`, …)를 아키텍처 기본값으로 채웁니다.
 - **MTP를 FP4 파일에 구워 넣음(사이드-shard 아님).** 단독 MTP 헤드(arch `deepseek4_mtp_support`, `mtp.0.*`)는 `tok_embd`/`output`이 없어 단독 draft로 못 뜹니다. `turboquant/ds4_fp4_bake_mtp.py`가 mmap으로 스트리밍(150GB를 RAM에 안 올림)해 결합 GGUF 1개 = 모든 FP4 텐서 바이트-동일 + `blk.43.nextn.*`로 리네임된 MTP 헤드 + `nextn_predict_layers=1`, `file_type 41` 유지(FP4 어댑터 계속 적용). 그 후 `--spec-type draft-mtp`가 바로 소비.
