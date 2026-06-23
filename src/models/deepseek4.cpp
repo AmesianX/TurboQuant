@@ -2221,11 +2221,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 // through the batched single-step multislot build. K==1 keeps the plain multislot path.
                 const bool chunk_ms = multislot && ubatch.n_seq_tokens > 1;
                 // roadmap ③: O(1)-graph batched chunk compressor, replacing the unrolled per-token
-                // _chunk recurrence that explodes the graph arena on long multi-turn prefill chunks.
-                // Gated by DSV4_BATCHED_COMPRESSOR. Only used when the plain (non-multislot, non-uniform,
-                // n_tokens>1) _chunk would run AND out_snaps would be unused (cparams.n_rs_seq==0, the
-                // crashing prefill-chunk case) — MTP rollback (n_rs_seq>0) keeps the unrolled snaps path.
-                static const bool dsv4_batched_comp = getenv("DSV4_BATCHED_COMPRESSOR") != nullptr;
+                // _chunk recurrence that explodes the graph arena on long multi-turn prefill chunks
+                // (the "괭"-after-N-turns crash). It is numerically equal to the unrolled recurrence,
+                // so it is the DEFAULT — a correctness fix, not an opt-in. Only applies when the plain
+                // (non-multislot, non-uniform, n_tokens>1) _chunk would run AND out_snaps are unused
+                // (cparams.n_rs_seq==0, the crashing prefill-chunk case) — MTP rollback (n_rs_seq>0)
+                // keeps the unrolled snaps path. DSV4_DISABLE_BATCHED_COMPRESSOR forces the old unrolled
+                // path for debugging only.
+                static const bool dsv4_batched_comp = getenv("DSV4_DISABLE_BATCHED_COMPRESSOR") == nullptr;
                 // Batched path only pays off (and is only worth its edge-case surface) for genuinely
                 // large chunks where the unrolled per-token graph-object explosion bites. Small chunks
                 // (< 64 tokens) stay on the proven unrolled _chunk: cheap, no explosion, and it already

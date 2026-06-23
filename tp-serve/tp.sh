@@ -39,7 +39,7 @@ SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
-COMMON="-c $CTX --parallel 1 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 $SPEC"
+COMMON="-c $CTX --parallel 1 -b 512 -ub 256 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --reasoning off $SPEC"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
@@ -59,6 +59,8 @@ env_common() {
     export GGML_TP_MASTER_PORT="$MASTER_PORT"
     export DSV4_GRAPH_SLOTS="${GRAPH_SLOTS:-1}"          # MTP graph-reuse slot pool (both ranks must match)
     if [ -n "${VERIFY_REUSE:-}" ]; then export DSV4_VERIFY_REUSE=1; fi
+    # O(1) batched chunk compressor (long multi-turn "괭" crash fix) is now DEFAULT-ON in the binary
+    # — no env needed. Set DSV4_DISABLE_BATCHED_COMPRESSOR=1 only to force the old unrolled path for debug.
 }
 
 stop_local() {
