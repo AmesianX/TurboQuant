@@ -22,7 +22,12 @@ REPO="$HOME/work/TurboQuant"                 # repo root (has build/bin/llama-se
 MODEL="$HOME/Models/DeepSeek-V4-Flash-GGUF/Q4mtp/DSV4-Q4-00001-of-00002.gguf"
 PORT=8080
 API_KEY="tbq-dsv4"                           # required because we bind 0.0.0.0
-CTX=8192
+CTX=32768       # default context (per-shape KV; tbq3 MLA quant-KV under -sm tensor)
+GRAPH_SLOTS=1   # MTP graph-reuse pool (1=off). >1 + VERIFY_REUSE = MTP graph reuse.
+SLOT_PROBE=     # diag: DSV4_SLOT_PROBE (pool slot actions)
+RESULT_DEBUG=   # diag: LLAMA_GRAPH_RESULT_DEBUG (REUSE_BREAK/PARAMS_DBG)
+VERIFY_REUSE=   # DSV4_VERIFY_REUSE: verify-graph reuse (NOT greedy-bit-identical; needs pool>1)
+                #  quant KV now allowed under -sm tensor for MLA (mirrored KV) — see llama-context.cpp guard.
 IFACE="enp1s0f0np0"                          # RoCE interface
 MASTER_IP="10.0.1.1"
 SLAVE_IP="10.0.1.2"
@@ -36,7 +41,7 @@ SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
-COMMON="-c $CTX -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk f16 -ctv f16 $SPEC"
+COMMON="-c $CTX --parallel 1 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 $SPEC"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
@@ -54,6 +59,11 @@ env_common() {
     export GGML_TP_NRANKS=2
     export GGML_TP_MASTER_ADDR="$MASTER_IP"
     export GGML_TP_MASTER_PORT="$MASTER_PORT"
+    if [ -n "${DSV4_MTP_PROF:-}" ]; then export DSV4_MTP_PROF; fi   # DIAG: build+alloc per step (set-e safe)
+    export DSV4_GRAPH_SLOTS="${GRAPH_SLOTS:-1}"   # MTP graph-reuse slot pool (both ranks must match)
+    if [ -n "${SLOT_PROBE:-}" ]; then export DSV4_SLOT_PROBE=1; fi
+    if [ -n "${RESULT_DEBUG:-}" ]; then export LLAMA_GRAPH_RESULT_DEBUG="$RESULT_DEBUG"; fi
+    if [ -n "${VERIFY_REUSE:-}" ]; then export DSV4_VERIFY_REUSE=1; fi
 }
 
 stop_local() {

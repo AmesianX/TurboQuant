@@ -1,3 +1,4 @@
+#include <typeinfo>
 #include "llama-graph.h"
 
 #include "llama-impl.h"
@@ -921,6 +922,7 @@ void llm_graph_result::reset() {
     t_dflash_feat = nullptr;
     t_dflash_layers.clear();
 
+    if (debug > 0) fprintf(stderr, "PARAMS_DBG[%p]: reset (was nt=%d)\n", (void*) this, (int) params.ubatch.n_tokens);
     params = {};
 
     inputs.clear();
@@ -984,6 +986,12 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
+        if (debug > 0) {
+            // DSV4_REUSE_PROBE (via LLAMA_GRAPH_RESULT_DEBUG): stderr is unfiltered by log verbosity.
+            fprintf(stderr, "REUSE_BREAK[params %p]: n_tokens %d->%d, n_outputs %d->%d\n", (void*) this,
+                    (int) this->params.ubatch.n_tokens, (int) params.ubatch.n_tokens,
+                    (int) this->params.n_outputs, (int) params.n_outputs);
+        }
 
         return false;
     }
@@ -994,11 +1002,15 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    for (auto & input : inputs) {
-        const bool cur = input->can_reuse(params);
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const bool cur = inputs[i]->can_reuse(params);
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+        }
+        if (debug > 0 && !cur) {
+            fprintf(stderr, "REUSE_BREAK[input #%d/%s]: params matched but input rejected (n_tokens=%d)\n",
+                    (int) i, typeid(*inputs[i]).name(), (int) params.ubatch.n_tokens);
         }
 
         res = res && cur;
@@ -1017,6 +1029,7 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
+    if (debug > 0) fprintf(stderr, "PARAMS_DBG[%p]: set nt=%d no=%d\n", (void*) this, (int) params.ubatch.n_tokens, (int) params.n_outputs);
     this->params = params;
 }
 

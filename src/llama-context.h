@@ -389,6 +389,36 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
+    // MTP graph-reuse slot pool.
+    // MTP speculative decode alternates ubatch shapes (n_tokens, n_outputs) every step
+    // (verify vs draft, plus variable draft-acceptance widths), which defeats the single
+    // gf_res_prev reuse slot -> graphs reused = 0 -> per-step graph recapture whose cost
+    // scales with the allocated KV size -> large-context generation collapses.
+    // Keep a small pool of (sched, graph-result) slots keyed by shape so each recurring
+    // shape's graph persists and is reused. Inactive slots live here; the active slot stays
+    // in (sched, gf_res_prev) so the ~40 other sched users need no change. Each slot owns its
+    // own sched because ggml_backend_sched_reset() deallocates globally (can't hold two graph
+    // allocations in one sched). A fresh slot needs no worst-case reserve: it only ever sees
+    // one small shape, so its first alloc_graph sizes the buffer exactly.
+    struct graph_slot {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+        uint64_t key = UINT64_MAX;
+        uint64_t gen = 0;   // invalidated when sched_generation bumps (model/state change)
+        uint64_t lru = 0;
+    };
+    std::vector<graph_slot> graph_slots;          // inactive slots only
+    uint64_t active_graph_key = UINT64_MAX;
+    uint64_t active_graph_gen = 0;
+    uint64_t sched_generation = 0;                // bumped on every full sched_reserve()
+    uint64_t graph_lru        = 0;
+    size_t   max_graph_slots  = 1;                // K; 1 = pool disabled (env DSV4_GRAPH_SLOTS)
+    int64_t  graph_slot_max_nodes = 0;            // node budget for fresh slot scheds/results
+
+    // select (or lazily create) the pool slot whose graph matches this ubatch shape, and
+    // make it the active (sched, gf_res_prev). No-op when max_graph_slots <= 1.
+    void select_graph_slot(llm_graph_type gtype, const llama_ubatch & ubatch);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

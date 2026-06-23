@@ -430,6 +430,18 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
+    // a real re-reserve means the graph topology / buffers changed: drop all pooled graph
+    // slots and bump the generation so any stragglers are treated as stale. The freshly
+    // reserved sched below becomes the active slot (claimed by the first ubatch shape).
+    graph_slots.clear();
+    active_graph_key = UINT64_MAX;
+    sched_generation++;
+    active_graph_gen = sched_generation;
+    {
+        static const char * const gs = getenv("DSV4_GRAPH_SLOTS");
+        max_graph_slots = gs ? (size_t) std::max(1, atoi(gs)) : 1;
+    }
+
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
@@ -440,6 +452,7 @@ void llama_context::sched_reserve() {
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    graph_slot_max_nodes = (int64_t) max_nodes;   // node budget for lazily-created pool scheds
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1309,12 +1322,102 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+void llama_context::select_graph_slot(llm_graph_type gtype, const llama_ubatch & ubatch) {
+    static const bool slot_probe = getenv("DSV4_SLOT_PROBE") != nullptr;
+    if (max_graph_slots <= 1) {
+        if (slot_probe) {
+            static bool once = false;
+            if (!once) { once = true; fprintf(stderr, "SLOT_PROBE: pool DISABLED (max_graph_slots=%zu)\n", max_graph_slots); }
+        }
+        return; // pool disabled -> legacy single-slot behavior
+    }
+
+    // shape signature that uniquely keys a reusable graph topology (matches the fields that
+    // llm_graph_params::allow_reuse compares: n_tokens, n_outputs, gtype)
+    const uint64_t key =
+        ((uint64_t) (uint32_t) gtype           << 48) ^
+        ((uint64_t) (uint32_t) ubatch.n_tokens << 24) ^
+        ((uint64_t) (uint32_t) n_outputs);
+
+    // the freshly-reserved active sched has no shape yet -> claim it for this shape
+    if (active_graph_key == UINT64_MAX) {
+        active_graph_key = key;
+        active_graph_gen = sched_generation;
+        if (slot_probe) fprintf(stderr, "SLOT_PROBE: claim nt=%d no=%d key=%llx gen=%llu K=%zu\n",
+                (int) ubatch.n_tokens, (int) n_outputs, (unsigned long long) key, (unsigned long long) sched_generation, max_graph_slots);
+        return;
+    }
+
+    if (key == active_graph_key && active_graph_gen == sched_generation) {
+        if (slot_probe) fprintf(stderr, "SLOT_PROBE: active-hit nt=%d no=%d\n", (int) ubatch.n_tokens, (int) n_outputs);
+        return; // already active
+    }
+
+    // stash the current active slot
+    graph_slot cur;
+    cur.sched = std::move(sched);
+    cur.res   = std::move(gf_res_prev);
+    cur.key   = active_graph_key;
+    cur.gen   = active_graph_gen;
+    cur.lru   = ++graph_lru;
+
+    // look for a cached slot with this shape (current generation only)
+    int found = -1;
+    for (size_t i = 0; i < graph_slots.size(); ++i) {
+        if (graph_slots[i].sched && graph_slots[i].key == key && graph_slots[i].gen == sched_generation) {
+            found = (int) i;
+            break;
+        }
+    }
+
+    if (found >= 0) {
+        // swap the cached slot in; its stored graph has this exact shape -> can_reuse() will hit
+        sched            = std::move(graph_slots[found].sched);
+        gf_res_prev      = std::move(graph_slots[found].res);
+        active_graph_key = key;
+        active_graph_gen = sched_generation;
+        graph_slots[found] = std::move(cur);
+        if (slot_probe) fprintf(stderr, "SLOT_PROBE: swap-FOUND nt=%d no=%d (pool=%zu)\n",
+                (int) ubatch.n_tokens, (int) n_outputs, graph_slots.size());
+        return;
+    }
+    if (slot_probe) fprintf(stderr, "SLOT_PROBE: fresh nt=%d no=%d key=%llx (pool=%zu/%zu)\n",
+            (int) ubatch.n_tokens, (int) n_outputs, (unsigned long long) key, graph_slots.size(), max_graph_slots);
+
+    // no cached slot: park `cur`, then build a fresh active for this shape
+    if (graph_slots.size() < max_graph_slots - 1) {
+        graph_slots.push_back(std::move(cur));
+    } else {
+        // evict: prefer a stale-generation/empty slot, otherwise the least-recently-used
+        size_t victim = 0;
+        for (size_t i = 1; i < graph_slots.size(); ++i) {
+            const bool i_stale = !graph_slots[i].sched      || graph_slots[i].gen      != sched_generation;
+            const bool v_stale = !graph_slots[victim].sched || graph_slots[victim].gen != sched_generation;
+            if (i_stale && !v_stale) { victim = i; continue; }
+            if (!i_stale && v_stale) { continue; }
+            if (graph_slots[i].lru < graph_slots[victim].lru) { victim = i; }
+        }
+        graph_slots[victim] = std::move(cur);
+    }
+
+    // a fresh slot only ever sees one small shape, so no worst-case reserve is needed:
+    // the first ggml_backend_sched_alloc_graph in process_ubatch sizes its buffer exactly.
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                graph_slot_max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    gf_res_prev.reset(new llm_graph_result(graph_slot_max_nodes));
+    active_graph_key = key;
+    active_graph_gen = sched_generation;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    // route to the graph-reuse slot matching this ubatch shape (no-op unless the pool is enabled)
+    select_graph_slot(gtype, ubatch);
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
