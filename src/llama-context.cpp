@@ -1323,12 +1323,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 void llama_context::select_graph_slot(llm_graph_type gtype, const llama_ubatch & ubatch) {
-    static const bool slot_probe = getenv("DSV4_SLOT_PROBE") != nullptr;
     if (max_graph_slots <= 1) {
-        if (slot_probe) {
-            static bool once = false;
-            if (!once) { once = true; fprintf(stderr, "SLOT_PROBE: pool DISABLED (max_graph_slots=%zu)\n", max_graph_slots); }
-        }
         return; // pool disabled -> legacy single-slot behavior
     }
 
@@ -1343,13 +1338,10 @@ void llama_context::select_graph_slot(llm_graph_type gtype, const llama_ubatch &
     if (active_graph_key == UINT64_MAX) {
         active_graph_key = key;
         active_graph_gen = sched_generation;
-        if (slot_probe) fprintf(stderr, "SLOT_PROBE: claim nt=%d no=%d key=%llx gen=%llu K=%zu\n",
-                (int) ubatch.n_tokens, (int) n_outputs, (unsigned long long) key, (unsigned long long) sched_generation, max_graph_slots);
         return;
     }
 
     if (key == active_graph_key && active_graph_gen == sched_generation) {
-        if (slot_probe) fprintf(stderr, "SLOT_PROBE: active-hit nt=%d no=%d\n", (int) ubatch.n_tokens, (int) n_outputs);
         return; // already active
     }
 
@@ -1377,12 +1369,8 @@ void llama_context::select_graph_slot(llm_graph_type gtype, const llama_ubatch &
         active_graph_key = key;
         active_graph_gen = sched_generation;
         graph_slots[found] = std::move(cur);
-        if (slot_probe) fprintf(stderr, "SLOT_PROBE: swap-FOUND nt=%d no=%d (pool=%zu)\n",
-                (int) ubatch.n_tokens, (int) n_outputs, graph_slots.size());
         return;
     }
-    if (slot_probe) fprintf(stderr, "SLOT_PROBE: fresh nt=%d no=%d key=%llx (pool=%zu/%zu)\n",
-            (int) ubatch.n_tokens, (int) n_outputs, (unsigned long long) key, graph_slots.size(), max_graph_slots);
 
     // no cached slot: park `cur`, then build a fresh active for this shape
     if (graph_slots.size() < max_graph_slots - 1) {
