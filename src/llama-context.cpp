@@ -3683,8 +3683,25 @@ llama_context * llama_init_from_model(
             return nullptr;
         }
         if (ggml_is_quantized(params.type_k) || ggml_is_quantized(params.type_v)) {
-            LLAMA_LOG_ERROR("%s: simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented\n", __func__);
-            return nullptr;
+            // Upstream blocks quantized KV under tensor split because standard attention
+            // shards the KV cache on the head dimension, where quantization block boundaries
+            // do not align with the per-rank slices (stride/offset math in get_k/cpy_k assumes
+            // element-granular layout). MLA archs are the exception: they compress KV into a
+            // shared low-rank latent that is MIRRORED (replicated) across ranks rather than
+            // head-split (see llama-model.cpp tensor-config, [tp-2node-dsv4]). With a mirrored
+            // cache every rank holds the full quantized KV and runs the identical single-device
+            // dequant path — no shard boundary exists, so the block-alignment problem cannot
+            // arise. Allow quant KV there; keep upstream's block for genuinely-sharded archs.
+            const bool kv_mirrored =
+                model->arch == LLM_ARCH_DEEPSEEK2  ||
+                model->arch == LLM_ARCH_DEEPSEEK32 ||
+                model->arch == LLM_ARCH_DEEPSEEK4  ||
+                model->arch == LLM_ARCH_GLM_DSA;
+            if (!kv_mirrored) {
+                LLAMA_LOG_ERROR("%s: simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented for head-sharded attention\n", __func__);
+                return nullptr;
+            }
+            LLAMA_LOG_WARN("%s: KV cache quantization under SPLIT_MODE_TENSOR enabled (MLA mirrored KV)\n", __func__);
         }
     }
 
