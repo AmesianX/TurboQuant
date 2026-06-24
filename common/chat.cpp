@@ -1921,9 +1921,12 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         if (extract_reasoning && inputs.enable_thinking) {
             reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
         } else if (extract_reasoning) {
-            // Thinking disabled but reasoning extraction requested: the generation prompt
-            // contains an empty <think></think> pair that must still be consumed.
-            reasoning = p.optional(p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
+            // Thinking disabled but reasoning extraction requested: the generation prompt forces the
+            // thinking block closed, which most templates render as an empty <think></think> pair —
+            // but some (e.g. DeepSeek-V4 with enable_thinking=false) emit only a bare </think>. Make
+            // the opening <think> optional so both forms are consumed; otherwise a lone </think> falls
+            // through to content and leaks into the reply.
+            reasoning = p.optional(p.optional(p.literal(THINK_START)) + p.until(THINK_END) + p.literal(THINK_END));
         }
 
         if (has_response_format) {
