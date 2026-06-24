@@ -86,6 +86,8 @@ bash fp4ctl.sh start                 # start | stop | restart | status  (pid-onl
 > sudo apt-mark hold rdma-core ibverbs-providers libibverbs1   # 다음 OTA가 또 다운그레이드 못 하게 hold
 > ```
 > **확인:** `nm -D /usr/lib/aarch64-linux-gnu/libmlx5.so* | grep MLX5_1.25`로 심볼 뜨고, NCCL 로그에 `GPU Direct RDMA Enabled`. (`nvidia-peermem`은 GB10 open 드라이버선 로드 실패 — dmabuf가 정석.)
+>
+> **⚠️ 두 박스가 *완전히 같은* rdma-core/libmlx5 버전이어야 한다.** 두 Spark가 불일치하면 — 한쪽만 업그레이드했거나 OTA가 한쪽만 건드리면 — NCCL이 노드 간 공통 RDMA 전송을 못 정하고 **조용히 TCP 소켓으로 폴백**한다. 각 박스의 GPUDirect가 로컬로는 멀쩡해 보여도 *같은* prefill 급락이 난다. 그러니 항상 **양쪽 박스**에 동일 버전을 `apt install` + `apt-mark hold` 하고, 시스템 업데이트 후엔 모델 탓하기 전에 `nm -D … | grep MLX5_1.25`로 양쪽 다 재확인.
 
 > 🛠️ **개발 기간.** 주말 프로젝트가 아닙니다. FP4 + 2-노드 TP + 멀티슬롯 + MTP 스택은 거의 쉬지 않은 ~5일 스프린트(**2026년 6/18–22, ~46커밋**)에 들어왔고, 그것은 **~2주 DeepSeek-V4-Flash 마라톤**(**~140 DSV4 관련 커밋**, 6/9–22 거의 매일)의 끝자락입니다. 개발자 1명, DGX Spark 2대, 잠 거의 없이 — 타입 포팅, 로더 어댑터, 굽기 파이프라인, 긴 컨텍스트 크래시 추적, graphs-reused-0 → verify-reuse 돌파, 푸시 전 전수 감사까지 전부 수작업.
 

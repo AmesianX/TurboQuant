@@ -86,6 +86,8 @@ Key env baked into the launch scripts: `DSV4_MULTISLOT=1` (concurrent slot batch
 > sudo apt-mark hold rdma-core ibverbs-providers libibverbs1   # stop the next OTA from re-downgrading it
 > ```
 > **Verify:** `nm -D /usr/lib/aarch64-linux-gnu/libmlx5.so* | grep MLX5_1.25` prints the symbol, and NCCL now logs `GPU Direct RDMA Enabled`. (`nvidia-peermem` is *not* the fix on the GB10 open driver — it fails to load; dmabuf is the path.)
+>
+> **⚠️ Both boxes must run the *exact same* rdma-core/libmlx5 version.** If the two Sparks mismatch — you upgrade only one, or an OTA bumps one and not the other — NCCL can't negotiate a common RDMA transport across the link and **silently falls back to TCP sockets** between the nodes. That's the *same* drastic prefill slowdown, even when each box's GPUDirect looks fine locally. So always `apt install` **and** `apt-mark hold` the identical version on **both** boxes; after any system update, re-check both with `nm -D … | grep MLX5_1.25` before blaming the model.
 
 > 🛠️ **Development effort.** This was not a weekend project. The FP4 + 2-node TP + multi-slot + MTP stack landed in a ~5-day near-continuous sprint (**Jun 18–22 2026, ~46 commits**), the tail end of a **~2-week DeepSeek-V4-Flash marathon** (**~140 DSV4-related commits**, near-daily Jun 9–22). One developer, two DGX Sparks, very little sleep — the type port, the loader adapter, the bake pipeline, the long-context crash hunt, the graphs-reused-0 → verify-reuse breakthrough, and a full pre-push audit, all by hand.
 
