@@ -22,7 +22,13 @@ REPO="$HOME/work/TurboQuant"                 # repo root (has build/bin/llama-se
 MODEL="$HOME/Models/DeepSeek-V4-Flash-GGUF/Q4mtp/DSV4-Q4-00001-of-00002.gguf"
 PORT=8080
 API_KEY="tbq-dsv4"                           # required because we bind 0.0.0.0
-CTX=0           # 0 = full native context (1M for DSV4). quant KV (-ctk/-ctv tbq3) keeps it ~9.6 GB.
+CTX="${CTX:-0}" # 0 = full native context (1M for DSV4, KV ~9.6GB). BUT 1M reserves the full 9.6GB KV up front,
+                # starving working-memory headroom — a single ~27K prefill then crosses the watchdog and dies at
+                # progress ~0.96. For real single-prompt use, set CTX=262144 (256K → KV ~2.4GB, +7GB headroom,
+                # lets -ub go to 2048 for fast prefill). 1M is the demo/brag number, not a daily-driver value.
+UB="${UB:-256}" # prefill micro-batch. 256 = memory-safe but slow prefill (many cross-node NCCL syncs at -sm tensor).
+                # Bigger = faster prefill, more memory. CEILING 2048 (user: >2048 explodes memory). Raise only with
+                # freed headroom (smaller CTX). Both ranks MUST match (graph shape) — forwarded via ALLRESTART FWD.
 PARALLEL="${PARALLEL:-2}"  # server slots (--parallel). 1 = single stream. 2 = multi-slot concurrent serving
                 # (PARALLEL>1 auto-sets DSV4_MULTISLOT=1 below — the batched-decode path; without it 2 slots
                 # just contend and run SLOWER than single). MEASURED @1M Q4: single ~16 t/s, multi-slot 2-concurrent
@@ -57,7 +63,7 @@ SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
-COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b 512 -ub 256 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --chat-template-kwargs {\"enable_thinking\":false} $SPEC"
+COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b 512 -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --reasoning off $SPEC"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
@@ -173,7 +179,7 @@ case "${1:-}" in
         stop_local
         echo "== ALLRESTART: starting slave then master =="
         # forward the slot/graph overrides so BOTH ranks build matching graphs (TP requires it).
-        FWD="PARALLEL=$PARALLEL GRAPH_SLOTS=$GRAPH_SLOTS"
+        FWD="PARALLEL=$PARALLEL GRAPH_SLOTS=$GRAPH_SLOTS CTX=$CTX UB=$UB"
         # don't let a slave-side failure abort under set -e before the master is started — warn and go on
         ssh "$SLAVE_SSH" "$FWD $SELF START" || echo "[WARN] slave START failed ($SLAVE_SSH) — starting master anyway"
         sleep 3
