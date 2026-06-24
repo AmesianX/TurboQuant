@@ -23,11 +23,17 @@ MODEL="$HOME/Models/DeepSeek-V4-Flash-GGUF/Q4mtp/DSV4-Q4-00001-of-00002.gguf"
 PORT=8080
 API_KEY="tbq-dsv4"                           # required because we bind 0.0.0.0
 CTX=0           # 0 = full native context (1M for DSV4). quant KV (-ctk/-ctv tbq3) keeps it ~9.6 GB.
-GRAPH_SLOTS=4   # MTP graph-reuse pool (GPU compute buffers, ~2GB/slot measured @ -ub 256). MEASURED box-free
+PARALLEL="${PARALLEL:-2}"  # server slots (--parallel). 1 = single stream. 2 = multi-slot concurrent serving
+                # (PARALLEL>1 auto-sets DSV4_MULTISLOT=1 below — the batched-decode path; without it 2 slots
+                # just contend and run SLOWER than single). MEASURED @1M Q4: single ~16 t/s, multi-slot 2-concurrent
+                # ~22.8 t/s aggregate (~1.4x), min box-free ~7GB (safe). GS must stay 2 at 1M (see GRAPH_SLOTS).
+GRAPH_SLOTS="${GRAPH_SLOTS:-2}"   # MTP graph-reuse pool. @1M MUST be 2: GS=4 multi-slot peaks at ~2.5GB box-free
+                # and a real conversation pushed it to 1GB -> watchdog killed it. GS=2 holds ~7GB free, same speed
+                # (GS=4 only +4% t/s). >64k contexts can raise this; at 1M, 2 is the ceiling. Old pool (GPU compute buffers, ~2GB/slot measured @ -ub 256). MEASURED box-free
                 # left after a 6-question session: 2 slots=>~14GB, 4=>~10GB, 6=>~7GB, 16=>OOM. 4 is the balance
                 # (more reuse cache, still ~10GB safety). These buffers live on the UNIFIED GPU pool — a cgroup
                 # (host-only) can't see them, so the watchdog below (box-wide free mem) is the real OOM guard.
-WATCH_MIN_GB=4  # memory watchdog: if box MemAvailable drops below this, kill ONLY llama-server (never Claude Code/ssh).
+WATCH_MIN_GB="${WATCH_MIN_GB:-4}"  # memory watchdog: if box MemAvailable drops below this, kill ONLY llama-server (never Claude Code/ssh).
 VERIFY_REUSE=1  # let DSV4 verify graphs qualify for reuse (pairs with the slot pool)
 # --- memory protection (box = 124546 MiB; ~16GB box-free at idle after model+KV) ---------
 #   The GB-scale OOM driver is the graph-slot pool on the GPU (~2GB/slot). It killed Claude Code + ssh via the
@@ -51,7 +57,7 @@ SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
-COMMON="-c $CTX -n 16384 --parallel 1 -b 512 -ub 256 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --chat-template-kwargs {\"enable_thinking\":false} $SPEC"
+COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b 512 -ub 256 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --chat-template-kwargs {\"enable_thinking\":false} $SPEC"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
@@ -71,6 +77,10 @@ env_common() {
     export GGML_TP_MASTER_PORT="$MASTER_PORT"
     export DSV4_GRAPH_SLOTS="${GRAPH_SLOTS:-1}"          # MTP graph-reuse slot pool (both ranks must match)
     if [ -n "${VERIFY_REUSE:-}" ]; then export DSV4_VERIFY_REUSE=1; fi
+    # DSV4-specific multi-slot batched decode (splitter emits n_seqs>1 ubatches, batched over MoE/dense/norm/lm_head).
+    # WITHOUT this, --parallel>1 just runs naive contending slots (slower than single). THIS env is what gives the
+    # ~2x aggregate. Gated on PARALLEL>1 so single-stream serving is unaffected. Both ranks must match (SPMD).
+    if [ "${PARALLEL:-1}" -gt 1 ]; then export DSV4_MULTISLOT=1; fi
     # O(1) batched chunk compressor (long multi-turn "괭" crash fix) is now DEFAULT-ON in the binary
     # — no env needed. Set DSV4_DISABLE_BATCHED_COMPRESSOR=1 only to force the old unrolled path for debug.
 }
@@ -162,8 +172,10 @@ case "${1:-}" in
         ssh "$SLAVE_SSH" "$SELF STOP" || true
         stop_local
         echo "== ALLRESTART: starting slave then master =="
+        # forward the slot/graph overrides so BOTH ranks build matching graphs (TP requires it).
+        FWD="PARALLEL=$PARALLEL GRAPH_SLOTS=$GRAPH_SLOTS"
         # don't let a slave-side failure abort under set -e before the master is started — warn and go on
-        ssh "$SLAVE_SSH" "$SELF START" || echo "[WARN] slave START failed ($SLAVE_SSH) — starting master anyway"
+        ssh "$SLAVE_SSH" "$FWD $SELF START" || echo "[WARN] slave START failed ($SLAVE_SSH) — starting master anyway"
         sleep 3
         start_local ;;
     *)
