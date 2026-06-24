@@ -23,8 +23,20 @@ MODEL="$HOME/Models/DeepSeek-V4-Flash-GGUF/Q4mtp/DSV4-Q4-00001-of-00002.gguf"
 PORT=8080
 API_KEY="tbq-dsv4"                           # required because we bind 0.0.0.0
 CTX=0           # 0 = full native context (1M for DSV4). quant KV (-ctk/-ctv tbq3) keeps it ~9.6 GB.
-GRAPH_SLOTS=16  # MTP graph-reuse slot pool size (K); >1 enables it. ON is ~+0.4 t/s across all ctx.
+GRAPH_SLOTS=4   # MTP graph-reuse pool (GPU compute buffers, ~2GB/slot measured @ -ub 256). MEASURED box-free
+                # left after a 6-question session: 2 slots=>~14GB, 4=>~10GB, 6=>~7GB, 16=>OOM. 4 is the balance
+                # (more reuse cache, still ~10GB safety). These buffers live on the UNIFIED GPU pool — a cgroup
+                # (host-only) can't see them, so the watchdog below (box-wide free mem) is the real OOM guard.
+WATCH_MIN_GB=4  # memory watchdog: if box MemAvailable drops below this, kill ONLY llama-server (never Claude Code/ssh).
 VERIFY_REUSE=1  # let DSV4 verify graphs qualify for reuse (pairs with the slot pool)
+# --- memory protection (box = 124546 MiB; ~16GB box-free at idle after model+KV) ---------
+#   The GB-scale OOM driver is the graph-slot pool on the GPU (~2GB/slot). It killed Claude Code + ssh via the
+#   kernel's indiscriminate GLOBAL OOM-killer. The WATCH_MIN_GB watchdog (above) is the real guard — it watches
+#   box-wide free mem (GPU + host) and kills only the server before the global OOM fires.
+MEM_CAP="110G"  # cgroup v2 ceiling — HOST-side only, a secondary backstop. NOTE: on GB10 unified memory the
+                # GPU allocations (model + graph compute buffers) are NOT charged to the cgroup, so this does
+                # NOT bound the real OOM driver — it only catches a host-side runaway. The watchdog does the rest.
+CACHE_RAM=2048  # prompt-cache byte limit (MiB) = 2GB share of the dynamic budget. (--cache-ram)
 IFACE="enp1s0f0np0"                          # RoCE interface
 MASTER_IP="10.0.1.1"
 SLAVE_IP="10.0.1.2"
@@ -39,7 +51,7 @@ SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
-COMMON="-c $CTX --parallel 1 -b 512 -ub 256 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --jinja --reasoning-format deepseek --chat-template-kwargs {\"enable_thinking\":false} $SPEC"
+COMMON="-c $CTX --parallel 1 -b 512 -ub 256 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --chat-template-kwargs {\"enable_thinking\":false} $SPEC"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
@@ -72,6 +84,8 @@ stop_local() {
     # give it a moment, then hard-kill any survivor
     sleep 2
     for p in $(ps -C llama-server -o pid=); do kill -9 "$p" 2>/dev/null || true; done
+    # stop the memory watchdog sidecar too
+    [ -f /tmp/tp_memwatch.pid ] && { kill "$(cat /tmp/tp_memwatch.pid)" 2>/dev/null || true; rm -f /tmp/tp_memwatch.pid; }
     echo "[$ROLE] STOP: killed [$pids]"
 }
 
@@ -81,22 +95,53 @@ start_local() {
         echo "[$ROLE] START: already running (use RESTART)"; return 0
     fi
     env_common
+    # memory-capped cgroup v2 scope (no sudo). An over-budget OOM then kills ONLY this scope (llama-server),
+    # never the rest of the box (Claude Code / ssh / OS). Skip gracefully if the user systemd manager isn't
+    # reachable (e.g. a non-login ssh into the slave) — then launch plain (slave has no Claude Code to protect).
+    local CGRUN=""
+    if systemd-run --user --quiet --scope -p MemoryMax="$MEM_CAP" -p MemorySwapMax=0 -- true 2>/dev/null; then
+        CGRUN="systemd-run --user --quiet --scope --collect -p MemoryMax=$MEM_CAP -p MemorySwapMax=0"
+        echo "[$ROLE] cgroup cap ACTIVE: MemoryMax=$MEM_CAP MemorySwapMax=0"
+    else
+        echo "[$ROLE] WARN: systemd-run --user unavailable — launching WITHOUT cgroup cap"
+    fi
     case "$ROLE" in
         MASTER)
             export GGML_TP_RANK=0
-            nohup build/bin/llama-server -m "$MODEL" $COMMON \
+            nohup $CGRUN build/bin/llama-server -m "$MODEL" $COMMON \
                 --host 0.0.0.0 --port "$PORT" --api-key "$API_KEY" > "$LOG" 2>&1 &
             disown
             echo "[MASTER] START: serving http://0.0.0.0:$PORT (api-key $API_KEY), log $LOG" ;;
         SLAVE)
             export GGML_TP_RANK=1
-            nohup build/bin/llama-server -m "$MODEL" $COMMON \
+            nohup $CGRUN build/bin/llama-server -m "$MODEL" $COMMON \
                 --host 0.0.0.0 --port "$PORT" > "$LOG" 2>&1 &
             disown
             echo "[SLAVE] START: follower up (no HTTP), log $LOG" ;;
         *)
             echo "ERROR: role UNKNOWN — local $IFACE is neither $MASTER_IP nor $SLAVE_IP"; exit 1 ;;
     esac
+
+    # memory watchdog sidecar: the big dynamic memory (graph-slot GPU compute buffers) lives on the
+    # unified GPU pool, which a cgroup can't see — so we guard the BOX-wide free memory instead. If it
+    # drops below WATCH_MIN_GB we kill ONLY llama-server (controlled), pre-empting the kernel's global
+    # OOM-killer which is indiscriminate (it took down Claude Code + ssh). Server is restartable; the box
+    # (and Claude Code) survives.
+    [ -f /tmp/tp_memwatch.pid ] && kill "$(cat /tmp/tp_memwatch.pid)" 2>/dev/null
+    nohup bash -c '
+        min='"$WATCH_MIN_GB"'
+        while true; do
+            avail=$(awk "/MemAvailable/{print int(\$2/1024/1024)}" /proc/meminfo)
+            if [ "${avail:-99}" -lt "$min" ]; then
+                echo "$(date +%T) MemAvailable ${avail}GB < ${min}GB -> killing llama-server (OOM pre-empt)"
+                for p in $(ps -C llama-server -o pid=); do kill -9 "$p" 2>/dev/null; done
+                sleep 3
+            fi
+            sleep 0.2
+        done' > /tmp/tp_memwatch.log 2>&1 &
+    echo $! > /tmp/tp_memwatch.pid
+    disown
+    echo "[$ROLE] memwatch: guarding box MemAvailable >= ${WATCH_MIN_GB}GB (kills server only, protects Claude Code)"
 }
 
 status_local() {
