@@ -19,7 +19,7 @@
 | 📜 컨텍스트 길이 | **1,048,576** (풀 1M) |
 | 🗜️ KV 캐시 @ 1M | **~9.6 GB** — TurboQuant 3-bit (TBQ3) |
 | ⚡ 스펙 디코딩 | **MTP — 16.5 t/s @ 1M**, plain 능가 |
-| 🔀 연속 배칭 | 멀티슬롯 (`-np 2`) → ~2× aggregate |
+| 🔀 연속 배칭 | 멀티슬롯 (`-np 2`) → ~1.4× aggregate (~22.8 t/s @ 1M) |
 | 💻 하드웨어 | 2× DGX Spark (GB10, 128 GB) — 데이터센터 GPU 불필요 |
 
 **실측 처리량** — 단일 스트림, 2× DGX Spark over RoCE:
@@ -41,13 +41,13 @@
 - **재양자화 없이 FP4/FP8-native 로딩, 로드타임 어댑터로.** 146GB `nsparks` 체크포인트(F8_E4M3 dense + MXFP4 expert, `ftype 41`)를 그대로 서빙. 어댑터는 `ftype 41`에서만 켜져(**업스트림 모델은 모든 키 required 유지**) ~21개 nsparks 텐서명을 우리 `deepseek4` 스키마로 통역(`compressor→compress`, `attn_kv→attn_kv_latent`, `output_hc→hc_head`, `.weight` 접미사 제거)하고 nsparks가 빠뜨린 메타데이터 키(`output_lora_rank`, `n_hc`, `hc_sinkhorn`, 43개 `compress_ratios`, `compress_rope_freq_base`, …)를 아키텍처 기본값으로 채웁니다.
 - **MTP를 FP4 파일에 구워 넣음(사이드-shard 아님).** 단독 MTP 헤드(arch `deepseek4_mtp_support`, `mtp.0.*`)는 `tok_embd`/`output`이 없어 단독 draft로 못 뜹니다. `turboquant/ds4_fp4_bake_mtp.py`가 mmap으로 스트리밍(150GB를 RAM에 안 올림)해 결합 GGUF 1개 = 모든 FP4 텐서 바이트-동일 + `blk.43.nextn.*`로 리네임된 MTP 헤드 + `nextn_predict_layers=1`, `file_type 41` 유지(FP4 어댑터 계속 적용). 그 후 `--spec-type draft-mtp`가 바로 소비.
 - **`DSV4_VERIFY_REUSE`가 잠금 해제 열쇠 — v1.8.0의 정직한 반전.** v1.8.0에선 이 verify-graph-reuse 인프라가 **OFF**였습니다(그래프 재빌드가 async GPU와 오버랩돼 이득 ~0). FP4 + MTP 스택에선 상황이 역전 — MTP 첫 실측이 **2.27 t/s, `graphs reused = 0`**(매 스펙 라운드가 풀 DSV4 그래프 재빌드, ~1초/라운드)이고 *그 재빌드*가 이제 병목입니다. `DSV4_VERIFY_REUSE`를 켜면 재사용이 살아나(`0 → 100+/요청`) → **16.6 t/s, MTP 없는 baseline(~15)을 능가**. perplexity 민감(256-pad 뷰가 flash-attn fp 누적 순서를 교란)이라 게이트 유지하며, 여기선 무손실 검증(greedy `France→Paris`/`수도→서울`, 한글 자모 분해 멀티턴 repro, 양박스 안정).
-- **2-노드 TP + 멀티슬롯 + MTP, 합성.** 두 Spark에 걸친 SPMD 텐서 병렬(출력 미러, NCCL all-reduce), 멀티슬롯 디코드 배칭 경로(`DSV4_MULTISLOT`, 동시 요청 → ~2× aggregate), MTP가 전부 함께 돕니다. 가능케 한 수정은 메타-백엔드의 **graph-scoped 메타데이터 재빌드** — 멀티슬롯 + MTP verify 그래프가 TP split을 넘어 더는 오염되지 않습니다.
+- **2-노드 TP + 멀티슬롯 + MTP, 합성.** 두 Spark에 걸친 SPMD 텐서 병렬(출력 미러, NCCL all-reduce), 멀티슬롯 디코드 배칭 경로(`DSV4_MULTISLOT`, 동시 요청 → **~1.4× aggregate** — 2-box Q4 @ 1M 실측: 단일 ~16 t/s → 2동시 ~22.8 t/s), MTP가 전부 함께 돕니다. 가능케 한 수정은 메타-백엔드의 **graph-scoped 메타데이터 재빌드** — 멀티슬롯 + MTP verify 그래프가 TP split을 넘어 더는 오염되지 않습니다.
 - **긴 컨텍스트 그래프-arena 크래시 수정.** DSV4 chunk 압축기가 긴 멀티턴 prefill에서 `O(context)`개 그래프 객체를 만들어 메타데이터 arena를 고갈시킴(N턴 후 `"괭"` 크래시). `DSV4_BATCHED_COMPRESSOR`가 chunk 압축기를 고정 `O(1)` op 수로 재작성(carry-in / bulk-pool / carry-out, 언롤된 recurrence와 수치 동일); sched-context 분리(`max_splits` cap, 21GB → ~1.3GB 메타데이터)와 `-ub 256`이 모든 arena를 유계로 유지.
 - **푸시 전 코드 감사(병렬 심층 리뷰 4건 + 수동 검증).** 릴리스 전 잠복 **critical 2건**을 잡아 수정: (1) 신규 배치 압축기의 carry-out이 carry-in 블록이 유일한 완료 블록일 때(`n_full==0`, 예: 비정렬 `ratio==128` prefill chunk) **음수 텐서 오프셋**을 읽음; (2) `TBQ3_0 42→65` 이전으로 세 개의 `>=TBQ3_0 && <=TBQP4_4` range-guard(`65..61` = 항상 false)가 조용히 깨져 TBQ KV 캐시의 GB10 SoC-freeze 보호를 무력화 → `==TBQ3_0 || (TBQ4_0..TBQP4_4)`로 복원. 추가로 레이어×토큰마다 도는 `stderr` 디버그 flood를 런치 스크립트에서 제거. F8 코덱 / sched cap / 로더 alias / 굽기 툴은 감사 통과(조치 불필요).
 
 #### 성능 특성
 
-단일 스트림 디코드는 **~16.6 t/s**(MTP+reuse) vs **~15**(plain) — FP4 자체는 Q4 대비 디코드 속도 레버가 *아닙니다*(디코드는 메모리-바운드 GEMV; 네이티브 FP4 텐서코어는 GEMM/prefill엔 도움, 토큰당 GEMV엔 아님). 그래서 여기서의 승리는 quant가 아니라 **그래프 재사용으로 살려낸 MTP**입니다. 구조적 천장은 v1.8.0이 기록한 것과 동일 — DSV4 디코드는 LPDDR 대역폭 바운드(matmul ~52%, 데이터 셔플 ~19%, 어텐션 ~2.3%)이고 MoE 투기는 distinct-expert 바이트 증가로 상한이 걸립니다. 즉 MTP의 plain 대비 우위는 설계상 완만하고, 진짜 결과는 **풀 TP + 멀티슬롯 + MTP 스택이 네이티브 FP4 체크포인트 위에서 안정적·무손실로** parity-이상 처리량으로 돈다는 것입니다. 멀티슬롯은 *단일* MTP 스트림을 배칭하지 않습니다(`pure_decode=0`, recurrent-state 롤백 ⇒ `split_seq`); ~2×는 동시 부하에서의 aggregate.
+단일 스트림 디코드는 **~16.6 t/s**(MTP+reuse) vs **~15**(plain) — FP4 자체는 Q4 대비 디코드 속도 레버가 *아닙니다*(디코드는 메모리-바운드 GEMV; 네이티브 FP4 텐서코어는 GEMM/prefill엔 도움, 토큰당 GEMV엔 아님). 그래서 여기서의 승리는 quant가 아니라 **그래프 재사용으로 살려낸 MTP**입니다. 구조적 천장은 v1.8.0이 기록한 것과 동일 — DSV4 디코드는 LPDDR 대역폭 바운드(matmul ~52%, 데이터 셔플 ~19%, 어텐션 ~2.3%)이고 MoE 투기는 distinct-expert 바이트 증가로 상한이 걸립니다. 즉 MTP의 plain 대비 우위는 설계상 완만하고, 진짜 결과는 **풀 TP + 멀티슬롯 + MTP 스택이 네이티브 FP4 체크포인트 위에서 안정적·무손실로** parity-이상 처리량으로 돈다는 것입니다. 멀티슬롯은 *단일* MTP 스트림을 배칭하지 않습니다(`pure_decode=0`, recurrent-state 롤백 ⇒ `split_seq`); ~1.4×(~22.8 t/s vs 단일 ~16, 2-box Q4 @ 1M 실측)는 동시 부하에서의 aggregate. `DSV4_MULTISLOT=1` 필요 — 이 env 없이 `-np 2`만 주면 생짜 contending 경로라 단일보다 느림.
 
 #### 사용법
 
