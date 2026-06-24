@@ -19,7 +19,7 @@ set -euo pipefail
 
 # ---------------------------- config (edit here) ----------------------------
 REPO="$HOME/work/TurboQuant"                 # repo root (has build/bin/llama-server)
-MODEL="$HOME/Models/DeepSeek-V4-Flash-GGUF/Q4mtp/DSV4-Q4-00001-of-00002.gguf"
+MODEL="${MODEL:-$HOME/Models/DeepSeek-V4-Flash-GGUF/Q4mtp/DSV4-Q4-00001-of-00002.gguf}"  # env-overridable (FP4 등)
 PORT=8080
 API_KEY="tbq-dsv4"                           # required because we bind 0.0.0.0
 CTX="${CTX:-0}" # 0 = full native context (1M for DSV4, KV ~9.6GB). BUT 1M reserves the full 9.6GB KV up front,
@@ -179,7 +179,7 @@ case "${1:-}" in
         stop_local
         echo "== ALLRESTART: starting slave then master =="
         # forward the slot/graph overrides so BOTH ranks build matching graphs (TP requires it).
-        FWD="PARALLEL=$PARALLEL GRAPH_SLOTS=$GRAPH_SLOTS CTX=$CTX UB=$UB"
+        FWD="PARALLEL=$PARALLEL GRAPH_SLOTS=$GRAPH_SLOTS CTX=$CTX UB=$UB MODEL=$MODEL"
         # don't let a slave-side failure abort under set -e before the master is started — warn and go on
         ssh "$SLAVE_SSH" "$FWD $SELF START" || echo "[WARN] slave START failed ($SLAVE_SSH) — starting master anyway"
         sleep 3
