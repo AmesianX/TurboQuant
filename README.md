@@ -71,13 +71,17 @@ bash fp4ctl.sh start                 # start | stop | restart | status  (pid-onl
 
 Key env baked into the launch scripts: `DSV4_MULTISLOT=1` (concurrent slot batching), `DSV4_VERIFY_REUSE=1` (MTP verify-graph reuse — the speed key), `DSV4_BATCHED_COMPRESSOR=1` (long-context safety), with `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0`. Master and slave must run identical env (SPMD).
 
-> ⚠️ **2-node prefill suddenly 10–30× slower? Check GPUDirect RDMA first — NOT the code.**
-> If 2-node prompt processing jumps from ~1–2 s to ~30 s for the same prompt, the cause is almost always a broken NCCL **GPUDirect RDMA** path, not the model. A DGX Spark **OTA system update can silently downgrade `rdma-core`** to Ubuntu stock `50.0`, whose `libmlx5` lacks `mlx5dv_reg_dmabuf_mr@MLX5_1.25` — the symbol NCCL needs to register GPU memory for direct RDMA. NCCL then stages every per-layer all-reduce GPU→host→NIC, which cripples **prefill** (decode barely notices — its all-reduce is tiny). We burned hours probing kernels for this; don't.
+> ⚠️ **2-node prefill suddenly 10–30× slower? It's the RDMA userspace stack — not the model, and *not* GPUDirect.**
+> If 2-node prompt processing jumps from ~1–2 s to ~30 s for the same prompt, the cause is almost always a broken NCCL RDMA path. A DGX Spark **OTA can silently downgrade `rdma-core`** to Ubuntu stock `50.0`, whose `libmlx5` lacks the `mlx5dv_reg_dmabuf_mr@MLX5_1.25` symbol NCCL needs to register its RoCE comm buffers. NCCL then can't use the fast RDMA path and degrades, which cripples **prefill** (decode barely notices — its all-reduce is tiny). We burned hours probing kernels for this; don't — it's the environment.
 >
-> **Diagnose** — launch with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=NET`. Broken looks like:
-> `dlvsym failed on mlx5dv_reg_dmabuf_mr ... undefined symbol ... MLX5_1.25` + `GPU Direct RDMA Disabled for HCA`.
+> **GPUDirect is a red herring on GB10 — don't chase it.** GPUDirect RDMA is **not supported on DGX Spark at all**: NVIDIA confirms the iGPU's unified memory can't be coherently accessed by the NIC, so `nvidia-peermem`, `dma-buf`, and `GDRCopy` *all* do not work ([NVIDIA forum](https://forums.developer.nvidia.com/t/enabling-gpu-direct-rdma-for-dgx-spark-clustering/352051)). So `NCCL … GPU Direct RDMA Disabled` is **normal and expected — there is no "Enabled" to reach.** NCCL instead uses host-registered MR RDMA (`cudaHostAlloc` + `ib_reg_mr`), which still sustains ~176 Gbps over the 200G RoCE link. The bug is rdma-core being broken or version-mismatched between the boxes, never GDR.
 >
-> **Fix** — install the NVIDIA DOCA `rdma-core` on **both** boxes (Ubuntu's repo only has 50.0; DOCA ships 2604.x with `MLX5_1.25/26/27`):
+> **Diagnose** — `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=NET` should show `NET/IB : Using [rocep…]` and create QPs; broken shows `dlvsym failed on mlx5dv_reg_dmabuf_mr … MLX5_1.25`. Confirm RDMA is *actually* flowing (not silently degraded to TCP) by watching the RoCE port counter climb during inference — it counts RDMA verbs traffic only and stays flat under a socket fallback:
+> ```bash
+> watch -n1 'cat /sys/class/infiniband/rocep1s0f0/ports/1/counters/port_xmit_data'   # value ×4 = bytes
+> ```
+>
+> **Fix** — install the NVIDIA DOCA `rdma-core` on **both** boxes (Ubuntu's repo only has 50.0; DOCA ships 2604.x with the symbol):
 > ```bash
 > B=https://linux.mellanox.com/public/repo/doca/latest/ubuntu24.04/arm64-sbsa
 > curl -sL $B/doca_keyring.gpg | sudo tee /usr/share/keyrings/doca.gpg >/dev/null
@@ -85,9 +89,7 @@ Key env baked into the launch scripts: `DSV4_MULTISLOT=1` (concurrent slot batch
 > sudo apt update && sudo apt install -y --no-install-recommends rdma-core ibverbs-providers libibverbs1
 > sudo apt-mark hold rdma-core ibverbs-providers libibverbs1   # stop the next OTA from re-downgrading it
 > ```
-> **Verify:** `nm -D /usr/lib/aarch64-linux-gnu/libmlx5.so* | grep MLX5_1.25` prints the symbol, and NCCL now logs `GPU Direct RDMA Enabled`. (`nvidia-peermem` is *not* the fix on the GB10 open driver — it fails to load; dmabuf is the path.)
->
-> **⚠️ Both boxes must run the *exact same* rdma-core/libmlx5 version.** If the two Sparks mismatch — you upgrade only one, or an OTA bumps one and not the other — NCCL can't negotiate a common RDMA transport across the link and **silently falls back to TCP sockets** between the nodes. That's the *same* drastic prefill slowdown, even when each box's GPUDirect looks fine locally. So always `apt install` **and** `apt-mark hold` the identical version on **both** boxes; after any system update, re-check both with `nm -D … | grep MLX5_1.25` before blaming the model.
+> **Both boxes must run the *exact same* version.** A mismatch (you upgrade one, or an OTA bumps one and not the other) makes NCCL renegotiate down to a slower path between the nodes — the same drastic prefill slowdown. `apt-mark hold` both; after any system update re-check both with `nm -D /usr/lib/aarch64-linux-gnu/libmlx5.so* | grep MLX5_1.25` **and** confirm the RDMA counter above still climbs under load, before blaming the model.
 
 > 🛠️ **Development effort.** This was not a weekend project. The FP4 + 2-node TP + multi-slot + MTP stack landed in a ~5-day near-continuous sprint (**Jun 18–22 2026, ~46 commits**), the tail end of a **~2-week DeepSeek-V4-Flash marathon** (**~140 DSV4-related commits**, near-daily Jun 9–22). One developer, two DGX Sparks, very little sleep — the type port, the loader adapter, the bake pipeline, the long-context crash hunt, the graphs-reused-0 → verify-reuse breakthrough, and a full pre-push audit, all by hand.
 

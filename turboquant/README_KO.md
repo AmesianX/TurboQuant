@@ -71,13 +71,17 @@ bash fp4ctl.sh start                 # start | stop | restart | status  (pid-onl
 
 런치 스크립트에 박힌 핵심 env: `DSV4_MULTISLOT=1`(동시 슬롯 배칭), `DSV4_VERIFY_REUSE=1`(MTP verify-graph 재사용 — 속도 열쇠), `DSV4_BATCHED_COMPRESSOR=1`(긴 컨텍스트 안전), 그리고 `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0`. 마스터와 슬레이브는 동일 env로 돌아야 함(SPMD).
 
-> ⚠️ **2노드 prefill이 갑자기 10–30× 느려졌다? 코드 말고 GPUDirect RDMA부터 봐라.**
-> 같은 프롬프트 처리가 ~1–2초에서 ~30초로 뛰면 거의 항상 NCCL **GPUDirect RDMA** 경로가 깨진 거지 모델 문제가 아니다. DGX Spark **OTA 시스템 업데이트가 `rdma-core`를 Ubuntu 기본 `50.0`으로 조용히 다운그레이드**할 수 있는데, 그 `libmlx5`엔 NCCL이 GPU 메모리를 직접 RDMA 등록하는 데 쓰는 `mlx5dv_reg_dmabuf_mr@MLX5_1.25` 심볼이 없다. 그러면 NCCL이 레이어마다 all-reduce를 GPU→host→NIC로 스테이징해서 **prefill을 박살낸다**(decode는 all-reduce가 작아 거의 영향 없음). 우리는 이거 때문에 커널을 몇 시간 팠다 — 하지 마라.
+> ⚠️ **2노드 prefill이 갑자기 10–30× 느려졌다? RDMA userspace 스택 문제 — 모델도 GPUDirect도 아니다.**
+> 같은 프롬프트 처리가 ~1–2초에서 ~30초로 뛰면 거의 항상 NCCL RDMA 경로가 깨진 거다. DGX Spark **OTA가 `rdma-core`를 Ubuntu 기본 `50.0`으로 조용히 다운그레이드**할 수 있는데, 그 `libmlx5`엔 NCCL이 RoCE comm 버퍼를 등록하는 데 쓰는 `mlx5dv_reg_dmabuf_mr@MLX5_1.25` 심볼이 없다. 그러면 NCCL이 빠른 RDMA 경로를 못 써서 **prefill을 박살낸다**(decode는 all-reduce가 작아 거의 영향 없음). 이거 때문에 커널 몇 시간 팠다 — 하지 마라, 환경 문제다.
 >
-> **진단** — `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=NET`로 기동. 깨진 상태:
-> `dlvsym failed on mlx5dv_reg_dmabuf_mr ... undefined symbol ... MLX5_1.25` + `GPU Direct RDMA Disabled for HCA`.
+> **GPUDirect는 헛다리다 — 쫓지 마라.** GB10/DGX Spark은 **GPUDirect RDMA를 아예 지원 안 한다**: NVIDIA 공식 확인 — iGPU unified memory를 NIC가 coherent하게 접근 못 해서 `nvidia-peermem`·`dma-buf`·`GDRCopy` 전부 안 됨 ([NVIDIA 포럼](https://forums.developer.nvidia.com/t/enabling-gpu-direct-rdma-for-dgx-spark-clustering/352051)). 그래서 `GPU Direct RDMA Disabled`는 **정상이고, 도달할 "Enabled"가 없다.** NCCL은 대신 host-registered MR RDMA(`cudaHostAlloc`+`ib_reg_mr`)를 쓰고, 그래도 200G RoCE에서 ~176 Gbps 나온다. 버그는 rdma-core가 깨졌거나 양쪽 버전 불일치인 거지 GDR이 아니다.
 >
-> **수정** — NVIDIA DOCA `rdma-core`를 **양쪽 박스**에 설치(Ubuntu repo엔 50.0뿐, DOCA는 `MLX5_1.25/26/27` 가진 2604.x 제공):
+> **진단** — `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=NET`에 `NET/IB : Using [rocep…]` + QP 생성이 나와야 정상, 깨지면 `dlvsym failed on mlx5dv_reg_dmabuf_mr … MLX5_1.25`. 실제 RDMA가 흐르는지(조용히 TCP로 떨어진 게 아닌지)는 추론 중 RoCE 포트 카운터가 오르는지로 확인 — RDMA verbs 트래픽만 세고 소켓 폴백이면 안 움직인다:
+> ```bash
+> watch -n1 'cat /sys/class/infiniband/rocep1s0f0/ports/1/counters/port_xmit_data'   # 값 ×4 = 바이트
+> ```
+>
+> **수정** — NVIDIA DOCA `rdma-core`를 **양쪽 박스**에 설치(Ubuntu repo엔 50.0뿐, DOCA는 심볼 가진 2604.x):
 > ```bash
 > B=https://linux.mellanox.com/public/repo/doca/latest/ubuntu24.04/arm64-sbsa
 > curl -sL $B/doca_keyring.gpg | sudo tee /usr/share/keyrings/doca.gpg >/dev/null
@@ -85,9 +89,7 @@ bash fp4ctl.sh start                 # start | stop | restart | status  (pid-onl
 > sudo apt update && sudo apt install -y --no-install-recommends rdma-core ibverbs-providers libibverbs1
 > sudo apt-mark hold rdma-core ibverbs-providers libibverbs1   # 다음 OTA가 또 다운그레이드 못 하게 hold
 > ```
-> **확인:** `nm -D /usr/lib/aarch64-linux-gnu/libmlx5.so* | grep MLX5_1.25`로 심볼 뜨고, NCCL 로그에 `GPU Direct RDMA Enabled`. (`nvidia-peermem`은 GB10 open 드라이버선 로드 실패 — dmabuf가 정석.)
->
-> **⚠️ 두 박스가 *완전히 같은* rdma-core/libmlx5 버전이어야 한다.** 두 Spark가 불일치하면 — 한쪽만 업그레이드했거나 OTA가 한쪽만 건드리면 — NCCL이 노드 간 공통 RDMA 전송을 못 정하고 **조용히 TCP 소켓으로 폴백**한다. 각 박스의 GPUDirect가 로컬로는 멀쩡해 보여도 *같은* prefill 급락이 난다. 그러니 항상 **양쪽 박스**에 동일 버전을 `apt install` + `apt-mark hold` 하고, 시스템 업데이트 후엔 모델 탓하기 전에 `nm -D … | grep MLX5_1.25`로 양쪽 다 재확인.
+> **양쪽이 완전히 같은 버전이어야 한다.** 불일치하면(한쪽만 업그레이드/OTA가 한쪽만) NCCL이 더 느린 경로로 재협상 — 같은 prefill 급락. 양쪽 `apt-mark hold` 하고, 시스템 업데이트 후엔 양쪽 `nm -D /usr/lib/aarch64-linux-gnu/libmlx5.so* | grep MLX5_1.25` **+** 부하 중 위 RDMA 카운터 오르는지 재확인 후에 모델 탓해라.
 
 > 🛠️ **개발 기간.** 주말 프로젝트가 아닙니다. FP4 + 2-노드 TP + 멀티슬롯 + MTP 스택은 거의 쉬지 않은 ~5일 스프린트(**2026년 6/18–22, ~46커밋**)에 들어왔고, 그것은 **~2주 DeepSeek-V4-Flash 마라톤**(**~140 DSV4 관련 커밋**, 6/9–22 거의 매일)의 끝자락입니다. 개발자 1명, DGX Spark 2대, 잠 거의 없이 — 타입 포팅, 로더 어댑터, 굽기 파이프라인, 긴 컨텍스트 크래시 추적, graphs-reused-0 → verify-reuse 돌파, 푸시 전 전수 감사까지 전부 수작업.
 
