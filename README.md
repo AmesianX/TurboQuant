@@ -71,6 +71,22 @@ bash fp4ctl.sh start                 # start | stop | restart | status  (pid-onl
 
 Key env baked into the launch scripts: `DSV4_MULTISLOT=1` (concurrent slot batching), `DSV4_VERIFY_REUSE=1` (MTP verify-graph reuse — the speed key), `DSV4_BATCHED_COMPRESSOR=1` (long-context safety), with `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0`. Master and slave must run identical env (SPMD).
 
+> ⚠️ **2-node prefill suddenly 10–30× slower? Check GPUDirect RDMA first — NOT the code.**
+> If 2-node prompt processing jumps from ~1–2 s to ~30 s for the same prompt, the cause is almost always a broken NCCL **GPUDirect RDMA** path, not the model. A DGX Spark **OTA system update can silently downgrade `rdma-core`** to Ubuntu stock `50.0`, whose `libmlx5` lacks `mlx5dv_reg_dmabuf_mr@MLX5_1.25` — the symbol NCCL needs to register GPU memory for direct RDMA. NCCL then stages every per-layer all-reduce GPU→host→NIC, which cripples **prefill** (decode barely notices — its all-reduce is tiny). We burned hours probing kernels for this; don't.
+>
+> **Diagnose** — launch with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=NET`. Broken looks like:
+> `dlvsym failed on mlx5dv_reg_dmabuf_mr ... undefined symbol ... MLX5_1.25` + `GPU Direct RDMA Disabled for HCA`.
+>
+> **Fix** — install the NVIDIA DOCA `rdma-core` on **both** boxes (Ubuntu's repo only has 50.0; DOCA ships 2604.x with `MLX5_1.25/26/27`):
+> ```bash
+> B=https://linux.mellanox.com/public/repo/doca/latest/ubuntu24.04/arm64-sbsa
+> curl -sL $B/doca_keyring.gpg | sudo tee /usr/share/keyrings/doca.gpg >/dev/null
+> echo "deb [signed-by=/usr/share/keyrings/doca.gpg] $B/ ./" | sudo tee /etc/apt/sources.list.d/doca.list
+> sudo apt update && sudo apt install -y --no-install-recommends rdma-core ibverbs-providers libibverbs1
+> sudo apt-mark hold rdma-core ibverbs-providers libibverbs1   # stop the next OTA from re-downgrading it
+> ```
+> **Verify:** `nm -D /usr/lib/aarch64-linux-gnu/libmlx5.so* | grep MLX5_1.25` prints the symbol, and NCCL now logs `GPU Direct RDMA Enabled`. (`nvidia-peermem` is *not* the fix on the GB10 open driver — it fails to load; dmabuf is the path.)
+
 > 🛠️ **Development effort.** This was not a weekend project. The FP4 + 2-node TP + multi-slot + MTP stack landed in a ~5-day near-continuous sprint (**Jun 18–22 2026, ~46 commits**), the tail end of a **~2-week DeepSeek-V4-Flash marathon** (**~140 DSV4-related commits**, near-daily Jun 9–22). One developer, two DGX Sparks, very little sleep — the type port, the loader adapter, the bake pipeline, the long-context crash hunt, the graphs-reused-0 → verify-reuse breakthrough, and a full pre-push audit, all by hand.
 
 ---
