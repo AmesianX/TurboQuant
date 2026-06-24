@@ -51,7 +51,7 @@ SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
-COMMON="-c $CTX --parallel 1 -b 512 -ub 256 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --chat-template-kwargs {\"enable_thinking\":false} $SPEC"
+COMMON="-c $CTX -n 16384 --parallel 1 -b 512 -ub 256 -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --chat-template-kwargs {\"enable_thinking\":false} $SPEC"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
