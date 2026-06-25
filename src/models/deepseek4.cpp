@@ -1792,13 +1792,16 @@ static ggml_tensor * dsv4_build_indexer_scores_decode(
         int64_t              n_index_head,
         int64_t              n_index_head_size,
         int64_t              n_comp,
+        int64_t              n_tokens,
         int64_t              n_rot,
         int                  rope_type,
         const dsv4_rope_cfg & rope_cfg) {
+    // n_tokens > 1 under multi-slot decode (one query token per concurrent slot). Hard-coding 1
+    // here made ggml_reshape_3d abort the moment two requests decoded together. [TAG_MULTISLOT_INDEXER]
     ggml_tensor * q = ggml_mul_mat(ctx, wq_b, qr);
-    q = ggml_reshape_3d(ctx, q, n_index_head_size, n_index_head, 1);
+    q = ggml_reshape_3d(ctx, q, n_index_head_size, n_index_head, n_tokens);
     q = dsv4_apply_rope_tail(ctx, q, pos,
-            n_index_head_size, n_index_head, 1, n_rot, rope_type,
+            n_index_head_size, n_index_head, n_tokens, n_rot, rope_type,
             rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
             rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
 
@@ -1812,13 +1815,13 @@ static ggml_tensor * dsv4_build_indexer_scores_decode(
     ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x); // [n_heads, 1]
     const float scale = 1.0f / std::sqrt(float(n_index_head_size) * float(n_index_head));
     weights = dsv4_mul_scalar(ctx, weights, scale);
-    weights = ggml_reshape_3d(ctx, weights, 1, n_index_head, 1);
-    weights = ggml_permute(ctx, weights, 0, 2, 1, 3); // [1, 1, n_heads]
+    weights = ggml_reshape_3d(ctx, weights, 1, n_index_head, n_tokens);
+    weights = ggml_permute(ctx, weights, 0, 2, 1, 3); // [1, n_tokens, n_heads]
 
     score = ggml_mul(ctx, score, weights);
-    score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 2, 0, 3)); // [n_heads, n_comp, 1]
+    score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 2, 0, 3)); // [n_heads, n_comp, n_tokens]
     score = ggml_sum_rows(ctx, score);
-    return ggml_reshape_2d(ctx, score, n_comp, 1);
+    return ggml_reshape_2d(ctx, score, n_comp, n_tokens);
 }
 
 static ggml_tensor * dsv4_build_compressed_mask_from_topk(
@@ -2471,7 +2474,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                         cur, qr, index_cache_all,
                                         layer.indexer_attn_q_b, layer.indexer_proj, inp_pos,
                                         hparams.indexer_n_head, hparams.indexer_head_size,
-                                        n_seqs*n_comp_view, n_rot, rope_type, rope_cfg);
+                                        n_seqs*n_comp_view, n_tokens, n_rot, rope_type, rope_cfg);
                                 index_scores = ggml_add(ctx0, index_scores, block_mask);
                                 const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_view);
                                 ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
@@ -2595,6 +2598,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                         hparams.indexer_n_head,
                                         hparams.indexer_head_size,
                                         n_comp_view,
+                                        n_tokens,
                                         n_rot,
                                         rope_type,
                                         rope_cfg)
