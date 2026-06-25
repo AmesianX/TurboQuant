@@ -2959,9 +2959,13 @@ private:
                     // can't be reused on DSV4 anyway). Append-only continuations keep p0 > mem_max,
                     // so normal multi-turn reuse is untouched. The clear is broadcast to the follower
                     // like any other seq op, so both ranks stay consistent.
-                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                    // RS (recurrent/DSV4) can't rewind to an interior pos; FULL can only remove a whole
+                    // sequence — both abort on a backward [p0,end) trim. (PART/SWA handle it, so excluded.)
+                    if ((ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) &&
                         llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= p0) {
-                        SLT_WRN(slot, "RS/recurrent cache cannot trim [%d, end) backward — clearing sequence and re-prefilling from scratch\n", p0);
+                        SLT_WRN(slot, "%s cache cannot trim [%d, end) backward — clearing sequence and re-prefilling from scratch\n",
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? "FULL" : "RS/recurrent", p0);
                         common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
                         if (ctx_dft) {
                             common_context_seq_rm(ctx_dft.get(), slot.id, -1, -1);

@@ -1807,12 +1807,12 @@ static ggml_tensor * dsv4_build_indexer_scores_decode(
 
     ggml_tensor * k = ggml_reshape_3d(ctx, index_kv, n_index_head_size, 1, n_comp);
     k = ggml_permute(ctx, k, 0, 2, 1, 3); // [head_dim, n_comp, 1]
-    q = ggml_permute(ctx, q, 0, 2, 1, 3); // [head_dim, 1, n_heads]
+    q = ggml_permute(ctx, q, 0, 2, 1, 3); // [head_dim, n_tokens, n_heads]
 
-    ggml_tensor * score = ggml_mul_mat(ctx, k, q); // [n_comp, 1, n_heads]
+    ggml_tensor * score = ggml_mul_mat(ctx, k, q); // [n_comp, n_tokens, n_heads]
     score = ggml_relu(ctx, score);
 
-    ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x); // [n_heads, 1]
+    ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x); // [n_heads, n_tokens]
     const float scale = 1.0f / std::sqrt(float(n_index_head_size) * float(n_index_head));
     weights = dsv4_mul_scalar(ctx, weights, scale);
     weights = ggml_reshape_3d(ctx, weights, 1, n_index_head, n_tokens);

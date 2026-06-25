@@ -337,6 +337,8 @@ task_params server_task::params_from_json_cmpl(
         params.sampling.mirostat           = defaults.sampling.mirostat;
         params.sampling.mirostat_tau       = defaults.sampling.mirostat_tau;
         params.sampling.mirostat_eta       = defaults.sampling.mirostat_eta;
+        params.sampling.adaptive_target    = defaults.sampling.adaptive_target;
+        params.sampling.adaptive_decay     = defaults.sampling.adaptive_decay;
         params.sampling.samplers           = defaults.sampling.samplers;
     }
 
@@ -408,7 +410,9 @@ task_params server_task::params_from_json_cmpl(
         // Currently, this is not compatible with TextGen WebUI, Koboldcpp and SillyTavern format
         // Ref: https://github.com/oobabooga/text-generation-webui/blob/d1af7a41ade7bd3c3a463bfa640725edb818ebaf/extensions/openai/typing.py#L39
 
-        if (data.contains("dry_sequence_breakers")) {
+        // [TurboQuant] DRY breakers are a DRY knob; under --lock-server-params keep the server's
+        // (parsed below the lock block, so guard the override here too).
+        if (!params_base.lock_server_params && data.contains("dry_sequence_breakers")) {
             params.sampling.dry_sequence_breakers = json_value(data, "dry_sequence_breakers", std::vector<std::string>());
             if (params.sampling.dry_sequence_breakers.empty()) {
                 throw std::runtime_error("Error: dry_sequence_breakers must be a non-empty array of strings");
