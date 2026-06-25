@@ -209,6 +209,8 @@ inline void tp_bcast_stop() {
 inline void tp_follower_loop() {
     const int fd = tp_fd();
     std::map<uint64_t, std::vector<uint8_t>> state_store; // mirrored KV snapshots, keyed by leader's key
+    size_t state_store_bytes = 0;                         // running total, for the eviction cap below
+    static constexpr size_t TP_STATE_STORE_CAP = 8ull * 1024 * 1024 * 1024; // 8 GiB cap (leader live set is far smaller)
     std::vector<llama_token>   toks;
     std::vector<llama_pos>     pos;
     std::vector<int32_t>       nsid;
@@ -254,8 +256,21 @@ inline void tp_follower_loop() {
             if (ctx && op == TP_OP_STATE_SAVE) {
                 const size_t sz = llama_state_seq_get_size_ext(ctx, seq_id, (llama_state_seq_flags) flags);
                 std::vector<uint8_t> & dst = state_store[key];
+                state_store_bytes -= dst.size(); // 0 for a fresh key (monotonic keys never collide)
                 dst.resize(sz);
                 llama_state_seq_get_data_ext(ctx, dst.data(), sz, seq_id, (llama_state_seq_flags) flags);
+                state_store_bytes += sz;
+                // [TurboQuant] Bound the follower snapshot store. The leader evicts old checkpoints
+                // locally but sends no "free" signal, so without this cap state_store would grow
+                // unbounded over a long serving session and OOM the follower (GB10 unified RAM = GPU
+                // pool). Evict oldest-first (smallest monotonic key); the leader only ever restores
+                // keys from its bounded live checkpoint set (the most recent), so the oldest evicted
+                // here is never a key the leader will ask to restore.
+                while (state_store_bytes > TP_STATE_STORE_CAP && state_store.size() > 1) {
+                    auto oldest = state_store.begin();
+                    state_store_bytes -= oldest->second.size();
+                    state_store.erase(oldest);
+                }
             } else if (ctx) {
                 auto it = state_store.find(key);
                 if (it != state_store.end() && !it->second.empty()) {

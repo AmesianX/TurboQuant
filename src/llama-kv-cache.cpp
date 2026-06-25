@@ -359,8 +359,9 @@ llama_kv_cache::llama_kv_cache(
                         || type_v == GGML_TYPE_TBQ3_1  || type_v == GGML_TYPE_TBQ4_1
                         || type_v == GGML_TYPE_TBQ3_2  || type_v == GGML_TYPE_TBQ4_2
                         || type_v == GGML_TYPE_TBQ3_3  || type_v == GGML_TYPE_TBQ4_3
-                        || type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4;
-    const bool is_amx_v  = type_v == GGML_TYPE_AMX3_1;
+                        || type_v == GGML_TYPE_TBQ3_4  || type_v == GGML_TYPE_TBQ4_4
+                        || type_v == GGML_TYPE_TBQV3_1; // V-side 3-bit (tbq3-set), internal WHT
+    const bool is_amx_v  = type_v == GGML_TYPE_AMX3_1  || type_v == GGML_TYPE_AMXV3_1;
     const bool is_internal_wht_v = is_tbq_v || is_amx_v;
 
     attn_rot_v =
