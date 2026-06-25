@@ -2854,7 +2854,14 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            // [TurboQuant] never restore a checkpoint that reaches
+                                            // PAST the matched prefix (pos_next): doing so loads
+                                            // positions the new prompt diverges from, forcing a
+                                            // backward seq_rm [pos_next, pos_max) that the DSV4
+                                            // hybrid (recurrent + SWA) cache cannot honor -> abort.
+                                            // Restrict to checkpoints within the common prefix so a
+                                            // new/divergent conversation safely falls back to pos 0.
+                                            return (cur.pos_min < pos_min_thold || cur.pos_min == 0) && cur.pos_max < pos_next;
                                         }
                                     );
 
