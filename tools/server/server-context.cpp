@@ -176,6 +176,9 @@ struct server_slot {
     double t_token_generation = 0.0;  // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
+    // [TurboQuant] fires inside release() BEFORE reset(), while task/prompt/memory are still
+    // intact — used to snapshot the finished turn into a context checkpoint for next-turn reuse.
+    std::function<void(int /* id_slot */)> callback_on_release_pre;
 
     // Speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
@@ -369,6 +372,13 @@ struct server_slot {
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear(false);
+            }
+
+            // [TurboQuant] snapshot the finished turn (prompt + generated response) into a
+            // context checkpoint BEFORE reset() clears the task — lets the next turn restore it
+            // instead of re-prefilling the response.
+            if (callback_on_release_pre) {
+                callback_on_release_pre(id);
             }
 
             reset();
@@ -1080,6 +1090,37 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+            };
+
+            // [TurboQuant] end-of-turn context checkpoint. Fires on EVERY generation completion
+            // (all release paths, incl. the MTP/spec path) just before reset(), so the full turn
+            // (prompt + generated response) is snapshotted once. The next turn restores it and
+            // skips re-prefilling the response. One save per turn, post-generation -> no per-token
+            // cost, MTP decode speed unaffected. Upstream only checkpoints during prompt
+            // processing, leaving long responses uncovered (every follow-up re-prefilled them).
+            slot.callback_on_release_pre = [this](int id_slot) {
+                server_slot * s = get_slot_by_id(id_slot);
+                if (!s || !s->task || params_base.n_ctx_checkpoints <= 0 ||
+                    s->task->type != SERVER_TASK_TYPE_COMPLETION) {
+                    return;
+                }
+                // only models that rely on checkpoints for reuse (SWA / recurrent / bounded seq-rm)
+                if (!(ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                      ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                      n_swa > 0)) {
+                    return;
+                }
+                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), s->id);
+                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), s->id);
+                if (pos_min < 0) {
+                    return;
+                }
+                // respect the min spacing — skip if a recent checkpoint already covers this
+                if (!s->prompt.checkpoints.empty() &&
+                    s->prompt.n_tokens() <= s->prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                    return;
+                }
+                create_checkpoint(*s, 0, pos_min, pos_max);
             };
 
             slot.reset();

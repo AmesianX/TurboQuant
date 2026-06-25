@@ -503,6 +503,15 @@ void llama_memory_hybrid_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_
 
 llama_pos llama_memory_hybrid_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the min of the total cache is the max of the two caches' min values
+    if (has_dsv4_compressed_kv()) {
+        // DSV4's compressed KV (recr) keeps a ratio-compressed copy of the whole
+        // sequence from pos 0, so it never constrains the resume point — only the SWA
+        // attention window does. Folding mem_recr in via max() pegs pos_min at the
+        // recurrent state's position, which makes every context checkpoint
+        // unrestorable (pos_min == pos_max) and forces a full prompt re-prefill on
+        // every chat turn (multi-turn KV reuse breaks; cache_n stuck at 1).
+        return mem_attn->seq_pos_min(seq_id);
+    }
     return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));
 }
 
