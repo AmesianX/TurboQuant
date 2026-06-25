@@ -305,6 +305,41 @@ task_params server_task::params_from_json_cmpl(
     params.sampling.backend_sampling   = json_value(data, "backend_sampling",    defaults.sampling.backend_sampling);
     params.post_sampling_probs         = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
 
+    // [TurboQuant] Locked-service mode (--lock-server-params): re-assert the operator's CLI
+    // generation params over whatever the client/web-UI sent, so server-launch options actually
+    // take effect through the UI (which otherwise ships its own sampling defaults — e.g. DRY off,
+    // its own max_tokens — that silently override the server). -c/n_ctx is fixed at load; here we
+    // enforce -n (n_predict), n_keep and the sampling knobs. The penalty_last_n/dry_penalty_last_n
+    // == -1 -> n_ctx_slot conversion below still runs on these. Structural/per-call fields (grammar,
+    // json_schema, logit_bias, lora, tools, stream, seed, n_probs/logprobs) are intentionally left
+    // per-request.
+    if (params_base.lock_server_params) {
+        params.n_predict                   = defaults.n_predict;
+        params.n_keep                      = defaults.n_keep;
+        params.sampling.top_k              = defaults.sampling.top_k;
+        params.sampling.top_p              = defaults.sampling.top_p;
+        params.sampling.min_p              = defaults.sampling.min_p;
+        params.sampling.top_n_sigma        = defaults.sampling.top_n_sigma;
+        params.sampling.xtc_probability    = defaults.sampling.xtc_probability;
+        params.sampling.xtc_threshold      = defaults.sampling.xtc_threshold;
+        params.sampling.typ_p              = defaults.sampling.typ_p;
+        params.sampling.temp               = defaults.sampling.temp;
+        params.sampling.dynatemp_range     = defaults.sampling.dynatemp_range;
+        params.sampling.dynatemp_exponent  = defaults.sampling.dynatemp_exponent;
+        params.sampling.penalty_last_n     = defaults.sampling.penalty_last_n;
+        params.sampling.penalty_repeat     = defaults.sampling.penalty_repeat;
+        params.sampling.penalty_freq       = defaults.sampling.penalty_freq;
+        params.sampling.penalty_present    = defaults.sampling.penalty_present;
+        params.sampling.dry_multiplier     = defaults.sampling.dry_multiplier;
+        params.sampling.dry_base           = defaults.sampling.dry_base;
+        params.sampling.dry_allowed_length = defaults.sampling.dry_allowed_length;
+        params.sampling.dry_penalty_last_n = defaults.sampling.dry_penalty_last_n;
+        params.sampling.mirostat           = defaults.sampling.mirostat;
+        params.sampling.mirostat_tau       = defaults.sampling.mirostat_tau;
+        params.sampling.mirostat_eta       = defaults.sampling.mirostat_eta;
+        params.sampling.samplers           = defaults.sampling.samplers;
+    }
+
     params.speculative = defaults.speculative;
 
     // TODO: to keep things simple, we disable speculative parameter adjustments for now

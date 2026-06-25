@@ -2281,6 +2281,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"--lock-server-params"},
+        "[TurboQuant] locked-service mode: make the server's CLI generation params authoritative — "
+        "client/web-UI sampling knobs (temperature, repeat/freq/presence penalty, DRY, top-k/p, ...) "
+        "and n_predict/n_keep are IGNORED so end users can't override server tuning (e.g. disable DRY "
+        "-> runaway repetition). Structural fields (grammar, json_schema, logit_bias, lora, tools, "
+        "stream) stay per-request. n_ctx (-c) is already fixed at load.",
+        [](common_params & params) {
+            params.lock_server_params = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOCK_SERVER_PARAMS"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",
