@@ -58,12 +58,12 @@ SLAVE_SSH="10.0.1.2"                         # ssh target for the slave box
 # width every round. A high p-min (e.g. 0.75) makes the draft length vary with confidence, which makes
 # the meta/CUDA graph re-capture every round (graphs reused = 0) and is a net slowdown — measured 6.5 t/s
 # at p-min 0.75 vs 10.3 t/s at p-min 0.0 on DSV4 Q4 2-box. 0.0 also matches the model's standard sampling.
-SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"
+SPEC="${SPEC---spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0}"  # env-overridable: SPEC="" disables MTP
 # MTP (≤64k): SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"; set GRAPH_SLOTS=16 VERIFY_REUSE=1 for graph reuse (disabled-default)
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
-COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b 512 -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --reasoning off $SPEC"
+COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b 512 -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --reasoning off $SPEC ${EXTRA_ARGS:-}"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
@@ -179,7 +179,7 @@ case "${1:-}" in
         stop_local
         echo "== ALLRESTART: starting slave then master =="
         # forward the slot/graph overrides so BOTH ranks build matching graphs (TP requires it).
-        FWD="PARALLEL=$PARALLEL GRAPH_SLOTS=$GRAPH_SLOTS CTX=$CTX UB=$UB MODEL=$MODEL"
+        FWD="PARALLEL=$PARALLEL GRAPH_SLOTS=$GRAPH_SLOTS CTX=$CTX UB=$UB MODEL=$MODEL SPEC=\"$SPEC\""
         # don't let a slave-side failure abort under set -e before the master is started — warn and go on
         ssh "$SLAVE_SSH" "$FWD $SELF START" || echo "[WARN] slave START failed ($SLAVE_SSH) — starting master anyway"
         sleep 3
