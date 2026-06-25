@@ -2949,11 +2949,31 @@ private:
                     // truncate any tokens that are beyond n_past for this slot
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
 
-                    SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
-
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                    // DSV4/recurrent (RS-type) caches cannot rewind to an interior position — the
+                    // compressed recurrent state keeps no per-token history to roll back, so ANY
+                    // backward removal fails. If this slot's memory still holds tokens at/after p0
+                    // (it was reused by a shorter/divergent conversation, or the matched prefix is
+                    // shorter than the resident state), seq_rm [p0,end) returns false and
+                    // common_context_seq_rm aborts BOTH TP nodes. Detect it on the leader and clear
+                    // the whole sequence + re-prefill from scratch instead (the divergent prefix
+                    // can't be reused on DSV4 anyway). Append-only continuations keep p0 > mem_max,
+                    // so normal multi-turn reuse is untouched. The clear is broadcast to the follower
+                    // like any other seq op, so both ranks stay consistent.
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= p0) {
+                        SLT_WRN(slot, "RS/recurrent cache cannot trim [%d, end) backward — clearing sequence and re-prefilling from scratch\n", p0);
+                        common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot.id, -1, -1);
+                        }
+                        slot.prompt.tokens.keep_first(0);
+                        slot.n_prompt_tokens_cache = 0;
+                    } else {
+                        SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+                        common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come
