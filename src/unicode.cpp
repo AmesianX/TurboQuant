@@ -744,7 +744,18 @@ static std::vector<size_t> unicode_regex_split_stl(const std::basic_string<CharT
 #else
     constexpr auto regex_flags = std::regex_constants::optimize | std::regex_constants::nosubs;
 #endif
-    std::basic_regex<CharT> expr(regex, regex_flags);
+    // [TurboQuant] Compiling a converted unicode-property regex (the \p{L}/\p{N}/... classes are
+    // expanded into huge character-range sets) is expensive: std::regex's compiler runs locale
+    // collate transforms over every range. perf showed THIS dominated tokenization — one HTTP
+    // worker thread pegged at 100% CPU in std::collate::do_transform under the regex _Compiler,
+    // GPU idle, the cost scaling with the full prompt re-tokenized every turn. The regex string is
+    // fixed per model, so build the automaton once and reuse it instead of recompiling per call.
+    static thread_local std::map<std::basic_string<CharT>, std::basic_regex<CharT>> expr_cache;
+    auto cit = expr_cache.find(regex);
+    if (cit == expr_cache.end()) {
+        cit = expr_cache.emplace(regex, std::basic_regex<CharT>(regex, regex_flags)).first;
+    }
+    const std::basic_regex<CharT> & expr = cit->second;
     std::vector<size_t> bpe_offsets; // store the offset of each word
     bpe_offsets.reserve(offsets.size()); // Reserve memory for the approximate size
     size_t start = 0;
