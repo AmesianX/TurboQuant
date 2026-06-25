@@ -1379,7 +1379,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // probe (env DSV4_GRAPH_PROBE): one-line split summary per scheduled graph
     {
-        static const bool probe = getenv("DSV4_GRAPH_PROBE") != nullptr;
+        static const bool probe = getenv("DSV4_GRAPH_PROBE") != nullptr || getenv("LLAMA_CPUFB") != nullptr;
         if (probe) {
             fprintf(stderr, "sched: n_nodes=%d n_splits=%d [", graph->n_nodes, sched->n_splits);
             for (int i = 0; i < sched->n_splits && i < 64; i++) {
@@ -1392,10 +1392,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             for (int i = 0; i < sched->n_splits; i++) {
                 const auto & sp = sched->splits[i];
                 const char * bname = ggml_backend_name(sched->backends[sp.backend_id]);
-                if (strncmp(bname, "CPU", 3) == 0 && sp.i_end - sp.i_start <= 4) {
+                if (strncmp(bname, "CPU", 3) == 0) {
                     for (int n = sp.i_start; n < sp.i_end; n++) {
                         ggml_tensor * node = graph->nodes[n];
-                        fprintf(stderr, "  cpu-node: op=%s name='%s' src0='%s'(%s)\n",
+                        fprintf(stderr, "[CPUFB:op] cpu-node: op=%s name='%s' src0='%s'(%s)\n",
                                 ggml_op_name(node->op), node->name,
                                 node->src[0] ? node->src[0]->name : "-",
                                 node->src[0] && node->src[0]->buffer ? ggml_backend_buffer_name(node->src[0]->buffer) : "nobuf");
