@@ -494,6 +494,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     LOG_WRN("%s: backend offload failed for seq_id=%d; using CPU sampler\n", __func__, (int) seq_id);
+                    if (getenv("LLAMA_CPUFB")) LOG_WRN("[CPUFB:draft-offload] MTP draft set_sampler failed (seq %d) -> CPU draft sampler (top_k)\n", (int) seq_id);
                     llama_sampler_free(chain);
                     chain = nullptr;
                 }

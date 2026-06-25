@@ -388,13 +388,13 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     if (grmr && params.backend_sampling) {
         LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
-
+        if (getenv("LLAMA_CPUFB")) LOG_WRN("[CPUFB:grammar] grammar present -> backend_sampling OFF -> CPU sampler chain\n");
         params.backend_sampling = false;
     }
 
     if (rbudget && params.backend_sampling) {
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
+        if (getenv("LLAMA_CPUFB")) LOG_WRN("[CPUFB:rbudget] reasoning-budget present -> backend_sampling OFF -> CPU sampler chain\n");
         params.backend_sampling = false;
     }
 

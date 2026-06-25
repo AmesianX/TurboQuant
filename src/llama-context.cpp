@@ -1219,6 +1219,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
             warned = true;
         }
+        if (getenv("LLAMA_CPUFB")) LLAMA_LOG_WARN("[CPUFB:split-tensor-guard] set_sampler refused under SPLIT_MODE_TENSOR (seq %d) -> CPU sampler (NOTE: relaxing measured ~0 gain, lm_head matmul-bound)\n", (int) seq_id);
         if (sampling.samplers.count(seq_id) > 0) {
             sched_need_reserve = true;
         }

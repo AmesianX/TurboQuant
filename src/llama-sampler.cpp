@@ -711,9 +711,11 @@ static bool llama_sampler_chain_backend_init(
         if (smpl.ptr->iface->backend_init) {
             if (!smpl.ptr->iface->backend_init(smpl.ptr, buft)) {
                 res_cur = false;
+                if (getenv("LLAMA_CPUFB")) LLAMA_LOG_WARN("[CPUFB:backend-failed] sampler '%s' backend_init returned false -> chain falls to CPU\n", llama_sampler_name(smpl.ptr));
             }
         } else {
             res_cur = false;
+            if (getenv("LLAMA_CPUFB")) LLAMA_LOG_WARN("[CPUFB:no-backend] sampler '%s' has no GPU backend_init -> chain falls to CPU\n", llama_sampler_name(smpl.ptr));
         }
 
         smpl.is_backend = res_cur;
