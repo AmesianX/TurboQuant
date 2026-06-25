@@ -66,7 +66,7 @@ SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # Anti-repetition default sampling. DSV4-Flash tends to loop/re-emit whole sections without hitting
 # EOS (verbose "탁록전쟁"-style restatement). DRY penalizes repeated token *sequences* (best for that),
 # repeat-penalty handles shorter loops. Env-overridable; a per-request body still overrides these.
-SAMPLING="${SAMPLING:---repeat-penalty 1.1 --repeat-last-n 1024 --dry-multiplier 0.8 --dry-base 1.75 --dry-allowed-length 2 --dry-penalty-last-n -1}"
+SAMPLING="${SAMPLING:---repeat-penalty 1.1 --repeat-last-n 1024 --dry-multiplier 0.8 --dry-base 1.75 --dry-allowed-length 2 --dry-penalty-last-n 32768}"
 
 COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b 512 -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --reasoning off --lock-server-params $SPEC $SAMPLING ${EXTRA_ARGS:-}"
 
