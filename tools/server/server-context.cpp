@@ -1115,9 +1115,14 @@ private:
                 if (pos_min < 0) {
                     return;
                 }
-                // respect the min spacing — skip if a recent checkpoint already covers this
+                // This fires at the TURN boundary (generation end), not mid-prefill, so checkpoint the
+                // full turn even when it grew less than checkpoint_min_step. Without this the first few
+                // small turns (< min_step tokens) never get a checkpoint, so the NEXT turn finds only the
+                // pos-0 checkpoint and re-prefills the whole prompt (no reuse until the context crosses
+                // min_step — that was the "first turns don't reuse" symptom). Skip only when the latest
+                // checkpoint already covers the current position (no new tokens since).
                 if (!s->prompt.checkpoints.empty() &&
-                    s->prompt.n_tokens() <= s->prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                    s->prompt.n_tokens() <= s->prompt.checkpoints.back().n_tokens) {
                     return;
                 }
                 create_checkpoint(*s, 0, pos_min, pos_max);
