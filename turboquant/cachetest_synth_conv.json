@@ -1,0 +1,52 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "안녕? 자기소개 한 문장."
+  },
+  {
+   "role": "assistant",
+   "content": "안녕하세요! 저는 AI 어시스턴트입니다."
+  },
+  {
+   "role": "user",
+   "content": "트랜스포머를 두 문장으로 설명해."
+  },
+  {
+   "role": "assistant",
+   "content": "트랜스포머는 어텐션 기반 신경망입니다. 병렬 처리와 장거리 의존성에 강합니다."
+  },
+  {
+   "role": "user",
+   "content": "방금 설명에서 어텐션이 뭔지 한 문장."
+  },
+  {
+   "role": "assistant",
+   "content": "어텐션은 각 위치가 다른 위치를 참조해 가중합하는 메커니즘입니다."
+  },
+  {
+   "role": "user",
+   "content": "RNN과 비교하면 장점은?"
+  },
+  {
+   "role": "assistant",
+   "content": "순차 처리가 없어 병렬화가 쉽고 장거리 의존성을 잘 잡습니다."
+  },
+  {
+   "role": "user",
+   "content": "그럼 단점은 뭐야?"
+  },
+  {
+   "role": "assistant",
+   "content": "시퀀스 길이에 제곱으로 비용이 늘어 긴 입력에 부담이 큽니다."
+  },
+  {
+   "role": "user",
+   "content": "지금까지 내용을 세 줄로 요약해."
+  },
+  {
+   "role": "assistant",
+   "content": "트랜스포머는 어텐션 기반이고, 병렬·장거리에 강하며, 긴 입력엔 비용이 큽니다."
+  }
+ ]
+}
