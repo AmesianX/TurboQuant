@@ -2787,6 +2787,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // [EP2] expert-parallel node (meta-backend set op_params[1]=1): src0 is sliced on the expert
+    // dimension so this rank holds only its LOCAL experts; the per-rank GLOBAL offset is op_params[0].
+    // (1) pre-zero dst so the remote-expert output positions this rank does NOT write are 0 for the
+    // following cross-rank AllReduce (which sums the per-rank partial MoE outputs). (2) force the mmq
+    // path -- the only one wired to read op_params[0] and remap GLOBAL ids to the LOCAL expert slice.
+    // op_params[1]==0 (default) leaves the upstream dispatch byte-identical. [ep2-dp]
+    if (dst->op_params[1] != 0) {
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        return;
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);

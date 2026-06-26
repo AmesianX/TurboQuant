@@ -178,8 +178,12 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
+        // [EP2] expert-parallel: meta-backend stores this rank's GLOBAL expert offset in op_params[0]
+        // (0 for the default non-EP path -> byte-identical). Lets the per-rank LOCAL expert slice
+        // (ne02 experts) match GLOBAL ids via ids == local_expert + offset. [ep2-dp]
+        const int expert_offset = dst->op_params[0];
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, expert_offset, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 

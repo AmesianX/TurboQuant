@@ -1275,6 +1275,25 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+        // [EP2] expert-parallel: for a mul_mat_id whose expert weight (src[0]) is split on the expert
+        // dimension (AXIS_2), stamp device j's GLOBAL expert offset into op_params[0] and mark EP in
+        // op_params[1]. The CUDA mul_mat_id then remaps GLOBAL ids -> this rank's LOCAL expert slice
+        // and pre-zeros dst; the per-token PARTIAL outputs are summed by the existing AllReduce. [ep2-dp]
+        if (tensor->op == GGML_OP_MUL_MAT_ID && tensor->src[0] != nullptr &&
+                ggml_backend_buffer_is_meta(tensor->src[0]->buffer)) {
+            const ggml_backend_meta_split_state ss0 =
+                ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+            if (ss0.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                int64_t expert_offset = 0;
+                for (size_t jj = 0; jj < j; jj++) {
+                    for (size_t s = 0; s < ss0.n_segments; s++) {
+                        expert_offset += ss0.ne[s*n_simple_bufs + jj];
+                    }
+                }
+                t_ij->op_params[0] = (int32_t) expert_offset;
+                t_ij->op_params[1] = 1;
+            }
+        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
