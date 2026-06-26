@@ -660,13 +660,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
         }
-        // [EP2] mul_mat_id with expert-dim-split weights (src0 AXIS_2 = n_expert): each rank owns
-        // WHOLE experts [r*E/2,(r+1)*E/2) and the mirrored activations are routed to local experts
-        // only (ids remapped per rank in the slice step). The per-token gate-weighted sum over the
-        // selected experts is therefore PARTIAL across ranks -> the existing AllReduce combines them
-        // into the full MoE output. Activations (src1) mirrored. [ep2-dp]
+        // [EP2] mul_mat_id with expert-dim-split weights (src0 AXIS_2 = n_expert): each rank owns WHOLE
+        // experts [r*E/2,(r+1)*E/2) and the per-rank ids remap (slice step) routes activations to the
+        // LOCAL experts only. ONE AllReduce per FFN layer, NOT three: gate/up keep their disjoint
+        // rank-local experts flowing as MIRRORED (no collective -- each rank's down consumes its OWN
+        // local experts' activations, which it has); only the DOWN projection's output is PARTIAL so a
+        // single AllReduce sums the disjoint per-rank expert outputs into the full MoE result. Marking
+        // gate/up PARTIAL too (3 AllReduces) explodes the subgraph count -> OOM/deadlock at slot-init.
+        // (The MIRRORED label on gate/up is a benign "lie": the data is only consumed by glu->down on
+        // the same rank, never by an op that assumes cross-rank identity.) [ep2-dp]
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
+            const bool is_down = tensor->src[0] != nullptr && strstr(tensor->src[0]->name, "down") != nullptr;
+            return {is_down ? (assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL)
+                            : GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
         }
         GGML_ABORT("fatal error");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
@@ -2280,6 +2286,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         backend_ctx->uid         = cgraph->uid;
         backend_ctx->n_subgraphs = n_subgraphs;
+
+        // [EP2 DIAG] count PARTIAL nodes (= cross-rank AllReduces) so we can compare the two ranks.
+        // A mismatch here is a deadlock (one rank waits on a collective the other never issues).
+        if (getenv("DSV4_EP_DBG")) {
+            int n_partial = 0;
+            for (int ii = 0; ii < cgraph->n_nodes; ii++) {
+                if (ggml_backend_meta_get_split_state(cgraph->nodes[ii], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                    n_partial++;
+                }
+            }
+            fprintf(stderr, "[EP_DBG] graph_compute: n_nodes=%d n_subgraphs=%zu n_partial=%d\n",
+                cgraph->n_nodes, (size_t) n_subgraphs, n_partial);
+            fflush(stderr);
+        }
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
             for (size_t j = 0; j < n_backends; j++) {
