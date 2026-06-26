@@ -152,7 +152,7 @@ start_local() {
     case "$ROLE" in
         MASTER)
             export GGML_TP_RANK=0
-            nohup $CGRUN build/bin/llama-server -m "$MODEL" $COMMON \
+            nohup $CGRUN ${MASTER_WRAP:-} build/bin/llama-server -m "$MODEL" $COMMON \
                 --host 0.0.0.0 --port "$PORT" --api-key "$API_KEY" > "$LOG" 2>&1 &
             disown
             echo "[MASTER] START: serving http://0.0.0.0:$PORT (api-key $API_KEY), log $LOG" ;;

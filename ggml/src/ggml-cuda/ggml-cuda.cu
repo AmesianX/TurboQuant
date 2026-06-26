@@ -2794,8 +2794,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // path -- the only one wired to read op_params[0] and remap GLOBAL ids to the LOCAL expert slice.
     // op_params[1]==0 (default) leaves the upstream dispatch byte-identical. [ep2-dp]
     if (dst->op_params[1] != 0) {
+        static const bool ep_sync = getenv("DSV4_EP_SYNC") != nullptr; // [EP DIAG] localize async OOB
         CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        if (ep_sync) { CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); } // OOB here => dst-zero memset
         ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        if (ep_sync) { CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); } // OOB here => mmq (helper or matmul)
         return;
     }
 
