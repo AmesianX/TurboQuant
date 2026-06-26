@@ -660,6 +660,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
         }
+        // [EP2] mul_mat_id with expert-dim-split weights (src0 AXIS_2 = n_expert): each rank owns
+        // WHOLE experts [r*E/2,(r+1)*E/2) and the mirrored activations are routed to local experts
+        // only (ids remapped per rank in the slice step). The per-token gate-weighted sum over the
+        // selected experts is therefore PARTIAL across ranks -> the existing AllReduce combines them
+        // into the full MoE output. Activations (src1) mirrored. [ep2-dp]
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
+        }
         GGML_ABORT("fatal error");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
     };

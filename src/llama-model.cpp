@@ -561,6 +561,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
+        // [EP2] expert-parallel (DSV4_EP): split ROUTED experts along the EXPERT dimension (axis 2 =
+        // n_expert) so each box owns WHOLE experts [0,N/2)/[N/2,N), instead of within-expert (axis 0/1)
+        // which forces an AllReduce of the full hidden state every MoE layer. Gated so the default
+        // tensor-split path stays byte-identical when DSV4_EP is unset. Foundation for the EP dispatch
+        // path (mul_mat_id local-expert compute + all-to-all combine). [tp-2node-dsv4][ep2-dp]
+        static const bool dsv4_ep = getenv("DSV4_EP") != nullptr;
+        if (dsv4_ep && tensor_name.find("_exps.weight") != std::string::npos) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
