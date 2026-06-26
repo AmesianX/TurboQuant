@@ -2631,6 +2631,21 @@ struct llama_sampler_penalties {
 
     // a frequency map to count token occurrences
     std::unordered_map<llama_token, int> token_count;
+
+    // GPU backend (TP/SPMD): apply penalties on-device as DENSE full-vocab elementwise ops.
+    // (A sparse get_rows/set_rows/fill version was ~6 t/s slower under SPLIT_MODE_TENSOR -- the
+    // scatter ops are expensive on the meta/TP backend. Dense mirrored elementwise is nearly free.)
+    //   inp_mask[t] = 1 if token t got penalized this step, else 0  (gates the repeat multiply)
+    //   inp_addb[t] = -(count*freq + present) for penalized t, else 0  (additive freq/present term)
+    struct ggml_tensor * inp_mask = nullptr; // F32 [n_vocab]
+    struct ggml_tensor * inp_addb = nullptr; // F32 [n_vocab]
+    int32_t              n_vocab  = 0;
+
+    // persistent host upload buffers (reused across tokens; only the previously-dirtied indices are
+    // re-zeroed each step instead of memset-ing the whole vocab twice -- token_count is sparse).
+    std::vector<float>       mask_buf;
+    std::vector<float>       addb_buf;
+    std::vector<llama_token> dirty; // indices written last step (to clear before the next)
 };
 
 static const char * llama_sampler_penalties_name(const struct llama_sampler * /*smpl*/) {
@@ -2729,6 +2744,103 @@ static void llama_sampler_penalties_free(struct llama_sampler * smpl) {
     delete (llama_sampler_penalties *) smpl->ctx;
 }
 
+static bool llama_sampler_penalties_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft) {
+    // gated: default keeps upstream CPU path unchanged. n_vocab is learned from data->logits in apply().
+    if (!getenv("DSV4_GPU_SAMPLER")) {
+        return false;
+    }
+    auto * sctx = (llama_sampler_penalties *) smpl->ctx;
+    // Degenerate/no-op configs -> stay on CPU (don't offload):
+    //  - penalty_repeat <= 0: the CPU path's logit/=r yields +/-inf for logit>0; the fused GPU
+    //    factor (step*(r-1/r)+1/r) can't represent that without NaN, so defer to the CPU apply. [fix #1]
+    //  - effective no-op: injecting a per-token full-vocab subgraph that reduces to identity is pure
+    //    hot-path waste; match the CPU apply's early-out. [fix #8]
+    if (sctx->penalty_repeat <= 0.0f ||
+        sctx->penalty_last_n == 0 ||
+        (sctx->penalty_repeat == 1.0f && sctx->penalty_freq == 0.0f && sctx->penalty_present == 0.0f)) {
+        return false;
+    }
+    // validate the meta/CUDA backend actually supports the ops backend_apply emits (STEP, SCALE via
+    // scale_bias, MUL, ADD on the mirrored full-vocab logits) -- like every other sampler's init. If
+    // unsupported, fall back to CPU instead of asserting at graph build. [fix #3/#5]
+    return llama_sampler_backend_support(smpl, buft);
+}
+
+static void llama_sampler_penalties_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    GGML_UNUSED(gf);
+    auto * sctx = (llama_sampler_penalties *) smpl->ctx;
+
+    const int64_t n = ggml_nelements(data->logits);
+    sctx->n_vocab = (int32_t) n;
+
+    sctx->inp_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_set_name(sctx->inp_mask, "pen_mask");
+    ggml_set_input(sctx->inp_mask);
+
+    sctx->inp_addb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_set_name(sctx->inp_addb, "pen_addb");
+    ggml_set_input(sctx->inp_addb);
+
+    const float r     = sctx->penalty_repeat;
+    const float inv_r = r != 0.0f ? 1.0f / r : 1.0f;
+
+    // repeat factor per token: logit<=0 -> *r ; logit>0 -> *(1/r).
+    // base_factor = step(-logit)*(r - 1/r) + 1/r   (logit==0 -> *r*0 == *(1/r)*0, harmless tie)
+    ggml_tensor * neg         = ggml_step(ctx, ggml_neg(ctx, data->logits));
+    ggml_tensor * base_factor = ggml_scale_bias(ctx, neg, r - inv_r, inv_r);
+
+    // gate by mask: factor = mask*(base_factor - 1) + 1  (= base_factor where penalized, else 1)
+    ggml_tensor * bf_m1  = ggml_scale_bias(ctx, base_factor, 1.0f, -1.0f);
+    ggml_tensor * factor = ggml_scale_bias(ctx, ggml_mul(ctx, sctx->inp_mask, bf_m1), 1.0f, 1.0f);
+
+    // logits = logits*factor + addb   (addb = -(count*freq + present), 0 where unpenalized)
+    data->logits = ggml_add(ctx, ggml_mul(ctx, data->logits, factor), sctx->inp_addb);
+}
+
+static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_penalties *) smpl->ctx;
+    if (sctx->n_vocab <= 0) {
+        return;
+    }
+    GGML_ASSERT(sctx->inp_mask && sctx->inp_addb);
+
+    // Persistent buffers: allocate+zero ONCE, then each step clear only last step's dirtied indices
+    // and write the (sparse) token_count entries -- avoids two full-vocab memsets per token. [fix #7]
+    // NOTE the dense [id] indexing assumes penalties precedes any vocab-shrinking op (top_k) in the
+    // backend chain, which holds for the standard chain order. [fix #2 — documented invariant]
+    if ((int32_t) sctx->mask_buf.size() != sctx->n_vocab) {
+        sctx->mask_buf.assign(sctx->n_vocab, 0.0f);
+        sctx->addb_buf.assign(sctx->n_vocab, 0.0f);
+        sctx->dirty.clear();
+    } else {
+        for (const llama_token id : sctx->dirty) {
+            sctx->mask_buf[id] = 0.0f;
+            sctx->addb_buf[id] = 0.0f;
+        }
+        sctx->dirty.clear();
+    }
+
+    for (const auto & kv : sctx->token_count) {
+        const llama_token id = kv.first;
+        if (id < 0 || id >= sctx->n_vocab) {
+            continue;
+        }
+        const int count = kv.second; // > 0, so the present term applies
+        sctx->mask_buf[id] = 1.0f;
+        sctx->addb_buf[id] = -(float(count) * sctx->penalty_freq + sctx->penalty_present);
+        sctx->dirty.push_back(id);
+    }
+
+    ggml_backend_tensor_set(sctx->inp_mask, sctx->mask_buf.data(), 0, ggml_nbytes(sctx->inp_mask));
+    ggml_backend_tensor_set(sctx->inp_addb, sctx->addb_buf.data(), 0, ggml_nbytes(sctx->inp_addb));
+}
+
 static struct llama_sampler_i llama_sampler_penalties_i = {
     /* .name              = */ llama_sampler_penalties_name,
     /* .accept            = */ llama_sampler_penalties_accept,
@@ -2736,10 +2848,10 @@ static struct llama_sampler_i llama_sampler_penalties_i = {
     /* .reset             = */ llama_sampler_penalties_reset,
     /* .clone             = */ llama_sampler_penalties_clone,
     /* .free              = */ llama_sampler_penalties_free,
-    /* .backend_init      = */ nullptr,
+    /* .backend_init      = */ llama_sampler_penalties_backend_init,
     /* .backend_accept    = */ nullptr,
-    /* .backend_apply     = */ nullptr,
-    /* .backend_set_input = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_penalties_backend_apply,
+    /* .backend_set_input = */ llama_sampler_penalties_backend_set_input,
 };
 
 struct llama_sampler * llama_sampler_init_penalties(
@@ -2870,6 +2982,17 @@ struct llama_sampler_dry {
     std::vector<int> dry_repeat_count;
     std::unordered_map<llama_token, int> dry_max_token_repeat;
     ring_buffer<llama_token> last_tokens;
+
+    // GPU backend (TP/SPMD): DRY penalties are purely additive (logit-independent), so we apply
+    // them on-device as a dense full-vocab bias vector. The expensive z-algorithm matching stays
+    // on the host in backend_set_input (overlaps the forward matmul), only the sparse penalties
+    // touch the GPU. Avoids the host full-vocab logit gather entirely.
+    struct ggml_tensor * inp_penvec = nullptr; // F32 [n_vocab]  additive penalty (<=0) per token
+    int32_t              n_vocab    = 0;
+
+    // persistent host upload buffer (reused; only last step's dirtied indices re-zeroed). [fix #7]
+    std::vector<float>       penvec_buf;
+    std::vector<llama_token> dirty;
 };
 
 // Ported from Koboldcpp, original PR: https://github.com/LostRuins/koboldcpp/pull/982 (Original author: pi6am)
@@ -2929,18 +3052,20 @@ static void llama_sampler_dry_accept(struct llama_sampler * smpl, llama_token to
 }
 
 // Ported from Koboldcpp, original PR: https://github.com/LostRuins/koboldcpp/pull/982 (Original author: pi6am)
-static void llama_sampler_dry_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
-    auto * ctx = (llama_sampler_dry *) smpl->ctx;
-
+// Steps 1-3 of DRY: run the (logit-independent) z-algorithm matching over the token history and
+// populate ctx->dry_max_token_repeat. Returns false if there is nothing to apply (early-outs).
+// Factored out of llama_sampler_dry_apply so the GPU backend can run it on the host (overlapping
+// the forward matmul) without needing the full-vocab logits.
+static bool llama_sampler_dry_compute_repeats(llama_sampler_dry * ctx) {
     if (ctx->dry_multiplier == 0.0f || ctx->dry_base < 1.0f || ctx->dry_penalty_last_n == 0) {
-        return;
+        return false;
     }
 
     int32_t effective_dry_penalty_last_n = (ctx->dry_penalty_last_n == -1) ? ctx->total_context_size : std::max(ctx->dry_penalty_last_n, 0);
     int last_n_repeat = std::min(std::min((int)ctx->last_tokens.size(), effective_dry_penalty_last_n), ctx->total_context_size);
 
     if (last_n_repeat <= ctx->dry_allowed_length) {
-        return;
+        return false;
     }
 
     ctx->dry_repeat_count.assign(last_n_repeat, 0);
@@ -3004,7 +3129,7 @@ static void llama_sampler_dry_apply(struct llama_sampler * smpl, llama_token_dat
         }
     }
     if (rep_limit < ctx->dry_allowed_length) {
-        return;
+        return false;
     }
 
     // Step 2: Iterate in reverse over the last N tokens of the context, using the "Z-algorithm" (in
@@ -3098,39 +3223,56 @@ static void llama_sampler_dry_apply(struct llama_sampler * smpl, llama_token_dat
         }
     }
 
-    // Step 4: Apply logit penalties based on the maximum repeat length for relevant tokens.
+    return true;
+}
 
-    // Prevent floating point overflow in `pow(penalty_base, exponent)` by clamping to `max_exponent`.
-    // Compute it from `penalty_base` and the approximate log of `std::numeric_limits<float>::max()`
+// max pow() exponent that won't overflow float, derived from dry_base
+static int llama_sampler_dry_max_exponent(const llama_sampler_dry * ctx) {
     const float FLOAT_MAX_LOG = 88.7228391f;
     int max_exponent = 0;
     if (ctx->dry_base > 1.000001f) {
         max_exponent = FLOAT_MAX_LOG / std::log(ctx->dry_base);
     }
+    return max_exponent;
+}
+
+// Step 4 for a single token: the additive penalty to SUBTRACT from its logit (0 if unaffected or
+// the token is a single-token sequence breaker). Logit-independent -> usable on host for the GPU path.
+static float llama_sampler_dry_token_penalty(const llama_sampler_dry * ctx, llama_token id, int max_exponent) {
+    const auto & af_kvp = ctx->dry_max_token_repeat.find(id);
+    if (af_kvp == ctx->dry_max_token_repeat.end()) {
+        return 0.0f;
+    }
+
+    // Check all sequence breakers starting with this token
+    auto range = ctx->dry_processed_breakers.equal_range(id);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second.empty()) {
+            return 0.0f; // single-token sequence breaker -> no penalty
+        }
+    }
+
+    int repeat_exp = af_kvp->second - ctx->dry_allowed_length;
+    if (max_exponent > 0 && repeat_exp > max_exponent) {
+        repeat_exp = max_exponent;
+    }
+    return ctx->dry_multiplier * std::pow(ctx->dry_base, repeat_exp);
+}
+
+static void llama_sampler_dry_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (llama_sampler_dry *) smpl->ctx;
+
+    if (!llama_sampler_dry_compute_repeats(ctx)) {
+        return;
+    }
+
+    // Step 4: Apply logit penalties based on the maximum repeat length for relevant tokens.
+    const int max_exponent = llama_sampler_dry_max_exponent(ctx);
 
     for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto& af_kvp = ctx->dry_max_token_repeat.find(cur_p->data[i].id);
-        if (af_kvp != ctx->dry_max_token_repeat.end()) {
-            // Check all sequence breakers starting with this token
-            auto range = ctx->dry_processed_breakers.equal_range(cur_p->data[i].id);
-            bool is_single_token_breaker = false;
-
-            for (auto it = range.first; it != range.second; ++it) {
-                if (it->second.empty()) {
-                    is_single_token_breaker = true;
-                    break;
-                }
-            }
-
-            // Apply penalty only if it's not a single-token sequence breaker
-            if (!is_single_token_breaker) {
-                int repeat_exp = af_kvp->second - ctx->dry_allowed_length;
-                if (max_exponent > 0 && repeat_exp > max_exponent) {
-                    repeat_exp = max_exponent;
-                }
-                float penalty = ctx->dry_multiplier * std::pow(ctx->dry_base, repeat_exp);
-                cur_p->data[i].logit -= penalty;
-            }
+        const float penalty = llama_sampler_dry_token_penalty(ctx, cur_p->data[i].id, max_exponent);
+        if (penalty != 0.0f) {
+            cur_p->data[i].logit -= penalty;
         }
     }
 
@@ -3168,6 +3310,76 @@ static void llama_sampler_dry_free(struct llama_sampler * smpl) {
     delete (llama_sampler_dry *) smpl->ctx;
 }
 
+static bool llama_sampler_dry_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft) {
+    // gated: default keeps the upstream CPU path. n_vocab is learned from data->logits in apply().
+    if (!getenv("DSV4_GPU_SAMPLER")) {
+        return false;
+    }
+    auto * sctx = (llama_sampler_dry *) smpl->ctx;
+    // no-op config (matches dry_apply's early-out) -> stay on CPU, don't inject a per-token subgraph. [fix #8]
+    if (sctx->dry_multiplier == 0.0f || sctx->dry_base < 1.0f || sctx->dry_penalty_last_n == 0) {
+        return false;
+    }
+    // validate the meta/CUDA backend supports the ADD op on the mirrored full-vocab logits. [fix #3/#5]
+    return llama_sampler_backend_support(smpl, buft);
+}
+
+static void llama_sampler_dry_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    GGML_UNUSED(gf);
+    auto * sctx = (llama_sampler_dry *) smpl->ctx;
+
+    const int64_t n = ggml_nelements(data->logits);
+    sctx->n_vocab = (int32_t) n;
+
+    // dense additive bias: logits += penvec  (penvec is logit-independent, built on host)
+    sctx->inp_penvec = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_set_name(sctx->inp_penvec, "dry_penvec");
+    ggml_set_input(sctx->inp_penvec);
+
+    data->logits = ggml_add(ctx, data->logits, sctx->inp_penvec);
+}
+
+static void llama_sampler_dry_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_dry *) smpl->ctx;
+    if (sctx->n_vocab <= 0) {
+        return;
+    }
+    GGML_ASSERT(sctx->inp_penvec != nullptr);
+
+    // Persistent buffer: zero once, then clear only last step's dirtied indices (sparse). [fix #7]
+    if ((int32_t) sctx->penvec_buf.size() != sctx->n_vocab) {
+        sctx->penvec_buf.assign(sctx->n_vocab, 0.0f);
+        sctx->dirty.clear();
+    } else {
+        for (const llama_token id : sctx->dirty) {
+            sctx->penvec_buf[id] = 0.0f;
+        }
+        sctx->dirty.clear();
+    }
+
+    // Steps 1-3 (z-algorithm matching) run here on the host -> overlaps the forward matmul.
+    if (llama_sampler_dry_compute_repeats(sctx)) {
+        const int max_exponent = llama_sampler_dry_max_exponent(sctx);
+        // Only the (sparse) tokens that end a repeat get a penalty -> iterate the map, not the vocab.
+        for (const auto & kv : sctx->dry_max_token_repeat) {
+            const llama_token id = kv.first;
+            if (id < 0 || id >= sctx->n_vocab) {
+                continue;
+            }
+            sctx->penvec_buf[id] = -llama_sampler_dry_token_penalty(sctx, id, max_exponent);
+            sctx->dirty.push_back(id);
+        }
+    }
+
+    ggml_backend_tensor_set(sctx->inp_penvec, sctx->penvec_buf.data(), 0, ggml_nbytes(sctx->inp_penvec));
+}
+
 static struct llama_sampler_i llama_sampler_dry_i = {
     /* .name              = */ llama_sampler_dry_name,
     /* .accept            = */ llama_sampler_dry_accept,
@@ -3175,10 +3387,10 @@ static struct llama_sampler_i llama_sampler_dry_i = {
     /* .reset             = */ llama_sampler_dry_reset,
     /* .clone             = */ llama_sampler_dry_clone,
     /* .free              = */ llama_sampler_dry_free,
-    /* .backend_init      = */ nullptr,
+    /* .backend_init      = */ llama_sampler_dry_backend_init,
     /* .backend_accept    = */ nullptr,
-    /* .backend_apply     = */ nullptr,
-    /* .backend_set_input = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_dry_backend_apply,
+    /* .backend_set_input = */ llama_sampler_dry_backend_set_input,
 };
 
 struct llama_sampler * llama_sampler_init_dry(const struct llama_vocab * vocab, int32_t n_ctx_train, float dry_multiplier, float dry_base, int32_t dry_allowed_length, int32_t dry_penalty_last_n, const char** seq_breakers, size_t num_breakers) {
