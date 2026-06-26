@@ -1213,7 +1213,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     // tried + MEASURED: backend sampling engages fine (with the meta-backend 0-element->MIRRORED fix), but
     // gives ~0 t/s gain -- the MTP draft is NOT sampler-bound, it's bound by its mirrored full-vocab lm_head
     // matmul. So we keep upstream PR #23287's CPU fallback as-is. (Left here so nobody re-chases this lever.)
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    // NOTE [tp-2node-dsv4]: the prior ~0-gain measurement was WITHOUT DRY/penalties. Those run on the
+    // CPU sampler and cost a measured ~1.7-3 t/s (host full-vocab gather + DRY z-algo on the hot path).
+    // Under DSV4_GPU_SAMPLER we relax the guard so the mirrored-output GPU can run the whole chain
+    // (penalties: sparse gather/scatter; DRY: dense additive bias, matching overlapped on host).
+    // Default (env unset) keeps upstream PR #23287's CPU fallback verbatim.
+    const bool gpu_sampler = getenv("DSV4_GPU_SAMPLER") != nullptr;
+    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !gpu_sampler) {
         static bool warned = false;
         if (!warned) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
@@ -2457,6 +2463,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         // some decode inputs (e.g. Hangul-decomposition prompts) and exhausted the
         // arena (ggml_new_object assert at ggml.c:1925). ~50GB GPU headroom absorbs
         // the larger sched context_buffer. [dsv4-fp4]
+        // 2026-06-26: object count is ~QUADRATIC in the ubatch (position-dependent compressor: each
+        // pos attends all priors). Measured UB=256 fits ~2M; UB=512 overflowed even 6M; UB=1024 would
+        // need ~32M arena -> OOM. So -ub > 256 is not viable via arena bumps; 256 is the practical
+        // ceiling on DSV4 (slow prefill is inherent until the compressor graph is rewritten). Kept the
+        // original 1024/token + 2M floor heuristic. [dsv4-fp4]
         return std::max<uint32_t>(2097152u, n_tokens * 1024 + 64u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());

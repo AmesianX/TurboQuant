@@ -878,7 +878,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
-            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+            // [DSV4_GPU_SAMPLER] GATED so the env-off path stays byte-identical to upstream (returns
+            // UNKNOWN). Only when the GPU sampler is active does its subgraph attach to a 0-row MTP
+            // output (e.g. mtp_result_output ne=[n_vocab,0] -> PAD) and need a defined axis; a
+            // 0-element tensor carries no data, so MIRRORED (replicated) is the safe neutral choice.
+            // Env-off keeps upstream UNKNOWN so a real 0-element view of a SPLIT tensor still asserts
+            // loudly if consumed, rather than silently picking a wrong reconciliation axis. [tp-2node-dsv4]
+            static const bool gpu_sampler = getenv("DSV4_GPU_SAMPLER") != nullptr;
+            return {gpu_sampler ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
         }
         if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
