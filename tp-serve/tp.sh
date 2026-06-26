@@ -19,14 +19,14 @@ set -euo pipefail
 
 # ---------------------------- config (edit here) ----------------------------
 REPO="$HOME/work/TurboQuant"                 # repo root (has build/bin/llama-server)
-MODEL="${MODEL:-$HOME/Models/DeepSeek-V4-Flash-GGUF/Q4mtp/DSV4-Q4-00001-of-00002.gguf}"  # env-overridable (FP4 등)
+MODEL="${MODEL:-$HOME/Models/DeepSeek-V4-Flash-GGUF/FP4/DeepSeek-V4-Flash-FP4-FP8-native-MTP.gguf}"  # FP4 (production default); env-overridable (Q4mtp 등)
 PORT=8080
 API_KEY="tbq-dsv4"                           # required because we bind 0.0.0.0
-CTX="${CTX:-0}" # 0 = full native context (1M for DSV4, KV ~9.6GB). BUT 1M reserves the full 9.6GB KV up front,
+CTX="${CTX:-524288}" # 512K (agent daily-driver). 0=full 1M (brag, slow prefill). KV~4.8GB@tbq3.
                 # starving working-memory headroom — a single ~27K prefill then crosses the watchdog and dies at
                 # progress ~0.96. For real single-prompt use, set CTX=262144 (256K → KV ~2.4GB, +7GB headroom,
                 # lets -ub go to 2048 for fast prefill). 1M is the demo/brag number, not a daily-driver value.
-UB="${UB:-256}" # prefill micro-batch. 256 = memory-safe but slow prefill (many cross-node NCCL syncs at -sm tensor).
+UB="${UB:-256}" # DSV4 ceiling: compressor builds ~O(n^2) graph objects, UB>256 OOMs the arena. Slow prefill is inherent.
                 # Bigger = faster prefill, more memory. CEILING 2048 (user: >2048 explodes memory). Raise only with
                 # freed headroom (smaller CTX). Both ranks MUST match (graph shape) — forwarded via ALLRESTART FWD.
 PARALLEL="${PARALLEL:-2}"  # server slots (--parallel). 1 = single stream. 2 = multi-slot concurrent serving
@@ -58,8 +58,12 @@ SLAVE_SSH="10.0.1.2"                         # ssh target for the slave box
 # width every round. A high p-min (e.g. 0.75) makes the draft length vary with confidence, which makes
 # the meta/CUDA graph re-capture every round (graphs reused = 0) and is a net slowdown — measured 6.5 t/s
 # at p-min 0.75 vs 10.3 t/s at p-min 0.0 on DSV4 Q4 2-box. 0.0 also matches the model's standard sampling.
-SPEC="${SPEC---spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0}"  # env-overridable: SPEC="" disables MTP
-# MTP (≤64k): SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"; set GRAPH_SLOTS=16 VERIFY_REUSE=1 for graph reuse (disabled-default)
+# MTP only. (Tried draft-mtp,ngram-cache,ngram-map-k4v cascade 2026-06-26: 2.4 t/s DISASTER on DSV4 —
+# n-gram drafts are variable-width (breaks MTP verify graph reuse -> graphs reused 5 vs 100s) AND a
+# rejected n-gram draft rolls back via CHECKPOINT (~2s, not the cheap plane rollback MTP uses, since
+# ngram isn't in need_n_rs_seq). Structural incompat with DSV4's fixed-width/graph-reuse MTP pipeline.)
+SPEC="${SPEC---spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0}"  # env-overridable: SPEC="" disables spec
+# single MTP only: SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"; GRAPH_SLOTS=16 VERIFY_REUSE=1 for graph reuse
 SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
@@ -68,7 +72,13 @@ SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
 # repeat-penalty handles shorter loops. Env-overridable; a per-request body still overrides these.
 SAMPLING="${SAMPLING:---repeat-penalty 1.1 --repeat-last-n 1024 --dry-multiplier 0.8 --dry-base 1.75 --dry-allowed-length 2 --dry-penalty-last-n 32768}"
 
-COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b 512 -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --reasoning-format deepseek --reasoning off --lock-server-params $SPEC $SAMPLING ${EXTRA_ARGS:-}"
+# Deterministic decode for reproducible A/B measurement: temp 0 = greedy (no RNG), fixed seed.
+# Both must be server-level so EVERY request is bit-identical across runs -> the only variable left
+# is what we're testing (CPU vs GPU sampler etc.). Env-overridable (TEMP=0.7 SEED=... for real serving).
+TEMP="${TEMP:-0}"
+SEED="${SEED:-42}"
+
+COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b 512 -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --chat-template-file $REPO/models/templates/deepseek-ai-DeepSeek-V4.jinja --reasoning-format deepseek --reasoning off --lock-server-params --temp $TEMP --seed $SEED $SPEC $SAMPLING ${EXTRA_ARGS:-}"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
@@ -82,7 +92,14 @@ LOG="/tmp/tp_${ROLE}.log"
 
 env_common() {
     [ -d "$HOME/nccl-align" ] && export LD_LIBRARY_PATH="$HOME/nccl-align:${LD_LIBRARY_PATH:-}"
-    export NCCL_SOCKET_IFNAME="$IFACE"
+    export NCCL_SOCKET_IFNAME="$IFACE"          # TCP bootstrap rendezvous only
+    # [RDMA] data plane over RoCE (was implicitly socket/single-rail). 4x ConnectX-7 200G rails,
+    # RoCE v2 (GID 3). This is the fix for slow prefill: AllReduce was crawling over TCP/1-NIC
+    # instead of the 800G RDMA fabric NVIDIA put on the box for exactly this 2-Spark TP. [prefill]
+    export NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1}"
+    export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
+    export NCCL_IB_DISABLE=0
+    export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-SYS}"
     export GGML_TP_NRANKS=2
     export GGML_TP_MASTER_ADDR="$MASTER_IP"
     export GGML_TP_MASTER_PORT="$MASTER_PORT"
@@ -94,6 +111,14 @@ env_common() {
     if [ "${PARALLEL:-1}" -gt 1 ]; then export DSV4_MULTISLOT=1; fi
     # O(1) batched chunk compressor (long multi-turn "괭" crash fix) is now DEFAULT-ON in the binary
     # — no env needed. Set DSV4_DISABLE_BATCHED_COMPRESSOR=1 only to force the old unrolled path for debug.
+    # [GPU offload — kill CPU fallback under -sm tensor] penalties+DRY sampling + token_embd on GPU.
+    # DSV4_GPU_SAMPLER=1 (default): sampler chain runs on the meta/CUDA backend (no CPU sampler split).
+    # NOTE: GPU vs CPU sampler is ~parity on the real config (clean temp0/seed42 A/B still TODO); set
+    # DSV4_GPU_SAMPLER=0 to revert to the upstream CPU sampler. DSV4_GPU_INPUT_EMBD=1: token_embd on GPU.
+    export DSV4_GPU_SAMPLER="${DSV4_GPU_SAMPLER:-1}"
+    export DSV4_GPU_INPUT_EMBD="${DSV4_GPU_INPUT_EMBD:-1}"
+    # CPU-fallback monitoring probe (logs [CPUFB:...] + sched split summary). Set 0 to silence.
+    export LLAMA_CPUFB="${LLAMA_CPUFB:-1}"
 }
 
 stop_local() {
