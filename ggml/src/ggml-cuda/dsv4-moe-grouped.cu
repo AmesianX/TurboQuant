@@ -1055,12 +1055,44 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
   const float * d_rw     = (const float*) rw->data;
   float       * d_out    = (float*)       dst->data;
 
+  // [FUSED-LIVE FREED-WEIGHT OOB FIX] Under DSV4_MOE_FUSED, once the FUSED path has run for
+  // this layer it FREES the grouped per-projection gate/up weights (dq_gate, dq_up) +
+  // simple SFs (dsv4_moe_grouped_free_superseded_by_fused) to reclaim ~2 GB/layer. The graph
+  // routes M >= DSV4_MOE_FUSED_MIN_M (default 256) to the fused op and M <= 16 to the HP-decode
+  // path below (which is ALREADY fused-aware: it reads the fused fc1/fc2 via the dec_*_fused
+  // kernels). But a prefill ubatch in the BAND 16 < M < 256 — e.g. the small last chunk of a
+  // long prompt when total_tokens % n_ubatch lands in (16,256) — fell through to the grouped
+  // CUTLASS PREFILL path (below), which reads the now-FREED L->dq_gate / L->dq_up (== nullptr)
+  // -> illegal memory access. This is EAGER (no graph) and DATA-DEPENDENT (the crash chunk
+  // varies with prompt length % n_ubatch -> "~5th chunk, 5k-9k run to run"). It is NOT a graph
+  // or CUTLASS-runner bug (the fused runner is compute-sanitizer-clean over 60 imbalanced
+  // M<=1024 chunks). FIX: when the FUSED weights are live for this layer, route the ENTIRE
+  // small-prefill band (M < DSV4_MOE_FUSED_MIN_M) through the fused-aware HP path below, which
+  // never touches the freed grouped gate/up. The fast grouped CUTLASS prefill path is unchanged
+  // for non-fused runs (fused_live == false) and for M >= min_m (handled by the fused op itself).
+  static const int DSV4_FUSED_MIN_M = []{
+      if (getenv("DSV4_MOE_FUSED_DECODE") != nullptr) return 1;
+      const char* e = getenv("DSV4_MOE_FUSED_MIN_M"); return e ? atoi(e) : 256;
+  }();
+  bool prefill_fused_live = false;
+  {
+      int t_E=0,t_h=0,t_i=0; const void *p0,*p1,*p2,*p3; const float *p4,*p5;
+      prefill_fused_live = dsv4_moe_fused_get_layer(il,&t_E,&t_h,&t_i,&p0,&p1,&p2,&p3,&p4,&p5);
+  }
+
   // ===== HIGH-PRECISION DECODE PATH (small M) ================================
   // For decode / MTP-verify (small batch) the NVFP4 4-bit ACTIVATION is too coarse
   // and flips borderline tokens (CJK corruption). Use FP32 activations with on-the-fly
   // dequantized NVFP4 weights. Threshold mirrors the mmvq mmid small-batch idea.
   static const int DSV4_DECODE_MAX = []{ const char*e=getenv("DSV4_MOE_DECODE_MAX"); return e?atoi(e):16; }();
-  if (M <= DSV4_DECODE_MAX && getenv("DSV4_MOE_NO_HP_DECODE")==nullptr) {
+  // HP path fires for: genuine decode/verify (M<=DSV4_DECODE_MAX), OR any small-prefill band
+  // chunk (M<DSV4_FUSED_MIN_M) on a FUSED-LIVE layer (the freed-weight OOB fix above). Both use
+  // the fused-aware kernels when prefill_fused_live, so neither reads the freed grouped gate/up.
+  // NOTE: hp_small_prefill bypasses DSV4_MOE_NO_HP_DECODE — when fused is live the grouped CUTLASS
+  // prefill path below is UNUSABLE (it reads the freed dq_gate/dq_up), so the fused-aware HP path is
+  // the ONLY correct route for M<min_m on a fused-live layer, regardless of that debug toggle.
+  const bool hp_small_prefill = prefill_fused_live && (M < DSV4_FUSED_MIN_M);
+  if (hp_small_prefill || (M <= DSV4_DECODE_MAX && getenv("DSV4_MOE_NO_HP_DECODE")==nullptr)) {
     // Persistent per-layer activation scratch.  For the REAL decode regime
     // (M small) we size to a small constant graph-capture ceiling (16*U*F) so
     // the buffer never grows mid-capture -> CUDA-graph-safe.  When the HP path
@@ -1073,6 +1105,14 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
       size_t want = (size_t)graph_ceiling * U * F;         // small graph-safe ceiling
       size_t need = (size_t)rows * F;                      // exact need for this call
       if (want < need) want = need;                        // grow to fit large (prefill) M
+      // [FUSED-LIVE band capture-safety] When this is the small-prefill band (16<M<min_m on a
+      // fused-live layer), pin the buffer to the WORST-CASE band size ((min_m-1)*U*F) ONCE so it
+      // never regrows for a different band M (a mid-capture cudaMalloc would be illegal). The band
+      // is the rare partial last chunk, so the one-time over-alloc (~min_m*U*F floats) is cheap.
+      if (hp_small_prefill) {
+          size_t band_cap = (size_t)(DSV4_FUSED_MIN_M - 1) * U * F;
+          if (want < band_cap) want = band_cap;
+      }
       if (L->d_act_decode == nullptr || L->act_decode_elems < want) {
         // CAPTURE-SAFETY (fused-prefill -> grouped-decode transition crash): under
         // DSV4_MOE_FUSED, PREFILL uses the FUSED op, so the GROUPED decode buffer
