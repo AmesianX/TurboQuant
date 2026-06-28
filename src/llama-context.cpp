@@ -13,11 +13,13 @@
 #include "llama-kv-cache.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 //
 // llama_context
@@ -1496,6 +1498,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u TOTAL compute-buffer %8.1f MiB (%.2f KiB/token)\n",
                         ubatch.n_tokens, total / (1024.0*1024.0),
                         (total / 1024.0) / (double) ubatch.n_tokens);
+                // [DSV4_PREFILL_VRAM_PROBE] Name the wall: list the largest graph nodes by bytes so
+                // the O(ub^2) driver is identified by tensor name+shape (not guessed). Pure read-only
+                // over the already-built graph; no compute effect.
+                if (gf) {
+                    const int nn = ggml_graph_n_nodes(gf);
+                    struct probe_ent { const char * name; size_t bytes; int64_t ne0, ne1, ne2, ne3; };
+                    std::vector<probe_ent> ents;
+                    ents.reserve(nn);
+                    for (int ni = 0; ni < nn; ++ni) {
+                        ggml_tensor * t = ggml_graph_node(gf, ni);
+                        if (!t) continue;
+                        ents.push_back({ t->name, ggml_nbytes(t), t->ne[0], t->ne[1], t->ne[2], t->ne[3] });
+                    }
+                    std::sort(ents.begin(), ents.end(),
+                              [](const probe_ent & a, const probe_ent & b){ return a.bytes > b.bytes; });
+                    const int topn = std::min<int>(20, (int) ents.size());
+                    for (int ti = 0; ti < topn; ++ti) {
+                        const auto & e = ents[ti];
+                        fprintf(stderr, "DSV4_PREFILL_VRAM:   top[%2d] %9.1f MiB  [%5lld,%5lld,%5lld,%5lld]  %s\n",
+                                ti, e.bytes / (1024.0*1024.0),
+                                (long long) e.ne0, (long long) e.ne1, (long long) e.ne2, (long long) e.ne3,
+                                e.name);
+                    }
+                }
                 fflush(stderr);
             }
         }

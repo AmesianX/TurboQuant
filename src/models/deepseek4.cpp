@@ -2810,8 +2810,51 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             ggml_tensor * attn_mask_cnv = (cparams.flash_attn && attn_mask->type != GGML_TYPE_F16) ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
             // DSV4 sparse-attn: when sparse_topk is set, pass it (+ raw-window row count) so the
             // flash-attn vec gather computes only the selected comp rows. Null = dense path.
-            cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, kq_scale, il,
-                                 sparse_topk, (int) sparse_n_raw);
+            //
+            // [DSV4_ATTN_QTILE] Tile the attention over the QUERY (token) dim to bound the per-ubatch
+            // compute buffer to O(qtile) instead of O(ub). The attention is per-query INDEPENDENT: each
+            // query token attends the SHARED, query-global K/V (k_all/v_all — already stored to cache
+            // above) under its OWN mask column; tokens never interact. So slicing q + the mask's query
+            // columns into tiles, running build_attn_mha per tile, and CONCATenating the per-tile output
+            // along the token dim is NUMERICALLY IDENTICAL to the whole-ub call (same per-query math).
+            //
+            // This is the NEXT O(ub^2) lever after the indexer qtile: with non-flash attention the KQ /
+            // softmax tensor is [n_kv, ub, n_head] (n_kv ~ 1.25*ub -> O(ub^2), ~1.25 GiB at ub=2048,
+            // ~5 GiB at ub=4096 PER live copy); with flash attention the FA kq_mask [n_kv, ub] and the
+            // per-query FA work scale with ub. Tiling bounds ALL of these to qtile. K/V are NOT sliced
+            // (the cache is query-global) and are reused across tiles, so the only growth is the small
+            // per-tile output that we concat. sparse_topk (DSV4_SPARSE_ATTN) is itself per-query indexed,
+            // so it is sliced the same way. Default 0 = OFF (whole-ub call, byte-identical to prior path).
+            // Same env-knob style as DSV4_INDEXER_QTILE; capture-safe (fixed node count per build given
+            // a fixed ub+qtile -> identical graph topology on both SPMD ranks).
+            static const int64_t attn_qtile = []{
+                const char * e = getenv("DSV4_ATTN_QTILE"); return e ? (int64_t) atoll(e) : 0;
+            }();
+            if (attn_qtile > 0 && attn_qtile < n_tokens && !multislot) {
+                ggml_tensor * out = nullptr;
+                for (int64_t t0 = 0; t0 < n_tokens; t0 += attn_qtile) {
+                    const int64_t tn = std::min<int64_t>(attn_qtile, n_tokens - t0);
+                    // q: [n_embd_head_k, n_head, n_tokens] -> slice the token (last) dim.
+                    ggml_tensor * q_t = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], tn,
+                            q->nb[1], q->nb[2], t0 * q->nb[2]);
+                    // mask: [n_kv, n_tokens(, 1, 1)] -> slice the query columns (dim 1).
+                    ggml_tensor * m_t = ggml_view_2d(ctx0, attn_mask_cnv, attn_mask_cnv->ne[0], tn,
+                            attn_mask_cnv->nb[1], t0 * attn_mask_cnv->nb[1]);
+                    // sparse_topk (if any) is [*, n_tokens] keyed per query -> slice its query columns.
+                    ggml_tensor * st_t = sparse_topk
+                        ? ggml_view_2d(ctx0, sparse_topk, sparse_topk->ne[0], tn,
+                                       sparse_topk->nb[1], t0 * sparse_topk->nb[1])
+                        : nullptr;
+                    ggml_tensor * cur_t = build_attn_mha(q_t, k_all, v_all, nullptr, m_t,
+                            layer.attn_sinks, nullptr, kq_scale, il, st_t, (int) sparse_n_raw);
+                    // cur_t: [n_embd_head_v*n_head, tn] -> concat along the token dim.
+                    out = out ? ggml_concat(ctx0, out, cur_t, 1) : cur_t;
+                }
+                cur = out;
+            } else {
+                cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, kq_scale, il,
+                                     sparse_topk, (int) sparse_n_raw);
+            }
             cb(cur, "kqv_out", il);
         }
         cur = ggml_reshape_3d(ctx0, cur, n_embd_head_v, n_head, n_tokens);
