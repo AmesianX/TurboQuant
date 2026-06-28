@@ -7,7 +7,36 @@ Env gate: `DSV4_SPARSE_ATTN=1`. Default (unset) = byte-identical dense path. Per
 This is the committed multi-week prefill lever (n^2 compressed-cache attention is the dominant
 growing prefill cost).
 
-## STATUS: DESIGN COMPLETE + baseline secured. Kernel NOT yet written. Default path untouched.
+## STATUS (round 2): KERNEL + WIRING IMPLEMENTED, BUILDS CLEAN (libllama.so.0.0.9708),
+## md5 SYNCED+VERIFIED on .66 AND .67 (server 13a69ff9.../lib 91e3dbaa...). NOT YET
+## numerically validated / measured (round 3). Default path (flag off) untouched.
+## Commits f35d47a3c, 48965947c on branch feat/dsv4-sparse-attn-gather.
+
+### What landed (round 2)
+- ggml: `ggml_flash_attn_ext_add_kv_idx(a, kv_idx, n_raw)` binds topk to src[6], n_raw at
+  op_params[4] (op_params[3]=FA precision — do NOT reuse). Decl in ggml.h.
+- fattn_kernel_t + all 4 kernels (vec/mma/tile/wmma) gain (kv_idx, top_k, n_raw) (mma/tile/wmma:
+  unused; default path functionally identical). launch_fattn extracts src[6], FORCES
+  parallel_blocks=1 under gather (KV split assumes contiguous rows).
+- VEC kernel gather: pos [0,n_raw)=dense raw window (identity), [n_raw,n_raw+top_k)=comp rows at abs
+  (n_raw + kv_idx[ord]); K_eff/V_eff/mask at translated abs row; OOB lanes -inf. cols_per_block
+  FORCED to 1 under gather. Added D=512 F16/F16 vec instance + dispatch (was missing).
+- fattn.cu get_best_fattn_kernel: src[6] bound -> FORCE VEC (else D=512 picks MMA, can't gather).
+- deepseek4.cpp chunk path (DSV4_SPARSE_ATTN=1, single-slot, !uniform, n_comp_view>top_k): captures
+  topk, builds ALL-ZERO comp mask (keeps K-layout mask contract; only K/V ADDRESSING differs),
+  passes topk+n_raw to build_attn_mha. Flag off = unchanged.
+
+### NEXT (round 3) — VALIDATE then MEASURE (do NOT claim results before)
+1. Bring up 2-node (binary 9708). Confirm DENSE (flag off) sane first; then DSV4_SPARSE_ATTN=1:
+   greedy temp0 same prompt sparse-vs-dense -> tokens+logits match to fp tol (softmax accumulation
+   ORDER is the only caveat). Korean + "프랑스의 수도는 파리" + coherent long answer.
+2. Prefill A/B ~13k cache_prompt=false, tok/s with vs without sparse. HONEST: 13k may be
+   break-even-to-modest (vec < dense MMA per-FLOP; big win = long ctx). Report real number anyway.
+3. Confirm graphs captured (DSV4_GRAPH_PROBE).
+- If numeric FAILS: STOP, report. Suspects: kv_idx layout (topk [top_k,n_tokens], kernel reads
+  kv_idx + ic0*top_k — verify contiguous row-major, top_k=ne[0]); all-zero mask vs slope; OOB lanes.
+- Live server pid 4165769 STILL on OLD binary (dense). Restart = the validation step; it's the
+  user's live FP4 service — confirm before restart.
 
 ## Verified integration points (line-exact, working tree of baseline 68224235f)
 - Dense call: `src/models/deepseek4.cpp:2712` `build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, …)`.
