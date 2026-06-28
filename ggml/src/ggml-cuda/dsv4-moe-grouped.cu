@@ -1067,6 +1067,18 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
   const int E = L->n_expert;
   const int F = L->n_ff_exp;
   GGML_ASSERT(D==L->n_embd);
+  // [ep2-dp] EP SAFETY: under EP this rank holds only its 128-expert SHARD, but every kernel in this
+  // GROUPED op indexes sel[row] (GLOBAL id, [0,256)) directly into the LOCAL weight arrays -> OOB /
+  // wrong-expert for remote ids. EP MUST run on the FUSED runMoe path (native global->local remap +
+  // remote-skip), routed by build_moe_ffn's EP min_m=1. If we reach the grouped op under EP it means
+  // the fused op returned false (e.g. runner threw) and fell back here -> that fallback is UNSAFE under
+  // EP, so fail loudly rather than silently corrupt. (g_ep==0 default => no change.)
+  if (g_ep) {
+    fprintf(stderr, "[dsv4-moe-grouped] FATAL: reached grouped op under EP (il=%d M=%d) -- the grouped "
+                    "path is EP-unsafe (local %d-expert shard vs GLOBAL sel). EP must run on the fused "
+                    "runMoe path; fused must not fall back to grouped under EP.\n", il, M, E);
+    return false;
+  }
   const int rows = M*U;
   const int kbD = D/SFVec, kbF = F/SFVec;
 
