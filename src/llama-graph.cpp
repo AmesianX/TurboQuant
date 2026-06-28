@@ -1642,7 +1642,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // back to grouped (returns from the op as false) until the CUTLASS runner TU
         // is built. See turboquant/DSV4_CUTLASS_FUSED_MOE_PORT.md.
         static const bool dsv4_moe_fused = getenv("DSV4_MOE_FUSED") != nullptr;
-        if (dsv4_moe_fused && arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 0 && dsv4_moe_grouped_have_layer(il)) {
+        // [DSV4_MOE_FUSED decode regression FIX] The fused CUTLASS op is prefill-tuned (workspace
+        // setup + retire-after-sync defer-free). At decode (M=1) that overhead makes decode t/s
+        // droop over a generation (climbs to ~13.8 then falls to 9-10), whereas the grouped op has
+        // a dedicated steady HP decode path (dec_gate_up_swiglu/dec_down_scatter, M<=DSV4_DECODE_MAX).
+        // So use FUSED only for PREFILL (n_tokens > 16); let DECODE (M<=16) fall through to the
+        // grouped path below, which stays flat. Env override DSV4_MOE_FUSED_DECODE forces fused at
+        // decode too (for A/B). Prefill keeps the fused 1.29x.
+        static const int  dsv4_fused_min_m = (getenv("DSV4_MOE_FUSED_DECODE") != nullptr) ? 1 : 17;
+        if (dsv4_moe_fused && n_tokens >= dsv4_fused_min_m
+                && arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 0 && dsv4_moe_grouped_have_layer(il)) {
             ggml_tensor * sel_i32 = ggml_cont(ctx0, selected_experts);
             ggml_tensor * w_2d    = ggml_cont(ctx0, ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens));
             ggml_tensor * cur_2d  = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
