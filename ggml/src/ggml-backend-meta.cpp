@@ -1095,6 +1095,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
+            case GGML_OP_DSV4_MOE_FUSED:
             case GGML_OP_DSV4_MOE_GROUPED: {
                 // [DSV4_MOE_GROUPED] The NVFP4 grouped-GEMM MoE op. Its graph inputs (hidden, sel,
                 // weights) are MIRRORED across ranks, but the per-layer expert weights were tensor-split

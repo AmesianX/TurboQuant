@@ -25,6 +25,8 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/dsv4.cuh"
 #include "ggml-cuda/dsv4-moe-grouped.cuh"
+#include "ggml-cuda/dsv4-moe-fused.cuh"
+#include "ggml-cuda/dsv4-fp8-gemm.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -2750,6 +2752,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // [DSV4_FP8_NATIVE] native sm120 FP8 tensor-core GEMM for the dense F8_E4M3_B128
+    // projections (MLA q_a/q_b/kv_latent/output_a/output_b + shared-expert FFN). Default
+    // OFF (env-gated): byte-identical to the cuBLAS dequant->F16 path. Returns false to
+    // fall through on any unsupported shape.
+    if (!split && src0->type == GGML_TYPE_F8_E4M3_B128
+        && ggml_cuda_dsv4_fp8_native_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -3263,6 +3274,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_MOE_GROUPED:
             ggml_cuda_op_dsv4_moe_grouped(ctx, dst);
             break;
+        case GGML_OP_DSV4_MOE_FUSED:
+            ggml_cuda_op_dsv4_moe_fused(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
             break;
@@ -3460,6 +3474,20 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // graphs OFF for this op so the speedup can be measured against an identical
         // binary. DSV4_MOE_PREFILL_GRAPH_OFF=1 keeps graphs off ONLY for the prefill
         // path -- a safety hatch if a CUTLASS build is found to allocate internally.)
+        // [DSV4_MOE_FUSED] CUDA-graph capture-safe (audited): the flashinfer runMoe
+        // does NO per-call cudaMalloc/free/sync/thrust in the non-LoRA, non-DeepSeek-
+        // block-scale path -- all scratch comes from the persistent workspace we
+        // pre-size (getWorkspaceSize) once to DSV4_MOE_PREFILL_MAX, the on-device sort
+        // is cub::BlockScan (no temp alloc), problem shapes are built on-device, and
+        // sync_check_cuda_error is a no-op in release/under-capture. Our op TU also
+        // grows scratch with RETIRE-after-sync (no immediate free). So allow graphs.
+        // A/B hatch: DSV4_MOE_FUSED_GRAPH_OFF=1 forces OFF for measurement.
+        if (node->op == GGML_OP_DSV4_MOE_FUSED) {
+            static const bool fused_graph_off = getenv("DSV4_MOE_FUSED_GRAPH_OFF") != nullptr;
+            if (fused_graph_off) {
+                use_cuda_graph = false;
+            }
+        }
         if (node->op == GGML_OP_DSV4_MOE_GROUPED) {
             static const int hp_max = []{ const char*e=getenv("DSV4_MOE_DECODE_MAX"); return e?atoi(e):16; }();
             static const bool graph_off = getenv("DSV4_MOE_GRAPH_OFF") != nullptr;
@@ -5799,6 +5827,8 @@ static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, co
             return ggml_cuda_op_dsv4_hc_weighted_sum_supported();
         case GGML_OP_DSV4_MOE_GROUPED:
             return ggml_cuda_op_dsv4_moe_grouped_supported();
+        case GGML_OP_DSV4_MOE_FUSED:
+            return ggml_cuda_op_dsv4_moe_fused_supported();
 
         default:
             return false;

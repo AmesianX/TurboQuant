@@ -598,6 +598,7 @@ extern "C" {
         GGML_OP_DSV4_FP8_KV_QUANTIZE,
         GGML_OP_DSV4_ROPE_TAIL,
         GGML_OP_DSV4_MOE_GROUPED,
+        GGML_OP_DSV4_MOE_FUSED,
 
         GGML_OP_UNARY,
 
@@ -2660,6 +2661,18 @@ extern "C" {
     // Expert weights are NOT ggml tensors -- they live in a per-layer device
     // registry filled by the load adapter; this op carries only the layer index.
     GGML_API struct ggml_tensor * ggml_dsv4_moe_grouped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * hidden,
+            struct ggml_tensor  * sel,
+            struct ggml_tensor  * weights,
+            int                   il,
+            float                 swiglu_limit);
+
+    // DeepSeek V4 NVFP4 (W4A4) FUSED MoE expert path (flashinfer CUTLASS
+    // CutlassMoeFCRunner: dispatch + W1 GEMM + SwiGLU + W2 GEMM in one call).
+    // Same registry-backed weights + interface as ggml_dsv4_moe_grouped; gated
+    // by DSV4_MOE_FUSED=1. Default OFF = grouped path (byte-identical).
+    GGML_API struct ggml_tensor * ggml_dsv4_moe_fused(
             struct ggml_context * ctx,
             struct ggml_tensor  * hidden,
             struct ggml_tensor  * sel,

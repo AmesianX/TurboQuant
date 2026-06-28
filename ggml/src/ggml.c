@@ -1217,6 +1217,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_FP8_KV_QUANTIZE",
     "DSV4_ROPE_TAIL",
     "DSV4_MOE_GROUPED",
+    "DSV4_MOE_FUSED",
 
     "UNARY",
 
@@ -1234,7 +1235,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1333,6 +1334,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_fp8_kv_quantize(x)",
     "dsv4_rope_tail(x)",
     "dsv4_moe_grouped(h,sel,w)",
+    "dsv4_moe_fused(h,sel,w)",
 
     "unary(x)",
 
@@ -1350,7 +1352,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6636,6 +6638,39 @@ struct ggml_tensor * ggml_dsv4_moe_grouped(
     ggml_set_op_params_f32(result, 1, swiglu_limit); // DSV4 per-layer SwiGLU clamp (0 = none)
 
     result->op     = GGML_OP_DSV4_MOE_GROUPED;
+    result->src[0] = hidden;
+    result->src[1] = sel;
+    result->src[2] = weights;
+
+    return result;
+}
+
+// ggml_dsv4_moe_fused
+//
+// Same registry-backed expert weights and external-routing interface as
+// ggml_dsv4_moe_grouped, but the CUDA backend dispatches the flashinfer CUTLASS
+// FUSED MoE runner (dispatch + W1 + SwiGLU + W2 in one launch) instead of the
+// staging-arena grouped-GEMM path. Carries the layer index + per-layer SwiGLU clamp.
+struct ggml_tensor * ggml_dsv4_moe_fused(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * sel,
+        struct ggml_tensor  * weights,
+        int                   il,
+        float                 swiglu_limit) {
+    GGML_ASSERT(hidden->type  == GGML_TYPE_F32);
+    GGML_ASSERT(sel->type     == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(sel->ne[0] == weights->ne[0]);
+    GGML_ASSERT(sel->ne[1] == weights->ne[1]);
+    GGML_ASSERT(sel->ne[1] == hidden->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden->ne[0], hidden->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, il);
+    ggml_set_op_params_f32(result, 1, swiglu_limit); // DSV4 per-layer SwiGLU clamp (0 = none)
+
+    result->op     = GGML_OP_DSV4_MOE_FUSED;
     result->src[0] = hidden;
     result->src[1] = sel;
     result->src[2] = weights;

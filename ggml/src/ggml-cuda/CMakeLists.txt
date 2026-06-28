@@ -356,6 +356,69 @@ if (CUDAToolkit_FOUND)
         message(WARNING "DSV4 flashinfer headers not found at ${DSV4_FLASHINFER_INCLUDE}; dsv4-moe-gemm.cu will fail to compile")
     endif()
 
+    # ---------------------------------------------------------------------
+    # DSV4 FUSED MoE (flashinfer CUTLASS CutlassMoeFCRunner, NVFP4 W4A4 -> bf16).
+    # The fused-MoE runner needs the full trtllm moe_gemm + SM120 TMA-WS launcher
+    # closure compiled with its own -D guards (COMPILE_BLACKWELL_SM120_..., ENABLE_FP4)
+    # and trtllm include dirs. To keep those flags/includes OUT of the rest of
+    # ggml-cuda, build the closure as a SCOPED static lib and link it in. Gated on
+    # the flashinfer source tree existing; when present, dsv4-moe-fused.cu is built
+    # with -DDSV4_MOE_FUSED_CUTLASS so it calls the real runner (else it falls back
+    # to the grouped path -- env-gated DSV4_MOE_FUSED=1, default off).
+    # ---------------------------------------------------------------------
+    set(DSV4_FI_SRC "/home/user/work/vllm-spark/flashinfer-src")
+    set(DSV4_FI_MOEGEMM "${DSV4_FI_SRC}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm")
+    set(DSV4_FI_NVINT   "${DSV4_FI_SRC}/csrc/nv_internal")
+    if (EXISTS "${DSV4_FI_SRC}/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh"
+        AND EXISTS "${DSV4_FI_NVINT}/tensorrt_llm/cutlass_instantiations/120/cutlass_kernel_file_gemm_grouped_sm120_M128_BS_group0.generated.cu")
+        add_library(dsv4-moe-fused-cutlass STATIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/dsv4-fused/our_fp4_moe_instantiation.cu
+            ${CMAKE_CURRENT_SOURCE_DIR}/dsv4-fused/dsv4-moe-fused-run.cu
+            ${DSV4_FI_MOEGEMM}/moe_gemm_kernels_fp4_fp4.cu
+            ${DSV4_FI_MOEGEMM}/moe_gemm_tma_warp_specialized_input.cu
+            ${DSV4_FI_NVINT}/tensorrt_llm/cutlass_instantiations/120/cutlass_kernel_file_gemm_grouped_sm120_M128_BS_group0.generated.cu
+            ${DSV4_FI_NVINT}/tensorrt_llm/cutlass_instantiations/120/cutlass_kernel_file_gemm_grouped_sm120_M256_BS_group0.generated.cu
+            ${DSV4_FI_NVINT}/cpp/common/envUtils.cpp
+            ${DSV4_FI_NVINT}/cpp/common/logger.cpp
+            ${DSV4_FI_NVINT}/cpp/common/stringUtils.cpp
+            ${DSV4_FI_NVINT}/cpp/common/tllmException.cpp
+            ${DSV4_FI_NVINT}/cpp/common/memoryUtils.cu
+            ${DSV4_FI_NVINT}/tensorrt_llm/kernels/preQuantScaleKernel.cu
+            ${DSV4_FI_NVINT}/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
+            ${DSV4_FI_NVINT}/tensorrt_llm/kernels/lora/lora.cpp
+            ${DSV4_FI_NVINT}/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+        )
+        set_target_properties(dsv4-moe-fused-cutlass PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+            CUDA_SEPARABLE_COMPILATION OFF)
+        target_compile_definitions(dsv4-moe-fused-cutlass PRIVATE
+            COMPILE_BLACKWELL_TMA_GEMMS
+            COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
+            ENABLE_BF16 ENABLE_FP8 ENABLE_FP4 USING_OSS_CUTLASS_MOE_GEMM)
+        target_include_directories(dsv4-moe-fused-cutlass PRIVATE
+            ${DSV4_FI_SRC}/csrc/fused_moe/cutlass_backend
+            ${DSV4_FI_NVINT}
+            ${DSV4_FI_NVINT}/include
+            ${DSV4_FI_NVINT}/tensorrt_llm/cutlass_extensions/include
+            ${DSV4_FI_NVINT}/tensorrt_llm/kernels/cutlass_kernels/include
+            ${DSV4_FI_NVINT}/tensorrt_llm/kernels/cutlass_kernels
+            ${DSV4_FI_SRC}/csrc
+            ${DSV4_FI_SRC}/include
+            ${DSV4_CUTLASS_INCLUDE}
+            ${DSV4_CUTLASS_UTIL_INCLUDE}
+            ${DSV4_FI_SRC}/3rdparty/spdlog/include
+            ${CUDAToolkit_INCLUDE_DIRS}
+            ${CUDAToolkit_INCLUDE_DIRS}/cccl
+            ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(dsv4-moe-fused-cutlass PRIVATE
+            "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda>")
+        target_link_libraries(ggml-cuda PRIVATE dsv4-moe-fused-cutlass)
+        target_compile_definitions(ggml-cuda PRIVATE DSV4_MOE_FUSED_CUTLASS)
+        message(STATUS "DSV4 fused MoE (CUTLASS NVFP4) ENABLED -> dsv4-moe-fused-cutlass")
+    else()
+        message(STATUS "DSV4 fused MoE sources not found; DSV4_MOE_FUSED falls back to grouped path")
+    endif()
+
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)

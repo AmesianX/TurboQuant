@@ -469,6 +469,12 @@ extern "C" void dsv4_moe_grouped_drain_retired(void){
   for(void* p : tmp) cudaFree(p);
 }
 
+// Public defer-free entry for the FUSED op: retire a device pointer to be freed at
+// the next backend synchronize (drained by dsv4_moe_grouped_drain_retired above),
+// so grow-reallocs in the fused op are CUDA-graph capture-safe (no immediate free
+// of a pointer a pending captured graph may still reference).
+extern "C" void dsv4_moe_grouped_retire_ptr(void* p){ dsv4_retire(p); }
+
 [[maybe_unused]] static void pack_upload_experts(const std::vector<std::vector<uint8_t>>& q_per_expert,ElementInput** dptr){
   size_t total=0; for(auto& q:q_per_expert) total+=q.size();
   std::vector<uint8_t> all(total); size_t off=0;
@@ -754,6 +760,64 @@ void dsv4_moe_grouped_set_expert_weights(int il,
 bool dsv4_moe_grouped_have_layer(int il){
   std::lock_guard<std::mutex> lk(g_reg_mu);
   return g_registry.count(il)>0;
+}
+
+// ---- accessor for the FUSED MoE op (dsv4-moe-fused.cu) -----------------------
+// The flashinfer CUTLASS fused runner consumes the SAME per-layer NVFP4 registry
+// this file owns. Rather than expose g_registry/LayerWeights (CUTLASS types) to
+// the fused TU, hand it the raw device pointers + dims it needs. The fused op is
+// responsible for any re-layout (gate||up concat into fused fc1, scale re-swizzle
+// to the fused kernel's tile-atom, global reconciliation) -- see the port doc.
+//
+// Returns false if the layer is not registered. The *_simple scale pointers are
+// the UN-SWIZZLED tight [E][n][k/16] ue4m3 (uint8) layout (built by
+// unswizzle_sfb_to_simple); they are currently populated for the HP-decode path
+// and are the right starting point for the fused kernel's own swizzler.
+extern "C" bool dsv4_moe_grouped_get_layer_nvfp4(
+        int il,
+        int* n_expert, int* n_embd, int* n_ff_exp,
+        const void** dq_gate,  const void** dq_up,  const void** dq_down,
+        const void** sf_gate_simple, const void** sf_up_simple, const void** sf_down_simple,
+        const float** global_gate, const float** global_up, const float** global_down) {
+  std::lock_guard<std::mutex> lk(g_reg_mu);
+  auto it = g_registry.find(il);
+  if (it == g_registry.end() || !it->second) return false;
+  LayerWeights* L = it->second;
+  if (n_expert) *n_expert = L->n_expert;
+  if (n_embd)   *n_embd   = L->n_embd;
+  if (n_ff_exp) *n_ff_exp = L->n_ff_exp;     // == n_ff_half (this rank's slice)
+  if (dq_gate)  *dq_gate  = (const void*)L->dq_gate;
+  if (dq_up)    *dq_up    = (const void*)L->dq_up;
+  if (dq_down)  *dq_down  = (const void*)L->dq_down;
+  if (sf_gate_simple) *sf_gate_simple = (const void*)L->dsf_gate_simple;
+  if (sf_up_simple)   *sf_up_simple   = (const void*)L->dsf_up_simple;
+  if (sf_down_simple) *sf_down_simple = (const void*)L->dsf_down_simple;
+  if (global_gate) *global_gate = L->dglobal_gate;
+  if (global_up)   *global_up   = L->dglobal_up;
+  if (global_down) *global_down = L->dglobal_down;
+  return true;
+}
+
+// Free the grouped-path buffers that the FUSED path supersedes after it has built
+// its own fused-format copies. The fused fc1 weights are a rearrangement of
+// dq_gate+dq_up (freeable); the fused fc1 SF is rebuilt from dsf_gate/up_simple
+// (freeable). The fused path ALIASES dq_down (fc2 weights) + dglobal_* + keeps
+// dsf_down_simple is also rebuilt -> freeable. Down weights MUST be kept (aliased).
+// Only valid when DSV4_MOE_FUSED commits to the fused path (no grouped fallback for
+// this layer afterward). Returns false if layer not found.
+extern "C" bool dsv4_moe_grouped_free_superseded_by_fused(int il) {
+  std::lock_guard<std::mutex> lk(g_reg_mu);
+  auto it = g_registry.find(il);
+  if (it == g_registry.end() || !it->second) return false;
+  LayerWeights* L = it->second;
+  auto F=[](void*&p){ if(p){ cudaFree(p); p=nullptr; } };
+  // gate/up packed weights (concatenated into fused fc1) -> free
+  F((void*&)L->dq_gate); F((void*&)L->dq_up);
+  // gate/up/down simple SF (re-swizzled into fused SF) -> free
+  F((void*&)L->dsf_gate_simple); F((void*&)L->dsf_up_simple); F((void*&)L->dsf_down_simple);
+  // NOTE: keep dq_down (fused fc2 aliases it), dglobal_* (fused reads them),
+  // and the grouped gg_*/swizzled dsf_* (harmless; could also free but small).
+  return true;
 }
 
 void dsv4_moe_grouped_free_all(void){

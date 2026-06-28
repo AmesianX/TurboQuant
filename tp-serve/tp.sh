@@ -122,6 +122,9 @@ env_common() {
     # NVFP4 grouped-MoE op + sidecar weights + HP-activation threshold. Both ranks (SPMD)
     # MUST run identically; forwarded to the slave via the ALLRESTART FWD line below.
     [ -n "${DSV4_MOE_GROUPED:-}" ]    && export DSV4_MOE_GROUPED
+    [ -n "${DSV4_MOE_FUSED:-}" ]      && export DSV4_MOE_FUSED
+    [ -n "${DSV4_MOE_FUSED_TACTIC:-}" ]   && export DSV4_MOE_FUSED_TACTIC
+    [ -n "${DSV4_MOE_FUSED_GRAPH_OFF:-}" ]&& export DSV4_MOE_FUSED_GRAPH_OFF
     [ -n "${DSV4_MOE_SIDECAR:-}" ]    && export DSV4_MOE_SIDECAR
     [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && export DSV4_MOE_DECODE_MAX
     # DSV4 sparse-attention (per-query top-k comp-row gather). SPMD: both ranks build the SAME graph
@@ -137,6 +140,10 @@ env_common() {
     # ggml_backend_sched_alloc_graph (split/buffer scheduling, grows with the compressed-cache view).
     [ -n "${DSV4_MTP_PROF:-}" ]       && export DSV4_MTP_PROF
     [ -n "${DSV4_PREFILL_PROF:-}" ]   && export DSV4_PREFILL_PROF
+    [ -n "${DSV4_KERNEL_PROF:-}" ]    && export DSV4_KERNEL_PROF
+    # native sm120 FP8 (F8_E4M3_B128) tensor-core GEMM for the dense MLA/shexp projections.
+    # Default OFF = byte-identical (dequant->F16 cuBLAS). SPMD: both ranks must match.
+    [ -n "${DSV4_FP8_NATIVE:-}" ]     && export DSV4_FP8_NATIVE
     return 0   # never let a skipped optional-export ([ -n "" ] -> 1) fail env_common under set -e
 }
 
@@ -231,6 +238,9 @@ case "${1:-}" in
         FWD="PARALLEL=$PARALLEL GRAPH_SLOTS=$GRAPH_SLOTS CTX=$CTX UB=$UB MODEL=$MODEL SPEC=\"$SPEC\""
         # forward NVFP4 grouped-MoE env so the slave runs the identical SPMD config
         [ -n "${DSV4_MOE_GROUPED:-}" ]    && FWD="$FWD DSV4_MOE_GROUPED=$DSV4_MOE_GROUPED"
+        [ -n "${DSV4_MOE_FUSED:-}" ]      && FWD="$FWD DSV4_MOE_FUSED=$DSV4_MOE_FUSED"
+        [ -n "${DSV4_MOE_FUSED_TACTIC:-}" ]   && FWD="$FWD DSV4_MOE_FUSED_TACTIC=$DSV4_MOE_FUSED_TACTIC"
+        [ -n "${DSV4_MOE_FUSED_GRAPH_OFF:-}" ]&& FWD="$FWD DSV4_MOE_FUSED_GRAPH_OFF=$DSV4_MOE_FUSED_GRAPH_OFF"
         [ -n "${DSV4_MOE_SIDECAR:-}" ]    && FWD="$FWD DSV4_MOE_SIDECAR=$DSV4_MOE_SIDECAR"
         [ -n "${DSV4_SPARSE_ATTN:-}" ]    && FWD="$FWD DSV4_SPARSE_ATTN=$DSV4_SPARSE_ATTN"
         [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && FWD="$FWD DSV4_MOE_DECODE_MAX=$DSV4_MOE_DECODE_MAX"
@@ -240,6 +250,8 @@ case "${1:-}" in
         [ -n "${DSV4_GRAPH_PROBE:-}" ]    && FWD="$FWD DSV4_GRAPH_PROBE=$DSV4_GRAPH_PROBE"
         [ -n "${DSV4_MTP_PROF:-}" ]       && FWD="$FWD DSV4_MTP_PROF=$DSV4_MTP_PROF"
         [ -n "${DSV4_PREFILL_PROF:-}" ]   && FWD="$FWD DSV4_PREFILL_PROF=$DSV4_PREFILL_PROF"
+        [ -n "${DSV4_KERNEL_PROF:-}" ]    && FWD="$FWD DSV4_KERNEL_PROF=$DSV4_KERNEL_PROF"
+        [ -n "${DSV4_FP8_NATIVE:-}" ]     && FWD="$FWD DSV4_FP8_NATIVE=$DSV4_FP8_NATIVE"
         [ -n "${NCCL_DEBUG:-}" ]          && FWD="$FWD NCCL_DEBUG=$NCCL_DEBUG"
         [ -n "${NCCL_IB_GID_INDEX:-}" ]   && FWD="$FWD NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX"
         # don't let a slave-side failure abort under set -e before the master is started — warn and go on

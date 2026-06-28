@@ -1636,6 +1636,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Q4_K experts that are NOT in the sidecar and NOT registered, so it falls through to the normal
     // mul_mat_id path below with its real (loaded) expert tensors. [DSV4_MOE_SIDECAR]
     {
+        // [DSV4_MOE_FUSED] flashinfer CUTLASS fused MoE (dispatch+W1+SwiGLU+W2 in one
+        // call). Takes priority over the grouped path. Same registry-backed NVFP4
+        // weights + same contiguous-routing inputs; only the device op differs. Falls
+        // back to grouped (returns from the op as false) until the CUTLASS runner TU
+        // is built. See turboquant/DSV4_CUTLASS_FUSED_MOE_PORT.md.
+        static const bool dsv4_moe_fused = getenv("DSV4_MOE_FUSED") != nullptr;
+        if (dsv4_moe_fused && arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 0 && dsv4_moe_grouped_have_layer(il)) {
+            ggml_tensor * sel_i32 = ggml_cont(ctx0, selected_experts);
+            ggml_tensor * w_2d    = ggml_cont(ctx0, ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens));
+            ggml_tensor * cur_2d  = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+            const float swiglu_limit = hparams.swiglu_clamp_exp[il];
+            ggml_tensor * moe_out = ggml_dsv4_moe_fused(ctx0, cur_2d, sel_i32, w_2d, il, swiglu_limit);
+            cb(moe_out, "ffn_moe_fused_out", il);
+            return moe_out;
+        }
         static const bool dsv4_moe_grouped = getenv("DSV4_MOE_GROUPED") != nullptr;
         if (dsv4_moe_grouped && arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 0 && dsv4_moe_grouped_have_layer(il)) {
             // selected_experts is a VIEW of ggml_argsort_top_k's full [n_expert, n_tokens]
