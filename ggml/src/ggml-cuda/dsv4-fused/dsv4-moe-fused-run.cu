@@ -202,6 +202,7 @@ struct FusedLayer {
     float    swiglu_limit_val=0.f;
     float*   swiglu_limit=nullptr;// [E]
     float*   fc2_act_global=nullptr; // [1] estimate from clamp limit (per-layer const)
+    int      tactic_idx=0;        // selected getTactics() index (for crash diagnostics)
     std::unique_ptr<tkc::CutlassMoeFCRunnerInterface> runner;
     // legacy unused (kept to avoid touching free path); transient scratch moved to g_scratch
     float*   fc1_act_global=nullptr;
@@ -339,6 +340,17 @@ static cudaError_t build_fused_layer(FusedLayer* L, int il,
     // overrides to sweep the SM120 tiles for A/B (layer-0 log prints the index->tile mapping).
     int ti = []{ const char* e=getenv("DSV4_MOE_FUSED_TACTIC"); return e?atoi(e):0; }();
     if (ti < 0 || ti >= (int)tactics.size()) ti = 0;
+    L->tactic_idx = ti;
+    // [256x128 SMEM DIAG] On layer 0, print the device smem opt-in cap so a tile whose dynamic smem
+    // exceeds it (the documented GB10 101376-byte limit -> cudaFuncSetAttribute fails) is obvious.
+    if (il == 0) {
+        int dev=0, smem_optin=0, smem_block=0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        cudaDeviceGetAttribute(&smem_block, cudaDevAttrMaxSharedMemoryPerBlock, dev);
+        fprintf(stderr,"[DSV4_MOE_FUSED] dev %d smem: MaxPerBlockOptin=%d MaxPerBlock=%d (selected tactic idx=%d sm=%d tileCfg=%d)\n",
+                dev, smem_optin, smem_block, ti, tactics[ti].sm_version, tactics[ti].getTileConfigAsInt());
+    }
     L->runner->setTactic(tactics[ti], tactics[ti]);
     CK(cudaStreamSynchronize(stream));   // ensure all repack reads of source buffers done
     // Free the grouped source weights we've folded in (dq_gate/up + simple SFs) to
@@ -496,15 +508,28 @@ extern "C" cudaError_t dsv4_moe_fused_run(
     tk::LoraParams lora{};
 
     { fprof::scope _p(stream,2);
-      L->runner->runMoe(
-        S.d_hidden_bf16, nullptr,
-        sel, weights,
-        L->fc1_w, nullptr, act,
-        L->fc2_w, nullptr, qp,
-        n_tokens, n_embd, n_ff_exp, n_expert, n_expert_used,
-        S.d_workspace, S.d_out_bf16, S.d_src2dst,
-        pc, false, false, lora,
-        false, false, mlp, false, stream); }
+      // [256x128 TACTIC CRASH DIAG] runMoe THROWS (TLLM_CHECK_WITH_INFO -> std::runtime_error) on a
+      // CUTLASS can_implement / initialize failure (e.g. a tile whose dynamic smem exceeds GB10's
+      // 101376-byte opt-in cap -> cudaFuncSetAttribute fails -> Status != kSuccess). An uncaught
+      // throw through this extern "C" = "died at warmup". Catch it, log the exact CUTLASS message +
+      // the active tactic, and return an error so the op falls back to grouped instead of crashing.
+      try {
+        L->runner->runMoe(
+          S.d_hidden_bf16, nullptr,
+          sel, weights,
+          L->fc1_w, nullptr, act,
+          L->fc2_w, nullptr, qp,
+          n_tokens, n_embd, n_ff_exp, n_expert, n_expert_used,
+          S.d_workspace, S.d_out_bf16, S.d_src2dst,
+          pc, false, false, lora,
+          false, false, mlp, false, stream);
+      } catch (const std::exception& ex) {
+        fprintf(stderr, "[DSV4_MOE_FUSED] runMoe THREW at layer %d M=%d tactic=%d: %s\n",
+                il, n_tokens, L->tactic_idx, ex.what());
+        fflush(stderr);
+        return cudaErrorLaunchFailure;
+      }
+    }
 
     { fprof::scope _p(stream,3);
       k_bf16_to_f32<<<grid_for(hreal),256,0,stream>>>(S.d_out_bf16, moe_out, hreal); }
