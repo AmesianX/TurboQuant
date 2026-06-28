@@ -230,6 +230,7 @@ struct FusedScratch {
     __nv_bfloat16* d_out_bf16=nullptr;    long out_bf16_cap=0;
     char* d_workspace=nullptr; size_t workspace_cap=0;
     int*  d_src2dst=nullptr; long src2dst_cap=0;
+    long  tok_cap_hw=0;                   // monotonic high-water token cap (multi-request graph-stable)
 };
 static FusedScratch g_scratch;
 
@@ -328,9 +329,20 @@ extern "C" cudaError_t dsv4_moe_fused_run(
     // SHARED scratch grow (ONE pool for all 58 layers). Sized to the prefill cap so it
     // never reallocs inside a captured region; grow RETIRES the old pointer (defer-free).
     // This is the lever-2 fix: per-layer workspace x58 -> single shared workspace.
-    const int pf_max = dsv4_fused_prefill_max();
-    const long tok_cap = pf_max > n_tokens ? pf_max : n_tokens;
+    //
+    // [MULTI-REQUEST CRASH FIX] tok_cap MUST be a MONOTONIC high-water mark, not per-request.
+    // When DSV4_MOE_PREFILL_MAX is unset (pf_max=0), the old `max(pf_max, n_tokens)` made the
+    // workspace size + getWorkspaceSize(tok_cap) + the captured graph shape REQUEST-SIZE-DEPENDENT.
+    // A large request-1 sized everything to its M and captured a graph; a small request-2 (M=17)
+    // recomputed a SMALLER tok_cap -> getWorkspaceSize shrank -> mismatched the already-captured
+    // workspace layout -> illegal memory access in graph evaluate/capture. Holding tok_cap at the
+    // max ever seen keeps the workspace, the getWorkspaceSize result, and the graph shape STABLE
+    // across requests of any size -> capture-safe + multi-request-safe. Grows are still retire-free.
     FusedScratch& S = g_scratch;
+    const int  pf_max = dsv4_fused_prefill_max();
+    long       tok_cap = pf_max > n_tokens ? pf_max : n_tokens;
+    if (tok_cap < S.tok_cap_hw) tok_cap = S.tok_cap_hw;   // never shrink below the high-water mark
+    S.tok_cap_hw = tok_cap;
     long hcap=(long)tok_cap*n_embd;
     if (S.hidden_bf16_cap < hcap) {
         if (S.d_hidden_bf16) dsv4_moe_grouped_retire_ptr(S.d_hidden_bf16);

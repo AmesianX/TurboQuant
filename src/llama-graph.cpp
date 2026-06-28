@@ -1646,10 +1646,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // setup + retire-after-sync defer-free). At decode (M=1) that overhead makes decode t/s
         // droop over a generation (climbs to ~13.8 then falls to 9-10), whereas the grouped op has
         // a dedicated steady HP decode path (dec_gate_up_swiglu/dec_down_scatter, M<=DSV4_DECODE_MAX).
-        // So use FUSED only for PREFILL (n_tokens > 16); let DECODE (M<=16) fall through to the
-        // grouped path below, which stays flat. Env override DSV4_MOE_FUSED_DECODE forces fused at
-        // decode too (for A/B). Prefill keeps the fused 1.29x.
-        static const int  dsv4_fused_min_m = (getenv("DSV4_MOE_FUSED_DECODE") != nullptr) ? 1 : 17;
+        //
+        // [SMALL-PREFILL CRASH FIX] Beyond decode, a SMALL second-request prefill (e.g. n_tokens=17)
+        // crashed: "illegal memory access" in graph evaluate/capture. The fused workspace was only
+        // ever exercised at large prefill (UB-sized M); a tiny M on a SECOND request (whose captured
+        // graph differs from request-1's) hit an unsafe path. The grouped op handles ALL M safely
+        // (it's the validated default), and the fused op's speed win is only on LARGE prefill tiles
+        // anyway. So engage FUSED only for genuinely large prefills (n_tokens >= DSV4_MOE_FUSED_MIN_M,
+        // default 256); everything below — decode AND small prefills — uses the grouped path. This is
+        // both the decode-steadiness fix AND the small-prefill crash safety valve. Env-tunable;
+        // DSV4_MOE_FUSED_DECODE=1 forces the old min=1 (A/B, fused at all M).
+        static const int dsv4_fused_min_m = []{
+            if (getenv("DSV4_MOE_FUSED_DECODE") != nullptr) return 1;
+            const char * e = getenv("DSV4_MOE_FUSED_MIN_M");
+            return e ? atoi(e) : 256;   // fused only for large prefill tiles; grouped handles the rest
+        }();
         if (dsv4_moe_fused && n_tokens >= dsv4_fused_min_m
                 && arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 0 && dsv4_moe_grouped_have_layer(il)) {
             ggml_tensor * sel_i32 = ggml_cont(ctx0, selected_experts);
