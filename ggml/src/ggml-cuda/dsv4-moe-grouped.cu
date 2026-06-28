@@ -453,6 +453,28 @@ struct LayerWeights {
 static std::mutex                              g_reg_mu;
 static std::unordered_map<int,LayerWeights*>   g_registry;
 
+// ---- EP (expert-parallel) config (process-global; set once at load) ---------
+// Records this rank's expert shard so the FUSED op can pass flashinfer's runMoe the
+// right MOEParallelismConfig (ep_size, ep_rank) + the GLOBAL num_experts. ep==0 =>
+// no EP (full local expert set, ep_size=1) => byte-identical to today.
+static int g_ep            = 0;
+static int g_ep_base       = 0;   // GLOBAL id of local expert 0
+static int g_ep_n_global   = 0;   // total experts across ranks (e.g. 256)
+static int g_ep_n_local    = 0;   // experts on THIS rank (e.g. 128)
+
+extern "C" void dsv4_moe_set_ep_config(int ep, int expert_base, int n_expert_global, int n_expert_local){
+    g_ep = ep; g_ep_base = expert_base; g_ep_n_global = n_expert_global; g_ep_n_local = n_expert_local;
+    fprintf(stderr,"[dsv4-moe-grouped] EP config: ep=%d expert_base=%d n_expert_global=%d n_expert_local=%d "
+                   "(ep_size=%d ep_rank=%d)\n", ep, expert_base, n_expert_global, n_expert_local,
+            (n_expert_local>0?n_expert_global/n_expert_local:1), (n_expert_local>0?expert_base/n_expert_local:0));
+}
+extern "C" int dsv4_moe_get_ep_config(int* expert_base, int* n_expert_global, int* n_expert_local){
+    if (expert_base)     *expert_base     = g_ep_base;
+    if (n_expert_global) *n_expert_global = g_ep_n_global;
+    if (n_expert_local)  *n_expert_local  = g_ep_n_local;
+    return g_ep;
+}
+
 // ---- DEFER-FREE retire list (CUDA-graph UAF guard) -------------------------
 // The prefill arena pointers live in LayerWeights (g_registry), NOT in any
 // ggml_tensor, so the CUDA-graph update check (ggml-cuda.cu, which only memcmp's

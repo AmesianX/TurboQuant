@@ -50,6 +50,12 @@ extern "C" bool dsv4_moe_grouped_free_superseded_by_fused(int il);
 // Implemented in dsv4-moe-grouped.cu; drained by dsv4_moe_grouped_drain_retired().
 extern "C" void dsv4_moe_grouped_retire_ptr(void* p);
 
+// [ep2-dp] EP (expert-parallel) config, set once at load from the EP sidecar header.
+// Returns ep flag; out-params get this rank's GLOBAL expert_base, the GLOBAL expert count,
+// and the LOCAL (registered) expert count. ep_size = global/local, ep_rank = base/local.
+// Implemented in dsv4-moe-grouped.cu. ep==0 => no parallelism (byte-identical).
+extern "C" int dsv4_moe_get_ep_config(int* expert_base, int* n_expert_global, int* n_expert_local);
+
 // Pre-size cap: the server publishes the prefill ubatch into DSV4_MOE_PREFILL_MAX
 // at startup (BEFORE any graph capture), so we allocate the per-call scratch ONCE
 // to that max and never realloc mid-capture. 0 => grow-once with retire-free.
@@ -481,8 +487,22 @@ extern "C" cudaError_t dsv4_moe_fused_run(
       k_fc1_alpha<<<grid_for(n_expert),256,0,stream>>>(L->g_common, S.fc1_act_global, S.fc1_alpha, n_expert);
       k_fc2_alpha<<<grid_for(n_expert),256,0,stream>>>(L->g_down,   L->fc2_act_global, S.fc2_alpha, n_expert); }
 
-    tkc::MOEParallelismConfig pc(1,0,1,0);
-    size_t ws = L->runner->getWorkspaceSize((int)tok_cap, n_embd, n_ff_exp, n_expert,
+    // [ep2-dp] Expert-parallel: when this rank holds an EXPERT SHARD (g_ep set at load from the EP
+    // sidecar), n_expert above is the LOCAL count (e.g. 128). flashinfer's runMoe wants the GLOBAL
+    // expert count + an MOEParallelismConfig(ep_size, ep_rank); internally it does
+    // num_experts_per_node = num_experts_global / ep_size, indexes the (local) weight arrays [0,local),
+    // and setLocalExperts() remaps the GLOBAL token_selected_experts (our sel, [0,global)) to local
+    // ids while SKIPPING remote experts (their per-token contribution = 0 on this rank). The per-rank
+    // partial MoE output is then summed by the existing GGML_OP_DSV4_MOE_FUSED -> PARTIAL AllReduce
+    // (1/layer). ep==0 (default / FF-split sidecar) => ep_size=1, GLOBAL==LOCAL => byte-identical. [ep2-dp]
+    int ep_base=0, ep_n_global=0, ep_n_local=0;
+    const int ep = dsv4_moe_get_ep_config(&ep_base, &ep_n_global, &ep_n_local);
+    const int ep_size = (ep && ep_n_local>0) ? (ep_n_global / ep_n_local) : 1;
+    const int ep_rank = (ep && ep_n_local>0) ? (ep_base    / ep_n_local) : 0;
+    const int n_expert_global = (ep && ep_n_global>0) ? ep_n_global : n_expert;
+
+    tkc::MOEParallelismConfig pc(1,0,ep_size,ep_rank);
+    size_t ws = L->runner->getWorkspaceSize((int)tok_cap, n_embd, n_ff_exp, n_expert_global,
         n_expert_used, tkc::ActivationType::Swiglu, pc, false, false, false, false);
     if (S.workspace_cap < ws) {
         if (S.d_workspace) dsv4_moe_grouped_retire_ptr(S.d_workspace);
@@ -519,7 +539,9 @@ extern "C" cudaError_t dsv4_moe_fused_run(
           sel, weights,
           L->fc1_w, nullptr, act,
           L->fc2_w, nullptr, qp,
-          n_tokens, n_embd, n_ff_exp, n_expert, n_expert_used,
+          // [ep2-dp] GLOBAL num_experts (runMoe derives per-node = global/ep_size internally); the
+          // weight/alpha/SF arrays are the LOCAL shard (L->E). pc carries ep_size/ep_rank.
+          n_tokens, n_embd, n_ff_exp, n_expert_global, n_expert_used,
           S.d_workspace, S.d_out_bf16, S.d_src2dst,
           pc, false, false, lora,
           false, false, mlp, false, stream);

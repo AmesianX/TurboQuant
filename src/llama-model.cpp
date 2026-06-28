@@ -54,11 +54,13 @@ struct dsv4_moe_grouped_blob_header {
     uint64_t blob_bytes;
 };
 #define DSV4_SIDECAR_MAGIC   0x344E5650u
-#define DSV4_SIDECAR_VERSION 1u
+#define DSV4_SIDECAR_VERSION 2u   // v2 adds the EP fields below (v1 reads as ep=0). [ep2-dp]
 struct dsv4_sidecar_file_header {
     uint32_t magic; uint32_t version; int32_t rank; int32_t n_ranks;
     int32_t n_layers; int32_t n_expert; int32_t n_embd; int32_t n_ff_half;
     uint64_t total_bytes;
+    // [ep2-dp] EP extension (must match dsv4-moe-grouped-blob.h byte-for-byte).
+    int32_t ep; int32_t expert_base; int32_t n_expert_global; int32_t _pad;
 };
 struct dsv4_sidecar_layer_entry {
     int32_t il; int32_t _pad; uint64_t offset; uint64_t size;
@@ -66,6 +68,8 @@ struct dsv4_sidecar_layer_entry {
 void dsv4_moe_grouped_set_expert_weights_blob(int il, const dsv4_moe_grouped_blob_header * hdr,
                                               const void * blob, size_t blob_size);
 bool dsv4_moe_grouped_have_layer(int il);
+// [ep2-dp] set this rank's expert shard so the FUSED op passes runMoe the right MOEParallelismConfig.
+extern "C" void dsv4_moe_set_ep_config(int ep, int expert_base, int n_expert_global, int n_expert_local);
 // rank for the per-process sidecar file (GGML_TP_RANK; 0 when not SPMD). Defined in ggml-backend-meta.cpp.
 extern "C" int ggml_backend_meta_tp_rank_public(void);
 
@@ -566,8 +570,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // which forces an AllReduce of the full hidden state every MoE layer. Gated so the default
         // tensor-split path stays byte-identical when DSV4_EP is unset. Foundation for the EP dispatch
         // path (mul_mat_id local-expert compute + all-to-all combine). [tp-2node-dsv4][ep2-dp]
-        static const bool dsv4_ep = getenv("DSV4_EP") != nullptr;
-        if (dsv4_ep && tensor_name.find("_exps.weight") != std::string::npos) {
+        //
+        // TWO EP modes, mutually exclusive:
+        //  * GENERIC EP (DSV4_EP, NO sidecar): the model's MXFP4 _exps.weight load split AXIS_2 here and
+        //    run on the generic mmq path with expert_offset. (Round 1 — slow kernel.)
+        //  * FUSED EP (DSV4_EP + DSV4_MOE_SIDECAR EP shard): the routed _exps.weight are TENSOR_SKIP'd
+        //    (never created) and the FUSED op runs the sidecar's 128-expert shard with runMoe's native
+        //    ep_size/ep_rank. The ONLY _exps.weight that still exist are the MTP/nextn draft layer's
+        //    Q4_K experts (NOT in the sidecar) -- those must NOT axis-2 split (the draft runs SOLO and
+        //    MIRRORED, off the TP critical path); they fall through to the FFN rules below. So skip the
+        //    axis-2 split entirely when a sidecar is active. [ep2-dp]
+        static const bool dsv4_ep       = getenv("DSV4_EP") != nullptr;
+        static const bool dsv4_sidecar  = getenv("DSV4_MOE_SIDECAR") != nullptr;
+        if (dsv4_ep && !dsv4_sidecar && tensor_name.find("_exps.weight") != std::string::npos) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
         }
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight)) {
@@ -1730,21 +1745,50 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] cannot open %s\n", __func__, path);
                 return false;
             }
+            // [ep2-dp] Version-tolerant header read: v2 adds 16 bytes of EP fields at the end. A v1 file
+            // (FF-split) is 16 bytes shorter -> read the v1 prefix, zero the EP tail (=> ep=0). The
+            // preconvert writes the data offset from the header size it used, so each file is internally
+            // consistent; we just parse the on-disk header by its declared version.
             dsv4_sidecar_file_header fh{};
-            if (fread(&fh, sizeof(fh), 1, f) != 1 || fh.magic != DSV4_SIDECAR_MAGIC ||
-                fh.version != DSV4_SIDECAR_VERSION) {
+            const size_t v1_bytes = offsetof(dsv4_sidecar_file_header, ep); // v1 = everything before EP
+            // peek magic+version first (read v1 prefix, then optionally the EP tail)
+            if (fread(&fh, v1_bytes, 1, f) != 1 || fh.magic != DSV4_SIDECAR_MAGIC ||
+                (fh.version != 1u && fh.version != DSV4_SIDECAR_VERSION)) {
                 LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] bad header in %s (magic=%08x ver=%u)\n",
                     __func__, path, fh.magic, fh.version);
                 fclose(f);
                 return false;
             }
-            if (fh.rank != rank || fh.n_expert != (int) hparams.n_expert || fh.n_embd != (int) hparams.n_embd) {
+            if (fh.version >= 2u) {
+                if (fread(&fh.ep, sizeof(fh) - v1_bytes, 1, f) != 1) {
+                    LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] truncated v2 EP header in %s\n", __func__, path);
+                    fclose(f);
+                    return false;
+                }
+            } else {
+                fh.ep = 0; fh.expert_base = 0; fh.n_expert_global = fh.n_expert; // v1 = FF-split
+            }
+            // [ep2-dp] Two sidecar layouts share this loader:
+            //  * FF-split (ep=0): fh.n_expert == global n_expert (all experts/rank, FF halved).
+            //  * EP (ep=1):       fh.n_expert == per-rank SHARD (n_expert/n_ranks, full FF); the GLOBAL
+            //                     count lives in fh.n_expert_global. Validate the right one per layout.
+            const int file_global = fh.ep ? fh.n_expert_global : fh.n_expert;
+            if (fh.rank != rank || file_global != (int) hparams.n_expert || fh.n_embd != (int) hparams.n_embd) {
                 LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] %s metadata mismatch "
-                    "(file rank=%d n_expert=%d n_embd=%d vs engine rank=%d n_expert=%d n_embd=%d)\n",
-                    __func__, path, fh.rank, fh.n_expert, fh.n_embd,
+                    "(file rank=%d ep=%d n_expert(blob)=%d n_expert_global=%d n_embd=%d vs engine rank=%d n_expert=%d n_embd=%d)\n",
+                    __func__, path, fh.rank, fh.ep, fh.n_expert, fh.n_expert_global, fh.n_embd,
                     rank, (int) hparams.n_expert, (int) hparams.n_embd);
                 fclose(f);
                 return false;
+            }
+            // [ep2-dp] Publish this rank's EP shard so the FUSED op (dsv4-moe-fused) hands flashinfer's
+            // runMoe the right MOEParallelismConfig(ep_size, ep_rank) + GLOBAL num_experts. ep=0 => the
+            // op runs ep_size=1 (full local expert set) -> byte-identical to today's mirrored/FF-split.
+            dsv4_moe_set_ep_config(fh.ep, fh.expert_base, file_global, fh.n_expert);
+            if (fh.ep) {
+                LLAMA_LOG_INFO("%s: [dsv4-moe-sidecar] EP shard: rank %d owns experts [%d,%d) of %d "
+                    "(full FF) -> fused runs ep_size=%d ep_rank=%d\n", __func__, rank, fh.expert_base,
+                    fh.expert_base + fh.n_expert, file_global, file_global/fh.n_expert, fh.expert_base/fh.n_expert);
             }
 
             std::vector<dsv4_sidecar_layer_entry> table(fh.n_layers);

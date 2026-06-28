@@ -57,6 +57,17 @@ void dsv4_moe_grouped_set_expert_weights(int il,
 // Whether layer il already has NVFP4 weights registered.
 bool dsv4_moe_grouped_have_layer(int il);
 
+// ---- EP (expert-parallel) config --------------------------------------------
+// Set ONCE at load (from the EP sidecar file header) so the FUSED op can hand
+// flashinfer's runMoe the right MOEParallelismConfig. When ep=0 (default / FF-split
+// sidecar) the fused op runs the full local expert set with no parallelism (ep_size=1).
+//   expert_base    : GLOBAL id of this rank's local expert 0
+//   n_expert_global: total experts across all ranks (e.g. 256)
+//   n_expert_local : experts registered on THIS rank (e.g. 128); ep_size = global/local.
+extern "C" void dsv4_moe_set_ep_config(int ep, int expert_base, int n_expert_global, int n_expert_local);
+// Read back the EP config (returns ep flag; out-params may be null). ep_size = global/local.
+extern "C" int  dsv4_moe_get_ep_config(int* expert_base, int* n_expert_global, int* n_expert_local);
+
 // Free all registered NVFP4 weights (called on model free / between runs).
 void dsv4_moe_grouped_free_all(void);
 

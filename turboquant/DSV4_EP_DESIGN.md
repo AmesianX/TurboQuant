@@ -148,12 +148,74 @@ A/B that already showed parity. The open question EP answers is "does the ~38 GB
   MASTER_WRAP.
 - tp.sh: forward `DSV4_EP` / `DSV4_EP_DBG` to the slave (SPMD parity).
 
-**REMAINING (coordinator):**
-- Deploy `DSV4_EP=1` with `DSV4_MOE_FUSED`/`SIDECAR` UNSET, `-ub 4096` (then 8192), watchdog
-  `WATCH_MIN_GB=4` ON; measure batched 13k/d8192 prefill t/s + per-node `nvidia-smi` (confirm
-  ~40 GB routed-MoE + the `-ub 4096` arena fit, no OOM-kill).
-- If the generic-path EP MoE is the bottleneck at large `-ub` (likely, per §4's "ggml kernels vs
-  ds4 fused"), the next lever is making the DSV4 FUSED custom op honor the expert shard (load only
-  128 experts/rank into the registry + reuse the down-PARTIAL AllReduce). That's a separate,
-  larger change — only pursue if the memory headroom proves EP lets big-ub run but the generic
-  kernel caps throughput.
+---
+
+## 6. ROUND 2 — EP on the FAST FUSED kernel (overhead removal)
+
+### Coordinator's measurement (confirms §4's prediction)
+Generic-path EP (`DSV4_EP=1`, no fused): **enables `-ub 2048`** (was OOM without EP → memory
+halving CONFIRMED; `-ub 4096` still OOMs, watchdog-killed at MemAvailable 2 GB → real ceiling
+`-ub 2048` on the generic path). BUT speed **~314–331 t/s = NO faster** than non-EP FUSED `-ub 1024`
+(~330), even though EP gives **96 tok/expert** (vs 24). So EP's memory win is real, the **speed is
+eaten by the generic mmq path overhead**: EP forces `ggml_cuda_mul_mat_q` (MXFP4 W4A16 mmq) +
+`mm_ids_helper` remap instead of the fast fused NVFP4 W4A4 CUTLASS kernel the non-EP path uses.
+
+### The fix: EP + FUSED coexist (remove the generic-mmq overhead)
+flashinfer's `CutlassMoeFCRunner::runMoe` **natively supports Expert-Parallel** via
+`MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank)`. Verified in source:
+- Binding passes `num_experts_total = num_experts_on_rank * ep_size` to runMoe
+  (`flashinfer_cutlass_fused_moe_sm100_binding.cu:320,472`).
+- Inside: `num_experts_per_node = full_num_experts / parallelism_config.ep_size`
+  (`cutlass_fused_moe_kernels.cuh:3726`) → the weight arrays are indexed LOCALLY [0,128).
+- `setLocalExperts` (`cutlass_fused_moe_kernels.cuh:92-105`): given `start_expert = ep_rank *
+  num_experts_per_node` and `end_expert`, it takes the GLOBAL `token_selected_experts` (our `sel`,
+  range [0,256)), keeps `expert ∈ [start,end)`, remaps to `local = expert - start`, and **naturally
+  skips remote experts** (their contribution = 0 on this rank). Exactly EP semantics, done by the
+  fast kernel internally — no `mm_ids_helper`, no generic mmq.
+
+So EP+fused = **register only this rank's 128-expert shard** + tell the fused runner `ep_size=2,
+ep_rank=rank, global num_experts=256`. The fused op output is the per-rank partial; the existing
+`GGML_OP_DSV4_MOE_FUSED → PARTIAL` (meta-backend `:1112-1125`) already inserts exactly ONE
+sum-AllReduce/layer to combine (down-only is moot — the whole fused op is one PARTIAL node). No new
+collective, no meta-backend change.
+
+### Implementation (this round)
+1. **Sidecar shard (memory halving):** preconvert `--ep` writes `sidecar_rank{r}.bin` holding only
+   experts `[r*128,(r+1)*128)` with FULL FF (2048). The blob/registry already accept arbitrary
+   `n_expert` → `n_expert=128` flows through `build_fused_layer` (sizes fc1/fc2/SF/alphas to 128,
+   halving the fused weight footprint). New header fields `ep`, `expert_base`, `n_expert_global`.
+   (`dsv4-moe-grouped-blob.h`, `tools/dsv4-nvfp4-preconvert`, sidecar load `llama-model.cpp`.)
+2. **Fused runner EP config:** `dsv4-moe-fused.cu` reads the per-rank `ep_size`/`ep_rank` from the
+   registry (`expert_base`/`n_expert_global`) and passes `MOEParallelismConfig(1,0,ep_size,ep_rank)`
+   + `num_experts = n_expert_global (256)` to `runMoe`, while `build_fused_layer` uses `E=128` local.
+   (`dsv4-moe-fused-run.cu`.)
+3. **Routing:** `sel` stays GLOBAL [0,256) (router unchanged); the runner's `setLocalExperts` does
+   the global→local remap + remote-skip. No change to `build_moe_ffn`.
+4. **Gate:** all of this only when `DSV4_EP=1` AND `DSV4_MOE_FUSED=1` AND sidecar is the EP shard.
+   The generic-path EP (Round 1) stays for the no-fused A/B. Default (no DSV4_EP) byte-identical.
+5. **NOT** apply the generic axis-2 `_exps.weight` split (llama-model.cpp:570) under EP+fused — the
+   experts come from the sharded sidecar, and `_exps.weight` are TENSOR_SKIP'd anyway.
+
+### Expected
+EP+fused `-ub 2048` runs the FAST NVFP4 CUTLASS kernel at 96 tok/expert on a 128-expert shard
+(half the fused weight/node, same memory headroom that unblocked `-ub 2048`). Should beat the
+~314 generic-EP and the ~330 non-EP-fused-`-ub 1024`, because it has BOTH the fast kernel AND 4×
+the tokens/expert (96 vs 24) → far better tile fill (the §A.1 starvation lever from AIDEN_1600).
+
+### Profile capture for the coordinator (run on the 314 baseline to confirm the split)
+On the EP `-ub 2048` generic run (2-node, graphs already off for fused but EP is generic):
+```
+# Per-op-class GPU time (2-node-safe, deferred — attributes mmq-MoE vs mm_ids_helper vs the rest):
+DSV4_OPPROF=1 DSV4_OPPROF_DUMP_AFTER=8000 DSV4_OPPROF_TOP=50
+# AllReduce count per layer (both ranks must match; ~58 = 1/layer):
+DSV4_EP_DBG=1
+```
+Look for: `MUL_MAT_ID(...mxfp4...)` total ms vs `mm_ids_helper`/glue vs `FLASH_ATTN_EXT`; and the
+`[EP_DBG] n_partial` count. Expectation from §4: the generic mmq MoE GEMM dominates (the slow
+W4A16 path), AllReduce is ~1/layer and small — i.e. the overhead is the KERNEL, which EP+fused
+removes.
+
+### Status this round
+- DONE (built .66): see commit list below.
+- REMAINING (coordinator): generate the EP sidecar shard (`--ep --n-ranks 2`), deploy
+  `DSV4_EP=1 DSV4_MOE_FUSED=1 DSV4_MOE_SIDECAR=<ep_dir>` `-ub 2048` (watchdog ON), measure vs 314.

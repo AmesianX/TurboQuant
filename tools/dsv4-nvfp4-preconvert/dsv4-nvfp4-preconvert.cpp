@@ -97,6 +97,7 @@ int main(int argc, char ** argv) {
     std::string model, outdir;
     int n_ranks = 2;
     int max_layers = -1; // debug: process only the first N MoE layers (-1 = all)
+    int ep = 0;          // [ep2-dp] --ep: shard whole EXPERTS across ranks (full FF) instead of FF halves
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string(); };
@@ -104,6 +105,7 @@ int main(int argc, char ** argv) {
         else if (a == "--out" || a == "-o") outdir = next();
         else if (a == "--n-ranks") n_ranks = atoi(next().c_str());
         else if (a == "--max-layers") max_layers = atoi(next().c_str());
+        else if (a == "--ep") ep = 1;
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
     if (model.empty() || outdir.empty()) {
@@ -169,8 +171,15 @@ int main(int argc, char ** argv) {
             (long long) d0.ne0, (long long) d0.ne1, (long long) d0.ne2, n_ff_exp, n_embd, n_expert);
         return 1;
     }
-    if (n_ff_exp % n_ranks != 0) { fprintf(stderr, "ERROR: n_ff_exp %d not divisible by n_ranks %d\n", n_ff_exp, n_ranks); return 1; }
-    const int n_ff_half = n_ff_exp / n_ranks;
+    // FF-split layout: each rank gets ALL experts, FF rows [r*n_ff_half,(r+1)*n_ff_half).
+    // EP layout (--ep): each rank gets WHOLE experts [r*n_expert_local,...), FULL FF (n_ff_exp).
+    if (!ep) {
+        if (n_ff_exp % n_ranks != 0) { fprintf(stderr, "ERROR: n_ff_exp %d not divisible by n_ranks %d\n", n_ff_exp, n_ranks); return 1; }
+    } else {
+        if (n_expert % n_ranks != 0) { fprintf(stderr, "ERROR: --ep needs n_expert %d divisible by n_ranks %d\n", n_expert, n_ranks); return 1; }
+    }
+    const int n_ff_half      = ep ? n_ff_exp        : n_ff_exp / n_ranks;  // per-blob FF rows/expert
+    const int n_expert_local = ep ? n_expert/n_ranks : n_expert;           // per-blob experts
     if ((n_ff_half * n_embd) % MX_QK != 0) { fprintf(stderr, "ERROR: rank slice not 32-aligned\n"); return 1; }
 
     if (max_layers >= 0 && max_layers < (int) moe_layers.size()) {
@@ -179,9 +188,10 @@ int main(int argc, char ** argv) {
     const int n_layers = (int) moe_layers.size();
 
     fprintf(stderr, "[preconvert] model=%s  MXFP4 MoE layers=%d%s  (skipped %d non-MXFP4, e.g. MTP/nextn)  "
-        "n_expert=%d n_embd=%d n_ff_exp=%d -> n_ff_half=%d  n_ranks=%d\n",
+        "n_expert=%d n_embd=%d n_ff_exp=%d  n_ranks=%d  layout=%s -> per-rank n_expert=%d n_ff/expert=%d\n",
         model.c_str(), n_layers, (max_layers >= 0 ? " (capped by --max-layers)" : ""),
-        n_skipped_non_mxfp4, n_expert, n_embd, n_ff_exp, n_ff_half, n_ranks);
+        n_skipped_non_mxfp4, n_expert, n_embd, n_ff_exp, n_ranks,
+        ep ? "EP(expert-shard,full-FF)" : "FF-split(mirrored-experts)", n_expert_local, n_ff_half);
 
     // ---- per-rank slicing helpers (must match ggml-backend-meta set_tensor exactly) ----
     // gate/up (AXIS_1, [n_embd, n_ff_exp, n_expert]): per expert, rank r owns the contiguous
@@ -220,6 +230,18 @@ int main(int argc, char ** argv) {
         }
     };
 
+    // [ep2-dp] EP slices: rank r owns WHOLE experts [r*n_expert_local, (r+1)*n_expert_local) with the
+    // FULL FF (n_ff_exp). Experts are the OUTERMOST dim (ne2) for all three tensors, so a rank's shard
+    // is a single contiguous run of n_expert_local whole experts -> one memcpy. The per-expert layout
+    // (gate/up [n_embd,n_ff_exp]; down [n_ff_exp,n_embd]) is the SAME as a single-GPU expert, so the
+    // existing convert_layer(n_expert=local, n_ff_half=n_ff_exp) produces the exact registry blob.
+    auto slice_ep_whole = [&](const ExpertTensor & T, int r, int per_expert_elems, std::vector<uint8_t> & out) {
+        const size_t expert_bytes = mx_bytes_for((int64_t) per_expert_elems);
+        const size_t off          = (size_t) r * n_expert_local * expert_bytes;
+        out.resize((size_t) n_expert_local * expert_bytes);
+        memcpy(out.data(), T.data.data() + off, out.size());
+    };
+
     // Open ALL rank sidecars at once and write them in a SINGLE pass over the layers, so each
     // 160GB-model expert tensor is streamed from disk exactly ONCE (not once per rank).
     int rc = 0;
@@ -235,7 +257,11 @@ int main(int argc, char ** argv) {
         fh[r] = dsv4_sidecar_file_header{};
         fh[r].magic = DSV4_SIDECAR_MAGIC; fh[r].version = DSV4_SIDECAR_VERSION;
         fh[r].rank = r; fh[r].n_ranks = n_ranks; fh[r].n_layers = n_layers;
-        fh[r].n_expert = n_expert; fh[r].n_embd = n_embd; fh[r].n_ff_half = n_ff_half;
+        fh[r].n_expert = n_expert_local; fh[r].n_embd = n_embd; fh[r].n_ff_half = n_ff_half;
+        // [ep2-dp] EP fields (ep=0 => legacy FF-split; loader treats v1 files as ep=0).
+        fh[r].ep = ep;
+        fh[r].expert_base     = ep ? r * n_expert_local : 0;
+        fh[r].n_expert_global = n_expert;
         table[r].assign(n_layers, dsv4_sidecar_layer_entry{});
         if (fout[r]) fseek(fout[r], data_off, SEEK_SET); // reserve header + table; backfilled at end
     }
@@ -250,14 +276,21 @@ int main(int argc, char ** argv) {
         snprintf(nb, sizeof(nb), "blk.%d.ffn_down_exps.weight", il); if (!stream_tensor(fd, gc, mc, base_off, nb, D)) { rc = 1; break; }
 
         for (int r = 0; r < n_ranks; r++) {
-            slice_gu(G, r, sg);
-            slice_gu(U, r, su);
-            slice_down(D, r, sd);
+            if (ep) {
+                slice_ep_whole(G, r, n_embd * n_ff_exp, sg);  // gate: [n_embd,n_ff_exp] per expert
+                slice_ep_whole(U, r, n_embd * n_ff_exp, su);  // up:   [n_embd,n_ff_exp] per expert
+                slice_ep_whole(D, r, n_ff_exp * n_embd, sd);  // down: [n_ff_exp,n_embd] per expert
+            } else {
+                slice_gu(G, r, sg);
+                slice_gu(U, r, su);
+                slice_down(D, r, sd);
+            }
 
             dsv4_moe_grouped_blob_header bh{};
             std::vector<uint8_t> blob;
+            // convert_layer's n_expert = per-blob experts (n_expert_local), n_ff_half = per-blob FF rows.
             dsv4_moe_grouped_convert_layer(sg.data(), su.data(), sd.data(),
-                                           n_expert, n_embd, n_ff_half, &bh, blob);
+                                           n_expert_local, n_embd, n_ff_half, &bh, blob);
 
             long rec_off = ftell(fout[r]);
             fwrite(&bh, sizeof(bh), 1, fout[r]);

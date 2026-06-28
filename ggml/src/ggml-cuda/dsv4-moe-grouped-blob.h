@@ -43,7 +43,10 @@ struct dsv4_moe_grouped_blob_header {
 // The rank-local AXIS_1(gate/up)/AXIS_0(down) n_ff split is BAKED into each blob offline, so the
 // engine never re-splits: it just memcpy-uploads blob[il] to the registry for layer il.
 #define DSV4_SIDECAR_MAGIC   0x344E5650u  /* "PVN4" little-endian-ish tag */
-#define DSV4_SIDECAR_VERSION 1u
+// VERSION 1 = FF-split (mirrored experts, n_ff_half = n_ff/n_ranks; ep=0).
+// VERSION 2 = adds the EP fields below (ep/expert_base/n_expert_global). A v1 file reads as
+//             ep=0 (FF-split) since the struct is fixed-size and the EP fields are appended.
+#define DSV4_SIDECAR_VERSION 2u
 
 struct dsv4_sidecar_file_header {
     uint32_t magic;          // DSV4_SIDECAR_MAGIC
@@ -51,10 +54,15 @@ struct dsv4_sidecar_file_header {
     int32_t  rank;           // which rank this sidecar is for (0 or 1)
     int32_t  n_ranks;        // total ranks the split was computed for (TP world size)
     int32_t  n_layers;       // number of MoE layer records that follow
-    int32_t  n_expert;
+    int32_t  n_expert;       // experts per RECORD/blob (= n_expert_global for FF-split; = shard for EP)
     int32_t  n_embd;
-    int32_t  n_ff_half;      // rank-local n_ff half (== n_ff_exp / n_ranks)
+    int32_t  n_ff_half;      // FF rows per expert in each blob (n_ff/n_ranks FF-split; full n_ff EP)
     uint64_t total_bytes;    // total file size for a sanity check
+    // ---- EP (expert-parallel) extension. v1 files lack these; the loader zero-inits => ep=0 ----
+    int32_t  ep;             // 1 = EXPERT-shard layout (rank owns whole experts [base,base+n_expert))
+    int32_t  expert_base;    // GLOBAL id of this rank's local expert 0 (= rank*n_expert for EP)
+    int32_t  n_expert_global;// total experts across all ranks (256); for EP combine / runMoe num_experts
+    int32_t  _pad;
 };
 
 struct dsv4_sidecar_layer_entry {
