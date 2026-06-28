@@ -1315,14 +1315,32 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
             // partials above a size floor (small reduces are latency-bound, compression is a loss).
             static const bool tp_reduce_bf16 = getenv("DSV4_TP_REDUCE_BF16") != nullptr;
             if (tp_reduce_bf16 && tensors[0]->type == GGML_TYPE_F32 && ne >= 32768) {
-                to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
-                to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-                ggml_cuda_pool_alloc<nv_bfloat16> tmp(cuda_ctx->pool(), ne);
-                to_bf16(tensors[0]->data, tmp.get(), ne, cuda_ctx->stream());
-                NCCL_CHECK(ncclAllReduce(tmp.get(), tmp.get(), ne, ncclBfloat16, ncclSum,
-                                         comm_ctx->comms[0], cuda_ctx->stream()));
-                to_fp32(tmp.get(), (float *) tensors[0]->data, ne, cuda_ctx->stream());
-                return true;
+                // [CAPTURE-SAFE] The SPMD reduce runs on the stream that the meta-backend may be
+                // CAPTURING into a CUDA graph. A pool/cudaMalloc mid-capture = crash at warmup (the
+                // earlier "died at warmup"). Use a PERSISTENT static bf16 scratch grown ONLY when the
+                // stream is NOT capturing; if capturing and the scratch is too small, fall through to
+                // the native F32 reduce (correct, just uncompressed for that one capture).
+                static nv_bfloat16* s_bf16 = nullptr;
+                static int64_t      s_cap  = 0;
+                cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+                cudaStreamIsCapturing(cuda_ctx->stream(), &cap);
+                const bool capturing = (cap == cudaStreamCaptureStatusActive);
+                if (s_cap < ne && !capturing) {
+                    if (s_bf16) cudaFree(s_bf16);
+                    if (cudaMalloc(&s_bf16, (size_t) ne * sizeof(nv_bfloat16)) == cudaSuccess) {
+                        s_cap = ne;
+                    } else { s_bf16 = nullptr; s_cap = 0; }
+                }
+                if (s_bf16 && s_cap >= ne) {
+                    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+                    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+                    to_bf16(tensors[0]->data, s_bf16, ne, cuda_ctx->stream());
+                    NCCL_CHECK(ncclAllReduce(s_bf16, s_bf16, ne, ncclBfloat16, ncclSum,
+                                             comm_ctx->comms[0], cuda_ctx->stream()));
+                    to_fp32(s_bf16, (float *) tensors[0]->data, ne, cuda_ctx->stream());
+                    return true;
+                }
+                // else: scratch not ready under capture -> fall through to native F32 reduce.
             }
 
             const ncclDataType_t dt = tensors[0]->type == GGML_TYPE_F16  ? ncclHalf
