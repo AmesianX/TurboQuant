@@ -8,6 +8,7 @@ extern void ggml_cuda_flash_attn_ext_mma_f16_tbq(ggml_backend_cuda_context & ctx
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
+#include "fattn-sparse-mla.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -798,11 +799,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE     =   0,
-    BEST_FATTN_KERNEL_TILE     = 200,
-    BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_NONE       =   0,
+    BEST_FATTN_KERNEL_TILE       = 200,
+    BEST_FATTN_KERNEL_VEC        = 100,
+    BEST_FATTN_KERNEL_WMMA_F16   = 300,
+    BEST_FATTN_KERNEL_MMA_F16    = 400,
+    BEST_FATTN_KERNEL_SPARSE_MLA = 500,  // DSV4 k4 tensor-core sparse gather (DSV4_SPARSE_ATTN)
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -818,9 +820,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * mask  = dst->src[3];
 
     // DSV4 sparse-gather: when the per-query comp-row index tensor is bound (src[6]), the gather is
-    // implemented ONLY in the vec kernel (one query column per block). Force the VEC path regardless
-    // of the usual D/batch heuristics, which would otherwise pick MMA for D=512/n_tokens=512.
+    // implemented in the vec kernel (one query column per block). DSV4_SPARSE_ATTN=1 OVERRIDES that
+    // with the k4 tensor-core sparse-MLA kernel (1 CTA/query, all 64 heads share the gathered keys,
+    // bf16 WMMA QK^T/PV) — 3.6-13x faster than dense + flat with context. Falls back to VEC if the
+    // shape isn't supported (e.g. non-D512 or unaligned top_k).
     if (dst->src[6] != nullptr) {
+        static const bool sparse_mla = getenv("DSV4_SPARSE_ATTN") != nullptr;
+        if (sparse_mla && ggml_cuda_fattn_sparse_mla_supported(dst)) {
+            return BEST_FATTN_KERNEL_SPARSE_MLA;
+        }
         return BEST_FATTN_KERNEL_VEC;
     }
 
@@ -1138,6 +1146,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_SPARSE_MLA:
+            ggml_cuda_flash_attn_ext_sparse_mla(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_WMMA_F16:
             ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
