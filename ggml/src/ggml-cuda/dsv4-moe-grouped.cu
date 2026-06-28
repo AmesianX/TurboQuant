@@ -558,7 +558,8 @@ __global__ void dec_gate_up_swiglu(
     const uint8_t* __restrict__ Wg, const uint8_t* __restrict__ Wu,
     const uint8_t* __restrict__ SFg, const uint8_t* __restrict__ SFu,
     const float* __restrict__ glg, const float* __restrict__ glu,
-    float* __restrict__ act, int M, int U, int D, int F, float limit){
+    float* __restrict__ act, int M, int U, int D, int F, float limit,
+    int expert_base, int E_local){
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int warps_per_block = blockDim.x >> 5;
@@ -566,7 +567,11 @@ __global__ void dec_gate_up_swiglu(
   const int row = blockIdx.y;                          // token*U + slot
   if(j >= F || row >= M*U) return;
   const int token = row / U;
-  const int e = sel[row];
+  // [ep2-dp] sel[] = GLOBAL ids; this rank owns local experts [expert_base, expert_base+E_local).
+  // Remap to local + SKIP remote (other rank covers them; the PARTIAL AllReduce sums both partials).
+  // Non-EP: expert_base=0, E_local=E => range check always passes (byte-identical).
+  const int e = sel[row] - expert_base;
+  if(e < 0 || e >= E_local){ act[(int64_t)row * F + j] = 0.f; return; }
   const float* __restrict__ x = hidden + (int64_t)token * D;
   const int kb = D / SFVec;
   const int nbytes = D >> 1;                            // packed bytes per weight row
@@ -607,7 +612,8 @@ __global__ void dec_down_scatter(
     const float* __restrict__ act, const int* __restrict__ sel,
     const float* __restrict__ rw, const uint8_t* __restrict__ Wd,
     const uint8_t* __restrict__ SFd, const float* __restrict__ gld,
-    float* __restrict__ out, int M, int U, int D, int F){
+    float* __restrict__ out, int M, int U, int D, int F,
+    int expert_base, int E_local){
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int warps_per_block = blockDim.x >> 5;
@@ -615,7 +621,10 @@ __global__ void dec_down_scatter(
   const int row = blockIdx.y;                          // token*U + slot
   if(i >= D || row >= M*U) return;
   const int token = row / U;
-  const int e = sel[row];
+  // [ep2-dp] GLOBAL->LOCAL remap + skip remote experts (act[] was zeroed for them; don't index local
+  // weights OOB). Non-EP: expert_base=0, E_local=E => no-op.
+  const int e = sel[row] - expert_base;
+  if(e < 0 || e >= E_local) return;
   const float w = rw[row];
   const float* __restrict__ a = act + (int64_t)row * F;
   const int kb = F / SFVec;
@@ -680,7 +689,7 @@ __global__ void dec_gate_up_swiglu_fused(
     const uint8_t* __restrict__ fc1_w, const uint8_t* __restrict__ fc1_sf,
     const float* __restrict__ g_common,
     float* __restrict__ act, int M, int U, int D, int F, int inter,
-    int sf1_stride, int sf1_cols, float limit){
+    int sf1_stride, int sf1_cols, float limit, int expert_base, int E_local){
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int warps_per_block = blockDim.x >> 5;
@@ -688,7 +697,9 @@ __global__ void dec_gate_up_swiglu_fused(
   const int row = blockIdx.y;                          // token*U + slot
   if(j >= F || row >= M*U) return;
   const int token = row / U;
-  const int e = sel[row];
+  // [ep2-dp] GLOBAL->LOCAL remap + skip remote experts (zero their act; other rank covers them).
+  const int e = sel[row] - expert_base;
+  if(e < 0 || e >= E_local){ act[(int64_t)row * F + j] = 0.f; return; }
   const float* __restrict__ x = hidden + (int64_t)token * D;
   const int nbytes = D >> 1;                            // packed bytes per weight row
   const int rows_fused = 2 * inter;
@@ -730,7 +741,7 @@ __global__ void dec_down_scatter_fused(
     const float* __restrict__ rw, const uint8_t* __restrict__ fc2_w,
     const uint8_t* __restrict__ fc2_sf, const float* __restrict__ g_down,
     float* __restrict__ out, int M, int U, int D, int F,
-    int sf2_stride, int sf2_cols){
+    int sf2_stride, int sf2_cols, int expert_base, int E_local){
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int warps_per_block = blockDim.x >> 5;
@@ -738,7 +749,9 @@ __global__ void dec_down_scatter_fused(
   const int row = blockIdx.y;
   if(i >= D || row >= M*U) return;
   const int token = row / U;
-  const int e = sel[row];
+  // [ep2-dp] GLOBAL->LOCAL remap + skip remote experts (other rank scatters them; AllReduce sums).
+  const int e = sel[row] - expert_base;
+  if(e < 0 || e >= E_local) return;
   const float w = rw[row];
   const float* __restrict__ a = act + (int64_t)row * F;
   const int nbytes = F >> 1;
@@ -1067,20 +1080,18 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
   const int E = L->n_expert;
   const int F = L->n_ff_exp;
   GGML_ASSERT(D==L->n_embd);
-  // [ep2-dp] EP SAFETY: under EP this rank holds only its 128-expert SHARD, but every kernel in this
-  // GROUPED op indexes sel[row] (GLOBAL id, [0,256)) directly into the LOCAL weight arrays -> OOB /
-  // wrong-expert for remote ids. EP MUST run on the FUSED runMoe path (native global->local remap +
-  // remote-skip), routed by build_moe_ffn's EP min_m=1. If we reach the grouped op under EP it means
-  // the fused op returned false (e.g. runner threw) and fell back here -> that fallback is UNSAFE under
-  // EP, so fail loudly rather than silently corrupt. (g_ep==0 default => no change.)
-  if (g_ep) {
-    fprintf(stderr, "[dsv4-moe-grouped] FATAL: reached grouped op under EP (il=%d M=%d) -- the grouped "
-                    "path is EP-unsafe (local %d-expert shard vs GLOBAL sel). EP must run on the fused "
-                    "runMoe path; fused must not fall back to grouped under EP.\n", il, M, E);
-    return false;
-  }
   const int rows = M*U;
   const int kbD = D/SFVec, kbF = F/SFVec;
+
+  // [ep2-dp] EP shard params for this op's kernels. Under EP this rank holds local experts
+  // [g_ep_base, g_ep_base+g_ep_n_local); sel[] are GLOBAL ids. The HP-DECODE kernels below remap
+  // GLOBAL->LOCAL and SKIP remote experts (the other rank covers them; the PARTIAL AllReduce sums).
+  // Non-EP => ep_base=0, ep_E_local=E => the range check is a no-op (byte-identical).
+  // NOTE: the large-M CUTLASS GROUPED prefill path further below is NOT EP-aware; under EP the graph
+  // routes large M to the FUSED op (runMoe) and only small M (decode + the fused-live HP band) here,
+  // so the grouped CUTLASS prefill is never reached under EP. Guard it explicitly to be safe.
+  const int ep_base    = g_ep ? g_ep_base    : 0;
+  const int ep_E_local = g_ep ? g_ep_n_local : E;
 
   cudaStream_t s = ctx.stream();
 
@@ -1214,12 +1225,12 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
           reinterpret_cast<const uint8_t*>(fc1_w),
           reinterpret_cast<const uint8_t*>(fc1_sf),
           fu_gcommon, d_act, M, U, D, F, /*inter=*/F,
-          sf1_stride, colsD, swiglu_limit);
+          sf1_stride, colsD, swiglu_limit, ep_base, ep_E_local);
       dec_down_scatter_fused<<<g_dn, blk, 0, s>>>(
           d_act, d_sel, d_rw,
           reinterpret_cast<const uint8_t*>(fc2_w),
           reinterpret_cast<const uint8_t*>(fc2_sf),
-          fu_gdown, d_out, M, U, D, F, sf2_stride, colsF);
+          fu_gdown, d_out, M, U, D, F, sf2_stride, colsF, ep_base, ep_E_local);
       return true;
     }
 
@@ -1228,13 +1239,24 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
         reinterpret_cast<const uint8_t*>(L->dq_gate),
         reinterpret_cast<const uint8_t*>(L->dq_up),
         L->dsf_gate_simple, L->dsf_up_simple,
-        L->dglobal_gate, L->dglobal_up, d_act, M, U, D, F, swiglu_limit);
+        L->dglobal_gate, L->dglobal_up, d_act, M, U, D, F, swiglu_limit, ep_base, ep_E_local);
     dec_down_scatter<<<g_dn, blk, 0, s>>>(
         d_act, d_sel, d_rw,
         reinterpret_cast<const uint8_t*>(L->dq_down),
-        L->dsf_down_simple, L->dglobal_down, d_out, M, U, D, F);
+        L->dsf_down_simple, L->dglobal_down, d_out, M, U, D, F, ep_base, ep_E_local);
     // NO sync, NO free: result feeds the graph; scratch is persistent.
     return true;
+  }
+
+  // [ep2-dp] EP GUARD: the large-M CUTLASS grouped prefill path below is NOT EP-aware (its on-device
+  // routing histograms sel[] over E local bins but sel carries GLOBAL ids [0,256) -> remote ids index
+  // out of the local histogram and the GEMM reads the wrong/OOB expert weights). Under EP the graph
+  // routes all large M to the FUSED op (runMoe, native EP), so this path must never be reached with EP.
+  // If it is (misconfig), fail loudly rather than silently corrupt. (g_ep==0 default => no change.)
+  if (g_ep) {
+    fprintf(stderr, "[dsv4-moe-grouped] FATAL: EP reached the grouped CUTLASS prefill path (il=%d M=%d). "
+                    "Large-M EP must run on the fused op; check DSV4_MOE_FUSED + min_m routing.\n", il, M);
+    return false;
   }
 
   // ===== CAPTURE-SAFE PREFILL PATH (large M, CUTLASS grouped GEMM) ============

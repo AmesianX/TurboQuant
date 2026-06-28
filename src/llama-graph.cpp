@@ -1656,20 +1656,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // default 256); everything below — decode AND small prefills — uses the grouped path. This is
         // both the decode-steadiness fix AND the small-prefill crash safety valve. Env-tunable;
         // DSV4_MOE_FUSED_DECODE=1 forces the old min=1 (A/B, fused at all M).
-        // [ep2-dp] Under EP the expert weights are SHARDED (only this rank's 128 experts are
-        // registered). The grouped HP-decode / small-prefill kernels index sel[row] (GLOBAL id,
-        // [0,256)) directly into the LOCAL 128-expert weight arrays -> OOB for remote experts. Only
-        // the FUSED runMoe path handles the global->local remap + remote-skip (via ep_size/ep_rank),
-        // and it is correct at ANY M. So when EP is active, force min_m=1 -> route EVERY M (decode
-        // included) through the fused EP op; never fall to the EP-unsafe grouped kernels. [ep2-dp]
-        static const bool dsv4_ep = getenv("DSV4_EP") != nullptr;
+        // [ep2-dp] Under EP, decode/small-M MUST stay on the grouped HIGH-PRECISION path (FP32
+        // activations -- dsv4-moe-grouped.cu dec_*_swiglu/scatter), NOT the fused W4A4 path: the fused
+        // op quantizes activations to FP4 (e2m1), which on M=1 decode drifts the per-token logits and
+        // hallucinates on long/complex generations. Non-EP already keeps decode on the grouped HP path
+        // (min_m=256); EP must do the SAME. The grouped HP kernels are now EP-aware (GLOBAL->LOCAL
+        // expert remap + remote-skip, gated on g_ep), so decode is both correct-precision AND shard-safe.
+        // Large prefill (M >= min_m) still routes to the fast fused EP op (runMoe ep_size/ep_rank). So we
+        // do NOT special-case min_m for EP -- the default 256 split gives EP the right behavior. [ep2-dp]
         static const int dsv4_fused_min_m = []{
-            if (getenv("DSV4_EP") != nullptr) return 1;          // EP: fused at ALL M (grouped is EP-unsafe)
             if (getenv("DSV4_MOE_FUSED_DECODE") != nullptr) return 1;
             const char * e = getenv("DSV4_MOE_FUSED_MIN_M");
-            return e ? atoi(e) : 256;   // fused only for large prefill tiles; grouped handles the rest
+            return e ? atoi(e) : 256;   // fused only for large prefill tiles; grouped HP handles the rest
         }();
-        (void) dsv4_ep;
         if (dsv4_moe_fused && n_tokens >= dsv4_fused_min_m
                 && arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 0 && dsv4_moe_grouped_have_layer(il)) {
             ggml_tensor * sel_i32 = ggml_cont(ctx0, selected_experts);
