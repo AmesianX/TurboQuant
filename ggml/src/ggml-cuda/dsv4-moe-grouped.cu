@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <vector>
 #include <unordered_map>
 #include <mutex>
@@ -35,6 +36,11 @@
 
 #define DSV4_CK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ fprintf(stderr,"[dsv4-moe-grouped] CUDA ERR %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); abort(); } }while(0)
 #define DSV4_CC(x) do{ cutlass::Status cs_=(x); if(cs_!=cutlass::Status::kSuccess){ fprintf(stderr,"[dsv4-moe-grouped] CUTLASS ERR %s:%d status=%d\n",__FILE__,__LINE__,(int)cs_); abort(); } }while(0)
+
+// Grouped-decode HP buffer warm-up counter (fused-prefill -> grouped-decode capture crash fix).
+// GLOBAL scope so both the in-namespace run() increment and the post-namespace decode_warmed()
+// query (+ the engine gate via extern) share it.
+static std::atomic<int> g_grouped_decode_warm_count{0};
 
 namespace dsv4_moe_grouped_detail {
 using namespace cute;
@@ -475,6 +481,16 @@ extern "C" void dsv4_moe_grouped_drain_retired(void){
 // of a pointer a pending captured graph may still reference).
 extern "C" void dsv4_moe_grouped_retire_ptr(void* p){ dsv4_retire(p); }
 
+// Grouped-decode HP buffer warm-up gate (fixes the fused-prefill -> grouped-decode capture crash).
+// Under DSV4_MOE_FUSED, prefill never touches the grouped op, so the grouped decode buffers
+// (d_act_decode) are first allocated on the FIRST decode — which, if CUDA-graph-captured, malloc's
+// mid-capture -> "internal operation failed". The engine's grouped graph-gate disables graphs for
+// grouped DECODE steps until this flag reports warmed; the op sets it once a decode-shaped call has
+// allocated its buffer outside capture. After warm-up, decode graphs re-enable (steady-state fast).
+// g_grouped_decode_warm_count + dsv4_moe_grouped_decode_warmed() are defined at GLOBAL scope after
+// the namespace closes (below), alongside dsv4_grouped_layer_count(). The increment site uses the
+// global via the ::-qualified name.
+
 [[maybe_unused]] static void pack_upload_experts(const std::vector<std::vector<uint8_t>>& q_per_expert,ElementInput** dptr){
   size_t total=0; for(auto& q:q_per_expert) total+=q.size();
   std::vector<uint8_t> all(total); size_t off=0;
@@ -762,6 +778,21 @@ bool dsv4_moe_grouped_have_layer(int il){
   return g_registry.count(il)>0;
 }
 
+// Number of registered grouped layers (for the decode warm-up gate).
+int dsv4_grouped_layer_count(){
+  std::lock_guard<std::mutex> lk(g_reg_mu);
+  return (int)g_registry.size();
+}
+
+// Grouped-decode HP buffers warmed? One non-captured decode pass touches every layer once (graphs
+// were deferred), allocating all d_act_decode buffers; after >= n_layers decode-shaped calls they
+// are all sized -> warmed -> the engine re-enables decode graphs. (Fixes the fused-prefill ->
+// grouped-decode mid-capture cudaMalloc = "internal operation failed" crash at long context.)
+extern "C" bool dsv4_moe_grouped_decode_warmed(void){
+  const int n = dsv4_grouped_layer_count();
+  return g_grouped_decode_warm_count.load(std::memory_order_relaxed) >= (n > 0 ? n : 1);
+}
+
 // ---- accessor for the FUSED MoE op (dsv4-moe-fused.cu) -----------------------
 // The flashinfer CUTLASS fused runner consumes the SAME per-layer NVFP4 registry
 // this file owns. Rather than expose g_registry/LayerWeights (CUTLASS types) to
@@ -901,6 +932,22 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
       size_t need = (size_t)rows * F;                      // exact need for this call
       if (want < need) want = need;                        // grow to fit large (prefill) M
       if (L->d_act_decode == nullptr || L->act_decode_elems < want) {
+        // CAPTURE-SAFETY (fused-prefill -> grouped-decode transition crash): under
+        // DSV4_MOE_FUSED, PREFILL uses the FUSED op, so the GROUPED decode buffer
+        // d_act_decode is never warmed during prefill -> the FIRST decode allocates it.
+        // If that first decode is being CUDA-graph-CAPTURED, the cudaMalloc here is illegal
+        // mid-capture -> "an internal operation failed" at long context. The engine's grouped
+        // graph-gate (ggml-cuda.cu) now disables graphs for grouped-decode until warmed (see
+        // dsv4_moe_grouped_decode_warmed), so this alloc lands OUTSIDE capture. Belt-and-suspenders:
+        // also bail clearly if somehow still capturing with an unready buffer.
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s, &cap);
+        if (cap != cudaStreamCaptureStatusNone) {
+          fprintf(stderr, "[dsv4-grouped] FATAL: decode act buffer (il=%d) unsized during graph "
+                          "capture; cannot cudaMalloc mid-capture. The grouped graph-gate should "
+                          "have deferred capture until warmed.\n", il);
+          return false; // surface as a launch error rather than an opaque capture failure
+        }
         std::lock_guard<std::mutex> lk(g_reg_mu);          // serialize first-touch alloc
         if (L->d_act_decode == nullptr || L->act_decode_elems < want) {
           // CUDA-graph-safe grow: alloc new, retire old (defer-free at next sync),
@@ -913,6 +960,9 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
         }
       }
     }
+    // Decode-shaped call with a ready buffer -> count toward warm-up (graphs re-enable once every
+    // layer has been touched once outside capture). Monotonic; repeated calls keep it warmed.
+    if (M <= DSV4_DECODE_MAX) g_grouped_decode_warm_count.fetch_add(1, std::memory_order_relaxed);
     float* d_act = L->d_act_decode;
     DSV4_CK(cudaMemsetAsync(d_out, 0, (size_t)M*D*4, s));
     // WARP-PER-OUTPUT re-tiling: one warp computes one output element so the K

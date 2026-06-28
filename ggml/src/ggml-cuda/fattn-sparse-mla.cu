@@ -41,12 +41,13 @@ extern __shared__ char sparse_mla_smem[];
 __global__ void __launch_bounds__(256) sparse_mla_kernel(
         const char * __restrict__ Q,   // [D, n_tokens, n_head, n_stream] f16/f32(->we read f16)
         const char * __restrict__ K,   // [D, n_kv, 1, n_stream] bf16/f16 (k_all)
-        const int  * __restrict__ kv_idx, // [top_k, n_tokens] i32
+        const int  * __restrict__ kv_idx, // [top_k, n_tokens] i32 (VIEW: row stride = kv_row_elems, NOT top_k!)
         float * __restrict__ dst,      // [D, n_head, n_tokens, n_stream] f32
         const float scale, const int n_raw, const int top_k, const int n_comp_view,
         const int n_tokens, const int n_head, const int n_kv,
         const int64_t Qnb1, const int64_t Qnb2, const int64_t Qnb3, // byte strides of Q dims 1,2,3
         const int64_t Knb1, const int64_t Knb3,                     // K row stride, stream stride
+        const int64_t kv_row_elems,                                 // kv_idx row stride in INT elements
         const int Ktype, const int Qtype) {                         // type: 0=f16, 1=bf16, 2=f32
     const int t=threadIdx.x, warp=t>>5, lane=t&31;
     const int gid = blockIdx.x;
@@ -79,7 +80,10 @@ __global__ void __launch_bounds__(256) sparse_mla_kernel(
     __syncthreads();
 
     const char* Kbase = K + (size_t)is*Knb3;     // this stream's K
-    const int*  idx_q = kv_idx + (size_t)it*top_k; // this token's top_k list
+    // kv_idx is a VIEW from ggml_argsort_top_k: ne[0]=top_k but the ROW STRIDE is the FULL argsort
+    // width (n_comp_view), passed as kv_row_elems — NOT top_k. Using it*top_k read the wrong query's
+    // row (and ran OFF THE BUFFER for late tokens at prefill -> illegal access). Decode (it=0) hid it.
+    const int*  idx_q = kv_idx + (size_t)it*kv_row_elems; // this token's top_k list (correct stride)
     const int   total = n_raw + top_k;            // logical keys: dense raw window + sparse comp
 
     for(int kb0=0; kb0<total; kb0+=SM_KB){
@@ -211,9 +215,13 @@ void ggml_cuda_flash_attn_ext_sparse_mla(ggml_backend_cuda_context & ctx, ggml_t
 
     float scale = 1.0f; memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
     int n_raw = ggml_get_op_params_i32(dst, 4);
-    // valid compressed-row count = comp segment length of k_all (n_kv includes raw + comp + 256-pad).
-    // Selected top_k indices are argsort over [0, n_comp_view); the in-kernel guard clamps to it.
-    const int n_comp_view = n_kv - n_raw;
+    // kv_idx (topk) is a VIEW of ggml_argsort over the comp scores [argsort_w, n_tokens]: ne[0]=top_k
+    // but nb[1] = argsort_w * 4 = the ROW STRIDE. argsort_w is the TRUE valid comp-row count the
+    // indices range over (= n_comp_view at the indexer, NOT the 256-padded k_all length). Use it for
+    // BOTH the per-token row offset and the in-kernel validity bound. (k_all's padded length = n_kv
+    // is a separate, larger number; the hard krow<n_kv clamp still guards the absolute row.)
+    const int64_t kv_row_elems = (int64_t)(kv->nb[1] / sizeof(int32_t));
+    const int     n_comp_view  = (int) kv_row_elems;
 
     const int Ktype = (K->type == GGML_TYPE_BF16) ? 1 : 0;
     const int Qtype = (Q->type == GGML_TYPE_F32) ? 2 : ((Q->type == GGML_TYPE_BF16) ? 1 : 0);
@@ -240,7 +248,7 @@ void ggml_cuda_flash_attn_ext_sparse_mla(ggml_backend_cuda_context & ctx, ggml_t
     sparse_mla_kernel<<<grid, 256, smem, stream>>>(
         (const char*)Q->data, (const char*)K->data, (const int*)kv->data, (float*)dst->data,
         scale, n_raw, top_k, n_comp_view, n_tokens, n_head, n_kv,
-        Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[3], Ktype, Qtype);
+        Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[3], kv_row_elems, Ktype, Qtype);
 #else
     (void)ctx; (void)dst; GGML_ABORT("sparse-mla kernel not built");
 #endif

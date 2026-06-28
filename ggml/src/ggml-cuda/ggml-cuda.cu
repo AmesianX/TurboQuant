@@ -3421,6 +3421,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 // RETIRED (not freed inline) during a CUDA-graph-safe grow. Safe to free here
 // because the stream has just drained, so no captured graph still references them.
 extern "C" void dsv4_moe_grouped_drain_retired(void);
+// Grouped-decode HP buffer warm-up gate (fused-prefill -> grouped-decode capture crash fix).
+extern "C" bool dsv4_moe_grouped_decode_warmed(void);
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
@@ -3494,10 +3496,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             static const bool prefill_graph_off = getenv("DSV4_MOE_PREFILL_GRAPH_OFF") != nullptr;
             const int moe_M = (node->src[0] ? (int)node->src[0]->ne[1] : 0);
             const bool is_decode = (getenv("DSV4_MOE_NO_HP_DECODE")==nullptr) && (moe_M <= hp_max);
-            if (graph_off || (!is_decode && prefill_graph_off)) {
+            // [fused-prefill -> grouped-decode capture crash FIX] Under DSV4_MOE_FUSED, prefill uses
+            // the FUSED op, so the grouped HP decode buffers are first allocated on the FIRST decode.
+            // A cudaMalloc during graph capture = "internal operation failed". Defer graph capture for
+            // grouped DECODE steps until the buffers are warmed (allocated once outside capture);
+            // after warm-up, decode graphs re-enable for steady-state speed.
+            const bool decode_unwarmed = is_decode && !dsv4_moe_grouped_decode_warmed();
+            if (graph_off || (!is_decode && prefill_graph_off) || decode_unwarmed) {
                 use_cuda_graph = false;
 #ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs for dsv4 grouped MoE (M=%d, decode=%d)\n", __func__, moe_M, (int)is_decode);
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs for dsv4 grouped MoE (M=%d, decode=%d, unwarmed=%d)\n", __func__, moe_M, (int)is_decode, (int)decode_unwarmed);
 #endif
             }
         }
