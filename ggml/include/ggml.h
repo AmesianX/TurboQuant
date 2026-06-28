@@ -2454,6 +2454,14 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * k_rope);
 
+    // TurboQuant DSV4 sparse-gather: attach per-query top-k comp-row index tensor (i32 [top_k,
+    // n_tokens]) to src[6]; n_raw = dense raw-window row count (gather offset). When bound, the CUDA
+    // flash-attn routes to the vec gather kernel computing only the selected comp rows. Optional.
+    GGML_API void ggml_flash_attn_ext_add_kv_idx(
+            struct ggml_tensor * a,
+            struct ggml_tensor * kv_idx,
+            int32_t              n_raw);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

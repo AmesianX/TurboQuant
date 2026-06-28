@@ -5586,6 +5586,26 @@ void ggml_flash_attn_ext_add_k_rope(
     a->src[5] = k_rope;
 }
 
+// TurboQuant DSV4 sparse-gather: per-query comp-row index tensor (i32 [top_k, n_tokens]) bound to
+// src[6]; n_raw (dense raw-window row count = gather offset) stashed in op_params[4]. The CUDA vec
+// kernel gathers comp rows at (n_raw + kv_idx[ord]) instead of scanning the full compressed cache.
+void ggml_flash_attn_ext_add_kv_idx(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kv_idx,
+        int32_t              n_raw) {
+    if (!kv_idx) {
+        a->src[6] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[6] == NULL);
+    GGML_ASSERT(kv_idx->type == GGML_TYPE_I32);
+
+    a->src[6] = kv_idx;
+    ggml_set_op_params_i32(a, 4, n_raw); // op_params[3] is FA precision; n_raw at [4]
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

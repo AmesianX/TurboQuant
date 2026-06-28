@@ -2646,7 +2646,8 @@ void launch_fattn(
     // op param stashed at op_params[3] (set by the deepseek4 graph when binding src[6]); fallback 0.
     int32_t kv_idx_n_raw = 0;
     if (kv_idx_t) {
-        memcpy(&kv_idx_n_raw, (const int32_t *) KQV->op_params + 3, sizeof(int32_t));
+        // op_params[3] is the FA precision (set_prec); n_raw is stashed at op_params[4].
+        memcpy(&kv_idx_n_raw, (const int32_t *) KQV->op_params + 4, sizeof(int32_t));
     }
 
     GGML_ASSERT(block_dim.x % warp_size == 0);

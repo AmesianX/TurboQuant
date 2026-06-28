@@ -371,6 +371,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_TBQ4_0)      // recommended 4-bit
 
     // ---- D=512 (_0, 2× 256-block) — Gemma 4 global attention ----
+    // DSV4 sparse-gather chunk path (src[6] bound) routes D=512 K/V=F16 here.
+    FATTN_VEC_CASE(512, GGML_TYPE_F16,     GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_F16,     GGML_TYPE_TBQ3_0)
     FATTN_VEC_CASE(512, GGML_TYPE_F16,     GGML_TYPE_TBQ4_0)
     FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0,  GGML_TYPE_F16)
@@ -471,6 +473,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_F16)
 
     // TurboQuant 256-block (_0) at D=512 (Gemma 4 global attention)
+    // DSV4 sparse-gather chunk path (src[6] bound) routes D=512 K/V=F16 here.
+    FATTN_VEC_CASE(512, GGML_TYPE_F16, GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
@@ -641,6 +645,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TBQP4_0, GGML_TYPE_Q8_0)
     // TurboQuant 256-block (_0) at D=512 (Gemma 4 global attention)
+    // DSV4 sparse-gather chunk path (src[6] bound) routes D=512 K/V=F16 here.
+    FATTN_VEC_CASE(512, GGML_TYPE_F16, GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
@@ -810,6 +816,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+
+    // DSV4 sparse-gather: when the per-query comp-row index tensor is bound (src[6]), the gather is
+    // implemented ONLY in the vec kernel (one query column per block). Force the VEC path regardless
+    // of the usual D/batch heuristics, which would otherwise pick MMA for D=512/n_tokens=512.
+    if (dst->src[6] != nullptr) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);

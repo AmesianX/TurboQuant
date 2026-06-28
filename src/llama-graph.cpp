@@ -2124,7 +2124,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kv_idx,
+                 int   kv_idx_n_raw) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2161,6 +2163,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        // DSV4 sparse-gather: bind the per-query comp-row index (src[6]) AFTER set_prec (which writes
+        // op_params[3]); the binder stashes n_raw at op_params[4]. Only when provided by the caller.
+        if (kv_idx != nullptr) {
+            ggml_flash_attn_ext_add_kv_idx(cur, kv_idx, kv_idx_n_raw);
+        }
 
         if (v_mla) {
 #if 0

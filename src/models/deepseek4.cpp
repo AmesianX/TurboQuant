@@ -2409,8 +2409,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 v_all = k_raw;
                 attn_mask = inp_attn->self_kq_mask_swa;
 
+                // DSV4 sparse-attention (DSV4_SPARSE_ATTN=1): instead of -inf-masking the
+                // non-selected compressed keys and running DENSE flash-attn over the whole
+                // compressed cache, GATHER only the top-k selected comp rows per query. The
+                // top-k IS the model's designed sparsity (the dense path already -inf-masks the
+                // rest), so this is numerically equivalent minus the wasted FLOPs. Single-slot
+                // chunk path only (n_tokens>1, !uniform, n_comp_view>top_k). Captured below, fed
+                // to build_attn_mha as src[6]; the comp -inf mask concat is then skipped.
+                static const bool dsv4_sparse_attn = (getenv("DSV4_SPARSE_ATTN") != nullptr);
+                ggml_tensor * sparse_topk   = nullptr;     // [top_k, n_tokens] per-query comp indices
+                int64_t       sparse_n_raw  = k_raw->ne[2]; // dense raw-window row count (gather offset)
+
                 if (n_comp_visible > 0 || uniform) {
                     ggml_tensor * comp_mask = nullptr;
+
                     if (multislot) {
                         // ===== multi-slot: concat each sequence's OWN compressed cache; separate the
                         // concurrent requests with a block-diagonal compress-causal mask. =====
@@ -2654,7 +2666,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
                             cb(topk, "indexer_topk", il);
 
-                            comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                            // DSV4 sparse-attn: gather the selected comp rows instead of -inf masking
+                            // them. Only when flash-attn is on AND there is something to gain
+                            // (n_comp_view > top_k); otherwise fall back to the dense -inf mask.
+                            // The comp mask becomes ALL-ZERO (every gathered comp row is valid; the
+                            // gather already restricts to the selected set), keeping the K-layout mask
+                            // contract intact: raw = causal, comp = 0, pad = -inf. Only the K/V row
+                            // ADDRESSING changes in-kernel (gathered vs scanned).
+                            if (dsv4_sparse_attn && cparams.flash_attn && n_comp_view > top_k) {
+                                sparse_topk = topk;          // consumed at build_attn_mha (src[6]) below
+                                comp_mask   = dsv4_new_filled_3d(ctx0, n_comp_view, n_tokens, 1, 0.0f);
+                                comp_mask   = ggml_reshape_2d(ctx0, comp_mask, n_comp_view, n_tokens);
+                            } else {
+                                comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                            }
                         }
                     } else {
                         comp_mask = get_dsv4_inputs()->add_mask(ctx0,
@@ -2666,7 +2691,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                     } // end single-slot branch (else of multislot)
 
                     // newer upstream returns the standard kq_mask as F16 when flash-attn is on;
-                    // the freshly built comp_mask is F32 — normalize before the concat
+                    // the freshly built comp_mask is F32 — normalize before the concat.
+                    // Sparse path: comp_mask is all-zero (gathered comp rows are all valid), so the
+                    // concat keeps the K-layout mask contract (raw=causal, comp=0); only the in-kernel
+                    // K/V addressing differs.
                     if (comp_mask->type != attn_mask->type) {
                         comp_mask = ggml_cast(ctx0, comp_mask, attn_mask->type);
                     }
@@ -2709,7 +2737,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             }
 
             ggml_tensor * attn_mask_cnv = (cparams.flash_attn && attn_mask->type != GGML_TYPE_F16) ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
-            cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, kq_scale, il);
+            // DSV4 sparse-attn: when sparse_topk is set, pass it (+ raw-window row count) so the
+            // flash-attn vec gather computes only the selected comp rows. Null = dense path.
+            cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, kq_scale, il,
+                                 sparse_topk, (int) sparse_n_raw);
             cb(cur, "kqv_out", il);
         }
         cur = ggml_reshape_3d(ctx0, cur, n_embd_head_v, n_head, n_tokens);

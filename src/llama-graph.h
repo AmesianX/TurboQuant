@@ -970,7 +970,13 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            // DSV4 sparse-gather (optional): per-query top-k comp-row index tensor [top_k, n_tokens]
+            // bound to the flash-attn node src[6]; kv_idx_n_raw = dense raw-window row count (gather
+            // offset). When non-null AND flash-attn is active, the comp segment is gathered, not
+            // densely scanned. Default null = unchanged dense path.
+            ggml_tensor * kv_idx = nullptr,
+                    int   kv_idx_n_raw = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

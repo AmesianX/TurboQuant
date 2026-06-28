@@ -1627,6 +1627,20 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+    // DSV4 sparse-gather (src[6] bound): each query column has its OWN top-k comp-row set, so it must
+    // be the only column in its block (cols_per_block==1; grid covers all columns). Otherwise the two
+    // columns sharing a block would need distinct K/V gathers, breaking the shared-tile V load.
+    const bool sparse_gather = (dst->src[6] != nullptr);
+    if (sparse_gather) {
+        constexpr int cols_per_block = 1;
+        if (logit_softcap == 0.0f) {
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, false>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, true>(ctx, dst);
+        }
+        return;
+    }
+
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
