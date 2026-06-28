@@ -92,6 +92,92 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+// =====================================================================================
+// [DSV4_OPPROF] Deferred, capture-safe, 2-node-safe per-op GPU profiler.
+//
+// The legacy DSV4_KERNEL_PROF forces CUDA graphs fully OFF for the whole graph AND does a
+// cudaEventSynchronize() per node. Under the 2-node SPMD meta-backend that per-node device
+// sync deadlocks/desyncs the cross-rank NCCL AllReduce (rank A blocks on its node sync while
+// rank B's AllReduce on the same stream waits for A to enqueue) -> the run "dies at load".
+//
+// DSV4_OPPROF instead:
+//   * NEVER forces graphs off and NEVER changes the execution path (purely additive).
+//   * Records a cudaEvent pair around each EAGER node dispatch on that node's own stream
+//     (events recorded on a stream do not perturb stream-ordered NCCL).
+//   * NEVER syncs in the hot path. Elapsed times are computed LAZILY at dump time after a
+//     single cudaDeviceSynchronize (process exit).
+//   * Only runs while a node is actually executed eagerly (the first encounter of each distinct
+//     shape, i.e. capture passes + graph-off ops). Captured-graph replays are untouched, so the
+//     steady-state path the TP meta-backend relies on is byte-identical to a non-profiled run.
+//
+// One eager pass over a 13k prefill chunk visits every distinct op exactly once with the real
+// per-op GPU time -> a clean per-op breakdown without destabilising the 2-node collective.
+// Enable with DSV4_OPPROF=1. Dump cap via DSV4_OPPROF_TOP (default 40).
+// =====================================================================================
+namespace dsv4_opprof {
+    struct entry { cudaEvent_t e0, e1; std::string key; };
+    struct profiler {
+        std::mutex mtx;
+        std::vector<entry> pending;                                  // recorded, not yet read
+        std::map<std::string, std::pair<double,int64_t>> acc;        // key -> (ms, count)
+        bool enabled = false;
+        int64_t dump_after = 0;     // auto-dump once after this many timed ops (0 = exit-only)
+        int64_t seen = 0;           // total timed ops recorded
+        bool dumped = false;        // one-shot guard for the auto-dump
+        profiler() {
+            enabled = getenv("DSV4_OPPROF") != nullptr;
+            // Auto-dump after N timed ops so the table prints WITHOUT a clean shutdown (the server is
+            // stopped via SIGKILL, which would skip the dtor). One full forward ~= a few thousand ops;
+            // default 8000 captures ~one 13k prefill forward's worth of distinct ops. 0 disables.
+            if (const char* d = getenv("DSV4_OPPROF_DUMP_AFTER")) dump_after = atoll(d);
+            else if (enabled) dump_after = 8000;
+        }
+        void dump_locked(const char * why) {
+            cudaDeviceSynchronize();
+            drain_locked(/*force=*/true);
+            std::vector<std::pair<std::string,std::pair<double,int64_t>>> v(acc.begin(), acc.end());
+            std::sort(v.begin(), v.end(), [](const auto&a,const auto&b){ return a.second.first > b.second.first; });
+            double total = 0.0; for (auto & e : v) total += e.second.first;
+            size_t topn = 40; if (const char* t = getenv("DSV4_OPPROF_TOP")) topn = (size_t) atoi(t);
+            fprintf(stderr, "\n[DSV4_OPPROF] (%s) eager-pass GPU time total %.1f ms over %zu op-classes\n",
+                    why, total, v.size());
+            for (size_t k = 0; k < v.size() && k < topn; ++k) {
+                fprintf(stderr, "  %8.2f ms  %5.1f%%  %9" PRId64 "x  %s\n",
+                        v[k].second.first, total>0?100.0*v[k].second.first/total:0.0,
+                        v[k].second.second, v[k].first.c_str());
+            }
+            fflush(stderr);
+        }
+
+        // Drain any pending event pairs whose stop event has completed (lazy, non-blocking).
+        void drain_locked(bool force) {
+            size_t kept = 0;
+            for (size_t i = 0; i < pending.size(); ++i) {
+                entry & en = pending[i];
+                cudaError_t st = force ? cudaSuccess : cudaEventQuery(en.e1);
+                if (force) { cudaEventSynchronize(en.e1); }
+                if (st == cudaSuccess) {
+                    float ms = 0.0f;
+                    if (cudaEventElapsedTime(&ms, en.e0, en.e1) == cudaSuccess) {
+                        auto & slot = acc[en.key];
+                        slot.first += ms; slot.second += 1;
+                    }
+                    cudaEventDestroy(en.e0); cudaEventDestroy(en.e1);
+                } else {
+                    pending[kept++] = en;   // not ready: keep
+                }
+            }
+            pending.resize(kept);
+        }
+        ~profiler() {
+            if (!enabled) { return; }
+            std::lock_guard<std::mutex> lk(mtx);
+            dump_locked("exit");
+        }
+    };
+    static profiler g_prof;
+}
+
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
@@ -4556,6 +4642,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// [DSV4_OPPROF] Build a stable op-class key (op name + shape signature for the heavy GEMM/attn ops).
+static std::string ggml_dsv4_opprof_key(const ggml_tensor * node) {
+    std::string key = ggml_op_name(node->op);
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        key += std::string("(") + ggml_type_name(node->src[0]->type)
+             + "," + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1])
+             + ",n=" + std::to_string(node->src[1]->ne[1]) + ")";
+    } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        key += std::string("(K=") + ggml_type_name(node->src[1]->type)
+             + ",D=" + std::to_string(node->src[0]->ne[0])
+             + ",nq=" + std::to_string(node->src[0]->ne[1]) + ")";
+    } else if (node->op == GGML_OP_DSV4_MOE_FUSED || node->op == GGML_OP_DSV4_MOE_GROUPED) {
+        key += std::string("(M=") + std::to_string(node->src[0] ? node->src[0]->ne[1] : 0) + ")";
+    }
+    return key;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4772,6 +4875,34 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     auto & slot = prof.acc[key];
                     slot.first  += ms;
                     slot.second += 1;
+                } else if (dsv4_opprof::g_prof.enabled && !use_cuda_graph) {
+                    // [DSV4_OPPROF] Deferred per-op timing on this node's stream. Gated on
+                    // !use_cuda_graph: only PURE-EAGER passes are timed (recording timing events
+                    // while the stream is mid-capture is illegal). The heavy DSV4 ops (fused/grouped
+                    // MoE, the small-prefill band) already run graphs-off, so they ARE timed; to time
+                    // the captured dense GEMM/attn path too, run with DSV4_MOE_FUSED_GRAPH_OFF or
+                    // GGML_CUDA_NO_GRAPHS for one prefill. No device sync in the hot path: record
+                    // start/stop events, push to the pending pool, drain ready ones lazily. Safe under
+                    // the 2-node SPMD meta-backend (NCCL is stream-ordered).
+                    cudaStream_t stream = cuda_ctx->stream();
+                    cudaEvent_t e0 = nullptr, e1 = nullptr;
+                    bool timed = (cudaEventCreate(&e0) == cudaSuccess) && (cudaEventCreate(&e1) == cudaSuccess);
+                    if (timed) { cudaEventRecord(e0, stream); }
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                    if (timed) {
+                        cudaEventRecord(e1, stream);
+                        std::lock_guard<std::mutex> lk(dsv4_opprof::g_prof.mtx);
+                        dsv4_opprof::g_prof.pending.push_back({e0, e1, ggml_dsv4_opprof_key(node)});
+                        dsv4_opprof::g_prof.drain_locked(/*force=*/false);  // reclaim completed pairs
+                        dsv4_opprof::g_prof.seen++;
+                        // One-shot auto-dump so the table prints without relying on a clean shutdown
+                        // (server is stopped via SIGKILL -> the dtor never runs).
+                        if (!dsv4_opprof::g_prof.dumped && dsv4_opprof::g_prof.dump_after > 0 &&
+                                dsv4_opprof::g_prof.seen >= dsv4_opprof::g_prof.dump_after) {
+                            dsv4_opprof::g_prof.dumped = true;
+                            dsv4_opprof::g_prof.dump_locked("auto");
+                        }
+                    }
                 } else {
                     ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 }
