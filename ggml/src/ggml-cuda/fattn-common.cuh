@@ -45,7 +45,10 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q_wht2_data,
         const int32_t Q_wht2_stride,
         const char * __restrict__ k_rope_data,      // TurboQuant: MLA _4 rope slice (f16). nullptr unless src[5] set.
-        const int32_t k_rope_stride);               // bytes per K cell row in k_rope tensor
+        const int32_t k_rope_stride,                // bytes per K cell row in k_rope tensor
+        const int  * __restrict__ kv_idx,           // DSV4 sparse-gather: per-query comp-row indices [top_k, n_tokens]. nullptr unless src[6] set.
+        const int32_t kv_idx_top_k,                 // number of gathered comp rows per query (top_k)
+        const int32_t kv_idx_n_raw);                // dense raw-window row count (gather offset; comp row = n_raw + kv_idx[..])
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -2359,7 +2362,9 @@ void launch_fattn(
 
     // TurboQuant side-channel tensors (optional, only set when relevant):
     //   src[5]: k_rope (f16) — decoupled rope slice for MLA `_4` types (GLM/DeepSeek)
+    //   src[6]: kv_idx (i32) — DSV4 sparse-gather per-query comp-row indices [top_k, n_tokens]
     const ggml_tensor * k_rope     = dst->src[5];
+    const ggml_tensor * kv_idx_t   = dst->src[6];
 
     ggml_tensor * KQV = dst;
 
@@ -2585,6 +2590,13 @@ void launch_fattn(
             }
         }
 
+        // DSV4 sparse-gather: the gather scans a per-query logical row space [0, n_raw+top_k); the
+        // blockIdx.y KV-split assumes contiguous KV rows, which does not hold under gather. Force a
+        // single KV partition so the loop is a plain scan over the gathered set (no split-KV reduction).
+        if (kv_idx_t != nullptr) {
+            parallel_blocks = 1;
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
@@ -2620,6 +2632,23 @@ void launch_fattn(
     const char * k_rope_data      = k_rope     ? (const char *)  k_rope->data     : nullptr;
     const int32_t k_rope_stride_b = k_rope     ? (int32_t) k_rope->nb[1]           : 0;
 
+    // DSV4 sparse-gather: kv_idx is the on-graph `topk` tensor (i32 [top_k, n_tokens]). When bound,
+    // the comp segment of K/V is GATHERED at rows (n_raw + kv_idx[ord]) instead of scanned densely.
+    // n_raw is derived from K rows (ne11) minus the comp extent; but the kernel only needs top_k and
+    // n_raw, which we pass explicitly. n_raw = K->ne[1] - n_comp; here the wiring passes n_comp via
+    // kv_idx->ne[0] (==top_k) is the per-query count; n_raw is K rows minus the comp segment length.
+    // The deepseek4 graph guarantees comp segment length and sets these; we read top_k from kv_idx->ne[0].
+    const int  * kv_idx_data      = kv_idx_t   ? (const int *)   kv_idx_t->data    : nullptr;
+    const int32_t kv_idx_top_k    = kv_idx_t   ? (int32_t) kv_idx_t->ne[0]         : 0;
+    // n_raw: rows of K that are the dense raw window. The comp segment is the remaining K rows, but the
+    // gather only touches the comp segment, so the raw count = total K rows - (comp rows). The graph
+    // passes the raw window as the leading K rows; comp rows = (n_kv - n_raw). We recover n_raw from the
+    // op param stashed at op_params[3] (set by the deepseek4 graph when binding src[6]); fallback 0.
+    int32_t kv_idx_n_raw = 0;
+    if (kv_idx_t) {
+        memcpy(&kv_idx_n_raw, (const int32_t *) KQV->op_params + 3, sizeof(int32_t));
+    }
+
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
     // TBQP: Q stays spatial (K is spatial too). V = K view (spatial). No hacks.
@@ -2643,7 +2672,10 @@ void launch_fattn(
         q_wht2_ptr,
         q_wht2_stride,
         k_rope_data,
-        k_rope_stride_b
+        k_rope_stride_b,
+        kv_idx_data,
+        kv_idx_top_k,
+        kv_idx_n_raw
     );
     CUDA_CHECK(cudaGetLastError());
 

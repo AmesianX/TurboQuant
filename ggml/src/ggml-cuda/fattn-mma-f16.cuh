@@ -1916,13 +1916,14 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
         const char * __restrict__ raw_K_data, const int32_t raw_K_stride,
         const char * __restrict__ Q_wht2_data, const int32_t Q_wht2_stride,
-        const char * __restrict__ k_rope_data, const int32_t k_rope_stride) {
+        const char * __restrict__ k_rope_data, const int32_t k_rope_stride,
+        const int * __restrict__ kv_idx, const int32_t kv_idx_top_k, const int32_t kv_idx_n_raw) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE))
     // TurboQuant MLA side channel — currently unused by MMA kernel
     // (GLM _4 retrofit is VEC-only for now). Signature keeps these for
     // fattn_kernel_t compatibility.
-    GGML_UNUSED_VARS(k_rope_data, k_rope_stride);
+    GGML_UNUSED_VARS(k_rope_data, k_rope_stride, kv_idx, kv_idx_top_k, kv_idx_n_raw);
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
@@ -2086,7 +2087,7 @@ static __global__ void flash_attn_ext_f16(
               nb21, nb22, nb23,
               ne31, ne32, ne33,
               nb31, nb32, nb33, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride,
-              k_rope_data, k_rope_stride);
+              k_rope_data, k_rope_stride, kv_idx, kv_idx_top_k, kv_idx_n_raw);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }

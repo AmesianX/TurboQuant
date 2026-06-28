@@ -42,7 +42,8 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
         const char * __restrict__ raw_K_data, const int32_t raw_K_stride,
         const char * __restrict__ Q_wht2_data, const int32_t Q_wht2_stride,
-        const char * __restrict__ k_rope_data, const int32_t k_rope_stride) {
+        const char * __restrict__ k_rope_data, const int32_t k_rope_stride,
+        const int  * __restrict__ kv_idx, const int32_t kv_idx_top_k, const int32_t kv_idx_n_raw) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
 
@@ -57,7 +58,7 @@ static __global__ void flash_attn_ext_vec(
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
                   nb31, nb32, nb33, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride,
-                  k_rope_data, k_rope_stride);
+                  k_rope_data, k_rope_stride, kv_idx, kv_idx_top_k, kv_idx_n_raw);
         NO_DEVICE_CODE;
         return;
     }
@@ -852,13 +853,28 @@ static __global__ void flash_attn_ext_vec(
     // AMX3_1 FA path uses Part A (WHT qs) only — no polar freq table needed.
     // TriAttention scoring reads Part B (polar) through a separate dedicated kernel.
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // DSV4 sparse-gather: scan a logical row space [0, n_raw + top_k). Positions [0,n_raw) are the
+    // dense raw window (identity map); positions [n_raw, n_raw+top_k) gather comp rows at absolute
+    // row (n_raw + kv_idx[ord]). Forced single KV partition (gridDim.y==1) by the host launcher, so
+    // the loop is a plain scan and K/V/maskh stay at their bases (we index by translated abs row).
+    const bool sparse_gather = (kv_idx != nullptr);
+    const char * const K_base    = K;   // un-advanced bases for gather addressing
+    const char * const V_base    = V;
+    const half * const maskh_base = maskh;
+    const int * const kv_idx_q   = sparse_gather ? (kv_idx + ic0*kv_idx_top_k) : nullptr; // this column's top_k list
+
+    const int k_VKQ_max = sparse_gather ? (kv_idx_n_raw + kv_idx_top_k)
+                        : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+
+        // For the gather path, translate each in-tile logical position to its absolute K/V row.
+        // pos = k_VKQ_0 + local; abs = pos<n_raw ? pos : n_raw + kv_idx_q[pos-n_raw]. We expose a
+        // lambda-free helper via a macro-like inline below (computed per-use to keep registers low).
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -873,6 +889,30 @@ static __global__ void flash_attn_ext_vec(
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
 
+            // DSV4 sparse-gather: absolute K/V row for this in-tile position. Dense: K is pre-advanced
+            // by k_VKQ_0 so K + i_KQ*nb11 == row (k_VKQ_0 + i_KQ). Gather: translate the logical pos
+            // (k_VKQ_0 + i_KQ) to the absolute comp row via kv_idx. K_eff is the K pointer to use; the
+            // mask is read at the absolute row m_row_eff.
+            const char * K_eff;
+            int m_row_eff;
+            const int pos_KQ = k_VKQ_0 + i_KQ;
+            const bool oob_KQ = sparse_gather && (pos_KQ >= k_VKQ_max);
+            if (sparse_gather) {
+                int arow;
+                if (oob_KQ) {
+                    arow = 0;                                     // out-of-range lane (score forced -inf below)
+                } else if (pos_KQ < kv_idx_n_raw) {
+                    arow = pos_KQ;                                // dense raw window
+                } else {
+                    arow = kv_idx_n_raw + kv_idx_q[pos_KQ - kv_idx_n_raw]; // gathered comp row
+                }
+                K_eff     = K_base + (int64_t)arow*nb11;
+                m_row_eff = arow;
+            } else {
+                K_eff     = K + (int64_t)i_KQ*nb11;
+                m_row_eff = i_KQ; // mask read uses pre-advanced maskh + i_KQ
+            }
+
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum;
@@ -881,10 +921,11 @@ static __global__ void flash_attn_ext_vec(
                 if constexpr (is_cross_head_K) {
                     // Cross-head scoring: combine 8 groups with H_8 signs
                     // H_512 = H_8 ⊗ H_64 → score = (1/8)Σ_g H_8[h][g] · vec_dot(K_g, Q_wht)
+                    // (is_cross_head_K is mutually exclusive with the DSV4 latent sparse path.)
                     sum = 0.0f;
                     #pragma unroll
                     for (int g = 0; g < 8; g++) {
-                        const char * K_g = K + (int64_t)(g - kv_head_idx) * nb12 + (int64_t)i_KQ * nb11;
+                        const char * K_g = K_eff + (int64_t)(g - kv_head_idx) * nb12;
                         float partial = vec_dot_KQ(K_g, Q_src, Q_i32[j], Q_ds[j]);
                         const int h8_sign = (__popc(kv_head_idx & g) & 1) ? -1 : 1;
                         sum += h8_sign * partial;
@@ -892,7 +933,7 @@ static __global__ void flash_attn_ext_vec(
                     sum = warp_reduce_sum<nthreads_KQ>(sum);
                     sum *= 0.125f; // 1/8
                 } else {
-                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_src, Q_i32[j], Q_ds[j]);
+                    sum = vec_dot_KQ(K_eff, Q_src, Q_i32[j], Q_ds[j]);
                     sum = warp_reduce_sum<nthreads_KQ>(sum);
                 }
 
@@ -903,7 +944,7 @@ static __global__ void flash_attn_ext_vec(
                 // AMX3_OUTLIERS (ol_val==0 → no-op). `sum` is identical across the nthreads_KQ
                 // reduction lanes and corr is computed identically, so they stay in sync.
                 if constexpr (type_K == GGML_TYPE_AMX3_1) {
-                    const block_amx3_1 * K_ol = (const block_amx3_1 *) (K + i_KQ*nb11);
+                    const block_amx3_1 * K_ol = (const block_amx3_1 *) (K_eff);
                     const float * Q_raw = (const float *) (Q + j*nb01);
                     const float corr = Q_raw[K_ol->ol_idx[0]] * __half2float(K_ol->ol_val[0])
                                      + Q_raw[K_ol->ol_idx[1]] * __half2float(K_ol->ol_val[1]);
@@ -911,7 +952,7 @@ static __global__ void flash_attn_ext_vec(
                 }
                 // tbq3_1 (K) outlier isolation: same correction as amx3 Part A (tbq3_1 동치).
                 if constexpr (type_K == GGML_TYPE_TBQ3_1) {
-                    const block_tbq3_1 * K_ol = (const block_tbq3_1 *) (K + i_KQ*nb11);
+                    const block_tbq3_1 * K_ol = (const block_tbq3_1 *) (K_eff);
                     const float * Q_raw = (const float *) (Q + j*nb01);
                     const float corr = Q_raw[K_ol->ol_idx[0]] * __half2float(K_ol->ol_val[0])
                                      + Q_raw[K_ol->ol_idx[1]] * __half2float(K_ol->ol_val[1]);
@@ -928,7 +969,18 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    // Gather: read mask at the absolute row from the base (maskh not pre-advanced for
+                    // the gathered comp rows). Dense: original pre-advanced maskh + i_KQ.
+                    const float mval = sparse_gather
+                        ? __half2float(maskh_base[j*ne11 + m_row_eff])
+                        : __half2float(maskh[j*ne11 + i_KQ]);
+                    sum += slope*mval;
+                }
+
+                // Gather: out-of-range tile lanes (pos >= n_raw+top_k) carry no key — force -inf so
+                // their softmax weight is 0 (mirrors the dense path's -inf pad-column masking).
+                if (oob_KQ) {
+                    sum = -INFINITY;
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -1015,6 +1067,24 @@ static __global__ void flash_attn_ext_vec(
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
+            // DSV4 sparse-gather: V row for this in-tile position k must match the K row that produced
+            // KQ[k]. Dense: V is pre-advanced, V + k*nb21 == row (k_VKQ_0 + k). Gather: translate.
+            const char * V_eff;
+            if (sparse_gather) {
+                const int pos = k_VKQ_0 + k;
+                int arow;
+                if (pos < kv_idx_n_raw) {
+                    arow = pos;
+                } else if (pos < k_VKQ_max) {
+                    arow = kv_idx_n_raw + kv_idx_q[pos - kv_idx_n_raw];
+                } else {
+                    arow = 0; // out-of-range tile lane; KQ[k] is 0 for these so V contribution is 0
+                }
+                V_eff = V_base + (int64_t)arow*nb21;
+            } else {
+                V_eff = V + (int64_t)k*nb21;
+            }
+
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
 #pragma unroll
@@ -1026,14 +1096,14 @@ static __global__ void flash_attn_ext_vec(
                 half2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
+                    dequantize_V(V_eff, tmp_f,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
+                    dequantize_V(V_eff, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
@@ -1061,7 +1131,7 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
                     for (int g = 0; g < 8; g++) {
                         float2 v_g[V_rows_per_thread/2];
-                        dequantize_V(V + (int64_t)(g - kv_head_idx) * nb22 + k*nb21, v_g, v_elem);
+                        dequantize_V(V_eff + (int64_t)(g - kv_head_idx) * nb22, v_g, v_elem);
                         const float sign = (__popc(kv_head_idx & g) & 1) ? -0.125f : 0.125f;
 #pragma unroll
                         for (int iv = 0; iv < V_rows_per_thread/2; iv++) {
@@ -1070,7 +1140,7 @@ static __global__ void flash_attn_ext_vec(
                         }
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp, v_elem);
+                    dequantize_V(V_eff, tmp, v_elem);
                 }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -1528,7 +1598,7 @@ static __global__ void flash_attn_ext_vec(
               nb21, nb22, nb23,
               ne31, ne32, ne33,
               nb31, nb32, nb33, raw_K_data, raw_K_stride, Q_wht2_data, Q_wht2_stride,
-              k_rope_data, k_rope_stride);
+              k_rope_data, k_rope_stride, kv_idx, kv_idx_top_k, kv_idx_n_raw);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }
