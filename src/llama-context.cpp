@@ -1495,31 +1495,76 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u nodes=%d backend[%zu] compute-buffer %8.1f MiB\n",
                             ubatch.n_tokens, gf ? ggml_graph_n_nodes(gf) : -1, i, bs / (1024.0*1024.0));
                 }
+                // Path fingerprint: FA vs non-FA tells us whether the [n_kv,ub,n_head] KQ/softmax
+                // exists (non-FA -> it does; that path is what DSV4_ATTN_QTILE tiles). Count the
+                // attention op-classes so the coordinator sees which path the reserve graph took.
+                if (gf) {
+                    int n_fa = 0, n_softmax = 0, n_argsort = 0, n_flashish = 0;
+                    for (int ni = 0; ni < ggml_graph_n_nodes(gf); ++ni) {
+                        ggml_tensor * t = ggml_graph_node(gf, ni);
+                        if (!t) continue;
+                        if (t->op == GGML_OP_FLASH_ATTN_EXT) n_fa++;
+                        else if (t->op == GGML_OP_SOFT_MAX)  n_softmax++;
+                        else if (t->op == GGML_OP_ARGSORT)   n_argsort++;
+                        if (t->name && strstr(t->name, LLAMA_TENSOR_NAME_FATTN)) n_flashish++;
+                    }
+                    fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u flash_attn=%d FLASH_ATTN_EXT=%d SOFT_MAX=%d ARGSORT=%d (fattn-named=%d)\n",
+                            ubatch.n_tokens, (int) cparams.flash_attn, n_fa, n_softmax, n_argsort, n_flashish);
+                }
                 fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u TOTAL compute-buffer %8.1f MiB (%.2f KiB/token)\n",
                         ubatch.n_tokens, total / (1024.0*1024.0),
                         (total / 1024.0) / (double) ubatch.n_tokens);
-                // [DSV4_PREFILL_VRAM_PROBE] Name the wall: list the largest graph nodes by bytes so
-                // the O(ub^2) driver is identified by tensor name+shape (not guessed). Pure read-only
-                // over the already-built graph; no compute effect.
+                // [DSV4_PREFILL_VRAM_PROBE] Name the wall. Summing ggml_nbytes over NODES is NOT the
+                // gallocr buffer (gallocr REUSES memory -> the buffer is the PEAK concurrent liveness,
+                // not the sum), and the top-N-by-individual-size is dominated by constant weights. So we
+                // also bucket by op-type and by whether the tensor's size SCALES with n_tokens (the ub
+                // lever): the ub^2 / O(ub) driver lives in the n_tokens-scaling buckets, and the per-op
+                // SUM of those names the op-class. Read-only over the built graph; no compute effect.
                 if (gf) {
                     const int nn = ggml_graph_n_nodes(gf);
-                    struct probe_ent { const char * name; size_t bytes; int64_t ne0, ne1, ne2, ne3; };
+                    const int64_t ubn = (int64_t) ubatch.n_tokens;
+                    struct probe_ent { const char * name; const char * op; size_t bytes; int64_t ne0, ne1, ne2, ne3; bool ub_scaled; };
                     std::vector<probe_ent> ents;
                     ents.reserve(nn);
+                    // op-type sum (only n_tokens-scaling nodes -> the ub lever)
+                    std::vector<std::pair<const char *, size_t>> op_sum;     // ub-scaled only
+                    std::vector<std::pair<const char *, size_t>> op_sum_all; // every node
+                    auto bump = [](std::vector<std::pair<const char *, size_t>> & v, const char * k, size_t b){
+                        for (auto & p : v) { if (p.first == k) { p.second += b; return; } }
+                        v.push_back({ k, b });
+                    };
+                    size_t ub_total = 0, all_total = 0;
                     for (int ni = 0; ni < nn; ++ni) {
                         ggml_tensor * t = ggml_graph_node(gf, ni);
                         if (!t) continue;
-                        ents.push_back({ t->name, ggml_nbytes(t), t->ne[0], t->ne[1], t->ne[2], t->ne[3] });
+                        const size_t b = ggml_nbytes(t);
+                        // "ub-scaled" = some dim equals (or is a clean multiple of) n_tokens -> grows with -ub.
+                        const bool ub_scaled = ubn > 1 &&
+                            (t->ne[0] == ubn || t->ne[1] == ubn || t->ne[2] == ubn || t->ne[3] == ubn ||
+                             t->ne[1] % ubn == 0 || t->ne[2] % ubn == 0);
+                        const char * op = ggml_op_name(t->op);
+                        ents.push_back({ t->name, op, b, t->ne[0], t->ne[1], t->ne[2], t->ne[3], ub_scaled });
+                        all_total += b;  bump(op_sum_all, op, b);
+                        if (ub_scaled) { ub_total += b; bump(op_sum, op, b); }
                     }
                     std::sort(ents.begin(), ents.end(),
                               [](const probe_ent & a, const probe_ent & b){ return a.bytes > b.bytes; });
-                    const int topn = std::min<int>(20, (int) ents.size());
-                    for (int ti = 0; ti < topn; ++ti) {
-                        const auto & e = ents[ti];
-                        fprintf(stderr, "DSV4_PREFILL_VRAM:   top[%2d] %9.1f MiB  [%5lld,%5lld,%5lld,%5lld]  %s\n",
-                                ti, e.bytes / (1024.0*1024.0),
-                                (long long) e.ne0, (long long) e.ne1, (long long) e.ne2, (long long) e.ne3,
-                                e.name);
+                    fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u SUM(all nodes)=%.1f MiB  SUM(ub-scaled nodes)=%.1f MiB  (nodes=%d)\n",
+                            ubatch.n_tokens, all_total/(1024.0*1024.0), ub_total/(1024.0*1024.0), nn);
+                    std::sort(op_sum.begin(), op_sum.end(),
+                              [](const auto & a, const auto & b){ return a.second > b.second; });
+                    for (size_t oi = 0; oi < op_sum.size() && oi < 12; ++oi) {
+                        fprintf(stderr, "DSV4_PREFILL_VRAM:   op-sum(ub-scaled) %-16s %9.1f MiB\n",
+                                op_sum[oi].first, op_sum[oi].second/(1024.0*1024.0));
+                    }
+                    // largest ub-scaled individual nodes (the actual transients the lever moves)
+                    int shown = 0;
+                    for (const auto & e : ents) {
+                        if (!e.ub_scaled) continue;
+                        fprintf(stderr, "DSV4_PREFILL_VRAM:   ub-node[%2d] %9.1f MiB  %-14s [%6lld,%6lld,%6lld,%6lld]  %s\n",
+                                shown, e.bytes/(1024.0*1024.0), e.op,
+                                (long long)e.ne0,(long long)e.ne1,(long long)e.ne2,(long long)e.ne3, e.name);
+                        if (++shown >= 20) break;
                     }
                 }
                 fflush(stderr);
