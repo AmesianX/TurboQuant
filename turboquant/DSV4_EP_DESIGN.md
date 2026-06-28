@@ -225,20 +225,46 @@ build/bin/llama-dsv4-nvfp4-preconvert --model <FP4.gguf> --out <EP_DIR> --n-rank
 
 # 2) Deploy EP on the FAST fused kernel (both ranks, watchdog ON). Env (tp.sh forwards DSV4_EP):
 DSV4_EP=1 DSV4_MOE_GROUPED=1 DSV4_MOE_FUSED=1 DSV4_MOE_SIDECAR=<EP_DIR>  -ub 2048
-#    (DSV4_MOE_GROUPED is required by the sidecar loader gate; DSV4_MOE_FUSED takes priority and
-#     runs runMoe with ep_size=2/ep_rank=rank. EP forces fused at ALL M, so decode is fused too.)
-#    Expect at load: "[dsv4-moe-grouped] EP config: ep=1 ... ep_size=2 ep_rank=<r>" on each rank,
-#    and "[dsv4-moe-sidecar] EP shard: rank r owns experts [.,.) ... ep_size=2 ep_rank=r".
+#    (GROUPED required by the sidecar loader gate. Large prefill -> fused runMoe ep_size=2/ep_rank.
+#     DECODE/small-M -> grouped HP FP32-activation path, now EP-aware. min_m stays 256, NOT forced.)
+#    Expect at load: "[dsv4-moe-grouped] EP config: ep=1 ... ep_size=2 ep_rank=<r>" on each rank.
 
-# 3) A/B vs the 314 generic-EP and the ~330 non-EP-fused-ub1024 baselines.
+# 3) A/B vs the 314 generic-EP and the ~330 non-EP-fused-ub1024 baselines; verify NO hallucination
+#    on "양자역학 발전에 핵심 역할 한 과학자 10명" (quality must match non-EP fused).
 ```
-Binaries to rsync to .67 (md5, build 03:50): llama-server 2a89dc5d, libllama.so.0.0.9740 1a4045d2,
-libggml-cuda.so.0.13.1 e06a4eac, libggml.so.0.13.1 c02c2eb8; preconvert 3cbb6a76.
+Binaries to rsync to .67 (md5, build 05:06): llama-server acf631f4, libllama.so.0.0.9745 70d3d559,
+libggml-cuda.so.0.13.1 0c23f0a1, libggml.so.0.13.1 c02c2eb8; preconvert 3cbb6a76 (unchanged).
 
-### Status this round
-- DONE (built .66, committed): sidecar v2 EP fields, `--ep` shard writer, EP config in the
-  registry, fused runner `MOEParallelismConfig(ep_size,ep_rank)`, loader publish + validation,
-  generic-axis2 skipped under sidecar, fused-at-all-M under EP, grouped-op EP-safety guard.
-- REMAINING (coordinator): run the deploy recipe; measure EP+fused `-ub 2048` vs 314 + per-node
-  `nvidia-smi` (confirm fused MoE cache halved = 128-expert footprint). Then push `-ub` higher if
-  memory allows (the half-weight fused cache frees more than the generic-EP path did).
+## 7. QUALITY FIX — EP decode must be FP32-activation (not W4A4)
+
+**Bug:** EP+fused hallucinated on long/complex generations (correct on short). **Root cause:** my
+round-2 change forced fused `min_m=1`, routing DECODE (M=1) through the fused **W4A4** path, which
+quantizes ACTIVATIONS to FP4 (e2m1). The non-EP baseline keeps decode on the grouped **HIGH-PRECISION
+path** (`dsv4-moe-grouped.cu:526` — "FP32 activations × dequantized NVFP4 weights, NO 4-bit activation
+quantization"); `min_m=256` sends only large prefill to fused. FP4 activations on every generated
+token drift the per-token logits → hallucinated names; short outputs survive the smaller error.
+
+**Not the alpha/SF order, not a missing W4A8 kernel.** The flashinfer EP indexing is correct (weights/
+SF/alpha all locally indexed [0,128), shard order = `start_expert+i`; getWorkspaceSize divides by
+ep_size — all consistent). And the GROUPED *prefill* GEMM is ALSO W4A4 (`ElementA=nv_float4_t<e2m1>`,
+`:51`), so W4A4 per se isn't the bug — DECODE specifically must be FP32-activation, which EP downgraded.
+
+**Fix (commit 9ed7c2551):**
+- `llama-graph.cpp` — DROP the EP `min_m=1` forcing; EP uses the SAME `min_m=256` as non-EP:
+  decode/small-M → grouped HP (FP32 act), large prefill → fused (fast).
+- `dsv4-moe-grouped.cu` — the 4 HP-decode kernels (`dec_gate_up_swiglu[_fused]`,
+  `dec_down_scatter[_fused]`) are now EP-aware: `e = sel[row] - expert_base`; if `e∉[0,E_local)` skip
+  (zero act / no scatter) → each rank emits its partial, the existing `GGML_OP_DSV4_MOE_GROUPED →
+  PARTIAL` AllReduce sums both → exact full result at FP32-activation precision. `ep_base`/`E_local`
+  from `g_ep` (0/E non-EP → no-op, byte-identical). Large-M grouped CUTLASS prefill is guarded (never
+  reached under EP).
+
+**Net under EP:** prefill = fast fused W4A4 (same as non-EP prefill — prompt-only, bounded error);
+decode = FP32-activation HP shard (== non-EP decode quality, exact). Quality should now match the
+non-EP fused baseline.
+
+### Status
+- DONE (built .66, committed): R2 EP+fused (sidecar v2, `--ep`, runner ep_size/ep_rank) + R3 quality
+  fix (EP decode on FP32-act HP path, EP-aware HP kernels, min_m unforced).
+- REMAINING (coordinator): re-run the exact prompt under the deploy recipe; confirm no hallucinated
+  names + speed (decode now on HP path like non-EP; prefill still fused-fast); per-node `nvidia-smi`.
