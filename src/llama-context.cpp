@@ -1420,7 +1420,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool reuse_ok = !graph_reuse_disable && res->can_reuse(gparams);
+    {
+        // DSV4_PREFILL_PROF: per-ubatch reuse decision (off by default; one getenv/process). Used to
+        // characterize prefill: MEASURED that every multi-token prefill chunk has reuse=0 (each chunk's
+        // compressed-cache view widens with kv_len -> distinct topology), and that the per-chunk graph
+        // *build* is only ~2 ms while the ~95-160 ms "rebuild" cost is ggml_backend_sched_alloc_graph
+        // (buffer scheduling, grows with the compressed-attention size) — see the PROF line in the build
+        // branch below. Pure instrumentation; no effect on the compute path.
+        static const bool prefill_prof_dbg = getenv("DSV4_PREFILL_PROF") != nullptr;
+        if (prefill_prof_dbg && ubatch.n_tokens > 1) {
+            fprintf(stderr, "DSV4_PREFILL_DBG: w=%u reuse=%d gtype=%d\n",
+                    ubatch.n_tokens, (int) reuse_ok, (int) gtype);
+        }
+    }
+    if (reuse_ok) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1438,7 +1452,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         // DSV4_MTP_PROF: cumulative graph build+alloc cost (the price of graphs reused = 0)
-        static const bool build_prof = getenv("DSV4_MTP_PROF") != nullptr;
+        static const bool build_prof = getenv("DSV4_MTP_PROF") != nullptr || getenv("DSV4_PREFILL_PROF") != nullptr;
         const auto t_start_us = build_prof ? ggml_time_us() : 0;
 
         gf = model.build_graph(gparams);
@@ -1460,9 +1474,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (build_prof) {
             static double t_build_acc = 0.0, t_alloc_acc = 0.0;
             static int64_t n_builds = 0;
-            t_build_acc += (t_built_us - t_start_us)/1000.0;
-            t_alloc_acc += (ggml_time_us() - t_built_us)/1000.0;
-            if (++n_builds % 200 == 0) {
+            const double t_b = (t_built_us - t_start_us)/1000.0;
+            const double t_a = (ggml_time_us() - t_built_us)/1000.0;
+            t_build_acc += t_b;
+            t_alloc_acc += t_a;
+            ++n_builds;
+            // DSV4_PREFILL_PROF: per-build (not modulo-200) line so a single ~28-chunk prefill shows
+            // each chunk's CPU-side build+alloc cost — the part graph reuse can eliminate — vs the
+            // wall-clock per-chunk (which includes GPU compute). Width = ubatch.n_tokens.
+            static const bool prefill_prof = getenv("DSV4_PREFILL_PROF") != nullptr;
+            if (prefill_prof && ubatch.n_tokens > 1) {
+                fprintf(stderr, "DSV4_PREFILL_PROF: build#%lld w=%u nodes=%d | build %.1f ms + alloc %.1f ms\n",
+                        (long long) n_builds, ubatch.n_tokens, gf ? ggml_graph_n_nodes(gf) : -1, t_b, t_a);
+            }
+            if (n_builds % 200 == 0) {
                 LLAMA_LOG_INFO("DSV4_MTP_PROF: %lld graph builds (%d nodes) | build %.0f ms + alloc %.0f ms\n",
                         (long long) n_builds, gf ? ggml_graph_n_nodes(gf) : -1, t_build_acc, t_alloc_acc);
             }

@@ -95,6 +95,22 @@ extern "C" {
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
+    // [DSV4_MOE_GROUPED] Copy THIS rank's local split-slice bytes of a meta weight tensor into `dst`.
+    // For a tensor split along an axis (e.g. ffn_*_exps.weight on AXIS_1), this returns the rank-local
+    // half (its own simple tensor's contiguous bytes), NOT the reassembled global tensor. Handles a
+    // device-resident (CUDA) simple tensor by copying back to host. `size` must equal the local slice's
+    // ggml_nbytes. Returns the local slice element count along the split axis via *out_ne_axis (or the
+    // global ne if MIRRORED). Used by the DSV4 NVFP4 grouped-MoE load adapter to read each rank's half.
+    GGML_API bool ggml_backend_meta_buffer_get_local_tensor_data(
+        const struct ggml_tensor * tensor, void * dst, size_t size, int64_t * out_ne0, int64_t * out_ne1, int64_t * out_ne2);
+
+    // [DSV4_MOE_GROUPED] Bytes of THIS rank's local split-slice for a meta weight tensor (the size the
+    // dst buffer for ggml_backend_meta_buffer_get_local_tensor_data must have). Half of the global
+    // ggml_nbytes for a split tensor on 2 ranks; the full global size for a MIRRORED tensor. Returns 0
+    // if the tensor is not in a meta buffer or has no local slice. Lets the load adapter size its temp
+    // read buffer to the LOCAL slice (not the 2x global), so it never over-allocates per layer.
+    GGML_API size_t ggml_backend_meta_buffer_local_nbytes(const struct ggml_tensor * tensor);
+
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 

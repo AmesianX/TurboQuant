@@ -78,7 +78,9 @@ SAMPLING="${SAMPLING:---repeat-penalty 1.1 --repeat-last-n 1024 --dry-multiplier
 TEMP="${TEMP:-0}"
 SEED="${SEED:-42}"
 
-COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b 512 -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --chat-template-file $REPO/models/templates/deepseek-ai-DeepSeek-V4.jinja --reasoning-format deepseek --reasoning off --lock-server-params --temp $TEMP --seed $SEED $SPEC $SAMPLING ${EXTRA_ARGS:-}"
+# -b (logical batch) must be >= -ub (micro-batch). Derive it so raising UB never violates that.
+BB="$UB"; [ "$BB" -lt 512 ] && BB=512
+COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b $BB -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --chat-template-file $REPO/models/templates/deepseek-ai-DeepSeek-V4.jinja --reasoning-format deepseek --reasoning off --lock-server-params --temp $TEMP --seed $SEED $SPEC $SAMPLING ${EXTRA_ARGS:-}"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
@@ -117,6 +119,22 @@ env_common() {
     # DSV4_GPU_SAMPLER=0 to revert to the upstream CPU sampler. DSV4_GPU_INPUT_EMBD=1: token_embd on GPU.
     export DSV4_GPU_SAMPLER="${DSV4_GPU_SAMPLER:-1}"
     export DSV4_GPU_INPUT_EMBD="${DSV4_GPU_INPUT_EMBD:-1}"
+    # NVFP4 grouped-MoE op + sidecar weights + HP-activation threshold. Both ranks (SPMD)
+    # MUST run identically; forwarded to the slave via the ALLRESTART FWD line below.
+    [ -n "${DSV4_MOE_GROUPED:-}" ]    && export DSV4_MOE_GROUPED
+    [ -n "${DSV4_MOE_SIDECAR:-}" ]    && export DSV4_MOE_SIDECAR
+    [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && export DSV4_MOE_DECODE_MAX
+    # capture-safe prefill arena cap + prefill-graph safety hatch (both ranks identical)
+    [ -n "${DSV4_MOE_PREFILL_MAX:-}" ]       && export DSV4_MOE_PREFILL_MAX
+    [ -n "${DSV4_MOE_PREFILL_GRAPH_OFF:-}" ] && export DSV4_MOE_PREFILL_GRAPH_OFF
+    [ -n "${NCCL_DEBUG:-}" ]          && export NCCL_DEBUG
+    [ -n "${NCCL_IB_GID_INDEX:-}" ]   && export NCCL_IB_GID_INDEX
+    # prefill graph-build profiling (off by default; both ranks identical). Used to characterize the
+    # prefill bottleneck: per-chunk graph BUILD is ~2 ms, the dominant per-chunk cost is GPU compute +
+    # ggml_backend_sched_alloc_graph (split/buffer scheduling, grows with the compressed-cache view).
+    [ -n "${DSV4_MTP_PROF:-}" ]       && export DSV4_MTP_PROF
+    [ -n "${DSV4_PREFILL_PROF:-}" ]   && export DSV4_PREFILL_PROF
+    return 0   # never let a skipped optional-export ([ -n "" ] -> 1) fail env_common under set -e
 }
 
 stop_local() {
@@ -208,6 +226,18 @@ case "${1:-}" in
         echo "== ALLRESTART: starting slave then master =="
         # forward the slot/graph overrides so BOTH ranks build matching graphs (TP requires it).
         FWD="PARALLEL=$PARALLEL GRAPH_SLOTS=$GRAPH_SLOTS CTX=$CTX UB=$UB MODEL=$MODEL SPEC=\"$SPEC\""
+        # forward NVFP4 grouped-MoE env so the slave runs the identical SPMD config
+        [ -n "${DSV4_MOE_GROUPED:-}" ]    && FWD="$FWD DSV4_MOE_GROUPED=$DSV4_MOE_GROUPED"
+        [ -n "${DSV4_MOE_SIDECAR:-}" ]    && FWD="$FWD DSV4_MOE_SIDECAR=$DSV4_MOE_SIDECAR"
+        [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && FWD="$FWD DSV4_MOE_DECODE_MAX=$DSV4_MOE_DECODE_MAX"
+        [ -n "${DSV4_MOE_PREFILL_MAX:-}" ]       && FWD="$FWD DSV4_MOE_PREFILL_MAX=$DSV4_MOE_PREFILL_MAX"
+        [ -n "${DSV4_MOE_PREFILL_GRAPH_OFF:-}" ] && FWD="$FWD DSV4_MOE_PREFILL_GRAPH_OFF=$DSV4_MOE_PREFILL_GRAPH_OFF"
+        [ -n "${DSV4_MOE_GRAPH_OFF:-}" ]  && FWD="$FWD DSV4_MOE_GRAPH_OFF=$DSV4_MOE_GRAPH_OFF"
+        [ -n "${DSV4_GRAPH_PROBE:-}" ]    && FWD="$FWD DSV4_GRAPH_PROBE=$DSV4_GRAPH_PROBE"
+        [ -n "${DSV4_MTP_PROF:-}" ]       && FWD="$FWD DSV4_MTP_PROF=$DSV4_MTP_PROF"
+        [ -n "${DSV4_PREFILL_PROF:-}" ]   && FWD="$FWD DSV4_PREFILL_PROF=$DSV4_PREFILL_PROF"
+        [ -n "${NCCL_DEBUG:-}" ]          && FWD="$FWD NCCL_DEBUG=$NCCL_DEBUG"
+        [ -n "${NCCL_IB_GID_INDEX:-}" ]   && FWD="$FWD NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX"
         # don't let a slave-side failure abort under set -e before the master is started — warn and go on
         ssh "$SLAVE_SSH" "$FWD $SELF START" || echo "[WARN] slave START failed ($SLAVE_SSH) — starting master anyway"
         sleep 3

@@ -126,8 +126,16 @@ struct server_slot {
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        // [tp-2node-dsv4] FIX#1: the prompt-cache save bypassed the TP broadcast, so the
+        // follower's mirrored KV never snapshotted -> on slot reuse / restore the ranks
+        // desynced -> NCCL/CUDA crash. Mirror this snapshot on the SPMD follower under a
+        // fresh key; the matching restore (server_prompt_cache::load) replays it.
+        cur->tp_key = tpserve::tp_next_state_key();
+        tpserve::tp_bcast_state_op(tpserve::tp_ctx_id(ctx_tgt), tpserve::TP_OP_STATE_SAVE, cur->tp_key, id, (int32_t) LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            cur->tp_key_dft = tpserve::tp_next_state_key();
+            tpserve::tp_bcast_state_op(tpserve::tp_ctx_id(ctx_dft), tpserve::TP_OP_STATE_SAVE, cur->tp_key_dft, id, (int32_t) LLAMA_STATE_SEQ_FLAGS_NONE);
         }
     }
 

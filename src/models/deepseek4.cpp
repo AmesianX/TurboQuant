@@ -8,9 +8,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+// [DSV4_MOE_SIDECAR] defined in llama-model.cpp / ggml-backend-meta.cpp (same libs).
+bool dsv4_sidecar_read_layer_set(const char * dir, int rank, std::set<int> & out);
+extern "C" int ggml_backend_meta_tp_rank_public(void);
 
 namespace {
 
@@ -361,8 +366,22 @@ public:
             return false;
         }
 
-        const int64_t   last = (int64_t) params.ubatch.n_tokens - 1;
-        const llama_pos pos  = params.ubatch.pos ? params.ubatch.pos[last] : (llama_pos) last;
+        // [tp-2node-dsv4] FIX#2: derive the topology drivers from the MAX pos over the
+        // whole ubatch, not the LAST token's pos. The graph BUILD path sizes the
+        // compressed-cache view from the maximum position in the ubatch; under
+        // multi-slot / concurrent batching the last token is not necessarily the
+        // highest-pos token, so keying reuse on pos[last] could admit a graph whose
+        // view/mask shape differs from what the build path would produce -> shape
+        // mismatch -> abort. Taking the max makes can_reuse match the build path.
+        const int64_t last = (int64_t) params.ubatch.n_tokens - 1;
+        llama_pos pos = params.ubatch.pos ? params.ubatch.pos[0] : (llama_pos) last;
+        if (params.ubatch.pos) {
+            for (int64_t i = 1; i < (int64_t) params.ubatch.n_tokens; i++) {
+                if (params.ubatch.pos[i] > pos) { pos = params.ubatch.pos[i]; }
+            }
+        } else {
+            pos = (llama_pos) last;
+        }
 
         for (const auto & r : reuse_recs) {
             const int64_t visible = (pos + 1) / r.ratio;
@@ -3118,6 +3137,28 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
     const int64_t hc_dim            = n_hc * n_embd;
     const int64_t hc_mix            = (2 + n_hc) * n_hc;
 
+    // [DSV4_MOE_SIDECAR] When the NVFP4 grouped-GEMM MoE adapter loads its experts from a pre-converted
+    // per-rank sidecar (DSV4_MOE_SIDECAR set), the routed-expert MXFP4 weights are NEVER referenced by
+    // the graph and must NOT be device-resident (holding MXFP4 next to the NVFP4 registry is the ~2x
+    // OOM). Mark them TENSOR_SKIP so the loader neither creates nor loads them (ffn_*_exps stay null);
+    // the NVFP4 registry is filled post-load from the sidecar.
+    //
+    // PER-LAYER: TENSOR_SKIP applies ONLY to layers present in this rank's sidecar (the MXFP4 MoE
+    // layers actually pre-converted). The MTP/nextn draft layer has Q4_K experts that are NOT in the
+    // sidecar -> it must load its experts NORMALLY and run on the standard mul_mat_id path. We read the
+    // sidecar header's layer table here (tiny, no blobs) to learn which il's are present. Env off ->
+    // dsv4_sidecar_layers empty -> exps_flags_for(i) == 0 for all layers (default path, byte-identical).
+    if (const char * sc_dir = getenv("DSV4_MOE_SIDECAR")) {
+        const int rank = ggml_backend_meta_tp_rank_public();
+        if (!dsv4_sidecar_read_layer_set(sc_dir, rank, dsv4_sidecar_layers)) {
+            throw std::runtime_error("DSV4_MOE_SIDECAR set but sidecar_rank" + std::to_string(rank) +
+                ".bin is missing/invalid in " + sc_dir);
+        }
+    }
+    auto exps_flags_for = [&](int il) -> int {
+        return dsv4_sidecar_layers.count(il) ? llama_model_loader::TENSOR_SKIP : 0;
+    };
+
     if (n_out_groups == 0) {
         throw std::runtime_error("DeepSeek V4 requires attention output groups");
     }
@@ -3187,9 +3228,9 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
             layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, TENSOR_NOT_REQUIRED);
         }
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags_for(i));
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, exps_flags_for(i));
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags_for(i));
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
@@ -3227,9 +3268,9 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, f);
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, f);
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, f);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, f);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, f);
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, f | exps_flags_for(i));
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, f | exps_flags_for(i));
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, f | exps_flags_for(i));
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, f);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, f);

@@ -6,6 +6,7 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <set>
 
 //
 // base classes
@@ -1045,6 +1046,12 @@ struct llama_model_deepseek4 : public llama_model_base {
     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // [DSV4_MOE_SIDECAR] set of layer indices present in this rank's sidecar (the MXFP4 MoE layers
+    // pre-converted to NVFP4). Only these get TENSOR_SKIP + the grouped-GEMM op; the MTP/nextn layer
+    // (Q4_K experts, NOT in the sidecar) loads + runs on the normal mul_mat_id path. Empty if the
+    // sidecar env is unset. Populated in load_arch_tensors, consumed there and in load_tensors.
+    std::set<int> dsv4_sidecar_layers;
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);

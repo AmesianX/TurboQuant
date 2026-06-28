@@ -660,20 +660,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
         }
-        // [EP2] mul_mat_id with expert-dim-split weights (src0 AXIS_2 = n_expert): each rank owns WHOLE
-        // experts [r*E/2,(r+1)*E/2) and the per-rank ids remap (slice step) routes activations to the
-        // LOCAL experts only. ONE AllReduce per FFN layer, NOT three: gate/up keep their disjoint
-        // rank-local experts flowing as MIRRORED (no collective -- each rank's down consumes its OWN
-        // local experts' activations, which it has); only the DOWN projection's output is PARTIAL so a
-        // single AllReduce sums the disjoint per-rank expert outputs into the full MoE result. Marking
-        // gate/up PARTIAL too (3 AllReduces) explodes the subgraph count -> OOM/deadlock at slot-init.
-        // (The MIRRORED label on gate/up is a benign "lie": the data is only consumed by glu->down on
-        // the same rank, never by an op that assumes cross-rank identity.) [ep2-dp]
-        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-            const bool is_down = tensor->src[0] != nullptr && strstr(tensor->src[0]->name, "down") != nullptr;
-            return {is_down ? (assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL)
-                            : GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
-        }
         GGML_ABORT("fatal error");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
     };
@@ -1109,6 +1095,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
+            case GGML_OP_DSV4_MOE_GROUPED: {
+                // [DSV4_MOE_GROUPED] The NVFP4 grouped-GEMM MoE op. Its graph inputs (hidden, sel,
+                // weights) are MIRRORED across ranks, but the per-layer expert weights were tensor-split
+                // AXIS_1 (intermediate n_ff) at load -> EACH RANK COMPUTED WITH ONLY ITS HALF of the
+                // experts, so the down-projection output is a PARTIAL sum over n_ff. Mirror the
+                // down-projection mul_mat case (AXIS_0/AXIS_0 -> assume_sync ? MIRRORED : PARTIAL): the
+                // false-assume_sync query at the subgraph-boundary scan (line ~2183) then sees PARTIAL and
+                // the existing machinery inserts ONE AllReduce to sum the two ranks' moe_out. Under
+                // single-rank / no-TP all srcs stay MIRRORED, n_bufs==1, and the AllReduce is a no-op, so
+                // this resolves to MIRRORED (no collective). Reuses the proven PARTIAL->AllReduce path;
+                // no new comm. [tp-2node-dsv4][ep2-dp]
+                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
+            } break;
             case GGML_OP_MAP_CUSTOM1:
             case GGML_OP_MAP_CUSTOM2:
             case GGML_OP_MAP_CUSTOM3:
@@ -1281,25 +1281,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
-        // [EP2] expert-parallel: for a mul_mat_id whose expert weight (src[0]) is split on the expert
-        // dimension (AXIS_2), stamp device j's GLOBAL expert offset into op_params[0] and mark EP in
-        // op_params[1]. The CUDA mul_mat_id then remaps GLOBAL ids -> this rank's LOCAL expert slice
-        // and pre-zeros dst; the per-token PARTIAL outputs are summed by the existing AllReduce. [ep2-dp]
-        if (tensor->op == GGML_OP_MUL_MAT_ID && tensor->src[0] != nullptr &&
-                ggml_backend_buffer_is_meta(tensor->src[0]->buffer)) {
-            const ggml_backend_meta_split_state ss0 =
-                ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
-            if (ss0.axis == GGML_BACKEND_SPLIT_AXIS_2) {
-                int64_t expert_offset = 0;
-                for (size_t jj = 0; jj < j; jj++) {
-                    for (size_t s = 0; s < ss0.n_segments; s++) {
-                        expert_offset += ss0.ne[s*n_simple_bufs + jj];
-                    }
-                }
-                t_ij->op_params[0] = (int32_t) expert_offset;
-                t_ij->op_params[1] = 1;
-            }
-        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
@@ -1657,6 +1638,53 @@ static inline int ggml_meta_tp_rank() {
 }
 static inline bool ggml_meta_tp_buf_is_local(size_t index) {
     return !ggml_meta_tp_is_spmd() || (int) index == ggml_meta_tp_rank();
+}
+
+// Public accessor for the SPMD rank (GGML_TP_RANK; 0 when not SPMD). Used by the engine to pick the
+// per-rank DSV4 NVFP4 sidecar file. [DSV4_MOE_SIDECAR]
+extern "C" int ggml_backend_meta_tp_rank_public(void) {
+    return ggml_meta_tp_is_spmd() ? ggml_meta_tp_rank() : 0;
+}
+
+// [DSV4_MOE_GROUPED] Read THIS rank's local split-slice of a meta weight tensor straight out of the
+// simple (e.g. CUDA) tensor it was loaded into. Each process owns ONE local rank slice (SPMD), so we
+// index the rank-local simple tensor and ggml_backend_tensor_get its contiguous bytes (device->host).
+// For an AXIS_1-split ffn_*_exps.weight this is exactly the rank's half [n_embd, n_ff_half, n_expert]
+// (or [n_ff_half, n_embd, n_expert] for down on AXIS_0); for a MIRRORED tensor it is the full tensor.
+bool ggml_backend_meta_buffer_get_local_tensor_data(
+        const struct ggml_tensor * tensor, void * dst, size_t size,
+        int64_t * out_ne0, int64_t * out_ne1, int64_t * out_ne2) {
+    if (tensor == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return false;
+    }
+    const size_t idx = ggml_meta_tp_is_spmd() ? (size_t) ggml_meta_tp_rank() : 0;
+    const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, idx);
+    if (simple_tensor == nullptr) {
+        return false;
+    }
+    // The rank-local simple tensor carries this rank's slice dims (split axis already halved).
+    const size_t local_bytes = ggml_nbytes(simple_tensor);
+    if (local_bytes == 0 || local_bytes > size) {
+        return false;
+    }
+    if (out_ne0) { *out_ne0 = simple_tensor->ne[0]; }
+    if (out_ne1) { *out_ne1 = simple_tensor->ne[1]; }
+    if (out_ne2) { *out_ne2 = simple_tensor->ne[2]; }
+    // ggml_backend_tensor_get is synchronous and handles a CUDA-resident src (copies back to host).
+    ggml_backend_tensor_get(simple_tensor, dst, 0, local_bytes);
+    return true;
+}
+
+size_t ggml_backend_meta_buffer_local_nbytes(const struct ggml_tensor * tensor) {
+    if (tensor == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return 0;
+    }
+    const size_t idx = ggml_meta_tp_is_spmd() ? (size_t) ggml_meta_tp_rank() : 0;
+    const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, idx);
+    if (simple_tensor == nullptr) {
+        return 0;
+    }
+    return ggml_nbytes(simple_tensor);
 }
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -2286,20 +2314,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         backend_ctx->uid         = cgraph->uid;
         backend_ctx->n_subgraphs = n_subgraphs;
-
-        // [EP2 DIAG] count PARTIAL nodes (= cross-rank AllReduces) so we can compare the two ranks.
-        // A mismatch here is a deadlock (one rank waits on a collective the other never issues).
-        if (getenv("DSV4_EP_DBG")) {
-            int n_partial = 0;
-            for (int ii = 0; ii < cgraph->n_nodes; ii++) {
-                if (ggml_backend_meta_get_split_state(cgraph->nodes[ii], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                    n_partial++;
-                }
-            }
-            fprintf(stderr, "[EP_DBG] graph_compute: n_nodes=%d n_subgraphs=%zu n_partial=%d\n",
-                cgraph->n_nodes, (size_t) n_subgraphs, n_partial);
-            fflush(stderr);
-        }
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
             for (size_t j = 0; j < n_backends; j++) {

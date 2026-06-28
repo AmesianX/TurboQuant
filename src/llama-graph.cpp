@@ -19,6 +19,10 @@
 #include <sstream>
 #include <unordered_set>
 
+// [DSV4_MOE_SIDECAR] per-layer gate for the NVFP4 grouped-GEMM MoE hook: true iff layer il's NVFP4
+// experts were registered from the sidecar. Defined in libggml-cuda (dsv4-moe-grouped.cu).
+bool dsv4_moe_grouped_have_layer(int il);
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -1621,6 +1625,39 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // DSV4 NVFP4 grouped-GEMM MoE op (STEP 2b). Gated behind DSV4_MOE_GROUPED=1; with the
+    // flag off this branch is never taken and the default mul_mat_id path below is byte-identical.
+    // The op reuses the exact router computed above (selected_experts + normalized/scaled weights)
+    // and reads the per-layer NVFP4 expert weights from the device registry populated at load.
+    //
+    // PER-LAYER gate: only layers whose NVFP4 experts were actually registered (i.e. present in the
+    // sidecar -> dsv4_moe_grouped_have_layer(il)) take this path. The MTP/nextn draft layer ships
+    // Q4_K experts that are NOT in the sidecar and NOT registered, so it falls through to the normal
+    // mul_mat_id path below with its real (loaded) expert tensors. [DSV4_MOE_SIDECAR]
+    {
+        static const bool dsv4_moe_grouped = getenv("DSV4_MOE_GROUPED") != nullptr;
+        if (dsv4_moe_grouped && arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 0 && dsv4_moe_grouped_have_layer(il)) {
+            // selected_experts is a VIEW of ggml_argsort_top_k's full [n_expert, n_tokens]
+            // buffer: ne=[n_expert_used, n_tokens] but nb[1] = n_expert*sizeof(int) (the FULL
+            // argsort row stride), so it is NON-CONTIGUOUS. The grouped op reads the expert id
+            // as sel[token*n_expert_used + slot] (dense stride = n_expert_used), so for every
+            // token>0 it indexes into the discarded argsort tail -> WRONG experts (CJK/EOS
+            // corruption). Force a contiguous [n_expert_used, n_tokens] copy before the op.
+            ggml_tensor * sel_i32 = ggml_cont(ctx0, selected_experts); // [n_expert_used, n_tokens] I32, contiguous
+            ggml_tensor * w_2d    = ggml_cont(ctx0, ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens)); // [n_expert_used, n_tokens] F32
+            ggml_tensor * cur_2d  = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+            // Thread the SAME per-layer DeepSeek-V4 SwiGLU clamp limit that the reference
+            // routed-expert path applies (see DEEPSEEK4 branch below): clamp gate to
+            // (-INF, limit] and up to [-limit, limit] before silu(gate)*up. Without it the
+            // grouped op produces unclamped outlier activations that break nuanced behavior
+            // (instruction-following / language) while leaving in-range tokens correct.
+            const float swiglu_limit = hparams.swiglu_clamp_exp[il];
+            ggml_tensor * moe_out = ggml_dsv4_moe_grouped(ctx0, cur_2d, sel_i32, w_2d, il, swiglu_limit);
+            cb(moe_out, "ffn_moe_grouped_out", il);
+            return moe_out;
+        }
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 

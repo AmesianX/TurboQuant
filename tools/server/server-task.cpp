@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "tp-serve.h" // [tp-2node-dsv4] FIX#1: mirror prompt-cache restore to the SPMD follower
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -2131,6 +2132,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         {
             auto & data = it_best->data.main;
 
+            // [tp-2node-dsv4] FIX#1: mirror the restore on the SPMD follower BEFORE we set
+            // locally, keyed off the tp_key recorded at prompt_save time, so the follower's
+            // mirrored KV jumps to the same snapshot and the next decode's NCCL lines up.
+            if (it_best->tp_key != 0) {
+                tpserve::tp_bcast_state_op(tpserve::tp_ctx_id(ctx_tgt), tpserve::TP_OP_STATE_RESTORE, it_best->tp_key, id_slot, 0);
+            }
+
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
@@ -2148,6 +2156,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
+
+                if (it_best->tp_key_dft != 0) {
+                    tpserve::tp_bcast_state_op(tpserve::tp_ctx_id(ctx_dft), tpserve::TP_OP_STATE_RESTORE, it_best->tp_key_dft, id_slot, 0);
+                }
 
                 const size_t size = data.size();
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);

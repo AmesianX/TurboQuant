@@ -24,6 +24,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/dsv4.cuh"
+#include "ggml-cuda/dsv4-moe-grouped.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -2787,21 +2788,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
-    // [EP2] expert-parallel node (meta-backend set op_params[1]=1): src0 is sliced on the expert
-    // dimension so this rank holds only its LOCAL experts; the per-rank GLOBAL offset is op_params[0].
-    // (1) pre-zero dst so the remote-expert output positions this rank does NOT write are 0 for the
-    // following cross-rank AllReduce (which sums the per-rank partial MoE outputs). (2) force the mmq
-    // path -- the only one wired to read op_params[0] and remap GLOBAL ids to the LOCAL expert slice.
-    // op_params[1]==0 (default) leaves the upstream dispatch byte-identical. [ep2-dp]
-    if (dst->op_params[1] != 0) {
-        static const bool ep_sync = getenv("DSV4_EP_SYNC") != nullptr; // [EP DIAG] localize async OOB
-        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
-        if (ep_sync) { CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); } // OOB here => dst-zero memset
-        ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
-        if (ep_sync) { CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); } // OOB here => mmq (helper or matmul)
-        return;
-    }
-
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -3274,6 +3260,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_ROPE_TAIL:
             ggml_cuda_op_dsv4_rope_tail(ctx, dst);
             break;
+        case GGML_OP_DSV4_MOE_GROUPED:
+            ggml_cuda_op_dsv4_moe_grouped(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
             break;
@@ -3414,10 +3403,17 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     return true;
 }
 
+// DSV4 grouped-MoE defer-free drain: frees prefill-arena pointers that were
+// RETIRED (not freed inline) during a CUDA-graph-safe grow. Safe to free here
+// because the stream has just drained, so no captured graph still references them.
+extern "C" void dsv4_moe_grouped_drain_retired(void);
+
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+
+    dsv4_moe_grouped_drain_retired();
 
     GGML_UNUSED(backend);
 }
@@ -3447,6 +3443,35 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split buffer\n", __func__);
 #endif
+        }
+
+        // [DSV4_MOE_GROUPED] the NVFP4 grouped-MoE op has TWO paths keyed on batch M
+        // (= src[0]->ne[1], the token count). BOTH are now CUDA-graph capture-safe:
+        //   * DECODE / MTP-verify (small M <= HP threshold): persistent per-layer
+        //     scratch + two plain kernel launches. No malloc/free/sync/thrust.
+        //   * PREFILL (large M, CUTLASS grouped GEMM): rewritten to be capture-safe too
+        //     -- on-device counting sort (histogram + exclusive scan + scatter), on-device
+        //     absmax->gscale, a persistent per-layer arena (grow-once, no per-call
+        //     malloc/free), and CUTLASS grouped GEMM driven with host_problem_shapes=NULL
+        //     so the grid is sized to sm_count (M-independent) and the persistent tile
+        //     scheduler reads the DEVICE problem shapes at runtime. NO thrust, NO per-call
+        //     cudaMalloc, NO cudaStreamSynchronize, NO host round-trips on either path.
+        // So we allow graphs for BOTH paths. (A/B lever DSV4_MOE_GRAPH_OFF=1 still forces
+        // graphs OFF for this op so the speedup can be measured against an identical
+        // binary. DSV4_MOE_PREFILL_GRAPH_OFF=1 keeps graphs off ONLY for the prefill
+        // path -- a safety hatch if a CUTLASS build is found to allocate internally.)
+        if (node->op == GGML_OP_DSV4_MOE_GROUPED) {
+            static const int hp_max = []{ const char*e=getenv("DSV4_MOE_DECODE_MAX"); return e?atoi(e):16; }();
+            static const bool graph_off = getenv("DSV4_MOE_GRAPH_OFF") != nullptr;
+            static const bool prefill_graph_off = getenv("DSV4_MOE_PREFILL_GRAPH_OFF") != nullptr;
+            const int moe_M = (node->src[0] ? (int)node->src[0]->ne[1] : 0);
+            const bool is_decode = (getenv("DSV4_MOE_NO_HP_DECODE")==nullptr) && (moe_M <= hp_max);
+            if (graph_off || (!is_decode && prefill_graph_off)) {
+                use_cuda_graph = false;
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs for dsv4 grouped MoE (M=%d, decode=%d)\n", __func__, moe_M, (int)is_decode);
+#endif
+            }
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -5772,6 +5797,8 @@ static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, co
             return ggml_cuda_op_dsv4_fp8_kv_quantize_supported();
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
             return ggml_cuda_op_dsv4_hc_weighted_sum_supported();
+        case GGML_OP_DSV4_MOE_GROUPED:
+            return ggml_cuda_op_dsv4_moe_grouped_supported();
 
         default:
             return false;

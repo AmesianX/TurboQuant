@@ -582,6 +582,16 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // [tp-2node-dsv4] TP mirror keys for the prompt-cache state blob. When this
+    // prompt's KV snapshot is saved (prompt_save) the leader broadcasts a
+    // TP_OP_STATE_SAVE under tp_key (and tp_key_dft for the draft ctx) so the
+    // follower mirrors the same snapshot; on restore (server_prompt_cache::load)
+    // the leader broadcasts TP_OP_STATE_RESTORE under the SAME keys so the
+    // follower's mirrored KV jumps to the matching snapshot and the next decode's
+    // NCCL collectives line up. 0 = not yet saved (skip the restore broadcast).
+    uint64_t tp_key     = 0;
+    uint64_t tp_key_dft = 0;
+
     size_t size() const {
         size_t res = 0;
 
@@ -603,6 +613,8 @@ struct server_prompt {
             tokens.clone(),
             data,
             checkpoints,
+            tp_key,
+            tp_key_dft,
         };
     }
 };

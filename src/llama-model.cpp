@@ -24,16 +24,73 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <functional>
 #include <map>
 #include <numeric>
+#include <set>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// [DSV4_MOE_SIDECAR] NVFP4 grouped-GEMM MoE sidecar load. The blob uploader + POD blob header live in
+// libggml-cuda (ggml-cuda/dsv4-moe-grouped.cu, default visibility -> resolvable since libllama links
+// libggml-cuda). The sidecar holds the pre-converted, per-rank, rank-local-sliced NVFP4 expert blobs,
+// so the engine never touches MXFP4 on device and never re-splits at load. Only referenced when
+// DSV4_MOE_SIDECAR is set -> the default build path is unaffected.
+// POD blob header mirror (must match ggml-cuda/dsv4-moe-grouped-blob.h byte-for-byte; that header is
+// not on libllama's include path so it is mirrored here -- it is a fixed on-disk/ABI layout).
+struct dsv4_moe_grouped_blob_header {
+    int32_t  n_expert;
+    int32_t  n_embd;
+    int32_t  n_ff_half;
+    int32_t  sfb_words_gu;
+    int32_t  sfb_words_d;
+    int32_t  _pad;
+    uint64_t blob_bytes;
+};
+#define DSV4_SIDECAR_MAGIC   0x344E5650u
+#define DSV4_SIDECAR_VERSION 1u
+struct dsv4_sidecar_file_header {
+    uint32_t magic; uint32_t version; int32_t rank; int32_t n_ranks;
+    int32_t n_layers; int32_t n_expert; int32_t n_embd; int32_t n_ff_half;
+    uint64_t total_bytes;
+};
+struct dsv4_sidecar_layer_entry {
+    int32_t il; int32_t _pad; uint64_t offset; uint64_t size;
+};
+void dsv4_moe_grouped_set_expert_weights_blob(int il, const dsv4_moe_grouped_blob_header * hdr,
+                                              const void * blob, size_t blob_size);
+bool dsv4_moe_grouped_have_layer(int il);
+// rank for the per-process sidecar file (GGML_TP_RANK; 0 when not SPMD). Defined in ggml-backend-meta.cpp.
+extern "C" int ggml_backend_meta_tp_rank_public(void);
+
+// [DSV4_MOE_SIDECAR] Read the set of layer indices present in this rank's sidecar (header layer table
+// only -- a tiny read, NO blobs). Returns false if the sidecar is missing/invalid. Shared by
+// deepseek4.cpp (per-layer TENSOR_SKIP gating) and load_tensors (upload). Non-static -> linkable from
+// deepseek4.cpp's TU. `out` is cleared then filled with the converted (MXFP4) layers' real il values.
+bool dsv4_sidecar_read_layer_set(const char * dir, int rank, std::set<int> & out) {
+    out.clear();
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/sidecar_rank%d.bin", dir, rank);
+    FILE * f = fopen(path, "rb");
+    if (!f) { return false; }
+    dsv4_sidecar_file_header fh{};
+    if (fread(&fh, sizeof(fh), 1, f) != 1 || fh.magic != DSV4_SIDECAR_MAGIC || fh.version != DSV4_SIDECAR_VERSION) {
+        fclose(f); return false;
+    }
+    std::vector<dsv4_sidecar_layer_entry> table(fh.n_layers);
+    if (fh.n_layers > 0 && fread(table.data(), sizeof(table[0]), fh.n_layers, f) != (size_t) fh.n_layers) {
+        fclose(f); return false;
+    }
+    fclose(f);
+    for (const auto & e : table) { out.insert(e.il); }
+    return true;
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -504,15 +561,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
-        // [EP2] expert-parallel (DSV4_EP): split ROUTED experts along the EXPERT dimension (axis 2 =
-        // n_expert) so each box owns WHOLE experts [0,N/2)/[N/2,N), instead of within-expert (axis 0/1)
-        // which forces an AllReduce of the full hidden state every MoE layer. Gated so the default
-        // tensor-split path stays byte-identical when DSV4_EP is unset. Foundation for the EP dispatch
-        // path (mul_mat_id local-expert compute + all-to-all combine). [tp-2node-dsv4][ep2-dp]
-        static const bool dsv4_ep = getenv("DSV4_EP") != nullptr;
-        if (dsv4_ep && tensor_name.find("_exps.weight") != std::string::npos) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
-        }
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -1645,6 +1693,82 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // [DSV4_MOE_SIDECAR] Populate the per-layer NVFP4 expert-weight registry from a PRE-CONVERTED,
+    // per-rank sidecar file -- NO load-time MXFP4->NVFP4 conversion, NO MXFP4 experts on device.
+    //
+    // Under DSV4_MOE_SIDECAR the DSV4 routed-expert tensors were skipped at create_tensor time
+    // (TENSOR_SKIP in deepseek4.cpp -> never allocated/loaded -> layer.ffn_*_exps == nullptr), so the
+    // full MXFP4 expert set is never device-resident. The rank-local AXIS_1(gate/up)/AXIS_0(down) n_ff
+    // split was BAKED into the sidecar OFFLINE by tools/dsv4-nvfp4-preconvert, so the engine never
+    // re-splits at load: this rank reads sidecar_rank{rank}.bin and memcpy-uploads each layer's NVFP4
+    // blob straight into the device registry. Peak = model - MXFP4_experts + NVFP4_registry (no 2x).
+    if (const char * sc_dir = getenv("DSV4_MOE_SIDECAR")) {
+        if (getenv("DSV4_MOE_GROUPED") == nullptr) {
+            LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] DSV4_MOE_SIDECAR set but DSV4_MOE_GROUPED is not -- "
+                "the grouped-GEMM op must be enabled to consume the sidecar\n", __func__);
+            return false;
+        }
+        if (arch == LLM_ARCH_DEEPSEEK4) {
+            const int rank = ggml_backend_meta_tp_rank_public();
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/sidecar_rank%d.bin", sc_dir, rank);
+
+            FILE * f = fopen(path, "rb");
+            if (!f) {
+                LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] cannot open %s\n", __func__, path);
+                return false;
+            }
+            dsv4_sidecar_file_header fh{};
+            if (fread(&fh, sizeof(fh), 1, f) != 1 || fh.magic != DSV4_SIDECAR_MAGIC ||
+                fh.version != DSV4_SIDECAR_VERSION) {
+                LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] bad header in %s (magic=%08x ver=%u)\n",
+                    __func__, path, fh.magic, fh.version);
+                fclose(f);
+                return false;
+            }
+            if (fh.rank != rank || fh.n_expert != (int) hparams.n_expert || fh.n_embd != (int) hparams.n_embd) {
+                LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] %s metadata mismatch "
+                    "(file rank=%d n_expert=%d n_embd=%d vs engine rank=%d n_expert=%d n_embd=%d)\n",
+                    __func__, path, fh.rank, fh.n_expert, fh.n_embd,
+                    rank, (int) hparams.n_expert, (int) hparams.n_embd);
+                fclose(f);
+                return false;
+            }
+
+            std::vector<dsv4_sidecar_layer_entry> table(fh.n_layers);
+            if (fh.n_layers > 0 && fread(table.data(), sizeof(table[0]), fh.n_layers, f) != (size_t) fh.n_layers) {
+                LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] truncated layer table in %s\n", __func__, path);
+                fclose(f);
+                return false;
+            }
+
+            std::vector<uint8_t> rec;
+            int n_loaded = 0;
+            for (const auto & e : table) {
+                if (dsv4_moe_grouped_have_layer(e.il)) {
+                    continue;
+                }
+                rec.resize(e.size);
+                if (fseek(f, (long) e.offset, SEEK_SET) != 0 ||
+                    fread(rec.data(), 1, e.size, f) != e.size) {
+                    LLAMA_LOG_ERROR("%s: [dsv4-moe-sidecar] failed to read layer %d record (off=%llu size=%llu) from %s\n",
+                        __func__, e.il, (unsigned long long) e.offset, (unsigned long long) e.size, path);
+                    fclose(f);
+                    return false;
+                }
+                const dsv4_moe_grouped_blob_header * bh = (const dsv4_moe_grouped_blob_header *) rec.data();
+                const void * blob = rec.data() + sizeof(dsv4_moe_grouped_blob_header);
+                const size_t blob_size = e.size - sizeof(dsv4_moe_grouped_blob_header);
+                dsv4_moe_grouped_set_expert_weights_blob(e.il, bh, blob, blob_size);
+                n_loaded++;
+            }
+            fclose(f);
+            LLAMA_LOG_INFO("%s: [dsv4-moe-sidecar] uploaded NVFP4 experts for %d MoE layers from %s "
+                "(rank %d/%d, n_ff_half=%d; MXFP4 never device-resident)\n",
+                __func__, n_loaded, path, rank, fh.n_ranks, fh.n_ff_half);
         }
     }
 

@@ -275,6 +275,17 @@ inline void tp_follower_loop() {
                 auto it = state_store.find(key);
                 if (it != state_store.end() && !it->second.empty()) {
                     llama_state_seq_set_data_ext(ctx, it->second.data(), it->second.size(), seq_id, (llama_state_seq_flags) flags);
+                } else {
+                    // [tp-2node-dsv4] FIX#5: a STATE_RESTORE for a key the follower never
+                    // stored means the leader<->follower snapshot sets have DESYNCED. A
+                    // silent no-op leaves the follower's KV stale -> the next decode's NCCL
+                    // collectives mismatch the leader -> hang/garbage. Fail loud so the
+                    // desync is diagnosable instead of corrupting silently.
+                    fprintf(stderr, "[tp-op] FATAL: STATE_RESTORE key=%llu MISS on follower "
+                            "(ctx=%d seq=%d) — leader/follower snapshot desync\n",
+                            (unsigned long long) key, ctx_id, (int) seq_id);
+                    fflush(stderr);
+                    abort();
                 }
             }
         } else {

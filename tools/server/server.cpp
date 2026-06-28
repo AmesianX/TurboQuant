@@ -98,6 +98,24 @@ int llama_server(int argc, char ** argv) {
         LOG_INF("%s: embedding mode detected, setting AMX3_LAMBDA=2.5 for encoder-optimal quantization\n", __func__);
     }
 
+    // DSV4 grouped-MoE: PRE-SIZE the persistent prefill arena to the server's max
+    // prefill ubatch BEFORE any model load / CUDA-graph capture. Every prefill
+    // ubatch has M <= n_ubatch, so sizing the arena to n_ubatch tokens once means
+    // the arena grow guard never re-fires after a graph is captured -> no
+    // cudaMalloc/cudaFree post-capture -> a replayed prefill graph always sees the
+    // same device addresses -> graphs stay ON and capture-safe (no use-after-free
+    // under --parallel 2 clear-and-reprefill). Honor an explicit override if set.
+    if (!getenv("DSV4_MOE_PREFILL_MAX") && params.n_ubatch > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", params.n_ubatch);
+#ifdef _WIN32
+        _putenv_s("DSV4_MOE_PREFILL_MAX", buf);
+#else
+        setenv("DSV4_MOE_PREFILL_MAX", buf, 0);
+#endif
+        LOG_INF("%s: DSV4 grouped-MoE prefill arena pre-sized to n_ubatch=%d (capture-safe)\n", __func__, params.n_ubatch);
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
 

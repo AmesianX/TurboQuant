@@ -1216,6 +1216,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_EXPAND",
     "DSV4_FP8_KV_QUANTIZE",
     "DSV4_ROPE_TAIL",
+    "DSV4_MOE_GROUPED",
 
     "UNARY",
 
@@ -1233,7 +1234,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1331,6 +1332,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_expand(x)",
     "dsv4_fp8_kv_quantize(x)",
     "dsv4_rope_tail(x)",
+    "dsv4_moe_grouped(h,sel,w)",
 
     "unary(x)",
 
@@ -1348,7 +1350,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6578,6 +6580,45 @@ struct ggml_tensor * ggml_dsv4_rope_tail(
     result->src[0] = a;
     result->src[1] = pos;
     result->src[2] = freq_factors;
+
+    return result;
+}
+
+// ggml_dsv4_moe_grouped
+//
+// NVFP4 (W4A4) grouped-GEMM MoE expert path. The expert weights are NOT ggml
+// tensors -- they live in a per-layer device registry filled by the load adapter
+// (dsv4_moe_grouped_set_expert_weights). This op carries the layer index in
+// op_params[0] and the per-layer DeepSeek-V4 SwiGLU clamp limit in op_params[1]
+// (float bits; 0 = no clamp); the CUDA dispatch looks the weights up.
+//
+//   hidden : F32 [n_embd, n_tokens]          this layer's ffn input (post-norm)
+//   sel    : I32 [n_expert_used, n_tokens]   selected expert ids
+//   weights: F32 [n_expert_used, n_tokens]   router weights (already normalized)
+//   out    : F32 [n_embd, n_tokens]          moe output
+struct ggml_tensor * ggml_dsv4_moe_grouped(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * sel,
+        struct ggml_tensor  * weights,
+        int                   il,
+        float                 swiglu_limit) {
+    GGML_ASSERT(hidden->type  == GGML_TYPE_F32);
+    GGML_ASSERT(sel->type     == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(sel->ne[0] == weights->ne[0]);
+    GGML_ASSERT(sel->ne[1] == weights->ne[1]);
+    GGML_ASSERT(sel->ne[1] == hidden->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden->ne[0], hidden->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, il);
+    ggml_set_op_params_f32(result, 1, swiglu_limit); // DSV4 per-layer SwiGLU clamp (0 = none)
+
+    result->op     = GGML_OP_DSV4_MOE_GROUPED;
+    result->src[0] = hidden;
+    result->src[1] = sel;
+    result->src[2] = weights;
 
     return result;
 }

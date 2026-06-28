@@ -335,6 +335,27 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    # ---------------------------------------------------------------------
+    # DSV4 MoE grouped-GEMM (dsv4-moe-gemm.cu): flashinfer SM120 core + CUTLASS.
+    # Scoped to the ggml-cuda target only so nothing else in the tree sees these
+    # include dirs. Arch is unchanged (already sm_121a via CMAKE_CUDA_ARCHITECTURES).
+    # ---------------------------------------------------------------------
+    set(DSV4_FLASHINFER_INCLUDE "/home/user/work/vllm-spark/flashinfer-src/include")
+    set(DSV4_CUTLASS_INCLUDE    "/home/user/work/flash-attention/csrc/cutlass/include")
+    set(DSV4_CUTLASS_UTIL_INCLUDE "/home/user/work/flash-attention/csrc/cutlass/tools/util/include")
+    if (EXISTS "${DSV4_FLASHINFER_INCLUDE}/flashinfer/gemm/group_gemm_fp8_groupwise_sm120.cuh")
+        target_include_directories(ggml-cuda PRIVATE
+            ${DSV4_FLASHINFER_INCLUDE}
+            ${DSV4_CUTLASS_INCLUDE}
+            ${DSV4_CUTLASS_UTIL_INCLUDE})
+        # CUTLASS host/device template code requires relaxed constexpr; extended
+        # lambda is already enabled below but flashinfer expects it explicitly too.
+        target_compile_options(ggml-cuda PRIVATE
+            "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda>")
+    else()
+        message(WARNING "DSV4 flashinfer headers not found at ${DSV4_FLASHINFER_INCLUDE}; dsv4-moe-gemm.cu will fail to compile")
+    endif()
+
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
