@@ -1860,6 +1860,71 @@ static ggml_tensor * dsv4_build_compressed_mask_from_topk(
     return ggml_reshape_2d(ctx, mask, n_comp, n_tokens);
 }
 
+// [DSV4_INDEXER_QTILE] Tiled prefill indexer mask builder — breaks the O(ub^2) memory wall that
+// blocks large ubatch (the structural lever for tokens-per-expert -> compute-bound MoE).
+//
+// The non-tiled path (dsv4_build_indexer_scores_prefill + argsort_top_k + mask) materializes, for
+// the WHOLE ubatch at once, the score tensor [n_comp, ub, n_heads] and its [n_heads, n_comp, ub]
+// transpose (ggml_cont) = O(n_heads * (ub/ratio) * ub) F32 per layer. At ub=8192, n_comp=2048,
+// n_heads=64 that is ~4 GB/layer of TRANSIENT compute buffer -> OOM well before the GEMMs are
+// compute-bound.
+//
+// The top-k selection is INDEPENDENT PER QUERY (no cross-query dependence in the indexer score /
+// argsort / mask), so we tile the QUERY (ub) dimension: for each tile of `qtile` queries we slice
+// qr/cur/pos/causal_mask, run the exact same score->topk->mask pipeline, and CONCAT the per-tile
+// [n_comp, qtile] masks along the token dim into the full [n_comp, ub] mask. Peak indexer memory
+// drops from O(n_heads*n_comp*ub) to O(n_heads*n_comp*qtile) -> bounded by qtile, not ub.
+// Numerically identical to the non-tiled path (same per-query math, just batched in slices).
+// index_kv (the full compressed cache, [head_dim,1,n_comp]) and the weights are shared across tiles.
+static ggml_tensor * dsv4_build_indexer_mask_tiled_prefill(
+        ggml_context        * ctx,
+        ggml_tensor         * x,        // [n_embd, n_tokens]
+        ggml_tensor         * qr,       // [q_lora, n_tokens]
+        ggml_tensor         * index_kv, // [head_dim, 1, n_comp] (shared, full)
+        ggml_tensor         * wq_b,
+        ggml_tensor         * wproj,
+        ggml_tensor         * pos,      // [n_tokens] i32
+        ggml_tensor         * causal_mask, // [n_comp, n_tokens]
+        int64_t               n_index_head,
+        int64_t               n_index_head_size,
+        int64_t               n_tokens,
+        int64_t               n_rot,
+        int                   rope_type,
+        const dsv4_rope_cfg & rope_cfg,
+        int64_t               n_comp,
+        int64_t               top_k,
+        int64_t               qtile) {
+    if (qtile <= 0 || qtile >= n_tokens) {
+        // No tiling: original whole-ubatch path (also the small-ub case).
+        ggml_tensor * scores = dsv4_build_indexer_scores_prefill(ctx, x, qr, index_kv, wq_b, wproj,
+                pos, causal_mask, n_index_head, n_index_head_size, n_tokens, n_rot, rope_type, rope_cfg);
+        ggml_tensor * topk = ggml_argsort_top_k(ctx, scores, top_k);
+        return dsv4_build_compressed_mask_from_topk(ctx, scores, topk);
+    }
+
+    ggml_tensor * full_mask = nullptr;
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += qtile) {
+        const int64_t tn = std::min<int64_t>(qtile, n_tokens - t0);
+
+        // Slice the per-query inputs to [.., tn]. All are contiguous along the token (last) dim.
+        ggml_tensor * x_t  = ggml_view_2d(ctx, x,  x->ne[0],  tn, x->nb[1],  t0 * x->nb[1]);
+        ggml_tensor * qr_t = ggml_view_2d(ctx, qr, qr->ne[0], tn, qr->nb[1], t0 * qr->nb[1]);
+        ggml_tensor * pos_t = ggml_view_1d(ctx, pos, tn, t0 * pos->nb[0]);
+        // causal_mask is [n_comp, n_tokens]; slice its query columns.
+        ggml_tensor * cm_t = ggml_view_2d(ctx, causal_mask, causal_mask->ne[0], tn,
+                                          causal_mask->nb[1], t0 * causal_mask->nb[1]);
+
+        ggml_tensor * scores_t = dsv4_build_indexer_scores_prefill(ctx, x_t, qr_t, index_kv,
+                wq_b, wproj, pos_t, cm_t, n_index_head, n_index_head_size, tn, n_rot, rope_type, rope_cfg);
+        ggml_tensor * topk_t = ggml_argsort_top_k(ctx, scores_t, top_k);
+        ggml_tensor * mask_t = dsv4_build_compressed_mask_from_topk(ctx, scores_t, topk_t); // [n_comp, tn]
+
+        full_mask = full_mask ? ggml_concat(ctx, full_mask, mask_t, 1) : mask_t;
+    }
+    GGML_ASSERT(full_mask && full_mask->ne[0] == n_comp && full_mask->ne[1] == n_tokens);
+    return full_mask;
+}
+
 static ggml_tensor * dsv4_cache_view_3d(ggml_context * ctx, ggml_tensor * cache, int64_t n_rows) {
     ggml_tensor * view = ggml_view_2d(ctx, cache, cache->ne[0], n_rows, cache->nb[1], 0);
     return ggml_reshape_3d(ctx, view, cache->ne[0], 1, n_rows);
@@ -2116,7 +2181,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
                     store_index_cache_rows(index_kv, 0, n_comp);
 
-                    ggml_tensor * index_scores = dsv4_build_indexer_scores_prefill(ctx0,
+                    const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp);
+
+                    // [DSV4_INDEXER_QTILE] Tile the indexer's query dim to bound peak memory at
+                    // O(n_heads*n_comp*qtile) instead of O(n_heads*n_comp*ub) -> unblocks large UB
+                    // (the tokens-per-expert lever). Default 0 = OFF (whole-ub, byte-identical to the
+                    // prior path). Set DSV4_INDEXER_QTILE=2048 (or so) for large UB. The top-k is
+                    // per-query independent, so tiling is numerically exact.
+                    static const int64_t indexer_qtile = []{
+                        const char * e = getenv("DSV4_INDEXER_QTILE"); return e ? (int64_t) atoll(e) : 0;
+                    }();
+                    ggml_tensor * comp_mask = dsv4_build_indexer_mask_tiled_prefill(ctx0,
                             cur, qr, index_kv,
                             layer.indexer_attn_q_b,
                             layer.indexer_proj,
@@ -2127,14 +2202,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             n_tokens,
                             n_rot,
                             rope_type,
-                            rope_cfg);
-                    cb(index_scores, "indexer_scores", il);
-
-                    const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp);
-                    ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
-                    cb(topk, "indexer_topk", il);
-
-                    ggml_tensor * comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                            rope_cfg,
+                            n_comp,
+                            top_k,
+                            indexer_qtile);
                     cb(comp_mask, "dsv4_attn_compress_mask", il);
 
                     attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
