@@ -3476,17 +3476,37 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // graphs OFF for this op so the speedup can be measured against an identical
         // binary. DSV4_MOE_PREFILL_GRAPH_OFF=1 keeps graphs off ONLY for the prefill
         // path -- a safety hatch if a CUTLASS build is found to allocate internally.)
-        // [DSV4_MOE_FUSED] CUDA-graph capture-safe (audited): the flashinfer runMoe
-        // does NO per-call cudaMalloc/free/sync/thrust in the non-LoRA, non-DeepSeek-
-        // block-scale path -- all scratch comes from the persistent workspace we
-        // pre-size (getWorkspaceSize) once to DSV4_MOE_PREFILL_MAX, the on-device sort
-        // is cub::BlockScan (no temp alloc), problem shapes are built on-device, and
-        // sync_check_cuda_error is a no-op in release/under-capture. Our op TU also
-        // grows scratch with RETIRE-after-sync (no immediate free). So allow graphs.
-        // A/B hatch: DSV4_MOE_FUSED_GRAPH_OFF=1 forces OFF for measurement.
+        // [DSV4_MOE_FUSED] CUDA-graph capture is UNSAFE for the flashinfer CUTLASS fused
+        // MoE across MULTI-CHUNK PREFILL -> graphs are OFF for this op BY DEFAULT.
+        //
+        // ROOT CAUSE (long-context crash, isolated 2026-06-28; confirmed by vLLM #39288 +
+        // #40969 "FlashInfer CUTLASS MoE backend causes CUDA illegal memory access during
+        // CUDA graph capture"): runMoe is NOT a fixed launch graph. Per call it does
+        // HOST-side, M-DEPENDENT control flow that bakes wrong values into a replayed graph:
+        //   * configureWsPtrs(num_rows=M) re-lays-out every workspace sub-buffer at offsets
+        //     computed from the CALL's M (cutlass_fused_moe_kernels.cuh:2806/3728). We size
+        //     the arena once to tok_cap=1024 but the OFFSETS inside it shift with M.
+        //   * computeNumTokensPerBlock(M) (kernels:524) picks a DIFFERENT templated sort
+        //     kernel <kNumTokensPerBlock> AND a host grid dim3(experts, ceilDiv(M, blk))
+        //     (threeStepBuildExpertMapsSortFirstToken, kernels:843). A graph captured at the
+        //     first chunk's M replays that grid/kernel for every later chunk; the partial
+        //     LAST chunk (M<1024) and the fused->decode transition then read/write off the
+        //     buffers the prologue sized for a different M -> illegal access at ~chunk 8 (the
+        //     grouped+sparse NO-fused path has none of this host M-dependence -> never crashes).
+        // This is a KNOWN flashinfer failure mode; their own use_cuda_graph wrapper pins the
+        // whole workspace to a fixed max_num_tokens OUTSIDE capture, which ggml's per-shape
+        // graph cache cannot reproduce for an op whose internal layout is M-keyed.
+        //
+        // Prefill is compute-bound (Round-3 measurement: graphs ~0 gain there), so disabling
+        // graphs for THIS op only removes the entire crash class at no throughput cost; the
+        // rest of the graph (attention, dense GEMMs, decode) is unaffected. Opt back IN for
+        // A/B measurement with DSV4_MOE_FUSED_GRAPH_ON=1 (default OFF = safe).
         if (node->op == GGML_OP_DSV4_MOE_FUSED) {
+            static const bool fused_graph_on  = getenv("DSV4_MOE_FUSED_GRAPH_ON")  != nullptr;
             static const bool fused_graph_off = getenv("DSV4_MOE_FUSED_GRAPH_OFF") != nullptr;
-            if (fused_graph_off) {
+            // Default OFF. DSV4_MOE_FUSED_GRAPH_ON=1 re-enables (and DSV4_MOE_FUSED_GRAPH_OFF=1
+            // still forces OFF, taking precedence so the safety gate can never be overridden).
+            if (!fused_graph_on || fused_graph_off) {
                 use_cuda_graph = false;
             }
         }

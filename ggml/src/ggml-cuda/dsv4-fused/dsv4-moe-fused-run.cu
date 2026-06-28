@@ -330,6 +330,17 @@ extern "C" cudaError_t dsv4_moe_fused_run(
     // never reallocs inside a captured region; grow RETIRES the old pointer (defer-free).
     // This is the lever-2 fix: per-layer workspace x58 -> single shared workspace.
     //
+    // [LONG MULTI-CHUNK PREFILL — CAPTURE SAFETY] The CUTLASS runMoe's internal workspace
+    // LAYOUT is M-keyed: configureWsPtrs(num_rows=n_tokens) recomputes every sub-buffer offset
+    // per call (cutlass_fused_moe_kernels.cuh:2806), and the prologue sort grid/kernel template
+    // is chosen host-side from M (computeNumTokensPerBlock, kernels:524/843). Sizing the arena
+    // to tok_cap (the MAX ubatch, >= every chunk's M) keeps the ALLOCATION big enough for any
+    // layout, but the OFFSETS still shift with M -> NOT safe to bake into a replayed CUDA graph.
+    // The engine therefore runs this op with graphs OFF by default (ggml-cuda.cu GGML_OP_DSV4_MOE_FUSED
+    // gate; DSV4_MOE_FUSED_GRAPH_ON=1 to re-enable for A/B). With graphs off, each chunk's runMoe
+    // is launched eagerly with its true M, exactly like Aiden's vLLM chunked prefill -> crash-free.
+    // We KEEP the fixed-cap pre-sizing below so the arena never reallocs mid-stream regardless.
+    //
     // [MULTI-REQUEST CRASH FIX] tok_cap MUST be a MONOTONIC high-water mark, not per-request.
     // When DSV4_MOE_PREFILL_MAX is unset (pf_max=0), the old `max(pf_max, n_tokens)` made the
     // workspace size + getWorkspaceSize(tok_cap) + the captured graph shape REQUEST-SIZE-DEPENDENT.
