@@ -215,7 +215,30 @@ Look for: `MUL_MAT_ID(...mxfp4...)` total ms vs `mm_ids_helper`/glue vs `FLASH_A
 W4A16 path), AllReduce is ~1/layer and small — i.e. the overhead is the KERNEL, which EP+fused
 removes.
 
+### Deploy recipe (coordinator)
+```
+# 1) Generate the EP sidecar shard (128 experts/rank, full FF). On .66:
+build/bin/llama-dsv4-nvfp4-preconvert --model <FP4.gguf> --out <EP_DIR> --n-ranks 2 --ep
+#    -> EP_DIR/sidecar_rank0.bin (experts 0-127), sidecar_rank1.bin (128-255), each ~HALF the
+#       FF-split sidecar size. rsync EP_DIR to .67 (same path). (NOTE: distinct dir from the
+#       FF-split sidecar; do not overwrite it — keep both for A/B.)
+
+# 2) Deploy EP on the FAST fused kernel (both ranks, watchdog ON). Env (tp.sh forwards DSV4_EP):
+DSV4_EP=1 DSV4_MOE_GROUPED=1 DSV4_MOE_FUSED=1 DSV4_MOE_SIDECAR=<EP_DIR>  -ub 2048
+#    (DSV4_MOE_GROUPED is required by the sidecar loader gate; DSV4_MOE_FUSED takes priority and
+#     runs runMoe with ep_size=2/ep_rank=rank. EP forces fused at ALL M, so decode is fused too.)
+#    Expect at load: "[dsv4-moe-grouped] EP config: ep=1 ... ep_size=2 ep_rank=<r>" on each rank,
+#    and "[dsv4-moe-sidecar] EP shard: rank r owns experts [.,.) ... ep_size=2 ep_rank=r".
+
+# 3) A/B vs the 314 generic-EP and the ~330 non-EP-fused-ub1024 baselines.
+```
+Binaries to rsync to .67 (md5, build 03:50): llama-server 2a89dc5d, libllama.so.0.0.9740 1a4045d2,
+libggml-cuda.so.0.13.1 e06a4eac, libggml.so.0.13.1 c02c2eb8; preconvert 3cbb6a76.
+
 ### Status this round
-- DONE (built .66): see commit list below.
-- REMAINING (coordinator): generate the EP sidecar shard (`--ep --n-ranks 2`), deploy
-  `DSV4_EP=1 DSV4_MOE_FUSED=1 DSV4_MOE_SIDECAR=<ep_dir>` `-ub 2048` (watchdog ON), measure vs 314.
+- DONE (built .66, committed): sidecar v2 EP fields, `--ep` shard writer, EP config in the
+  registry, fused runner `MOEParallelismConfig(ep_size,ep_rank)`, loader publish + validation,
+  generic-axis2 skipped under sidecar, fused-at-all-M under EP, grouped-op EP-safety guard.
+- REMAINING (coordinator): run the deploy recipe; measure EP+fused `-ub 2048` vs 314 + per-node
+  `nvidia-smi` (confirm fused MoE cache halved = 128-expert footprint). Then push `-ub` higher if
+  memory allows (the half-weight fused cache frees more than the generic-EP path did).
