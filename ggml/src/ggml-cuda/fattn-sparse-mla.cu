@@ -43,7 +43,7 @@ __global__ void __launch_bounds__(256) sparse_mla_kernel(
         const char * __restrict__ K,   // [D, n_kv, 1, n_stream] bf16/f16 (k_all)
         const int  * __restrict__ kv_idx, // [top_k, n_tokens] i32
         float * __restrict__ dst,      // [D, n_head, n_tokens, n_stream] f32
-        const float scale, const int n_raw, const int top_k,
+        const float scale, const int n_raw, const int top_k, const int n_comp_view,
         const int n_tokens, const int n_head, const int n_kv,
         const int64_t Qnb1, const int64_t Qnb2, const int64_t Qnb3, // byte strides of Q dims 1,2,3
         const int64_t Knb1, const int64_t Knb3,                     // K row stride, stream stride
@@ -59,6 +59,7 @@ __global__ void __launch_bounds__(256) sparse_mla_kernel(
     float*         sS=(float*)(sP+SM_HQ*SM_KB);
     __shared__ float m_run[SM_HQ], l_run[SM_HQ];
     __shared__ float wscratch[SM_WARPS][256];
+    __shared__ int   sValid[SM_KB];   // per key-slot validity for the current flash block
 
     // Load this token's Q for all heads -> sQ[h*D + d]. Q layout: element (d, it, h, is) at
     // Q + d*2 + it*Qnb1 + h*Qnb2 + is*Qnb3 (f16). (Q is f16 after build_attn_mha cast.)
@@ -82,20 +83,34 @@ __global__ void __launch_bounds__(256) sparse_mla_kernel(
     const int   total = n_raw + top_k;            // logical keys: dense raw window + sparse comp
 
     for(int kb0=0; kb0<total; kb0+=SM_KB){
-        // gather SM_KB logical keys into sK (bf16). pos in [0,n_raw): raw row pos. [n_raw,total):
-        // comp row n_raw + idx_q[pos-n_raw]. OOB (pos>=total) -> zero (masked by -inf below).
+        // gather SM_KB logical keys into sK (bf16). pos in [0,n_raw): raw row pos (always valid,
+        // 0<=pos<n_raw<=n_kv). [n_raw,total): comp slot; ord=pos-n_raw; the selected comp ROW is
+        // idx_q[ord]; absolute k_all row = n_raw + idx_q[ord]. At SHORT context n_comp_view < top_k,
+        // so most top_k slots are PADDING (idx out of [0,n_comp_view)) -> OOB k_all read (the crash).
+        // GUARD: a comp slot is valid only if 0 <= idx < n_comp_view; otherwise zero-fill + mark
+        // invalid (softmax -inf), never dereferencing the OOB row. pos>=total also invalid.
         for(int r=warp; r<SM_KB; r+=SM_WARPS){
             int pos = kb0 + r;
-            int krow; bool valid = pos < total;
-            if(!valid) krow = 0;
-            else if(pos < n_raw) krow = pos;
-            else krow = n_raw + idx_q[pos - n_raw];
+            int krow = 0; bool valid = false;
+            if(pos < total){
+                if(pos < n_raw){ krow = pos; valid = true; }            // raw window: in-bounds
+                else {
+                    int idx = idx_q[pos - n_raw];                        // selected comp row
+                    if(idx >= 0 && idx < n_comp_view){ krow = n_raw + idx; valid = true; }
+                    // else: padding/OOB top_k slot -> invalid, krow stays 0 (safe, won't read OOB)
+                }
+            }
+            // HARD SAFETY: never dereference a row outside k_all [0, n_kv). Defends against any
+            // index/stride surprise (n_kv = padded comp-cache length). If out of range, drop the slot.
+            if(valid && (krow < 0 || krow >= n_kv)){ valid = false; krow = 0; }
+            if(lane==0) sValid[r] = valid ? 1 : 0;
             const char* kp = Kbase + (size_t)krow*Knb1;
             for(int d=lane; d<SM_D; d+=32){
-                float kv;
-                if(!valid) kv=0.f;
-                else if(Ktype==1) kv=__bfloat162float(((const __nv_bfloat16*)kp)[d]);
-                else              kv=__half2float(((const half*)kp)[d]);
+                float kv = 0.f;
+                if(valid){
+                    if(Ktype==1) kv=__bfloat162float(((const __nv_bfloat16*)kp)[d]);
+                    else         kv=__half2float(((const half*)kp)[d]);
+                }
                 sK[r*SM_D+d]=__float2bfloat16(kv);
             }
         }
@@ -116,14 +131,14 @@ __global__ void __launch_bounds__(256) sparse_mla_kernel(
         }
         __syncthreads();
 
-        // online softmax. mask: positions >= total are invalid (-inf).
-        const int kc = min(SM_KB, total - kb0);
+        // online softmax. Mask = sValid[j] (covers BOTH pos>=total AND invalid/padding comp slots
+        // whose top_k index was out of [0,n_comp_view)). Invalid slots contribute -inf score -> 0 prob.
         for(int h=warp; h<SM_HQ; h+=SM_WARPS){
             float* sr=sS+h*SM_KB;
-            float bmx=-INFINITY; for(int j=lane;j<SM_KB;j+=32){ float v=(j<kc)?sr[j]*scale:-INFINITY; if(v>bmx)bmx=v; }
+            float bmx=-INFINITY; for(int j=lane;j<SM_KB;j+=32){ float v=sValid[j]?sr[j]*scale:-INFINITY; if(v>bmx)bmx=v; }
             for(int o=16;o>0;o>>=1) bmx=fmaxf(bmx,__shfl_xor_sync(0xffffffff,bmx,o));
             float mo=m_run[h],mn=fmaxf(mo,bmx),corr=(mo==-INFINITY)?0.f:expf(mo-mn);
-            float bs=0; for(int j=lane;j<SM_KB;j+=32){ float pp=(j<kc)?expf(sr[j]*scale-mn):0.f; sP[h*SM_KB+j]=__float2bfloat16(pp); bs+=pp; }
+            float bs=0; for(int j=lane;j<SM_KB;j+=32){ float pp=sValid[j]?expf(sr[j]*scale-mn):0.f; sP[h*SM_KB+j]=__float2bfloat16(pp); bs+=pp; }
             for(int o=16;o>0;o>>=1) bs+=__shfl_xor_sync(0xffffffff,bs,o);
             if(lane==0){ m_run[h]=mn; l_run[h]=l_run[h]*corr+bs; }
             for(int d=lane;d<SM_D;d+=32) Ot[h*SM_D+d]*=corr;
@@ -157,11 +172,25 @@ bool ggml_cuda_fattn_sparse_mla_supported(const ggml_tensor * dst) {
     const ggml_tensor * kv = dst->src[6];
     if (!kv) return false;
     // MQA D=512, 64 heads, K is f16/bf16 (materialized k_all). top_k must be 16-aligned (KB=16).
-    if (Q->ne[0] != SM_D || Q->ne[2] != SM_HQ) return false;
-    if (K->ne[2] != 1) return false;                       // single latent KV head (MQA)
+    // Q at the op (post view_4d + permute(0,2,1,3)) = [D, n_tokens, n_head, n_stream].
+    if (Q->ne[0] != SM_D || Q->ne[2] != SM_HQ) return false; // D=512, 64 Q heads
+    if (Q->ne[3] != 1) return false;                       // single stream only (validated case);
+                                                           // multislot (n_stream>1) -> fall back to VEC
+    if (K->ne[2] != 1 || K->ne[3] != 1) return false;      // single latent KV head (MQA), single stream
     if (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_BF16) return false;
     if (kv->type != GGML_TYPE_I32) return false;
     if (kv->ne[0] % SM_KB != 0) return false;              // top_k multiple of 16
+    if (kv->ne[1] != Q->ne[1]) return false;               // one top_k list per query token
+
+    // Set the 86KB opt-in smem attribute HERE — supported() is called during graph build /
+    // op-supported checks, which run OUTSIDE CUDA graph capture, so this is the capture-safe place
+    // to do it (cudaFuncSetAttribute is illegal mid-capture). Idempotent; once per process.
+    static bool s_attr_set = false;
+    if (!s_attr_set) {
+        const size_t smem = (size_t)SM_HQ*SM_D*2 + SM_KB*SM_D*2 + SM_HQ*SM_KB*2 + SM_HQ*SM_KB*4;
+        cudaFuncSetAttribute(sparse_mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        s_attr_set = true;
+    }
     return true;
 #else
     (void)dst; return false;
@@ -182,19 +211,35 @@ void ggml_cuda_flash_attn_ext_sparse_mla(ggml_backend_cuda_context & ctx, ggml_t
 
     float scale = 1.0f; memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
     int n_raw = ggml_get_op_params_i32(dst, 4);
+    // valid compressed-row count = comp segment length of k_all (n_kv includes raw + comp + 256-pad).
+    // Selected top_k indices are argsort over [0, n_comp_view); the in-kernel guard clamps to it.
+    const int n_comp_view = n_kv - n_raw;
 
     const int Ktype = (K->type == GGML_TYPE_BF16) ? 1 : 0;
     const int Qtype = (Q->type == GGML_TYPE_F32) ? 2 : ((Q->type == GGML_TYPE_BF16) ? 1 : 0);
 
     const size_t smem = (size_t)SM_HQ*SM_D*2 + SM_KB*SM_D*2 + SM_HQ*SM_KB*2 + SM_HQ*SM_KB*4;
-    static bool attr_set = false;
-    if (!attr_set) { cudaFuncSetAttribute(sparse_mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem); attr_set = true; }
+    cudaStream_t stream = ctx.stream();
+
+    // CAPTURE-SAFETY: cudaFuncSetAttribute is ILLEGAL during CUDA graph capture. The graph is
+    // captured on first use, so a naive "set on first call" lands inside capture -> the 86KB
+    // (>48KB default) opt-in never takes effect -> kernel launches with too little smem ->
+    // ILLEGAL MEMORY ACCESS. Set the attribute ONLY when NOT capturing; track per-device that
+    // it's been set so steady-state (captured) launches just run. The very first reach of this op
+    // is always a non-captured warmup/eager pass in this engine, so the attribute is set there.
+    static int s_attr_set_dev = -1;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    const bool capturing = (cap != cudaStreamCaptureStatusNone);
+    if (s_attr_set_dev != ctx.device && !capturing) {
+        cudaFuncSetAttribute(sparse_mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        s_attr_set_dev = ctx.device;
+    }
 
     const dim3 grid(n_tokens * n_stream);
-    cudaStream_t stream = ctx.stream();
     sparse_mla_kernel<<<grid, 256, smem, stream>>>(
         (const char*)Q->data, (const char*)K->data, (const int*)kv->data, (float*)dst->data,
-        scale, n_raw, top_k, n_tokens, n_head, n_kv,
+        scale, n_raw, top_k, n_comp_view, n_tokens, n_head, n_kv,
         Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[3], Ktype, Qtype);
 #else
     (void)ctx; (void)dst; GGML_ABORT("sparse-mla kernel not built");
