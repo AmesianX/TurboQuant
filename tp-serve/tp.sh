@@ -124,6 +124,9 @@ env_common() {
     [ -n "${DSV4_MOE_GROUPED:-}" ]    && export DSV4_MOE_GROUPED
     [ -n "${DSV4_MOE_SIDECAR:-}" ]    && export DSV4_MOE_SIDECAR
     [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && export DSV4_MOE_DECODE_MAX
+    # DSV4 sparse-attention (per-query top-k comp-row gather). SPMD: both ranks build the SAME graph
+    # shape (sparse skips the -inf comp mask concat + binds src[6]), so this MUST match on both ranks.
+    [ -n "${DSV4_SPARSE_ATTN:-}" ]    && export DSV4_SPARSE_ATTN
     # capture-safe prefill arena cap + prefill-graph safety hatch (both ranks identical)
     [ -n "${DSV4_MOE_PREFILL_MAX:-}" ]       && export DSV4_MOE_PREFILL_MAX
     [ -n "${DSV4_MOE_PREFILL_GRAPH_OFF:-}" ] && export DSV4_MOE_PREFILL_GRAPH_OFF
@@ -229,6 +232,7 @@ case "${1:-}" in
         # forward NVFP4 grouped-MoE env so the slave runs the identical SPMD config
         [ -n "${DSV4_MOE_GROUPED:-}" ]    && FWD="$FWD DSV4_MOE_GROUPED=$DSV4_MOE_GROUPED"
         [ -n "${DSV4_MOE_SIDECAR:-}" ]    && FWD="$FWD DSV4_MOE_SIDECAR=$DSV4_MOE_SIDECAR"
+        [ -n "${DSV4_SPARSE_ATTN:-}" ]    && FWD="$FWD DSV4_SPARSE_ATTN=$DSV4_SPARSE_ATTN"
         [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && FWD="$FWD DSV4_MOE_DECODE_MAX=$DSV4_MOE_DECODE_MAX"
         [ -n "${DSV4_MOE_PREFILL_MAX:-}" ]       && FWD="$FWD DSV4_MOE_PREFILL_MAX=$DSV4_MOE_PREFILL_MAX"
         [ -n "${DSV4_MOE_PREFILL_GRAPH_OFF:-}" ] && FWD="$FWD DSV4_MOE_PREFILL_GRAPH_OFF=$DSV4_MOE_PREFILL_GRAPH_OFF"
