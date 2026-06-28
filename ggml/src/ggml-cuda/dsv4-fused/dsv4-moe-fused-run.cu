@@ -34,6 +34,7 @@
 #include <memory>
 #include <cstdio>
 #include <cmath>
+#include <cinttypes>
 
 namespace tk  = tensorrt_llm::kernels;
 namespace tkc = tensorrt_llm::kernels::cutlass_kernels;
@@ -215,6 +216,49 @@ struct FusedLayer {
 static std::mutex g_fmu;
 static std::unordered_map<int,FusedLayer*> g_fcache;
 
+// ---- internal sub-phase profiler (DSV4_MOE_FUSED_PROF=1) ---------------------
+// Deferred cudaEvent timing of the per-call phases so we can see GEMM vs glue.
+// Same no-per-call-sync design as DSV4_OPPROF: record event pairs, drain ready
+// ones lazily, dump after N calls + at exit. NEVER syncs in the hot path. Skips
+// the FIRST call per layer (the one-time build) so steady-state isn't contaminated.
+namespace fprof {
+    struct ev { cudaEvent_t e0,e1; int phase; };  // phase: 0 cvt_in 1 route 2 runMoe 3 cvt_out
+    struct prof {
+        std::mutex m;
+        std::vector<ev> pend;
+        double ms[4]={0,0,0,0}; int64_t cnt[4]={0,0,0,0};
+        bool on=false; int64_t calls=0, dump_after=0; bool dumped=false;
+        const char* names[4]={"cvt_in(f32->bf16)","route(absmax+alpha)","runMoe(GEMM+sort+finalize)","cvt_out(bf16->f32)"};
+        prof(){ on=getenv("DSV4_MOE_FUSED_PROF")!=nullptr;
+                if(const char*d=getenv("DSV4_MOE_FUSED_PROF_AFTER")) dump_after=atoll(d); else if(on) dump_after=4000; }
+        void drain(bool force){ size_t k=0; for(size_t i=0;i<pend.size();++i){ ev&e=pend[i];
+            cudaError_t s=force?cudaSuccess:cudaEventQuery(e.e1); if(force)cudaEventSynchronize(e.e1);
+            if(s==cudaSuccess){ float t=0; if(cudaEventElapsedTime(&t,e.e0,e.e1)==cudaSuccess){ ms[e.phase]+=t; cnt[e.phase]++; }
+                cudaEventDestroy(e.e0); cudaEventDestroy(e.e1);} else pend[k++]=e; } pend.resize(k); }
+        void dump(const char* why){ cudaDeviceSynchronize(); std::lock_guard<std::mutex> lk(m); drain(true);
+            double tot=ms[0]+ms[1]+ms[2]+ms[3];
+            fprintf(stderr,"\n[DSV4_MOE_FUSED_PROF] (%s) per-call phase totals %.1f ms:\n",why,tot);
+            for(int p=0;p<4;p++) fprintf(stderr,"  %8.2f ms  %5.1f%%  %8" PRId64 "x  %s\n",
+                ms[p], tot>0?100.0*ms[p]/tot:0.0, cnt[p], names[p]);
+            fflush(stderr); }
+        ~prof(){ if(on) dump("exit"); }
+        // one-shot auto-dump after dump_after calls (so it prints without clean shutdown).
+        void tick_and_maybe_dump(){ if(!on||dumped||dump_after<=0) return;
+            bool fire=false; { std::lock_guard<std::mutex> lk(m); if(++calls>=dump_after){ dumped=true; fire=true; } }
+            if(fire) dump("auto"); }
+    };
+    static prof g;
+    // record one phase around a lambda body (events on `stream`, no sync).
+    struct scope {
+        cudaStream_t s; int phase; cudaEvent_t e0=nullptr,e1=nullptr; bool ok=false;
+        scope(cudaStream_t st,int p):s(st),phase(p){ if(!g.on)return;
+            ok=(cudaEventCreate(&e0)==cudaSuccess)&&(cudaEventCreate(&e1)==cudaSuccess);
+            if(ok)cudaEventRecord(e0,s); }
+        ~scope(){ if(!ok)return; cudaEventRecord(e1,s); std::lock_guard<std::mutex> lk(g.m);
+            g.pend.push_back({e0,e1,phase}); g.drain(false); }
+    };
+}
+
 // SHARED per-call transient scratch — ONE pool for ALL layers (they run
 // sequentially, so the runMoe workspace + bf16 buffers + routing scratch are
 // reused, not duplicated 58x). This is what lets UB scale: the per-layer footprint
@@ -284,11 +328,25 @@ static cudaError_t build_fused_layer(FusedLayer* L, int il,
     L->runner = std::make_unique<tkc::CutlassMoeFCRunner<__nv_fp4_e2m1,__nv_fp4_e2m1,__nv_bfloat16,__nv_bfloat16>>();
     auto tactics = L->runner->getTactics();
     if (tactics.empty()) { fprintf(stderr,"[DSV4_MOE_FUSED] no tactics, layer %d\n",il); return cudaErrorNotSupported; }
-    // Tactic selection: default = front(). DSV4_MOE_FUSED_TACTIC=<i> overrides to sweep
-    // the 4 SM120 tiles (128x128x128, 128x128x64, 128x256x64, 256x128x64) for the best
-    // per-shape config (lever 4). Clamped to range.
-    int ti = []{ const char* e=getenv("DSV4_MOE_FUSED_TACTIC"); return e?atoi(e):0; }();
-    if (ti < 0 || ti >= (int)tactics.size()) ti = 0;
+    // Tactic selection.
+    //   * DSV4_MOE_FUSED_TACTIC=<i>  : explicit index (sweep the SM120 tiles for A/B). Clamped.
+    //   * else default: prefer CtaShape256x128x64B (gemm_configs.h CutlassTileConfigSM120 enum=4,
+    //     the documented 356-TFLOPS SM120 config) if getTactics() exposes it; else front().
+    //     The grouped MoE GEMM is per-expert tile-bound at 24-96 tok/expert, so the widest-N tile
+    //     (256x128) packs more experts' rows per CTA than the default front() (often 128x128) ->
+    //     better SM occupancy at our M. DSV4_MOE_FUSED_TACTIC=-1 forces front() (old behavior).
+    int ti;
+    if (const char* e = getenv("DSV4_MOE_FUSED_TACTIC")) {
+        ti = atoi(e);
+        if (ti < 0 || ti >= (int)tactics.size()) ti = 0;   // -1 / OOR -> front()
+    } else {
+        ti = 0;  // fallback = front()
+        const int kCtaShape256x128x64B = 4;  // CutlassTileConfigSM120 enum value
+        for (int i = 0; i < (int)tactics.size(); ++i) {
+            if (tactics[i].sm_version == 120 &&
+                    (int)tactics[i].tile_config_sm120 == kCtaShape256x128x64B) { ti = i; break; }
+        }
+    }
     L->runner->setTactic(tactics[ti], tactics[ti]);
     CK(cudaStreamSynchronize(stream));   // ensure all repack reads of source buffers done
     // Free the grouped source weights we've folded in (dq_gate/up + simple SFs) to
@@ -409,13 +467,15 @@ extern "C" cudaError_t dsv4_moe_fused_run(
     if (!S.act_part)       CK(cudaMalloc(&S.act_part,(size_t)S.act_nparts*4));
 
     long hreal=(long)n_tokens*n_embd;
-    k_f32_to_bf16<<<grid_for(hreal),256,0,stream>>>(hidden,S.d_hidden_bf16,hreal);
+    { fprof::scope _p(stream,0);
+      k_f32_to_bf16<<<grid_for(hreal),256,0,stream>>>(hidden,S.d_hidden_bf16,hreal); }
 
     // dynamic act global + per-(layer,call) alphas into the SHARED buffers.
-    k_absmax_part<<<S.act_nparts,256,0,stream>>>(hidden, S.act_part, hreal);
-    k_absmax_final<<<1,256,0,stream>>>(S.act_part, S.act_nparts, S.fc1_act_global);
-    k_fc1_alpha<<<grid_for(n_expert),256,0,stream>>>(L->g_common, S.fc1_act_global, S.fc1_alpha, n_expert);
-    k_fc2_alpha<<<grid_for(n_expert),256,0,stream>>>(L->g_down,   L->fc2_act_global, S.fc2_alpha, n_expert);
+    { fprof::scope _p(stream,1);
+      k_absmax_part<<<S.act_nparts,256,0,stream>>>(hidden, S.act_part, hreal);
+      k_absmax_final<<<1,256,0,stream>>>(S.act_part, S.act_nparts, S.fc1_act_global);
+      k_fc1_alpha<<<grid_for(n_expert),256,0,stream>>>(L->g_common, S.fc1_act_global, S.fc1_alpha, n_expert);
+      k_fc2_alpha<<<grid_for(n_expert),256,0,stream>>>(L->g_down,   L->fc2_act_global, S.fc2_alpha, n_expert); }
 
     tkc::MOEParallelismConfig pc(1,0,1,0);
     size_t ws = L->runner->getWorkspaceSize((int)tok_cap, n_embd, n_ff_exp, n_expert,
@@ -443,7 +503,8 @@ extern "C" cudaError_t dsv4_moe_fused_run(
     tkc::MoeMinLatencyParams mlp{};
     tk::LoraParams lora{};
 
-    L->runner->runMoe(
+    { fprof::scope _p(stream,2);
+      L->runner->runMoe(
         S.d_hidden_bf16, nullptr,
         sel, weights,
         L->fc1_w, nullptr, act,
@@ -451,8 +512,10 @@ extern "C" cudaError_t dsv4_moe_fused_run(
         n_tokens, n_embd, n_ff_exp, n_expert, n_expert_used,
         S.d_workspace, S.d_out_bf16, S.d_src2dst,
         pc, false, false, lora,
-        false, false, mlp, false, stream);
+        false, false, mlp, false, stream); }
 
-    k_bf16_to_f32<<<grid_for(hreal),256,0,stream>>>(S.d_out_bf16, moe_out, hreal);
+    { fprof::scope _p(stream,3);
+      k_bf16_to_f32<<<grid_for(hreal),256,0,stream>>>(S.d_out_bf16, moe_out, hreal); }
+    fprof::g.tick_and_maybe_dump();
     return cudaGetLastError();
 }
