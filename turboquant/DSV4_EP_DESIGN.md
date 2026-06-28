@@ -304,11 +304,58 @@ grouped decode buffer first-alloc) — in that case pre-warm the grouped decode 
 no-op warmup step, or set `DSV4_MOE_DECODE_MAX` to route differently. (This fix should preempt that
 by running eager from step 1.)
 
+## 9. GARBAGE FIX — short-prompt EP prefill bypassed the EP-aware path
+
+**Symptom (R4):** decode no longer hung (12 t/s) but output was garbage — "1+1=2" correct, but
+~15+ token prompts → "<<<<" repetition.
+
+**Root cause (FOUND, not the remap/combine):** the small-prefill HP gate was
+`hp_small_prefill = prefill_fused_live && (M < min_m)`. The fused op (which builds `g_fcache` via
+`build_fused_layer`) is only called for **M ≥ 256**. A **short prompt** (M in (16,255]) prefills
+through the GROUPED op with `prefill_fused_live = false` → `hp_small_prefill = false` → M>16 falls
+through to the grouped **CUTLASS prefill** path, which is EP-unsafe and **hard-guarded to
+`return false` under `g_ep`** → **no `moe_out` written** → the residual stream corrupts → degenerate
+"<" repetition on the following decode. Tiny prompts (M ≤ 16) took the EP-aware HP path and were
+fine — exactly the observed split. **The remap and combine were correct all along.**
+
+**Fix (commit 70548fdb8, `dsv4-moe-grouped.cu`):**
+`hp_small_prefill = (prefill_fused_live || g_ep) && (M < min_m)`. Under EP, EVERY M below the fused
+threshold takes the EP-aware HP path: fused-aware kernels when fused is live (a long prompt built
+the cache + freed `dq_gate`), else the non-fused EP-aware kernels reading the still-valid grouped
+`dq_gate` (short-prompt-only: `build_fused_layer` never ran, so never freed). Both are EP-aware
+(GLOBAL→LOCAL remap + remote-skip) at FP32-activation precision. Large M (≥256) still routes to the
+fast fused op upstream. EP path coverage is now complete: M≤16 decode, 16<M<256 short prefill, both
+HP-EP-aware; M≥256 fused-EP; CUTLASS grouped prefill guarded (truly unreachable under EP).
+
+### Numerical-correctness argument
+- **ep_size=1 identity:** with `g_ep=1, expert_base=0, E_local=256` the HP kernels compute
+  `e=sel-0`, the skip `e∉[0,256)` never fires, local index == global → **byte-identical to non-EP**.
+  This proves the remap is an exact identity at ep_size=1 (no offset/sign/double-apply error).
+- **2-rank sum:** rank r computes only `e∈[expert_base, expert_base+128)` (`e=sel-expert_base`,
+  skip otherwise), `d_out` memset 0 then atomicAdd of local experts → per-rank partial = Σ over its
+  owned experts. The PARTIAL combine is `ncclSum` (`ggml-cuda.cu:1349`) → Σ over all ranks = Σ over
+  all 6 selected experts = the non-EP result. Each token's expert lives on exactly one rank, so no
+  double-count; remote-skip leaves 0, not garbage (memset). Worked example: rank1 (base=128) sees
+  global expert 200 → local 72 → fused cache slot 72 = global 200 (shard built in order). ✓
+
+### Honest assessment (cost/benefit)
+EP took 4 bug-rounds (W4A4 decode → deadlock → garbage → this), all in the decode/short-prefill
+plumbing, NOT the EP core (the remap/combine were correct from R2). The remaining risk is low: the
+fix closes the last EP-unsafe path, and all EP routes now funnel through the same EP-aware HP/fused
+kernels whose math is the ep_size=1 identity above. **This should be the last decode blocker.** BUT
+the payoff is modest: EP prefill is +5% (345 vs 330). EP's real value was the **memory headroom**
+(-ub 2048 vs OOM) — useful only if larger -ub then yields more than +5%, which the small-ub A/B did
+NOT show. **Recommendation:** verify this fix works; if EP+fused -ub 2048 still lands ~345 with
+correct quality, EP is a marginal win to keep behind the flag, NOT worth further rounds chasing
+larger -ub unless a separate measurement shows big-batch MoE scaling. The orthodox prefill lever
+remains D.1/D.3 (MoE tile-fill + indexer), not EP.
+
 ### Status
-- DONE (built .66, committed): R2 EP+fused, R3 quality fix (FP32-act HP decode), R4 deadlock fix
-  (EP grouped-decode eager) + EP_DBG crash guard.
-- Binaries for .67 (md5, build 05:xx after R4): llama-server `f50de2cf`, libllama.so.0.0.9746
-  `70d3d559`, libggml-cuda.so.0.13.1 `cfffb14e`, libggml.so.0.13.1 `c02c2eb8`; preconvert `3cbb6a76`.
-- REMAINING (coordinator): redeploy R4; confirm decode produces tokens AND no hallucination on
-  "양자역학 발전에 핵심 역할 한 과학자 10명"; if still hung, run the diagnostic plan above and report the
-  per-rank `[EP_DBG]`/`[tp]` lines.
+- DONE (built .66, committed): R2 EP+fused, R3 quality (FP32-act HP decode), R4 deadlock (eager
+  EP decode) + EP_DBG guard, R5 garbage fix (short-prompt EP → HP-EP path).
+- Binaries for .67 (md5, latest build): llama-server `bcb51c36`, libllama.so.0.0.9748 `70d3d559`,
+  libggml-cuda.so.0.13.1 `3ea4283c`, **libggml-base.so.0.13.1 `9ad25e1e`**, libggml.so.0.13.1
+  `c02c2eb8`; preconvert `3cbb6a76`. (rsync ALL of these — base + cuda both changed.)
+- REMAINING (coordinator): redeploy R5; run "대한민국 수도는..." + "양자역학...과학자 10명" — confirm coherent
+  output (no "<" repetition, no hallucinated names) AND speed. If still garbage on long prompts,
+  dump moe_out for one token EP vs non-EP (DSV4_EP_DBG + a tensor dump) to localize further.
