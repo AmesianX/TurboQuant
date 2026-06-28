@@ -230,22 +230,28 @@ namespace fprof {
         bool on=false; int64_t calls=0, dump_after=0; bool dumped=false;
         const char* names[4]={"cvt_in(f32->bf16)","route(absmax+alpha)","runMoe(GEMM+sort+finalize)","cvt_out(bf16->f32)"};
         prof(){ on=getenv("DSV4_MOE_FUSED_PROF")!=nullptr;
-                if(const char*d=getenv("DSV4_MOE_FUSED_PROF_AFTER")) dump_after=atoll(d); else if(on) dump_after=4000; }
+                if(const char*d=getenv("DSV4_MOE_FUSED_PROF_AFTER")) dump_after=atoll(d); else if(on) dump_after=4000;
+                if(on) fprintf(stderr,"[DSV4_MOE_FUSED_PROF] active, will auto-dump after %lld calls\n",
+                               (long long)dump_after); }
+        // drain: when force, sync ONLY our own events (cudaEventSynchronize) — NEVER a full
+        // cudaDeviceSynchronize (that hangs under the 2-node SPMD meta-backend mid-async-dispatch).
         void drain(bool force){ size_t k=0; for(size_t i=0;i<pend.size();++i){ ev&e=pend[i];
-            cudaError_t s=force?cudaSuccess:cudaEventQuery(e.e1); if(force)cudaEventSynchronize(e.e1);
+            cudaError_t s = force ? cudaEventSynchronize(e.e1) : cudaEventQuery(e.e1);
             if(s==cudaSuccess){ float t=0; if(cudaEventElapsedTime(&t,e.e0,e.e1)==cudaSuccess){ ms[e.phase]+=t; cnt[e.phase]++; }
                 cudaEventDestroy(e.e0); cudaEventDestroy(e.e1);} else pend[k++]=e; } pend.resize(k); }
-        void dump(const char* why){ cudaDeviceSynchronize(); std::lock_guard<std::mutex> lk(m); drain(true);
+        // dump_locked: caller MUST already hold m. No full-device sync (force-drains own events only).
+        void dump_locked(const char* why){ drain(true);
             double tot=ms[0]+ms[1]+ms[2]+ms[3];
-            fprintf(stderr,"\n[DSV4_MOE_FUSED_PROF] (%s) per-call phase totals %.1f ms:\n",why,tot);
+            fprintf(stderr,"\n[DSV4_MOE_FUSED_PROF] (%s) per-call phase totals %.1f ms over %lld calls:\n",
+                    why,tot,(long long)calls);
             for(int p=0;p<4;p++) fprintf(stderr,"  %8.2f ms  %5.1f%%  %8" PRId64 "x  %s\n",
                 ms[p], tot>0?100.0*ms[p]/tot:0.0, cnt[p], names[p]);
             fflush(stderr); }
-        ~prof(){ if(on) dump("exit"); }
+        ~prof(){ if(on){ std::lock_guard<std::mutex> lk(m); dump_locked("exit"); } }
         // one-shot auto-dump after dump_after calls (so it prints without clean shutdown).
         void tick_and_maybe_dump(){ if(!on||dumped||dump_after<=0) return;
-            bool fire=false; { std::lock_guard<std::mutex> lk(m); if(++calls>=dump_after){ dumped=true; fire=true; } }
-            if(fire) dump("auto"); }
+            std::lock_guard<std::mutex> lk(m);
+            if(++calls>=dump_after && !dumped){ dumped=true; dump_locked("auto"); } }
     };
     static prof g;
     // record one phase around a lambda body (events on `stream`, no sync).
@@ -328,25 +334,11 @@ static cudaError_t build_fused_layer(FusedLayer* L, int il,
     L->runner = std::make_unique<tkc::CutlassMoeFCRunner<__nv_fp4_e2m1,__nv_fp4_e2m1,__nv_bfloat16,__nv_bfloat16>>();
     auto tactics = L->runner->getTactics();
     if (tactics.empty()) { fprintf(stderr,"[DSV4_MOE_FUSED] no tactics, layer %d\n",il); return cudaErrorNotSupported; }
-    // Tactic selection.
-    //   * DSV4_MOE_FUSED_TACTIC=<i>  : explicit index (sweep the SM120 tiles for A/B). Clamped.
-    //   * else default: prefer CtaShape256x128x64B (gemm_configs.h CutlassTileConfigSM120 enum=4,
-    //     the documented 356-TFLOPS SM120 config) if getTactics() exposes it; else front().
-    //     The grouped MoE GEMM is per-expert tile-bound at 24-96 tok/expert, so the widest-N tile
-    //     (256x128) packs more experts' rows per CTA than the default front() (often 128x128) ->
-    //     better SM occupancy at our M. DSV4_MOE_FUSED_TACTIC=-1 forces front() (old behavior).
-    int ti;
-    if (const char* e = getenv("DSV4_MOE_FUSED_TACTIC")) {
-        ti = atoi(e);
-        if (ti < 0 || ti >= (int)tactics.size()) ti = 0;   // -1 / OOR -> front()
-    } else {
-        ti = 0;  // fallback = front()
-        const int kCtaShape256x128x64B = 4;  // CutlassTileConfigSM120 enum value
-        for (int i = 0; i < (int)tactics.size(); ++i) {
-            if (tactics[i].sm_version == 120 &&
-                    (int)tactics[i].tile_config_sm120 == kCtaShape256x128x64B) { ti = i; break; }
-        }
-    }
+    // Tactic selection: DEFAULT = front() (the only config measured stable; the 256x128x64B tile
+    // CRASHES at load on sm121 — confirmed by the coordinator, reverted). DSV4_MOE_FUSED_TACTIC=<i>
+    // overrides to sweep the SM120 tiles for A/B (layer-0 log prints the index->tile mapping).
+    int ti = []{ const char* e=getenv("DSV4_MOE_FUSED_TACTIC"); return e?atoi(e):0; }();
+    if (ti < 0 || ti >= (int)tactics.size()) ti = 0;
     L->runner->setTactic(tactics[ti], tactics[ti]);
     CK(cudaStreamSynchronize(stream));   // ensure all repack reads of source buffers done
     // Free the grouped source weights we've folded in (dq_gate/up + simple SFs) to

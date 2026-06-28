@@ -1305,6 +1305,26 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
             if ((tensors[0]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 CUDA_CHECK(cudaMemsetAsync(tensors[0]->data, 0, ggml_nbytes(tensors[0]), cuda_ctx->stream()));
             }
+
+            // [DSV4_TP_REDUCE_BF16] Halve the cross-node AllReduce bytes for the (bandwidth-bound)
+            // per-layer MoE-combine partial. DSV4's fused MoE writes an F32 partial; the inter-node
+            // link is the bottleneck at prefill (7168*UB*4B/layer). Compress F32->BF16, reduce in
+            // BF16, decompress -> half the wire volume. vLLM reduces TP in BF16/FP16 by default.
+            // GATED (default off) because BF16 reduce changes numerics (sum of 2 ranks' partials in
+            // bf16); coordinator verifies output quality before enabling. Only engages for F32
+            // partials above a size floor (small reduces are latency-bound, compression is a loss).
+            static const bool tp_reduce_bf16 = getenv("DSV4_TP_REDUCE_BF16") != nullptr;
+            if (tp_reduce_bf16 && tensors[0]->type == GGML_TYPE_F32 && ne >= 32768) {
+                to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+                to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+                ggml_cuda_pool_alloc<nv_bfloat16> tmp(cuda_ctx->pool(), ne);
+                to_bf16(tensors[0]->data, tmp.get(), ne, cuda_ctx->stream());
+                NCCL_CHECK(ncclAllReduce(tmp.get(), tmp.get(), ne, ncclBfloat16, ncclSum,
+                                         comm_ctx->comms[0], cuda_ctx->stream()));
+                to_fp32(tmp.get(), (float *) tensors[0]->data, ne, cuda_ctx->stream());
+                return true;
+            }
+
             const ncclDataType_t dt = tensors[0]->type == GGML_TYPE_F16  ? ncclHalf
                                     : tensors[0]->type == GGML_TYPE_BF16 ? ncclBfloat16
                                     : ncclFloat;
