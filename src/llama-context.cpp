@@ -1471,6 +1471,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // [DSV4_PREFILL_VRAM_PROBE] Wall-finder for the tokens-per-expert lever. After the
+        // graph is built+allocated for a multi-token (prefill) ubatch, report the per-backend
+        // compute-buffer reservation — THE buffer that scales with n_ubatch and is the OOM wall
+        // that caps -ub (and thus tok/expert -> MoE TF/s). Prints once per new high-water ubatch
+        // width so a single large prefill shows exactly how big the compute buffer got at this
+        // -ub (e.g. ub=4096 vs 8192), making the wall a real number instead of a guess. The MoE
+        // fused workspace is linear+tiny; the indexer transients are now query-tiled
+        // (DSV4_INDEXER_QTILE), so this number is dominated by the remaining O(ub) graph
+        // activations + the dedup'd masks. Pure instrumentation (env-gated, no compute effect).
+        static const bool vram_probe = getenv("DSV4_PREFILL_VRAM_PROBE") != nullptr;
+        if (vram_probe && ubatch.n_tokens > 1) {
+            static uint32_t probe_hw = 0;
+            if (ubatch.n_tokens > probe_hw) {
+                probe_hw = ubatch.n_tokens;
+                size_t total = 0;
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    ggml_backend_t backend = backend_ptrs[i];
+                    const size_t bs = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+                    total += bs;
+                    fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u nodes=%d backend[%zu] compute-buffer %8.1f MiB\n",
+                            ubatch.n_tokens, gf ? ggml_graph_n_nodes(gf) : -1, i, bs / (1024.0*1024.0));
+                }
+                fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u TOTAL compute-buffer %8.1f MiB (%.2f KiB/token)\n",
+                        ubatch.n_tokens, total / (1024.0*1024.0),
+                        (total / 1024.0) / (double) ubatch.n_tokens);
+                fflush(stderr);
+            }
+        }
+
         if (build_prof) {
             static double t_build_acc = 0.0, t_alloc_acc = 0.0;
             static int64_t n_builds = 0;
