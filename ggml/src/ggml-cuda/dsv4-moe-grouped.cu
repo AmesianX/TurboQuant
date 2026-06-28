@@ -1136,7 +1136,19 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
   // NOTE: hp_small_prefill bypasses DSV4_MOE_NO_HP_DECODE — when fused is live the grouped CUTLASS
   // prefill path below is UNUSABLE (it reads the freed dq_gate/dq_up), so the fused-aware HP path is
   // the ONLY correct route for M<min_m on a fused-live layer, regardless of that debug toggle.
-  const bool hp_small_prefill = prefill_fused_live && (M < DSV4_FUSED_MIN_M);
+  //
+  // [ep2-dp] EP CORRECTNESS: the grouped CUTLASS prefill path below is EP-UNSAFE (its on-device
+  // routing histograms sel[] over E LOCAL bins but sel carries GLOBAL ids -> remote ids corrupt the
+  // histogram + read OOB weights; it is hard-guarded to abort under g_ep). So under EP, EVERY M below
+  // the fused threshold (the whole small-prefill band 16<M<min_m AND, crucially, the SHORT-PROMPT case
+  // where M<min_m and fused was NEVER built so prefill_fused_live is false) MUST take the EP-aware HP
+  // path -- otherwise a short prompt (M in (16,255]) falls through to the guarded CUTLASS path, writes
+  // NO moe_out (return false), and the residual stream corrupts -> "<<<<" repetition. The HP path uses
+  // the fused-aware kernels when fused is live, else the non-fused EP-aware kernels reading the still-
+  // valid grouped dq_gate/dq_up (build_fused_layer -- which frees them -- was never called for a short
+  // prompt). Both are EP-aware (GLOBAL->LOCAL remap + remote-skip). Large M (>=min_m) still routes to
+  // the fast fused op upstream and never reaches this op. [ep2-dp]
+  const bool hp_small_prefill = (prefill_fused_live || g_ep) && (M < DSV4_FUSED_MIN_M);
   if (hp_small_prefill || (M <= DSV4_DECODE_MAX && getenv("DSV4_MOE_NO_HP_DECODE")==nullptr)) {
     // Persistent per-layer activation scratch.  For the REAL decode regime
     // (M small) we size to a small constant graph-capture ceiling (16*U*F) so
