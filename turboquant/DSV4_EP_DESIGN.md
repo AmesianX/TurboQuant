@@ -263,8 +263,52 @@ ep_size — all consistent). And the GROUPED *prefill* GEMM is ALSO W4A4 (`Eleme
 decode = FP32-activation HP shard (== non-EP decode quality, exact). Quality should now match the
 non-EP fused baseline.
 
+## 8. DEADLOCK FIX — EP grouped-decode must run eager (graphs off)
+
+**Symptom:** after R3, 2-node EP+fused DECODE hung (GPU idle, no tokens, server up) even at
+max_tokens=3. The R2 W4A4 fused decode did NOT hang; routing decode to the grouped HP path did.
+
+**Analysis (why the coordinator's "asymmetric PARTIAL" framing isn't the mechanism):** the graph is
+built by `build_moe_ffn`, which is SPMD — **both ranks emit the identical node graph**, hence the
+identical PARTIAL-node count and the identical number of inter-subgraph AllReduces
+(`n_subgraphs-1`, executor `ggml-backend-meta.cpp:2589`). So it is NOT an asymmetric collective
+count. The EP HP kernels also can't shuffle-deadlock: the expert-skip `if(e∉[0,E_local))return` is
+uniform per block (`e` depends only on `blockIdx.y`), so a warp either fully returns or fully runs;
+`warp_reduce_sum`'s `__shfl_down_sync(0xffffffff)` is only reached by fully-active warps.
+
+**Root cause (best-supported):** the grouped **M=1 decode being CUDA-graph-CAPTURED** alongside the
+**eager** inter-subgraph cross-rank PARTIAL AllReduce. Non-EP decode warms its grouped buffers and
+the warm→graphs-ON transition is benign there; the R2 fused decode was warm-from-prefill. Under
+EP+fused, prefill uses the fused op so the grouped decode buffers are first touched at decode, and
+the warm-up-gate transition (`decode_unwarmed`→graphs ON at step 2) + the per-rank EP skip interact
+badly with the captured-replay-vs-eager-NCCL ordering → both ranks block.
+
+**Fix (commit 926e5e6ae, `ggml-cuda.cu`):** under `DSV4_EP`, force grouped-**decode** graphs OFF
+(`ep_decode`). M=1 decode barely benefits from graphs; eager execution is deterministically
+SPMD-symmetric (both ranks run the same subgraph computes + the same AllReduces, no capture-timing
+skew). Prefill (large M → fused op) is untouched. `g_ep==0` ⇒ unchanged. Also fixed the
+`DSV4_EP_DBG` crash (`ggml-backend-meta.cpp`): the PARTIAL-count loop now guards to meta-buffer
+nodes and prints `rank` + `n_subgraphs` so both ranks can be compared.
+
+### Diagnostic plan if it STILL hangs after this fix
+Run both ranks with `DSV4_EP_DBG=1 GGML_TP_DBG=1`. Compare per rank:
+- `[EP_DBG] rank=R ... n_subgraphs=S n_partial=P` — **S and P MUST match across ranks** (they will,
+  by SPMD). If they don't, the graph build diverged (investigate `build_moe_ffn` env per rank).
+- `[tp] rank=R subgraph=i/S allreduce node=... ok=1` — both ranks must reach the SAME `i` count of
+  AllReduces and the last one must print on both. If rank A stops at subgraph i and rank B at j≠i,
+  the hang is the AllReduce at min(i,j)+1 — i.e. a genuine collective desync (would then point to a
+  real topology asymmetry, not capture).
+If both ranks show identical `n_subgraphs`/`n_partial` and the AllReduce logs advance in lockstep
+then stall together, the remaining suspects are NCCL-on-stream + concurrent `cudaMalloc` (the
+grouped decode buffer first-alloc) — in that case pre-warm the grouped decode buffers during a
+no-op warmup step, or set `DSV4_MOE_DECODE_MAX` to route differently. (This fix should preempt that
+by running eager from step 1.)
+
 ### Status
-- DONE (built .66, committed): R2 EP+fused (sidecar v2, `--ep`, runner ep_size/ep_rank) + R3 quality
-  fix (EP decode on FP32-act HP path, EP-aware HP kernels, min_m unforced).
-- REMAINING (coordinator): re-run the exact prompt under the deploy recipe; confirm no hallucinated
-  names + speed (decode now on HP path like non-EP; prefill still fused-fast); per-node `nvidia-smi`.
+- DONE (built .66, committed): R2 EP+fused, R3 quality fix (FP32-act HP decode), R4 deadlock fix
+  (EP grouped-decode eager) + EP_DBG crash guard.
+- Binaries for .67 (md5, build 05:xx after R4): llama-server `f50de2cf`, libllama.so.0.0.9746
+  `70d3d559`, libggml-cuda.so.0.13.1 `cfffb14e`, libggml.so.0.13.1 `c02c2eb8`; preconvert `3cbb6a76`.
+- REMAINING (coordinator): redeploy R4; confirm decode produces tokens AND no hallucination on
+  "양자역학 발전에 핵심 역할 한 과학자 10명"; if still hung, run the diagnostic plan above and report the
+  per-rank `[EP_DBG]`/`[tp]` lines.
