@@ -127,12 +127,21 @@ env_common() {
     [ -n "${DSV4_MOE_FUSED_GRAPH_OFF:-}" ]&& export DSV4_MOE_FUSED_GRAPH_OFF
     [ -n "${DSV4_MOE_SIDECAR:-}" ]    && export DSV4_MOE_SIDECAR
     [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && export DSV4_MOE_DECODE_MAX
+    # [ep2-dp] Expert-parallel: split routed experts on the expert dim (axis2), 128/rank, so each box
+    # loads HALF the MoE weight (memory headroom for large -ub). Runs the GENERIC mul_mat_id path with
+    # the per-rank expert_offset -> NOT the sidecar custom op (leave DSV4_MOE_FUSED/SIDECAR unset for EP).
+    # SPMD: both ranks MUST match -> forwarded to the slave on the ALLRESTART FWD line below.
+    [ -n "${DSV4_EP:-}" ]             && export DSV4_EP
+    [ -n "${DSV4_EP_DBG:-}" ]         && export DSV4_EP_DBG
     # DSV4 sparse-attention (per-query top-k comp-row gather). SPMD: both ranks build the SAME graph
     # shape (sparse skips the -inf comp mask concat + binds src[6]), so this MUST match on both ranks.
     [ -n "${DSV4_SPARSE_ATTN:-}" ]    && export DSV4_SPARSE_ATTN
     # capture-safe prefill arena cap + prefill-graph safety hatch (both ranks identical)
     [ -n "${DSV4_MOE_PREFILL_MAX:-}" ]       && export DSV4_MOE_PREFILL_MAX
     [ -n "${DSV4_MOE_PREFILL_GRAPH_OFF:-}" ] && export DSV4_MOE_PREFILL_GRAPH_OFF
+    # DSA indexer query-tiling (O(ub^2) -> O(tile^2)) to unblock large UB. SPMD: both ranks MUST match
+    # (same graph shape), so forward to the slave or it OOMs at large UB on the whole-ub indexer.
+    [ -n "${DSV4_INDEXER_QTILE:-}" ]         && export DSV4_INDEXER_QTILE
     [ -n "${NCCL_DEBUG:-}" ]          && export NCCL_DEBUG
     [ -n "${NCCL_IB_GID_INDEX:-}" ]   && export NCCL_IB_GID_INDEX
     # prefill graph-build profiling (off by default; both ranks identical). Used to characterize the
@@ -242,10 +251,13 @@ case "${1:-}" in
         [ -n "${DSV4_MOE_FUSED_TACTIC:-}" ]   && FWD="$FWD DSV4_MOE_FUSED_TACTIC=$DSV4_MOE_FUSED_TACTIC"
         [ -n "${DSV4_MOE_FUSED_GRAPH_OFF:-}" ]&& FWD="$FWD DSV4_MOE_FUSED_GRAPH_OFF=$DSV4_MOE_FUSED_GRAPH_OFF"
         [ -n "${DSV4_MOE_SIDECAR:-}" ]    && FWD="$FWD DSV4_MOE_SIDECAR=$DSV4_MOE_SIDECAR"
+        [ -n "${DSV4_EP:-}" ]             && FWD="$FWD DSV4_EP=$DSV4_EP"
+        [ -n "${DSV4_EP_DBG:-}" ]         && FWD="$FWD DSV4_EP_DBG=$DSV4_EP_DBG"
         [ -n "${DSV4_SPARSE_ATTN:-}" ]    && FWD="$FWD DSV4_SPARSE_ATTN=$DSV4_SPARSE_ATTN"
         [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && FWD="$FWD DSV4_MOE_DECODE_MAX=$DSV4_MOE_DECODE_MAX"
         [ -n "${DSV4_MOE_PREFILL_MAX:-}" ]       && FWD="$FWD DSV4_MOE_PREFILL_MAX=$DSV4_MOE_PREFILL_MAX"
         [ -n "${DSV4_MOE_PREFILL_GRAPH_OFF:-}" ] && FWD="$FWD DSV4_MOE_PREFILL_GRAPH_OFF=$DSV4_MOE_PREFILL_GRAPH_OFF"
+        [ -n "${DSV4_INDEXER_QTILE:-}" ]         && FWD="$FWD DSV4_INDEXER_QTILE=$DSV4_INDEXER_QTILE"
         [ -n "${DSV4_MOE_GRAPH_OFF:-}" ]  && FWD="$FWD DSV4_MOE_GRAPH_OFF=$DSV4_MOE_GRAPH_OFF"
         [ -n "${DSV4_GRAPH_PROBE:-}" ]    && FWD="$FWD DSV4_GRAPH_PROBE=$DSV4_GRAPH_PROBE"
         [ -n "${DSV4_MTP_PROF:-}" ]       && FWD="$FWD DSV4_MTP_PROF=$DSV4_MTP_PROF"
