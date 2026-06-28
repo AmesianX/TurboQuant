@@ -7,6 +7,32 @@ Env gate: `DSV4_SPARSE_ATTN=1`. Default (unset) = byte-identical dense path. Per
 This is the committed multi-week prefill lever (n^2 compressed-cache attention is the dominant
 growing prefill cost).
 
+## STATUS (round 3 — MEASURED): CORRECT & LOSSLESS, but SLOWER at 13k (vec inefficiency).
+## DSV4_SPARSE_ATTN gather works end-to-end on 2-node FP4: lossless quality, graphs captured.
+## REAL measured prefill @16,349 tok (CTX=262144, UB=512, cache_prompt=false):
+##   DENSE  (flag off): 294.48 / 299.39 tok/s  (54.6 s)
+##   SPARSE (flag on) : 182.02 / 180.94 tok/s  (89.8 s)   => ~0.61x  (a 1.6x SLOWDOWN, NOT a speedup)
+## Quality SPARSE==DENSE: "프랑스의 수도는 파리입니다." / "dog." (identical greedy); 13k summary coherent;
+## Korean AI-history long answer fluent+accurate. Numerics lossless (softmax order caveat = non-issue).
+## CUDA graphs reused (9/10/49) under sparse — capture OK. Both ranks SPMD (DSV4_SPARSE_ATTN forwarded).
+##
+## ROOT CAUSE of the slowdown (as the coordinator predicted): the FLOP reduction is real (comp segment
+## ~4087 rows -> gather 512 per query at 16k) BUT the vec kernel is one-query-per-block, NO tensor
+## cores, far less efficient per-FLOP than the dense MMA (<512,512>) path. At 13-16k the per-FLOP
+## penalty dominates the ~8x comp-FLOP saving. The big win is meant to be LONG context (100k+ ->
+## ~49x comp reduction) where the saving outgrows the penalty — NOT YET measured (256k ctx loaded;
+## a 100k-prompt A/B is the next data point). VERDICT so far: vec substrate is CORRECT but does NOT
+## win at 13k. To win broadly we likely need an MMA-class gather (tensor cores) — harder.
+##
+## Build/sync TRAP HIT+FIXED: first sparse launch crashed slave = `undefined symbol
+## ggml_flash_attn_ext_add_kv_idx` because rsync synced only llama-server+libllama.so* — the new
+## symbol lives in libggml-base.so and the kernel in libggml-cuda.so. FIX: rsync ALL of
+## {llama-server, libllama.so*, libggml-base.so*, libggml-cuda.so*}; md5 all 4 on BOTH nodes.
+##
+## NEXT (round 4): (a) 100k-prompt A/B to test the long-ctx crossover (the actual design target);
+## (b) if vec still loses at long ctx, the lever needs an MMA tile-gather (tensor cores) — scope it.
+## Default path (flag off) remains byte-identical/safe; server currently UP on sparse for inspection.
+
 ## STATUS (round 2): KERNEL + WIRING IMPLEMENTED, BUILDS CLEAN (libllama.so.0.0.9708),
 ## md5 SYNCED+VERIFIED on .66 AND .67 (server 13a69ff9.../lib 91e3dbaa...). NOT YET
 ## numerically validated / measured (round 3). Default path (flag off) untouched.
