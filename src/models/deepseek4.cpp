@@ -693,7 +693,15 @@ static dsv4_hc_mix dsv4_hc_pre(
     const int64_t hc_dim = n_embd * n_hc;
     ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
     flat = ggml_rms_norm(ctx, flat, norm_eps);
-    ggml_tensor * mixes = ggml_mul_mat(ctx, hc_fn, flat); // [mix_hc, n_tokens]
+    // [DSV4_HC_BF16] The hyper-connection mixing GEMM (hc_*_fn, [n_embd*n_hc=16384, 24]) is stored
+    // F32 in the gguf -> cublasSgemm (CUDA cores, tensor cores idle), ~7.6% of prefill at -ub=2048
+    // per DSV4_OPPROF. Casting the weight to BF16 routes it to cublasGemmEx CUDA_R_16BF +
+    // CUBLAS_COMPUTE_32F (BF16 tensor cores, FP32 accumulate) and halves the weight wire volume.
+    // The product feeds a Sinkhorn/sigmoid mixing-weight (precision-tolerant, F32 downstream).
+    // O(ub) not O(ub^2). Default OFF = byte-identical F32. Gate: DSV4_HC_BF16.
+    static const bool hc_bf16 = getenv("DSV4_HC_BF16") != nullptr;
+    ggml_tensor * hc_fn_g = hc_bf16 ? ggml_cast(ctx, hc_fn, GGML_TYPE_BF16) : hc_fn;
+    ggml_tensor * mixes = ggml_mul_mat(ctx, hc_fn_g, flat); // [mix_hc, n_tokens]
     ggml_tensor * split = ggml_dsv4_hc_split_sinkhorn(ctx, mixes, hc_scale, hc_base, n_hc, sinkhorn_iters, hc_eps);
     ggml_tensor * pre = ggml_view_2d(ctx, split, n_hc, n_tokens, split->nb[1], 0);
     ggml_tensor * post = ggml_view_2d(ctx, split, n_hc, n_tokens, split->nb[1], n_hc * split->nb[0]);
@@ -747,7 +755,10 @@ static ggml_tensor * dsv4_hc_head(
     ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
     flat = ggml_rms_norm(ctx, flat, norm_eps);
 
-    ggml_tensor * pre = ggml_mul_mat(ctx, hc_fn, flat); // [hc, n_tokens]
+    // [DSV4_HC_BF16] same lever as dsv4_hc_pre — BF16 tensor-core the hc mixing GEMM. Default OFF.
+    static const bool hc_bf16 = getenv("DSV4_HC_BF16") != nullptr;
+    ggml_tensor * hc_fn_g = hc_bf16 ? ggml_cast(ctx, hc_fn, GGML_TYPE_BF16) : hc_fn;
+    ggml_tensor * pre = ggml_mul_mat(ctx, hc_fn_g, flat); // [hc, n_tokens]
     pre = ggml_mul(ctx, pre, dsv4_view_scale(ctx, hc_scale, 0));
     pre = ggml_add(ctx, pre, dsv4_view_base(ctx, hc_base, n_hc, 0));
     pre = dsv4_add_scalar(ctx, ggml_sigmoid(ctx, pre), hc_eps);
