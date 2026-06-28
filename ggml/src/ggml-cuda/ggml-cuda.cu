@@ -3673,7 +3673,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }();
             static const bool fused_on = getenv("DSV4_MOE_FUSED") != nullptr;
             const bool fused_band = fused_on && !is_decode && moe_M > 0 && moe_M < fused_min_m;
-            if (graph_off || (!is_decode && prefill_graph_off) || decode_unwarmed || fused_band) {
+            // [ep2-dp] Under EP (expert shard) the grouped HP-decode op skips remote experts per rank.
+            // Capturing this M=1 decode into a CUDA graph alongside the cross-rank PARTIAL AllReduce
+            // proved to DEADLOCK on 2-node SPMD (GPU idle, no tokens) -- the warm-up-gate capture
+            // transition + per-rank skip interact with the eager inter-subgraph AllReduce. The fused
+            // decode that worked before was warm-from-prefill; the grouped EP decode has no such warm
+            // path. Run EP grouped-decode EAGERLY (graphs OFF): M=1 gains little from graphs, and eager
+            // execution is deterministically SPMD-symmetric (both ranks issue the identical subgraph
+            // computes + the same inter-subgraph AllReduces with no capture-timing skew). Prefill (large
+            // M) is unaffected (it routes to the fused op, not here). g_ep==0 => unchanged. [ep2-dp]
+            static const bool ep_on = getenv("DSV4_EP") != nullptr;
+            const bool ep_decode = ep_on && is_decode;
+            if (graph_off || (!is_decode && prefill_graph_off) || decode_unwarmed || fused_band || ep_decode) {
                 use_cuda_graph = false;
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs for dsv4 grouped MoE (M=%d, decode=%d, unwarmed=%d, fused_band=%d)\n", __func__, moe_M, (int)is_decode, (int)decode_unwarmed, (int)fused_band);

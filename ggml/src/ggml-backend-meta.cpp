@@ -2351,15 +2351,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         // [EP2 DIAG] count PARTIAL nodes (= cross-rank AllReduces) so we can compare the two ranks.
         // A mismatch here is a deadlock (one rank waits on a collective the other never issues).
+        // GUARD: get_split_state ABORTS on ops it doesn't model and on non-meta-buffer nodes; only
+        // query nodes whose buffer is meta (the split machinery's domain). n_subgraphs is the real
+        // AllReduce count anyway (one reduce per subgraph boundary), so report it alongside. [ep2-dp]
         if (getenv("DSV4_EP_DBG")) {
             int n_partial = 0;
             for (int ii = 0; ii < cgraph->n_nodes; ii++) {
-                if (ggml_backend_meta_get_split_state(cgraph->nodes[ii], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                ggml_tensor * nd = cgraph->nodes[ii];
+                if (!nd || !nd->buffer || !ggml_backend_buffer_is_meta(nd->buffer)) continue;
+                if (ggml_backend_meta_get_split_state(nd, false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     n_partial++;
                 }
             }
-            fprintf(stderr, "[EP_DBG] graph_compute: n_nodes=%d n_subgraphs=%zu n_partial=%d\n",
-                cgraph->n_nodes, (size_t) n_subgraphs, n_partial);
+            fprintf(stderr, "[EP_DBG] rank=%d graph_compute: n_nodes=%d n_subgraphs=%zu n_partial=%d (AllReduces=n_subgraphs-1=%zu)\n",
+                ggml_meta_tp_rank(), cgraph->n_nodes, (size_t) n_subgraphs, n_partial,
+                n_subgraphs > 0 ? n_subgraphs - 1 : 0);
             fflush(stderr);
         }
 
