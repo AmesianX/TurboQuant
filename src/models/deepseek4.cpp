@@ -1783,6 +1783,21 @@ static ggml_tensor * dsv4_build_indexer_scores_prefill(
     ggml_tensor * k = ggml_permute(ctx, index_kv, 0, 2, 1, 3); // [head_dim, n_comp, 1]
     q = ggml_permute(ctx, q, 0, 2, 1, 3);                     // [head_dim, n_tokens, n_heads]
 
+    // [DSV4_INDEXER_BF16] Aiden's +29% prefill lever (hazyumps sm12x_deep_gemm_fallbacks.py): the
+    // lightning-indexer logits GEMM is the prefill wall and it is O(ub*n_comp*n_head). vLLM/DeepGEMM
+    // runs it on FP8 tensor cores (Hopper) or a tf32 Triton kernel (GB10); ours runs it in plain F32,
+    // which on sm120/121 dispatches to cublas SGEMM (CUDA cores, tensor cores idle). Casting k and q
+    // to BF16 routes the same GEMM to ggml_cuda_mul_mat_batched_cublas -> BF16 tensor cores with FP32
+    // accumulation (batched_mul_mat_traits<BF16> = CUBLAS_COMPUTE_32F / CUDA_R_16BF). The score only
+    // feeds a top-k SELECTION (ggml_argsort_top_k picks indexer_top_k=512), so reduced precision on the
+    // logits is tolerable: the selected token set is unchanged within tie tolerance. Default OFF =
+    // byte-identical F32. Gate: DSV4_INDEXER_BF16=1.
+    static const bool indexer_bf16 = getenv("DSV4_INDEXER_BF16") != nullptr;
+    if (indexer_bf16) {
+        k = ggml_cast(ctx, k, GGML_TYPE_BF16);
+        q = ggml_cast(ctx, q, GGML_TYPE_BF16);
+    }
+
     ggml_tensor * score = ggml_mul_mat(ctx, k, q);            // [n_comp, n_tokens, n_heads]
     score = ggml_relu(ctx, score);
 
@@ -1827,6 +1842,15 @@ static ggml_tensor * dsv4_build_indexer_scores_decode(
     ggml_tensor * k = ggml_reshape_3d(ctx, index_kv, n_index_head_size, 1, n_comp);
     k = ggml_permute(ctx, k, 0, 2, 1, 3); // [head_dim, n_comp, 1]
     q = ggml_permute(ctx, q, 0, 2, 1, 3); // [head_dim, n_tokens, n_heads]
+
+    // [DSV4_INDEXER_BF16] same lever as the prefill path (see dsv4_build_indexer_scores_prefill):
+    // route the indexer logits GEMM through BF16 tensor cores. Decode n_comp is large at long ctx,
+    // so this also helps the MTP/multi-slot decode indexer. Default OFF = byte-identical F32.
+    static const bool indexer_bf16 = getenv("DSV4_INDEXER_BF16") != nullptr;
+    if (indexer_bf16) {
+        k = ggml_cast(ctx, k, GGML_TYPE_BF16);
+        q = ggml_cast(ctx, q, GGML_TYPE_BF16);
+    }
 
     ggml_tensor * score = ggml_mul_mat(ctx, k, q); // [n_comp, n_tokens, n_heads]
     score = ggml_relu(ctx, score);

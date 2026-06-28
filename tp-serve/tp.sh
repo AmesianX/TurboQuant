@@ -142,6 +142,7 @@ env_common() {
     # DSA indexer query-tiling (O(ub^2) -> O(tile^2)) to unblock large UB. SPMD: both ranks MUST match
     # (same graph shape), so forward to the slave or it OOMs at large UB on the whole-ub indexer.
     [ -n "${DSV4_INDEXER_QTILE:-}" ]         && export DSV4_INDEXER_QTILE
+    [ -n "${DSV4_ATTN_QTILE:-}" ]            && export DSV4_ATTN_QTILE
     [ -n "${NCCL_DEBUG:-}" ]          && export NCCL_DEBUG
     [ -n "${NCCL_IB_GID_INDEX:-}" ]   && export NCCL_IB_GID_INDEX
     # prefill graph-build profiling (off by default; both ranks identical). Used to characterize the
@@ -258,6 +259,7 @@ case "${1:-}" in
         [ -n "${DSV4_MOE_PREFILL_MAX:-}" ]       && FWD="$FWD DSV4_MOE_PREFILL_MAX=$DSV4_MOE_PREFILL_MAX"
         [ -n "${DSV4_MOE_PREFILL_GRAPH_OFF:-}" ] && FWD="$FWD DSV4_MOE_PREFILL_GRAPH_OFF=$DSV4_MOE_PREFILL_GRAPH_OFF"
         [ -n "${DSV4_INDEXER_QTILE:-}" ]         && FWD="$FWD DSV4_INDEXER_QTILE=$DSV4_INDEXER_QTILE"
+        [ -n "${DSV4_ATTN_QTILE:-}" ]            && FWD="$FWD DSV4_ATTN_QTILE=$DSV4_ATTN_QTILE"
         [ -n "${DSV4_MOE_GRAPH_OFF:-}" ]  && FWD="$FWD DSV4_MOE_GRAPH_OFF=$DSV4_MOE_GRAPH_OFF"
         [ -n "${DSV4_GRAPH_PROBE:-}" ]    && FWD="$FWD DSV4_GRAPH_PROBE=$DSV4_GRAPH_PROBE"
         [ -n "${DSV4_MTP_PROF:-}" ]       && FWD="$FWD DSV4_MTP_PROF=$DSV4_MTP_PROF"
