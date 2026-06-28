@@ -2006,6 +2006,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             ggml_tensor * k_all = kv;
             ggml_tensor * v_all = kv;
             ggml_tensor * attn_mask = nullptr;
+            // DSV4 sparse-attn (DSV4_SPARSE_ATTN=1): per-query top-k comp-row indices + raw-window
+            // row count, captured in the chunk path, consumed at build_attn_mha (src[6]). Null=dense.
+            ggml_tensor * sparse_topk  = nullptr;
+            int64_t       sparse_n_raw = 0;
             const llama_seq_id seq_id = ubatch.seq_id[0][0];
             auto store_attn_cache_rows = [&](ggml_tensor * src, int64_t row_start, int64_t n_rows) {
                 for (int32_t is = 0; is < ubatch.n_seq_id[0]; ++is) {
@@ -2409,16 +2413,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 v_all = k_raw;
                 attn_mask = inp_attn->self_kq_mask_swa;
 
-                // DSV4 sparse-attention (DSV4_SPARSE_ATTN=1): instead of -inf-masking the
-                // non-selected compressed keys and running DENSE flash-attn over the whole
-                // compressed cache, GATHER only the top-k selected comp rows per query. The
-                // top-k IS the model's designed sparsity (the dense path already -inf-masks the
-                // rest), so this is numerically equivalent minus the wasted FLOPs. Single-slot
-                // chunk path only (n_tokens>1, !uniform, n_comp_view>top_k). Captured below, fed
-                // to build_attn_mha as src[6]; the comp -inf mask concat is then skipped.
+                // DSV4 sparse-attention (DSV4_SPARSE_ATTN=1): GATHER only the top-k selected comp
+                // rows per query instead of -inf-masking the rest and scanning the full compressed
+                // cache. n_raw = dense raw-window row count (gather offset). Captured below in the
+                // single-slot topk branch; consumed at build_attn_mha (src[6]).
                 static const bool dsv4_sparse_attn = (getenv("DSV4_SPARSE_ATTN") != nullptr);
-                ggml_tensor * sparse_topk   = nullptr;     // [top_k, n_tokens] per-query comp indices
-                int64_t       sparse_n_raw  = k_raw->ne[2]; // dense raw-window row count (gather offset)
+                sparse_n_raw = k_raw->ne[2];
 
                 if (n_comp_visible > 0 || uniform) {
                     ggml_tensor * comp_mask = nullptr;
