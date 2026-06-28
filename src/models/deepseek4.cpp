@@ -2691,6 +2691,44 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         } else {
                             ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_view);
                             index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_view);
+                            const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_view);
+
+                            // [DSV4_INDEXER_QTILE] RESUMED-CHUNK path (n_tokens>1, !is_prefill): this is the
+                            // graph the DSV4 worst-case RESERVE builds at reserve_pos0 = max(n_batch, 8*ub)
+                            // (llama-context.cpp:632) -> n_comp_view ~ pos0/ratio is LARGE, so the untiled
+                            // indexer score [n_comp_view, ub, n_head] (built by _scores_prefill below) is the
+                            // ~2 GiB@ub2048 / ~8 GiB@ub4096 ub^2 driver that SIZES the gallocr compute buffer
+                            // (6278 MiB / OOM). It is per-query independent exactly like the is_prefill indexer,
+                            // so tile the QUERY dim with the SAME builder -> peak O(n_head*n_comp_view*qtile).
+                            // Only the dense (non-sparse) mask branch can use the mask-returning tiled builder;
+                            // when sparse-attn needs the raw top-k we keep the whole-ub score (sparse mode does
+                            // not materialize the [n_comp,ub] mask, but its score is still whole-ub — acceptable
+                            // since DSV4_SPARSE_ATTN is off in the EP/fused deploy). qtile<=0 or >=ub = OFF
+                            // (whole-ub, byte-identical). Same DSV4_INDEXER_QTILE knob as the is_prefill path.
+                            static const int64_t indexer_qtile_resumed = []{
+                                const char * e = getenv("DSV4_INDEXER_QTILE"); return e ? (int64_t) atoll(e) : 0;
+                            }();
+                            const bool tile_resumed = n_tokens > 1 && indexer_qtile_resumed > 0 && indexer_qtile_resumed < n_tokens &&
+                                                      !(dsv4_sparse_attn && cparams.flash_attn && n_comp_view > top_k);
+                            if (tile_resumed) {
+                                ggml_tensor * resumed_causal = get_dsv4_inputs()->add_mask(ctx0,
+                                        dsv4_mask_kind::COMPRESS_CAUSAL,
+                                        n_comp_visible, n_tokens,
+                                        0, n_comp_visible, 0, compress_ratio,
+                                        "dsv4_indexer_decode_causal_mask");
+                                // The tiled builder slices qr/cur/pos/causal_mask per query tile, runs the
+                                // exact _scores_prefill -> argsort_top_k -> mask pipeline per tile, and concats
+                                // the [n_comp_view, qtile] masks -> identical to the whole-ub path.
+                                comp_mask = dsv4_build_indexer_mask_tiled_prefill(ctx0,
+                                        cur, qr,
+                                        dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_view),
+                                        layer.indexer_attn_q_b, layer.indexer_proj, inp_pos,
+                                        resumed_causal,
+                                        hparams.indexer_n_head, hparams.indexer_head_size,
+                                        n_tokens, n_rot, rope_type, rope_cfg,
+                                        n_comp_view, top_k, indexer_qtile_resumed);
+                                cb(comp_mask, "indexer_scores", il);
+                            } else {
                             ggml_tensor * index_scores = n_tokens == 1
                                 ? dsv4_build_indexer_scores_decode(ctx0,
                                         cur, qr, index_cache,
@@ -2733,7 +2771,6 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                 index_scores = ggml_add(ctx0, index_scores, index_causal);
                             }
 
-                            const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_view);
                             ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
                             cb(topk, "indexer_topk", il);
 
@@ -2750,6 +2787,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                 comp_mask   = ggml_reshape_2d(ctx0, comp_mask, n_comp_view, n_tokens);
                             } else {
                                 comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                            }
                             }
                         }
                     } else {

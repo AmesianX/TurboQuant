@@ -1523,45 +1523,57 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 if (gf) {
                     const int nn = ggml_graph_n_nodes(gf);
                     const int64_t ubn = (int64_t) ubatch.n_tokens;
-                    struct probe_ent { const char * name; const char * op; size_t bytes; int64_t ne0, ne1, ne2, ne3; bool ub_scaled; };
+                    struct probe_ent { const char * name; const char * op; size_t bytes; int64_t ne0, ne1, ne2, ne3; bool ub_scaled; bool alloc; };
                     std::vector<probe_ent> ents;
                     ents.reserve(nn);
-                    // op-type sum (only n_tokens-scaling nodes -> the ub lever)
-                    std::vector<std::pair<const char *, size_t>> op_sum;     // ub-scaled only
-                    std::vector<std::pair<const char *, size_t>> op_sum_all; // every node
+                    // op-type sum over REAL-ALLOC nodes only (a view / reshape / permute / transpose has
+                    // view_src != NULL -> it ALIASES its parent's data -> consumes ZERO compute buffer;
+                    // counting those was the artifact that made RESHAPE look like 1.4 GB. A node whose
+                    // data already points into a preloaded WEIGHT buffer (t->data != NULL && !view) is also
+                    // not a compute-buffer allocation). So "alloc" = NOT a view AND data not pre-set.
+                    std::vector<std::pair<const char *, size_t>> op_sum;       // ub-scaled REAL-ALLOC
                     auto bump = [](std::vector<std::pair<const char *, size_t>> & v, const char * k, size_t b){
                         for (auto & p : v) { if (p.first == k) { p.second += b; return; } }
                         v.push_back({ k, b });
                     };
-                    size_t ub_total = 0, all_total = 0;
+                    size_t ub_alloc = 0, all_alloc = 0, view_total = 0;
                     for (int ni = 0; ni < nn; ++ni) {
                         ggml_tensor * t = ggml_graph_node(gf, ni);
                         if (!t) continue;
                         const size_t b = ggml_nbytes(t);
-                        // "ub-scaled" = some dim equals (or is a clean multiple of) n_tokens -> grows with -ub.
+                        const bool is_view = (t->view_src != nullptr) || ggml_is_view(t);
+                        // compute-buffer allocation iff not a view and not aliasing a preloaded buffer.
+                        const bool alloc = !is_view;
                         const bool ub_scaled = ubn > 1 &&
                             (t->ne[0] == ubn || t->ne[1] == ubn || t->ne[2] == ubn || t->ne[3] == ubn ||
                              t->ne[1] % ubn == 0 || t->ne[2] % ubn == 0);
                         const char * op = ggml_op_name(t->op);
-                        ents.push_back({ t->name, op, b, t->ne[0], t->ne[1], t->ne[2], t->ne[3], ub_scaled });
-                        all_total += b;  bump(op_sum_all, op, b);
-                        if (ub_scaled) { ub_total += b; bump(op_sum, op, b); }
+                        ents.push_back({ t->name, op, b, t->ne[0], t->ne[1], t->ne[2], t->ne[3], ub_scaled, alloc });
+                        if (alloc) { all_alloc += b; if (ub_scaled) { ub_alloc += b; bump(op_sum, op, b); } }
+                        else view_total += b;
                     }
                     std::sort(ents.begin(), ents.end(),
                               [](const probe_ent & a, const probe_ent & b){ return a.bytes > b.bytes; });
-                    fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u SUM(all nodes)=%.1f MiB  SUM(ub-scaled nodes)=%.1f MiB  (nodes=%d)\n",
-                            ubatch.n_tokens, all_total/(1024.0*1024.0), ub_total/(1024.0*1024.0), nn);
+                    // THE decisive line: reserved gallocr buffer vs the REAL-ALLOC node sum vs n_batch/n_ubatch.
+                    // buffer >> real-alloc-sum => gallocr over-reserve/fragmentation OR a worst-case path not
+                    // in THIS graph. buffer ~ real-alloc-sum => the named ops ARE the buffer. The (n_batch,
+                    // n_ubatch) pair lets the coordinator see whether the buffer tracks -b or -ub across runs.
+                    fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u n_batch=%u n_ubatch=%u  reserved-buffer=%.1f MiB  real-alloc-sum=%.1f MiB  view-sum(zero-cost)=%.1f MiB  (nodes=%d)\n",
+                            ubatch.n_tokens, cparams.n_batch, cparams.n_ubatch,
+                            total/(1024.0*1024.0), all_alloc/(1024.0*1024.0), view_total/(1024.0*1024.0), nn);
+                    fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u SUM(ub-scaled REAL-ALLOC)=%.1f MiB\n",
+                            ubatch.n_tokens, ub_alloc/(1024.0*1024.0));
                     std::sort(op_sum.begin(), op_sum.end(),
                               [](const auto & a, const auto & b){ return a.second > b.second; });
                     for (size_t oi = 0; oi < op_sum.size() && oi < 12; ++oi) {
-                        fprintf(stderr, "DSV4_PREFILL_VRAM:   op-sum(ub-scaled) %-16s %9.1f MiB\n",
+                        fprintf(stderr, "DSV4_PREFILL_VRAM:   op-sum(ub-scaled,alloc) %-16s %9.1f MiB\n",
                                 op_sum[oi].first, op_sum[oi].second/(1024.0*1024.0));
                     }
-                    // largest ub-scaled individual nodes (the actual transients the lever moves)
+                    // largest ub-scaled REAL-ALLOC nodes (the transients the -ub lever actually moves)
                     int shown = 0;
                     for (const auto & e : ents) {
-                        if (!e.ub_scaled) continue;
-                        fprintf(stderr, "DSV4_PREFILL_VRAM:   ub-node[%2d] %9.1f MiB  %-14s [%6lld,%6lld,%6lld,%6lld]  %s\n",
+                        if (!e.ub_scaled || !e.alloc) continue;
+                        fprintf(stderr, "DSV4_PREFILL_VRAM:   ub-alloc[%2d] %9.1f MiB  %-14s [%6lld,%6lld,%6lld,%6lld]  %s\n",
                                 shown, e.bytes/(1024.0*1024.0), e.op,
                                 (long long)e.ne0,(long long)e.ne1,(long long)e.ne2,(long long)e.ne3, e.name);
                         if (++shown >= 20) break;
