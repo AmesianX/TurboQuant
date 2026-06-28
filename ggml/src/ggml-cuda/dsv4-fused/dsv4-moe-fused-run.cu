@@ -304,6 +304,41 @@ static cudaError_t build_fused_layer(FusedLayer* L, int il,
     return cudaSuccess;
 }
 
+// ---- accessor for the GROUPED HP-DECODE op (dsv4-moe-grouped.cu) -------------
+// ORTHODOX SINGLE-WEIGHT-SET DESIGN: once a layer is folded into the fused fc1/fc2
+// layout, the grouped path's dq_gate/dq_up (+ simple SFs) are FREED (real memory
+// reclaimed, no duplicate). The HP DECODE kernels therefore must read the SAME
+// fused weight tensors. This hands the grouped TU the live fused pointers + dims so
+// its decode kernels can slice gate/up out of fc1 and read fc2, using the fused
+// swizzled SF + the per-expert g_common/g_down globals (numerically == prefill).
+// Returns false if layer not built in the fused cache (caller keeps grouped buffers).
+//   fc1_w  : [E][2*inter][hidden/2] e2m1, rows [0,inter)=UP then [inter,2*inter)=GATE
+//   fc2_w  : [E][hidden][inter/2]   e2m1 (alias dq_down)
+//   fc1_sf : SWIZZLED_128x4 ue4m3, per-expert stride padUp(2*inter,128)*padUp(hidden/16,4)
+//   fc2_sf : SWIZZLED_128x4 ue4m3, per-expert stride padUp(hidden,128)*padUp(inter/16,4)
+//   g_common: [E] fc1 weight global (=max(g_gate,g_up)); g_down: [E] fc2 weight global
+extern "C" bool dsv4_moe_fused_get_layer(
+        int il, int* E, int* hidden, int* inter,
+        const void** fc1_w, const void** fc2_w,
+        const void** fc1_sf, const void** fc2_sf,
+        const float** g_common, const float** g_down) {
+    std::lock_guard<std::mutex> lk(g_fmu);
+    auto it = g_fcache.find(il);
+    if (it == g_fcache.end() || !it->second) return false;
+    FusedLayer* L = it->second;
+    if (!L->fc1_w || !L->fc2_w || !L->fc1_sf || !L->fc2_sf) return false;
+    if (E)        *E        = L->E;
+    if (hidden)   *hidden   = L->hidden;
+    if (inter)    *inter    = L->inter;
+    if (fc1_w)    *fc1_w    = (const void*)L->fc1_w;
+    if (fc2_w)    *fc2_w    = (const void*)L->fc2_w;
+    if (fc1_sf)   *fc1_sf   = (const void*)L->fc1_sf;
+    if (fc2_sf)   *fc2_sf   = (const void*)L->fc2_sf;
+    if (g_common) *g_common = L->g_common;
+    if (g_down)   *g_down   = L->g_down;
+    return true;
+}
+
 extern "C" cudaError_t dsv4_moe_fused_run(
         int il,
         const float* hidden, const int* sel, const float* weights, float* moe_out,

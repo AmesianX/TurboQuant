@@ -617,10 +617,152 @@ __global__ void dec_down_scatter(
   }
 }
 
+// ===== ORTHODOX SINGLE-WEIGHT-SET HP DECODE (reads the FUSED fc1/fc2 layout) ===
+// Under DSV4_MOE_FUSED the grouped dq_gate/dq_up (+ simple SFs) are freed once the
+// fused repack folds them into fc1. These decode kernels read gate/up from the FUSED
+// fc1 [E][2*inter][D/2] (rows [0,inter)=UP, [inter,2*inter)=GATE), down from fc2
+// [E][D][F/2] (= dq_down alias), with the FUSED SWIZZLED_128x4 ue4m3 block scales +
+// the per-expert g_common (fc1) / g_down (fc2) globals. Effective weight scale
+// == ue4m3(simple * g_proj/g_common) * g_common == the prefill fused scale -> the
+// MoE output is numerically the prefill fused output (lossless, single weight set).
+
+// Mirror of dsv4-moe-fused-run.cu::sf_swizzled_index (computeSFIndex / SWIZZLED_128x4).
+// Returns the byte offset (within one expert's SF block) of the ue4m3 scale for
+// (rowIdx in [0,nRows_fused), colIdx = K-block in [0,totalColumn)).
+__device__ __forceinline__ int dsv4_sf_swizzled_index(int rowIdx, int colIdx, int totalColumn){
+  const int kColumnGroup0Size = 4;
+  const int kRowGroup0Size = 32;
+  const int kRowGroup1Size = kRowGroup0Size * 4; // 128
+  int paddedColumn = ((totalColumn + 3) / 4) * 4;
+  int columnIdxInGroup0 = colIdx % kColumnGroup0Size;
+  int columnGroupIdx    = colIdx / kColumnGroup0Size;
+  const int columnGroupStride = kColumnGroup0Size * kRowGroup1Size; // 512
+  int rowIdxInGroup0 = rowIdx % kRowGroup0Size;
+  int rowIdxInGroup1 = (rowIdx % kRowGroup1Size) / kRowGroup0Size;
+  int rowGroupIdx    = rowIdx / kRowGroup1Size;
+  const int rowGroup1Stride = kColumnGroup0Size;                    // 4
+  const int rowGroup0Stride = kColumnGroup0Size * rowGroup1Stride;  // 16
+  int rowGroupStride = kRowGroup1Size * paddedColumn;
+  return columnIdxInGroup0 + columnGroupIdx * columnGroupStride
+       + rowIdxInGroup0 * rowGroup0Stride + rowIdxInGroup1 * rowGroup1Stride
+       + rowGroupIdx * rowGroupStride;
+}
+
+// Stage 1 (fused layout): gate/up + swiglu, WARP-PER-OUTPUT.
+//   fc1: [E][2*inter][D/2] e2m1; UP at row j, GATE at row inter+j.
+//   fc1_sf: per-expert stride sf1_stride = padUp(2*inter,128)*padUp(D/16,4);
+//           scale byte at sf_off(e) + dsv4_sf_swizzled_index(row_fused, c/16, D/16).
+//   global g_common[e] applied to BOTH gate and up (== prefill convention).
+__global__ void dec_gate_up_swiglu_fused(
+    const float* __restrict__ hidden, const int* __restrict__ sel,
+    const uint8_t* __restrict__ fc1_w, const uint8_t* __restrict__ fc1_sf,
+    const float* __restrict__ g_common,
+    float* __restrict__ act, int M, int U, int D, int F, int inter,
+    int sf1_stride, int sf1_cols, float limit){
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int warps_per_block = blockDim.x >> 5;
+  const int j = blockIdx.x * warps_per_block + warp;   // output row in [0,F)  (F==inter)
+  const int row = blockIdx.y;                          // token*U + slot
+  if(j >= F || row >= M*U) return;
+  const int token = row / U;
+  const int e = sel[row];
+  const float* __restrict__ x = hidden + (int64_t)token * D;
+  const int nbytes = D >> 1;                            // packed bytes per weight row
+  const int rows_fused = 2 * inter;
+  const int64_t wbase = (int64_t)e * rows_fused * nbytes;
+  const int64_t sfbase = (int64_t)e * sf1_stride;
+  const float gc = g_common[e];
+  // UP at fused row j, GATE at fused row inter+j.
+  const int up_row   = j;
+  const int gate_row = inter + j;
+  const uint8_t* __restrict__ wur = fc1_w + wbase + (int64_t)up_row   * nbytes;
+  const uint8_t* __restrict__ wgr = fc1_w + wbase + (int64_t)gate_row * nbytes;
+  float accg = 0.f, accu = 0.f;
+  for(int p = lane; p < nbytes; p += 32){
+    int c = 2 * p;
+    int blk = c / SFVec;                               // SF K-block index (colIdx)
+    float sg = ue4m3_decode(fc1_sf[sfbase + dsv4_sf_swizzled_index(gate_row, blk, sf1_cols)]) * gc;
+    float su = ue4m3_decode(fc1_sf[sfbase + dsv4_sf_swizzled_index(up_row,   blk, sf1_cols)]) * gc;
+    uint8_t bg = wgr[p], bu = wur[p];
+    float x0 = x[c], x1 = x[c+1];
+    accg += e2m1_decode(bg & 0xF) * sg * x0 + e2m1_decode(bg >> 4) * sg * x1;
+    accu += e2m1_decode(bu & 0xF) * su * x0 + e2m1_decode(bu >> 4) * su * x1;
+  }
+  accg = warp_reduce_sum(accg);
+  accu = warp_reduce_sum(accu);
+  if(lane == 0){
+    float g = accg; if(limit > 0.f) g = fminf(g, limit);
+    float u = accu; if(limit > 0.f) u = fmaxf(-limit, fminf(u, limit));
+    float sv = g / (1.f + expf(-g));
+    act[(int64_t)row * F + j] = sv * u;
+  }
+}
+
+// Stage 2 (fused layout): down + router-weighted scatter-add.
+//   fc2: [E][D][F/2] e2m1 (== dq_down). fc2_sf: per-expert stride
+//   sf2_stride = padUp(D,128)*padUp(F/16,4); scale byte at sf_off(e) +
+//   dsv4_sf_swizzled_index(i, c/16, F/16). global g_down[e].
+__global__ void dec_down_scatter_fused(
+    const float* __restrict__ act, const int* __restrict__ sel,
+    const float* __restrict__ rw, const uint8_t* __restrict__ fc2_w,
+    const uint8_t* __restrict__ fc2_sf, const float* __restrict__ g_down,
+    float* __restrict__ out, int M, int U, int D, int F,
+    int sf2_stride, int sf2_cols){
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int warps_per_block = blockDim.x >> 5;
+  const int i = blockIdx.x * warps_per_block + warp;   // output row in [0,D)
+  const int row = blockIdx.y;
+  if(i >= D || row >= M*U) return;
+  const int token = row / U;
+  const int e = sel[row];
+  const float w = rw[row];
+  const float* __restrict__ a = act + (int64_t)row * F;
+  const int nbytes = F >> 1;
+  const int64_t wbase  = (int64_t)e * D * nbytes;
+  const int64_t sfbase = (int64_t)e * sf2_stride;
+  const float de = g_down[e];
+  const uint8_t* __restrict__ wdr = fc2_w + wbase + (int64_t)i * nbytes;
+  float acc = 0.f;
+  for(int p = lane; p < nbytes; p += 32){
+    int c = 2 * p;
+    int blk = c / SFVec;
+    float sd = ue4m3_decode(fc2_sf[sfbase + dsv4_sf_swizzled_index(i, blk, sf2_cols)]) * de;
+    uint8_t bd = wdr[p];
+    acc += e2m1_decode(bd & 0xF) * sd * a[c] + e2m1_decode(bd >> 4) * sd * a[c+1];
+  }
+  acc = warp_reduce_sum(acc);
+  if(lane == 0){
+    atomicAdd(&out[(int64_t)token * D + i], w * acc);
+  }
+}
+
 } // namespace dsv4_moe_grouped_detail
 
 // ===== public load adapter ===================================================
 using namespace dsv4_moe_grouped_detail;
+
+// Fused-layer accessor (dsv4-moe-fused-run.cu). Under DSV4_MOE_FUSED the grouped
+// gate/up weights + simple SFs are freed after the fused repack; the HP decode then
+// reads the SAME fused fc1/fc2 + swizzled SF + g_common/g_down via these pointers.
+// Returns false if the fused cache has no entry for the layer (grouped buffers live).
+#ifdef DSV4_MOE_FUSED_CUTLASS
+// Strong reference (the fused static lib is linked): forces archive extraction so
+// the symbol is non-null and the decode path can share the fused weight set.
+extern "C" bool dsv4_moe_fused_get_layer(
+        int il, int* E, int* hidden, int* inter,
+        const void** fc1_w, const void** fc2_w,
+        const void** fc1_sf, const void** fc2_sf,
+        const float** g_common, const float** g_down);
+#else
+// CUTLASS fused lib not built -> no fused layer ever exists; decode uses grouped
+// buffers. Provide a stub so the single code path below compiles + always falls
+// through to the grouped kernels.
+static inline bool dsv4_moe_fused_get_layer(
+        int, int*, int*, int*, const void**, const void**,
+        const void**, const void**, const float**, const float**) { return false; }
+#endif
 
 // ---- host blob builder (no device needed) -----------------------------------
 // Produces the exact 9-section NVFP4 registry blob for one layer / one rank from
@@ -973,6 +1115,40 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int blk = WPB * 32;
     dim3 g_gu((F + WPB - 1) / WPB, rows);                  // gate/up: F output rows
     dim3 g_dn((D + WPB - 1) / WPB, rows);                  // down:    D output rows
+
+    // ORTHODOX SINGLE-WEIGHT-SET: if the FUSED path built this layer, the grouped
+    // gate/up weights + simple SFs were freed (real memory reclaimed). Read gate/up
+    // from the fused fc1 slices + fc2 + the fused swizzled SF + g_common/g_down.
+    // There is exactly ONE weight set; nothing here reads the freed dq_gate/dq_up.
+    int  fu_E=0, fu_hidden=0, fu_inter=0;
+    const void *fc1_w=nullptr,*fc2_w=nullptr,*fc1_sf=nullptr,*fc2_sf=nullptr;
+    const float *fu_gcommon=nullptr,*fu_gdown=nullptr;
+    const bool fused_live =
+        dsv4_moe_fused_get_layer(il, &fu_E, &fu_hidden, &fu_inter,
+            &fc1_w, &fc2_w, &fc1_sf, &fc2_sf, &fu_gcommon, &fu_gdown);
+    if (fused_live) {
+      GGML_ASSERT(fu_E==E && fu_hidden==D && fu_inter==F &&
+                  "fused/grouped decode dim mismatch");
+      // Per-expert SWIZZLED_128x4 SF strides + unpadded K-block col counts (mirror
+      // of dsv4-moe-fused-run.cu build: padN=padUp(rows,128), padC=padUp(cols,4)).
+      auto padUp=[](int x,int a){ return (x + a - 1)/a*a; };
+      const int colsD = D / SFVec, colsF = F / SFVec;
+      const int sf1_stride = padUp(2*F,128) * padUp(colsD,4); // fc1: rows=2*inter, K=D
+      const int sf2_stride = padUp(D,  128) * padUp(colsF,4); // fc2: rows=D,       K=F
+      dec_gate_up_swiglu_fused<<<g_gu, blk, 0, s>>>(
+          d_hidden, d_sel,
+          reinterpret_cast<const uint8_t*>(fc1_w),
+          reinterpret_cast<const uint8_t*>(fc1_sf),
+          fu_gcommon, d_act, M, U, D, F, /*inter=*/F,
+          sf1_stride, colsD, swiglu_limit);
+      dec_down_scatter_fused<<<g_dn, blk, 0, s>>>(
+          d_act, d_sel, d_rw,
+          reinterpret_cast<const uint8_t*>(fc2_w),
+          reinterpret_cast<const uint8_t*>(fc2_sf),
+          fu_gdown, d_out, M, U, D, F, sf2_stride, colsF);
+      return true;
+    }
+
     dec_gate_up_swiglu<<<g_gu, blk, 0, s>>>(
         d_hidden, d_sel,
         reinterpret_cast<const uint8_t*>(L->dq_gate),
