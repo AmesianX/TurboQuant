@@ -1606,7 +1606,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // [DSV4_PHASE_PROF] Per-ubatch wall-time breakdown (graphs ON): set_inputs vs compute(+sync) vs
+    // the build/alloc already timed above. This is the measurement that separates the standalone-fast
+    // MoE kernel from the in-server-flat end-to-end: at -ub=2048 vs 4096 it shows whether the COMPUTE
+    // phase shrinks per-token (the MoE large-batch gain) or whether a fixed per-forward cost (graph
+    // re-alloc, set_inputs, the synchronize that stands in for the TP all-reduce + GPU drain)
+    // dominates. The sync is ONLY taken under this env so the normal async pipeline is untouched.
+    // Aggregates per ubatch-WIDTH so a 13k prefill prints a clean per-width table at process exit.
+    static const bool phase_prof = getenv("DSV4_PHASE_PROF") != nullptr;
+
     // set the input data for the input tensors
+    const auto t_si0 = phase_prof ? ggml_time_us() : 0;
     {
         //const auto t_start_us = ggml_time_us();
 
@@ -1615,12 +1625,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    const auto t_si1 = phase_prof ? ggml_time_us() : 0;
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (phase_prof && ubatch.n_tokens > 1) {
+        // Force the async compute to finish so we measure the REAL GPU compute wall (incl. the TP
+        // all-reduce, which lives inside the graph). Only under the env -> production path unaffected.
+        ggml_backend_sched_synchronize(sched.get());
+        const double t_si = (t_si1 - t_si0)/1000.0;
+        const double t_cc = (ggml_time_us() - t_si1)/1000.0;
+        // Live per-build line: width, set_inputs ms, compute(+sync incl. TP all-reduce) ms, and the
+        // per-token compute (the number that should DROP at -ub=4096 if the MoE large-batch gain shows).
+        // reuse_ok tells whether this chunk re-built+re-captured (the per-width re-capture cost).
+        fprintf(stderr, "DSV4_PHASE: w=%u reuse=%d set_in=%.2f ms compute=%.2f ms (%.2f us/tok)\n",
+                ubatch.n_tokens, (int) reuse_ok, t_si, t_cc, 1000.0 * t_cc / (double) ubatch.n_tokens);
     }
 
     ret = GGML_STATUS_SUCCESS;
