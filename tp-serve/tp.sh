@@ -145,6 +145,7 @@ env_common() {
     [ -n "${DSV4_ATTN_QTILE:-}" ]            && export DSV4_ATTN_QTILE
     [ -n "${DSV4_INDEXER_FUSED:-}" ]         && export DSV4_INDEXER_FUSED
     [ -n "${DSV4_HC_BF16:-}" ]               && export DSV4_HC_BF16
+    [ -n "${DSV4_MLA_MMA:-}" ]               && export DSV4_MLA_MMA
     [ -n "${DSV4_COMPRESSOR_BF16:-}" ]       && export DSV4_COMPRESSOR_BF16
     [ -n "${DSV4_INDEXER_BF16:-}" ]          && export DSV4_INDEXER_BF16
     [ -n "${DSV4_RESUMED_RESERVE_MULT:-}" ]  && export DSV4_RESUMED_RESERVE_MULT
@@ -266,7 +267,7 @@ case "${1:-}" in
         [ -n "${DSV4_INDEXER_QTILE:-}" ]         && FWD="$FWD DSV4_INDEXER_QTILE=$DSV4_INDEXER_QTILE"
         [ -n "${DSV4_ATTN_QTILE:-}" ]            && FWD="$FWD DSV4_ATTN_QTILE=$DSV4_ATTN_QTILE"
         [ -n "${DSV4_INDEXER_FUSED:-}" ]         && FWD="$FWD DSV4_INDEXER_FUSED=$DSV4_INDEXER_FUSED"
-        [ -n "${DSV4_HC_BF16:-}" ]               && FWD="$FWD DSV4_HC_BF16=$DSV4_HC_BF16 CTK=${CTK:-tbq3} CTV=${CTV:-tbq3}"
+        [ -n "${DSV4_HC_BF16:-}" ]               && FWD="$FWD DSV4_HC_BF16=$DSV4_HC_BF16 DSV4_MLA_MMA=${DSV4_MLA_MMA:-} CTK=${CTK:-tbq3} CTV=${CTV:-tbq3}"
         [ -n "${DSV4_COMPRESSOR_BF16:-}" ]       && FWD="$FWD DSV4_COMPRESSOR_BF16=$DSV4_COMPRESSOR_BF16"
         [ -n "${DSV4_INDEXER_BF16:-}" ]          && FWD="$FWD DSV4_INDEXER_BF16=$DSV4_INDEXER_BF16"
         [ -n "${DSV4_RESUMED_RESERVE_MULT:-}" ]  && FWD="$FWD DSV4_RESUMED_RESERVE_MULT=$DSV4_RESUMED_RESERVE_MULT"

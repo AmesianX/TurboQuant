@@ -1008,6 +1008,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      || V->type == GGML_TYPE_TBQ4_2 || V->type == GGML_TYPE_TBQ3_2
      || V->type == GGML_TYPE_TBQ4_3 || V->type == GGML_TYPE_TBQ3_3
      || V->type == GGML_TYPE_TBQ4_4 || V->type == GGML_TYPE_TBQ3_4;
+    {
+        static const bool fp = getenv("DSV4_FATTN_PROBE") != nullptr;
+        if (fp && Q->ne[0] >= 256) {
+            static bool done = false;
+            if (!done) {
+                done = true;
+                FILE* f = fopen("/tmp/dsv4_fattn_probe.log", "w");
+                if (f) {
+                    fprintf(f, "DSV4 FA dispatch: K=%s V=%s Q.ne0=%ld V.ne0=%ld tbq_k=%d tbq_v=%d -> %s\n",
+                            ggml_type_name(K->type), ggml_type_name(V->type),
+                            (long)Q->ne[0], (long)V->ne[0], (int)tbq_k_type, (int)tbq_v_type,
+                            (tbq_k_type || tbq_v_type) ? "TBQ-BLOCK(VEC)" : "NORMAL-PATH(MMA?)");
+                    fclose(f);
+                }
+            }
+        }
+    }
     if (tbq_k_type || tbq_v_type) {
         // EXPERIMENT (post-v1.5.3): route GLM MLA (D=576) to VEC kernel as well, to apply
         // v1.5.2 quality improvements (precision fix, sharpening, V IWHT float staging, etc.)
@@ -1023,10 +1040,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             && ggml_cuda_fattn_mma_tbq_supported(KQV)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
+        // User-requested re-enable of the MMA tensor-core path for D=576/512 MLA (was reverted
+        // to VEC for v1.5.2 quality work). Env-gated A/B: DSV4_MLA_MMA=1 -> MMA, default -> VEC.
+        // MUST fire BEFORE the <=576 VEC catch-all, else D=576 falls through to VEC.
+        static const bool dsv4_mla_mma = getenv("DSV4_MLA_MMA") != nullptr;
+        if (dsv4_mla_mma && Q->ne[0] == 576 && V->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0
+            && (turing_mma_available(cc) || volta_mma_available(cc))) {
+            static bool printed = false;
+            if (!printed) { fprintf(stderr, "DSV4_MLA_MMA: MLA D=576/512 -> MMA_F16 (was VEC)\n"); printed = true; }
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (Q->ne[0] <= 576 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+            if (dsv4_mla_mma) { static bool pv = false; if (!pv) { fprintf(stderr, "DSV4_MLA_MMA: MLA -> VEC (MMA not taken; Q=%ld V=%ld)\n", (long)Q->ne[0], (long)V->ne[0]); pv = true; } }
             return BEST_FATTN_KERNEL_VEC;
         }
-        // (Disabled during experiment — will be re-enabled after quality port.)
+        // Original disabled MMA block (now gated above via DSV4_MLA_MMA):
         // if (Q->ne[0] == 576 && V->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
         //     if (turing_mma_available(cc) || volta_mma_available(cc)) {
         //         return BEST_FATTN_KERNEL_MMA_F16;
@@ -1074,6 +1102,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
+        { static const bool fp = getenv("DSV4_FATTN_PROBE") != nullptr;
+          if (fp && Q->ne[0] >= 256) { static bool d2=false; if(!d2){d2=true; FILE*f=fopen("/tmp/dsv4_fattn_probe.log","a"); if(f){fprintf(f,"  RESOLVED: MMA_F16 (turing normal path L1105) Q=%ld V=%ld gqa=%d ne1=%ld\n",(long)Q->ne[0],(long)V->ne[0],(int)gqa_ratio,(long)Q->ne[1]); fclose(f);} } } }
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
