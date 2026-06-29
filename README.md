@@ -1,3 +1,19 @@
+# ⛔ Project Discontinued — Archived
+
+**The reasons for ending development are as follows.**
+
+For over three days, we worked with Claude Code to port vLLM's superior, cutting-edge kernel technology into llama.cpp — and we failed to complete the mission. We overcame countless rounds of painful, repetitive development, like felling the bosses of stage after stage, but we have now reached our limit.
+
+Aiden's vLLM achieves **1,600 tokens/s prefill and 45 tokens/s decode**. Yet on the **same hardware**, we could only reach **330 tokens/s prefill**, and decode never rose above **13–19.5 tokens/s**.
+
+And so, we have had to make the tearful decision to give up on improving the llama.cpp architecture and lay this project to rest.
+
+Even with a world-leading AI like **Opus 4.8** in Claude Code, this task could not be overcome. Even if **Fable 5** becomes publicly available, I believe AI will be no more able to solve it. I will no longer attempt to port vLLM's most advanced, latest techniques into llama.cpp using AI, and **this repository is being archived.**
+
+It has been a joy. It is sad, but please understand this announcement of the project's discontinuation. *(Everyone — use vLLM. It will not harm your mental health. For me personally, this will be a very sad day.)*
+
+---
+
 # TurboQuant KV Cache Compression for llama.cpp
 
 > Implementation of [TurboQuant (ICLR 2026, Google DeepMind)](https://arxiv.org/abs/2504.19874) — KV cache compression via Walsh-Hadamard Transform + Lloyd-Max quantization with QJL correction
