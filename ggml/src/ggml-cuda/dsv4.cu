@@ -5,9 +5,19 @@
 #include "dsv4.cuh"
 
 #include <cuda_fp8.h>
+#include <cuda_bf16.h>
+#if defined(GGML_USE_HIP)
+#else
+#include <mma.h>
+#endif
 
 #ifndef M_PI_F
 #define M_PI_F 3.141592653589793238462643383279502884f
+#endif
+
+// bf16 16x16x16 WMMA fragments require sm80+ (Ampere). Our target is sm121 (GB10).
+#if !defined(GGML_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#define DSV4_WMMA_AVAILABLE
 #endif
 
 namespace {
@@ -539,6 +549,118 @@ static __global__ void kernel_dsv4_indexer_logits(
     }
 }
 
+// ---- WMMA (tensor-core) fused indexer logits ----------------------------------------
+// Same math as kernel_dsv4_indexer_logits but the per-head Sigma_d q[d,t,h]*k[d,c] dot runs
+// on tensor cores (bf16 inputs, F32 accumulate, m16n8k16/16x16x16 MMA) instead of CUDA-core
+// block-reduce. One warp computes a 16(comp) x 16(token) output tile; for each of the 64
+// heads it stages the 16x128 K-tile and 16x128 Q-tile into bf16 smem, runs 8 k-steps of MMA
+// (128/16), ReLUs the F32 result, scales by weights[h,t] and adds into the running F32 tile
+// accumulator. The epilogue (relu + weight + head-sum) stays F32 -> precision-tolerant
+// (feeds the top-512 selection). head_dim is fixed to 128 (DSV4 indexer key_length).
+#define DSV4_IDX_HD 128
+#define DSV4_IDX_TILE 16
+
+template <typename kT, typename qT>
+static __global__ void kernel_dsv4_indexer_logits_wmma(
+        const ggml_cuda_kargs_dsv4_indexer_logits args,
+        const char * __restrict__ k,
+        const char * __restrict__ q,
+        const char * __restrict__ weights,
+        char * __restrict__ dst) {
+#ifdef DSV4_WMMA_AVAILABLE
+    namespace wmma = nvcuda::wmma;
+
+    const int64_t c0 = (int64_t) blockIdx.y * DSV4_IDX_TILE;   // first comp row of this tile
+    const int64_t t0 = (int64_t) blockIdx.x * DSV4_IDX_TILE;   // first token of this tile
+    const int      tid = threadIdx.x;                          // 0..31 (one warp)
+
+    // bf16 staging tiles: K [16c x 128d], Q [16t x 128d]
+    __shared__ __nv_bfloat16 sK[DSV4_IDX_TILE][DSV4_IDX_HD];
+    __shared__ __nv_bfloat16 sQ[DSV4_IDX_TILE][DSV4_IDX_HD];
+    __shared__ float         sW[DSV4_IDX_TILE];                  // weights[h, t]
+    __shared__ float         sM[DSV4_IDX_TILE][DSV4_IDX_TILE];   // per-head M result [c][t]
+    __shared__ float         sAcc[DSV4_IDX_TILE][DSV4_IDX_TILE]; // running F32 logits [c][t]
+
+    for (int idx = tid; idx < DSV4_IDX_TILE * DSV4_IDX_TILE; idx += 32) {
+        sAcc[idx / DSV4_IDX_TILE][idx % DSV4_IDX_TILE] = 0.0f;
+    }
+
+    const int64_t n_comp   = args.n_comp;
+    const int64_t n_tokens = args.n_tokens;
+
+    wmma::fragment<wmma::matrix_a,    16, 16, 16, __nv_bfloat16, wmma::row_major> fragK; // K[c,d]
+    wmma::fragment<wmma::matrix_b,    16, 16, 16, __nv_bfloat16, wmma::col_major> fragQ; // -> Q[d,t]
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float>                          fragM;
+
+    for (int64_t h = 0; h < args.n_head; ++h) {
+        __syncthreads();
+        // Stage K tile [16c x 128d] (bf16). 16*128/32 = 64 elements per lane.
+        for (int idx = tid; idx < DSV4_IDX_TILE * DSV4_IDX_HD; idx += 32) {
+            const int cc = idx / DSV4_IDX_HD;   // 0..15
+            const int dd = idx % DSV4_IDX_HD;   // 0..127
+            const int64_t cg = c0 + cc;
+            float kval = 0.0f;
+            if (cg < n_comp) {
+                kval = (float) (*((const kT *) (k + (uint64_t) dd * args.nb_k0 + (uint64_t) cg * args.nb_k1)));
+            }
+            sK[cc][dd] = __float2bfloat16(kval);
+        }
+        // Stage Q tile [16t x 128d] (bf16) for head h.
+        for (int idx = tid; idx < DSV4_IDX_TILE * DSV4_IDX_HD; idx += 32) {
+            const int tt = idx / DSV4_IDX_HD;
+            const int dd = idx % DSV4_IDX_HD;
+            const int64_t tg = t0 + tt;
+            float qval = 0.0f;
+            if (tg < n_tokens) {
+                qval = (float) (*((const qT *) (q + (uint64_t) dd * args.nb_q0 + (uint64_t) tg * args.nb_q1 + (uint64_t) h * args.nb_q2)));
+            }
+            sQ[tt][dd] = __float2bfloat16(qval);
+        }
+        if (tid < DSV4_IDX_TILE) {
+            const int64_t tg = t0 + tid;
+            sW[tid] = (tg < n_tokens) ? *((const float *) (weights + (uint64_t) h * args.nb_w0 + (uint64_t) tg * args.nb_w1)) : 0.0f;
+        }
+        __syncthreads();
+
+        // M[c,t] = sum_d K[c,d] * Q[t,d] over the 128-dim contraction (8 k-steps). With matrix_b in
+        // col_major the B operand reads sQ[t][d] as [d][t], so mma_sync yields D[c,t] = sum_d K[c,d]*Q[t,d].
+        wmma::fill_fragment(fragM, 0.0f);
+        #pragma unroll
+        for (int kd = 0; kd < DSV4_IDX_HD; kd += 16) {
+            wmma::load_matrix_sync(fragK, &sK[0][kd], DSV4_IDX_HD);
+            wmma::load_matrix_sync(fragQ, &sQ[0][kd], DSV4_IDX_HD);
+            wmma::mma_sync(fragM, fragK, fragQ, fragM);
+        }
+        wmma::store_matrix_sync(&sM[0][0], fragM, DSV4_IDX_TILE, wmma::mem_row_major);
+        __syncthreads();
+
+        // ReLU + weight[h,t] + head-accumulate (all F32).
+        for (int idx = tid; idx < DSV4_IDX_TILE * DSV4_IDX_TILE; idx += 32) {
+            const int cc = idx / DSV4_IDX_TILE;
+            const int tt = idx % DSV4_IDX_TILE;
+            const float m = sM[cc][tt];
+            const float r = m > 0.0f ? m : 0.0f;
+            sAcc[cc][tt] += sW[tt] * r;
+        }
+    }
+    __syncthreads();
+
+    // write the tile to dst[n_comp, n_tokens]
+    for (int idx = tid; idx < DSV4_IDX_TILE * DSV4_IDX_TILE; idx += 32) {
+        const int cc = idx / DSV4_IDX_TILE;
+        const int tt = idx % DSV4_IDX_TILE;
+        const int64_t cg = c0 + cc;
+        const int64_t tg = t0 + tt;
+        if (cg < n_comp && tg < n_tokens) {
+            *((float *) (dst + (uint64_t) cg * args.nb0 + (uint64_t) tg * args.nb1)) = sAcc[cc][tt];
+        }
+    }
+#else
+    GGML_UNUSED_VARS(args, k, q, weights, dst);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // Fused split_sinkhorn + weighted_sum (one block per token): thread 0 computes the
 // 24-value sinkhorn split (also written to the split dst so the later post/comb views
 // stay valid), then all threads do the pre-weighted sum over n_embd*n_hc.
@@ -899,12 +1021,37 @@ bool ggml_cuda_op_dsv4_indexer_logits(ggml_backend_cuda_context & ctx, ggml_tens
     };
 
     const cudaStream_t stream = ctx.stream();
-    const dim3 grid((unsigned) n_tokens, (unsigned) n_comp, 1);
-    const dim3 block(128, 1, 1);
 
     const bool kf16 = k->type == GGML_TYPE_F16;
     const bool qf16 = q->type == GGML_TYPE_F16;
 
+    // [DSV4_INDEXER_WMMA] tensor-core (bf16/F32-accumulate) dot for the indexer logits. Default ON
+    // (the whole point of the fused op is the tensor-core compute); set DSV4_INDEXER_NO_WMMA=1 to
+    // fall back to the CUDA-core block-reduce kernel (v1, for A/B and debugging).
+    static const bool no_wmma = getenv("DSV4_INDEXER_NO_WMMA") != nullptr;
+
+    if (!no_wmma) {
+        // one warp per 16(comp) x 16(token) output tile
+        const dim3 grid((unsigned) ((n_tokens + DSV4_IDX_TILE - 1) / DSV4_IDX_TILE),
+                        (unsigned) ((n_comp   + DSV4_IDX_TILE - 1) / DSV4_IDX_TILE), 1);
+        const dim3 block(32, 1, 1);
+        auto launch_wmma = [&](auto kt_tag, auto qt_tag) {
+            using kT = decltype(kt_tag);
+            using qT = decltype(qt_tag);
+            kernel_dsv4_indexer_logits_wmma<kT, qT><<<grid, block, 0, stream>>>(
+                args, (const char *) k->data, (const char *) q->data,
+                (const char *) w->data, (char *) dst->data);
+        };
+        if (kf16 && qf16)       launch_wmma(half{},  half{});
+        else if (kf16 && !qf16) launch_wmma(half{},  float{});
+        else if (!kf16 && qf16) launch_wmma(float{}, half{});
+        else                    launch_wmma(float{}, float{});
+        return true;
+    }
+
+    // CUDA-core fallback (v1): one 128-lane block per (comp,token).
+    const dim3 grid((unsigned) n_tokens, (unsigned) n_comp, 1);
+    const dim3 block(128, 1, 1);
     auto launch = [&](auto kt_tag, auto qt_tag) {
         using kT = decltype(kt_tag);
         using qT = decltype(qt_tag);
@@ -912,8 +1059,7 @@ bool ggml_cuda_op_dsv4_indexer_logits(ggml_backend_cuda_context & ctx, ggml_tens
             args, (const char *) k->data, (const char *) q->data,
             (const char *) w->data, (char *) dst->data);
     };
-
-    if (kf16 && qf16)      launch(half{},  half{});
+    if (kf16 && qf16)       launch(half{},  half{});
     else if (kf16 && !qf16) launch(half{},  float{});
     else if (!kf16 && qf16) launch(float{}, half{});
     else                    launch(float{}, float{});
