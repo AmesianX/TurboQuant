@@ -630,9 +630,23 @@ void llama_context::sched_reserve() {
     // DeepSeek V4 resumed-prompt chunks use the compressed-attention decode
     // graph, which is larger than the position-zero prefill graph.
     if (model.arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 1) {
+        // [DSV4_RESUMED_RESERVE_MULT] The resumed reserve sets pos0 so the compressed-cache view
+        // (n_comp_view ~ pos0/ratio) SIZES the gallocr compute buffer for the resumed-chunk graph
+        // (the RMS_NORM/DSV4_ROPE_TAIL/CONT compressor + indexer ops scale with it). The old factor
+        // was a fixed 8*ub: at -ub=4096, n_ctx=32768 that pins pos0 ~= full ctx -> n_comp_view ~7-8k
+        // -> a multi-GB buffer EVEN when the actual prompt's chunks never reach that position. The
+        // gallocr GROWS at runtime if a real chunk exceeds the reserve (these ops run eagerly, no
+        // captured-graph layout to break), so reserving the worst case up front only WASTES VRAM and
+        // is the named M=4096 OOM driver. Default factor 8 = byte-identical; lower it (e.g. 2-4) to
+        // tighten the reserve buffer to the realistic chunk depth and let runtime grow if needed.
+        static const uint32_t resumed_mult = []{
+            const char * e = getenv("DSV4_RESUMED_RESERVE_MULT");
+            const long v = e ? atol(e) : 8;
+            return (uint32_t) (v >= 1 ? v : 1);
+        }();
         const llama_pos reserve_pos0 = std::min<llama_pos>(
                 cparams.n_ctx > n_tokens ? cparams.n_ctx - n_tokens : n_tokens,
-                std::max<uint32_t>(cparams.n_batch, 8u*n_tokens));
+                std::max<uint32_t>(cparams.n_batch, resumed_mult*n_tokens));
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
                 model.hparams.no_alloc, nullptr, reserve_pos0);
         if (!gf) {
