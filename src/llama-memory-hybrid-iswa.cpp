@@ -319,7 +319,13 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                             seqs.insert(batch.seq_id ? batch.seq_id[i][0] : (llama_seq_id) i);
                         }
                         const uint32_t n_seqs_b = (uint32_t) std::max<size_t>(seqs.size(), 1);
-                        const bool resumed_prefill = (uint32_t) batch.n_tokens > n_seqs_b * 2;
+                        // Require BOTH high per-seq density (a prompt, not 1-token decode) AND a batch
+                        // larger than the decode cap itself: any batch that already fits in <=512 tokens
+                        // gains nothing from lifting the cap, and this keeps MTP-verify decode batches
+                        // (K tokens/seq, but small total) on the safe capped path.
+                        const bool resumed_prefill =
+                            (uint32_t) batch.n_tokens > DSV4_COMPRESSED_DECODE_UBATCH_MAX &&
+                            (uint32_t) batch.n_tokens > n_seqs_b * 2;
                         if (resumed_prefill) {
                             clamp_to_decode = false;
                         }
