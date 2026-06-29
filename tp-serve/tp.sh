@@ -80,7 +80,7 @@ SEED="${SEED:-42}"
 
 # -b (logical batch) must be >= -ub (micro-batch). Derive it so raising UB never violates that.
 BB="$UB"; [ "$BB" -lt 512 ] && BB=512
-COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b $BB -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk tbq3 -ctv tbq3 --cache-ram $CACHE_RAM --jinja --chat-template-file $REPO/models/templates/deepseek-ai-DeepSeek-V4.jinja --reasoning-format deepseek --reasoning off --lock-server-params --temp $TEMP --seed $SEED $SPEC $SAMPLING ${EXTRA_ARGS:-}"
+COMMON="-c $CTX -n 32768 --parallel $PARALLEL -b $BB -ub $UB -ngl 999 -fa on -sm tensor -fit off --no-warmup --no-mmap -ctk ${CTK:-tbq3} -ctv ${CTV:-tbq3} --cache-ram $CACHE_RAM --jinja --chat-template-file $REPO/models/templates/deepseek-ai-DeepSeek-V4.jinja --reasoning-format deepseek --reasoning off --lock-server-params --temp $TEMP --seed $SEED $SPEC $SAMPLING ${EXTRA_ARGS:-}"
 
 # ---- role auto-detect by local RoCE IP -------------------------------------
 detect_role() {
@@ -266,7 +266,7 @@ case "${1:-}" in
         [ -n "${DSV4_INDEXER_QTILE:-}" ]         && FWD="$FWD DSV4_INDEXER_QTILE=$DSV4_INDEXER_QTILE"
         [ -n "${DSV4_ATTN_QTILE:-}" ]            && FWD="$FWD DSV4_ATTN_QTILE=$DSV4_ATTN_QTILE"
         [ -n "${DSV4_INDEXER_FUSED:-}" ]         && FWD="$FWD DSV4_INDEXER_FUSED=$DSV4_INDEXER_FUSED"
-        [ -n "${DSV4_HC_BF16:-}" ]               && FWD="$FWD DSV4_HC_BF16=$DSV4_HC_BF16"
+        [ -n "${DSV4_HC_BF16:-}" ]               && FWD="$FWD DSV4_HC_BF16=$DSV4_HC_BF16 CTK=${CTK:-tbq3} CTV=${CTV:-tbq3}"
         [ -n "${DSV4_COMPRESSOR_BF16:-}" ]       && FWD="$FWD DSV4_COMPRESSOR_BF16=$DSV4_COMPRESSOR_BF16"
         [ -n "${DSV4_INDEXER_BF16:-}" ]          && FWD="$FWD DSV4_INDEXER_BF16=$DSV4_INDEXER_BF16"
         [ -n "${DSV4_RESUMED_RESERVE_MULT:-}" ]  && FWD="$FWD DSV4_RESUMED_RESERVE_MULT=$DSV4_RESUMED_RESERVE_MULT"
