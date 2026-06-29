@@ -800,6 +800,13 @@ static ggml_tensor * dsv4_softmax_pool_ratio(
         ggml_tensor  * kv,
         ggml_tensor  * score) {
     score = ggml_soft_max(ctx, score);
+    // [DSV4_COMPRESSOR_BF16] kv may arrive BF16 (the compressor's transpose chain ran in BF16 to cut
+    // the CONT byte traffic). The softmax weights are F32; ggml_mul needs matching types, so upcast kv
+    // back to F32 here (the BF16 win is the upstream transpose; this is a cheap final copy). F32 kv is a
+    // no-op cast.
+    if (kv->type != GGML_TYPE_F32) {
+        kv = ggml_cast(ctx, kv, GGML_TYPE_F32);
+    }
     ggml_tensor * pooled = ggml_mul(ctx, kv, score);
     pooled = ggml_sum_rows(ctx, pooled);
     return ggml_reshape_2d(ctx, pooled, kv->ne[1], kv->ne[2]);
@@ -851,6 +858,19 @@ static ggml_tensor * dsv4_build_compressor_prefill(
 
     ggml_tensor * kv = ggml_mul_mat(ctx, wkv, x);       // [coff*head_dim, n_tokens]
     ggml_tensor * score = ggml_mul_mat(ctx, wgate, x);  // [coff*head_dim, n_tokens]
+
+    // [DSV4_COMPRESSOR_BF16] The compressor's post-mul_mat activation chain (the view->permute->CONT
+    // transposes that feed the softmax-pool) runs in F32 -> the DSV4_ROPE_TAIL/CONT/RMS_NORM op-classes
+    // that the prefill OPPROF ranks at ~9% total (3.2+2.8+2.8). The CONT transposes are pure data
+    // movement; casting kv to BF16 here halves their byte traffic. score (the softmax logits) stays
+    // F32 — soft_max needs F32 and the pool weights are precision-sensitive. kv is only the VALUE that
+    // gets softmax-weighted then F16-stored in the compressed cache, so BF16 on it is tolerant. The
+    // final rms_norm/rope re-emit F32 for the cache store. Default OFF = byte-identical. Gate:
+    // DSV4_COMPRESSOR_BF16=1.
+    static const bool compressor_bf16 = getenv("DSV4_COMPRESSOR_BF16") != nullptr;
+    if (compressor_bf16) {
+        kv = ggml_cast(ctx, kv, GGML_TYPE_BF16);
+    }
 
     kv = ggml_view_3d(ctx, kv, n_kv, compress_ratio, n_comp,
             kv->nb[1],
