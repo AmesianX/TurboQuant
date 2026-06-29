@@ -1500,16 +1500,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 // attention op-classes so the coordinator sees which path the reserve graph took.
                 if (gf) {
                     int n_fa = 0, n_softmax = 0, n_argsort = 0, n_flashish = 0;
+                    // [DSV4_INDEXER_FUSED probe] count the fused indexer op vs the un-fused score GEMM,
+                    // so the resumed-chunk path can be confirmed fused (n_idx_fused>0) or caught un-fused
+                    // (n_idx_fused==0 while ub>1) — the latter is the [n_comp,ub,64] materialization wall.
+                    int n_idx_fused = 0;
                     for (int ni = 0; ni < ggml_graph_n_nodes(gf); ++ni) {
                         ggml_tensor * t = ggml_graph_node(gf, ni);
                         if (!t) continue;
                         if (t->op == GGML_OP_FLASH_ATTN_EXT) n_fa++;
                         else if (t->op == GGML_OP_SOFT_MAX)  n_softmax++;
                         else if (t->op == GGML_OP_ARGSORT)   n_argsort++;
+                        else if (t->op == GGML_OP_DSV4_INDEXER_LOGITS) n_idx_fused++;
                         if (t->name && strstr(t->name, LLAMA_TENSOR_NAME_FATTN)) n_flashish++;
                     }
-                    fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u flash_attn=%d FLASH_ATTN_EXT=%d SOFT_MAX=%d ARGSORT=%d (fattn-named=%d)\n",
-                            ubatch.n_tokens, (int) cparams.flash_attn, n_fa, n_softmax, n_argsort, n_flashish);
+                    fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u flash_attn=%d FLASH_ATTN_EXT=%d SOFT_MAX=%d ARGSORT=%d INDEXER_FUSED=%d (fattn-named=%d)\n",
+                            ubatch.n_tokens, (int) cparams.flash_attn, n_fa, n_softmax, n_argsort, n_idx_fused, n_flashish);
                 }
                 fprintf(stderr, "DSV4_PREFILL_VRAM: ub=%u TOTAL compute-buffer %8.1f MiB (%.2f KiB/token)\n",
                         ubatch.n_tokens, total / (1024.0*1024.0),

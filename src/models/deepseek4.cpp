@@ -1941,8 +1941,17 @@ static ggml_tensor * dsv4_build_indexer_mask_tiled_prefill(
         int64_t               n_comp,
         int64_t               top_k,
         int64_t               qtile) {
-    if (qtile <= 0 || qtile >= n_tokens) {
-        // No tiling: original whole-ubatch path (also the small-ub case).
+    // [DSV4_INDEXER_FUSED] When the fused indexer op is active, _scores_prefill emits the
+    // head-summed [n_comp, ub] logits in ONE kernel WITHOUT the O(n_comp*ub*n_head) score tensor /
+    // cont-transpose. The whole point of the qtile loop was to bound THAT materialization; with the
+    // fused op the score path is already O(n_comp*ub) (no n_head factor, no transpose), so tiling only
+    // MULTIPLIES the graph (per-tile fused-op + argsort + get_rows/set_rows + concat) -> the 3x node
+    // blowup the VRAM probe saw on the resumed chunk. Force the whole-ub (untiled) path when fused so
+    // the resumed chunk builds ONE fused op + one argsort + one mask, same as the is_prefill chunk.
+    static const bool indexer_fused_q = getenv("DSV4_INDEXER_FUSED") != nullptr;
+    if (indexer_fused_q || qtile <= 0 || qtile >= n_tokens) {
+        // No tiling: whole-ubatch path. With DSV4_INDEXER_FUSED the score chain inside
+        // _scores_prefill is the single fused op -> O(n_comp*ub) memory, no qtile needed.
         ggml_tensor * scores = dsv4_build_indexer_scores_prefill(ctx, x, qr, index_kv, wq_b, wproj,
                 pos, causal_mask, n_index_head, n_index_head_size, n_tokens, n_rot, rope_type, rope_cfg);
         ggml_tensor * topk = ggml_argsort_top_k(ctx, scores, top_k);
