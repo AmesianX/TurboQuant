@@ -60,3 +60,32 @@ MoE IS converting the larger batch to higher TF/s exactly as the bench predicts 
 tok/expert. The remaining gap to the bench's 57 (and the 1.8x) is tok/expert 48 vs 96,
 which requires M=4096, blocked by a separate activation-memory OOM — that OOM is the next
 real lever, not the MoE invocation.
+
+## UPDATE (2026-06-29): INDEXER_FUSED=21 is COMPLETE, not a half-fused bug
+
+The coordinator read INDEXER_FUSED=21 (not 43) as "only half the layers fuse". That is a
+MISREAD of the model topology. The DSV4-Flash per-layer compress_ratio array
+(deepseek4.cpp:3303) is:
+  {0,0, 4,128, 4,128, ... ,4}  -> 2 dense(0) + 20 ratio==4 + 19 ratio==128 (41 main layers)
+ONLY the ratio==4 layers have the lightning indexer (the `if (compress_ratio == 4)` guard at
+deepseek4.cpp:2161/2225/2571). So there are ~20-21 indexer layers TOTAL, and INDEXER_FUSED=21
+means **ALL of them ARE fused.** There is NO un-fused indexer layer.
+
+### So what is the 261 GB at the wide chunk?
+NOT the indexer (fully fused) and NOT the main attention KQ: tp.sh runs `-fa on`
+(tp.sh:83), and build_attn_mha uses ggml_flash_attn_ext when flash_attn && kq_b==null
+(llama-graph.cpp:2186) -> NO [n_kv,ub,n_head] materialization. With FA on + indexer fully
+fused, the 261 GB is a DIFFERENT ub-scaled transient.
+
+### NEED the probe's op-sum line to name it
+The DSV4_PREFILL_VRAM probe already prints, on each new high-water width:
+  `op-sum(ub-scaled,alloc) <OP> <MiB>`  (top-12)  and
+  `ub-alloc[ 0] <MiB> <OP> [ne0,ne1,ne2,ne3] <name>`  (top-20 largest nodes)
+THAT line (not relayed) names the 261 GB op + its [n_comp_view, ub, 64?] shape. Candidates
+once indexer+attention are ruled out: the indexer's downstream argsort/mask at the resumed
+RESERVE's n_comp_view = 8*ub/4 (the reserve over-provisions pos0 = max(n_batch, 8*ub),
+llama-context.cpp:633), or a compressor transient on the 19 ratio==128 layers, or the
+attn_mask concat + FA pad. The fix follows from WHICH op it is:
+  - if it's the indexer mask/argsort at reserve -> shrink reserve_pos0 (8*ub is excessive)
+  - if it's a [.,ub,64] KQ -> FA is silently falling back (check FLASH_ATTN_EXT count vs 20)
+  - if it's the ratio==128 compressor -> tile it like the indexer
