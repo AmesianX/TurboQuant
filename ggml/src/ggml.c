@@ -1218,6 +1218,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_ROPE_TAIL",
     "DSV4_MOE_GROUPED",
     "DSV4_MOE_FUSED",
+    "DSV4_INDEXER_LOGITS",
 
     "UNARY",
 
@@ -1235,7 +1236,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1335,6 +1336,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_rope_tail(x)",
     "dsv4_moe_grouped(h,sel,w)",
     "dsv4_moe_fused(h,sel,w)",
+    "dsv4_indexer_logits(k,q,w)",
 
     "unary(x)",
 
@@ -1352,7 +1354,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6673,6 +6675,36 @@ struct ggml_tensor * ggml_dsv4_moe_fused(
     result->op     = GGML_OP_DSV4_MOE_FUSED;
     result->src[0] = hidden;
     result->src[1] = sel;
+    result->src[2] = weights;
+
+    return result;
+}
+
+// ggml_dsv4_indexer_logits
+
+struct ggml_tensor * ggml_dsv4_indexer_logits(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * weights) {
+    // k:       [head_dim, n_comp, 1]
+    // q:       [head_dim, n_tokens, n_head]
+    // weights: [n_head, n_tokens]
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->ne[0] == q->ne[0]);          // head_dim
+    GGML_ASSERT(q->ne[1] == weights->ne[1]);    // n_tokens
+    GGML_ASSERT(q->ne[2] == weights->ne[0]);    // n_head
+    GGML_ASSERT(k->ne[2] == 1);
+    GGML_ASSERT(q->ne[3] == 1);
+
+    const int64_t n_comp   = k->ne[1];
+    const int64_t n_tokens = q->ne[1];
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_comp, n_tokens);
+
+    result->op     = GGML_OP_DSV4_INDEXER_LOGITS;
+    result->src[0] = k;
+    result->src[1] = q;
     result->src[2] = weights;
 
     return result;

@@ -1106,6 +1106,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_EXPAND:
             case GGML_OP_DSV4_FP8_KV_QUANTIZE:
             case GGML_OP_DSV4_ROPE_TAIL:
+            case GGML_OP_DSV4_INDEXER_LOGITS:
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;

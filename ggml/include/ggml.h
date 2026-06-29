@@ -599,6 +599,7 @@ extern "C" {
         GGML_OP_DSV4_ROPE_TAIL,
         GGML_OP_DSV4_MOE_GROUPED,
         GGML_OP_DSV4_MOE_FUSED,
+        GGML_OP_DSV4_INDEXER_LOGITS,
 
         GGML_OP_UNARY,
 
@@ -2679,6 +2680,20 @@ extern "C" {
             struct ggml_tensor  * weights,
             int                   il,
             float                 swiglu_limit);
+
+    // Fused DSA lightning-indexer logits: emits the head-summed compressed-row scores
+    //   logits[c, t] = sum_h weights[h, t] * relu( dot_d( q[d, t, h], k[d, c] ) )
+    // WITHOUT materializing the O(n_comp * n_tokens * n_head) per-head score tensor or its
+    // transpose (the O(ub^2) prefill wall). Replaces the mul_mat+relu+mul+cont+sum_rows chain.
+    //   k:       [head_dim, n_comp, 1]            (index cache, F16/BF16/F32)
+    //   q:       [head_dim, n_tokens, n_head]     (post-rope indexer query, F16/BF16/F32)
+    //   weights: [n_head, n_tokens]               (wproj output, already scaled, F32)
+    // returns logits [n_comp, n_tokens] F32. Gated by DSV4_INDEXER_FUSED at the call site.
+    GGML_API struct ggml_tensor * ggml_dsv4_indexer_logits(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * weights);
 
     // custom operators
 

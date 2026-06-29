@@ -1791,34 +1791,46 @@ static ggml_tensor * dsv4_build_indexer_scores_prefill(
             rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
             rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
 
-    ggml_tensor * k = ggml_permute(ctx, index_kv, 0, 2, 1, 3); // [head_dim, n_comp, 1]
-    q = ggml_permute(ctx, q, 0, 2, 1, 3);                     // [head_dim, n_tokens, n_heads]
+    ggml_tensor * k3 = ggml_permute(ctx, index_kv, 0, 2, 1, 3); // [head_dim, n_comp, 1]
+    ggml_tensor * q3 = ggml_permute(ctx, q, 0, 2, 1, 3);        // [head_dim, n_tokens, n_heads]
+
+    // weights = scaled wproj(x) -> [n_heads, n_tokens]
+    ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x);      // [n_heads, n_tokens]
+    const float scale = 1.0f / std::sqrt(float(n_index_head_size) * float(n_index_head));
+    weights = dsv4_mul_scalar(ctx, weights, scale);
+
+    // [DSV4_INDEXER_FUSED] Aiden's lightning-indexer fusion: compute the head-summed logits
+    //   logits[c,t] = sum_h weights[h,t] * relu(dot_d(q[d,t,h], k[d,c]))
+    // in ONE kernel, so the O(n_comp*ub*n_head) score tensor AND its O(ub^2) cont-transpose are
+    // never materialized (the prefill memory+compute wall). Replaces mul_mat+relu+mul+cont+sum_rows.
+    // Default OFF = the explicit chain (byte-identical). Gate: DSV4_INDEXER_FUSED=1. The fused path
+    // requires the F32/F16 k/q (head_dim==128); it falls back to the chain otherwise via supports_op.
+    static const bool indexer_fused = getenv("DSV4_INDEXER_FUSED") != nullptr;
+    if (indexer_fused) {
+        ggml_tensor * logits = ggml_dsv4_indexer_logits(ctx, k3, q3, weights); // [n_comp, n_tokens]
+        return ggml_add(ctx, logits, causal_mask);
+    }
 
     // [DSV4_INDEXER_BF16] Aiden's +29% prefill lever (hazyumps sm12x_deep_gemm_fallbacks.py): the
     // lightning-indexer logits GEMM is the prefill wall and it is O(ub*n_comp*n_head). vLLM/DeepGEMM
     // runs it on FP8 tensor cores (Hopper) or a tf32 Triton kernel (GB10); ours runs it in plain F32,
     // which on sm120/121 dispatches to cublas SGEMM (CUDA cores, tensor cores idle). Casting k and q
     // to BF16 routes the same GEMM to ggml_cuda_mul_mat_batched_cublas -> BF16 tensor cores with FP32
-    // accumulation (batched_mul_mat_traits<BF16> = CUBLAS_COMPUTE_32F / CUDA_R_16BF). The score only
-    // feeds a top-k SELECTION (ggml_argsort_top_k picks indexer_top_k=512), so reduced precision on the
-    // logits is tolerable: the selected token set is unchanged within tie tolerance. Default OFF =
-    // byte-identical F32. Gate: DSV4_INDEXER_BF16=1.
+    // accumulation. The score feeds a top-k SELECTION so reduced precision is tolerable. Gate:
+    // DSV4_INDEXER_BF16=1; default OFF = byte-identical F32.
     static const bool indexer_bf16 = getenv("DSV4_INDEXER_BF16") != nullptr;
     if (indexer_bf16) {
-        k = ggml_cast(ctx, k, GGML_TYPE_BF16);
-        q = ggml_cast(ctx, q, GGML_TYPE_BF16);
+        k3 = ggml_cast(ctx, k3, GGML_TYPE_BF16);
+        q3 = ggml_cast(ctx, q3, GGML_TYPE_BF16);
     }
 
-    ggml_tensor * score = ggml_mul_mat(ctx, k, q);            // [n_comp, n_tokens, n_heads]
+    ggml_tensor * score = ggml_mul_mat(ctx, k3, q3);         // [n_comp, n_tokens, n_heads]
     score = ggml_relu(ctx, score);
 
-    ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x);      // [n_heads, n_tokens]
-    const float scale = 1.0f / std::sqrt(float(n_index_head_size) * float(n_index_head));
-    weights = dsv4_mul_scalar(ctx, weights, scale);
-    weights = ggml_reshape_3d(ctx, weights, 1, n_index_head, n_tokens);
-    weights = ggml_permute(ctx, weights, 0, 2, 1, 3);         // [1, n_tokens, n_heads]
+    ggml_tensor * w3 = ggml_reshape_3d(ctx, weights, 1, n_index_head, n_tokens);
+    w3 = ggml_permute(ctx, w3, 0, 2, 1, 3);                  // [1, n_tokens, n_heads]
 
-    score = ggml_mul(ctx, score, weights);
+    score = ggml_mul(ctx, score, w3);
     score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 2, 0, 3)); // [n_heads, n_comp, n_tokens]
     score = ggml_sum_rows(ctx, score);                            // [1, n_comp, n_tokens]
     score = ggml_reshape_2d(ctx, score, index_kv->ne[2], n_tokens);

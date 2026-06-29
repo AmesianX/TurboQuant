@@ -107,6 +107,26 @@ struct ggml_cuda_kargs_dsv4_hc_weighted_sum {
     uint64_t nb1;
 };
 
+struct ggml_cuda_kargs_dsv4_indexer_logits {
+    int64_t  head_dim;   // ne00 of k/q
+    int64_t  n_comp;     // k->ne[1]
+    int64_t  n_tokens;   // q->ne[1]
+    int64_t  n_head;     // q->ne[2]
+    // k strides (bytes)
+    uint64_t nb_k0;
+    uint64_t nb_k1;
+    // q strides (bytes)
+    uint64_t nb_q0;
+    uint64_t nb_q1;
+    uint64_t nb_q2;
+    // weights strides (bytes) [n_head, n_tokens]
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    // dst strides (bytes) [n_comp, n_tokens]
+    uint64_t nb0;
+    uint64_t nb1;
+};
+
 struct ggml_cuda_kargs_dsv4_rope_tail {
     int64_t  ne00;
     int64_t  ne01;
@@ -445,6 +465,80 @@ static __global__ void kernel_dsv4_hc_weighted_sum(
     *((float *) (dst + d * args.nb0 + t * args.nb1)) = acc;
 }
 
+// ---- Fused DSA lightning-indexer logits ----------------------------------------------
+// logits[c, t] = sum_h weights[h, t] * relu( sum_d q[d, t, h] * k[d, c] )
+// Replaces the mul_mat([n_comp,ub,n_head]) + relu + mul(weights) + cont(transpose) +
+// sum_rows chain, so the O(n_comp*ub*n_head) score tensor and its transpose are NEVER
+// materialized (the O(ub^2) prefill wall). One block computes a TILE of comp rows for one
+// token; blockDim.x = head_dim lanes do the per-head dot via a block reduction.
+//
+// Templated on the k/q element read so F16 (cache) and F32 (fresh chunk) both work; the
+// dot product accumulates in F32 (numerically equivalent to the F32/BF16 mul_mat the
+// indexer fed into a top-k SELECTION — reduced input precision is tolerant).
+template <typename T>
+static __device__ __forceinline__ float dsv4_idx_load(const char * p) {
+    return (float) (*((const T *) p));
+}
+
+template <typename kT, typename qT, int HEAD_DIM>
+static __global__ void kernel_dsv4_indexer_logits(
+        const ggml_cuda_kargs_dsv4_indexer_logits args,
+        const char * __restrict__ k,
+        const char * __restrict__ q,
+        const char * __restrict__ weights,
+        char * __restrict__ dst) {
+    // grid.x = token, grid.y = comp tile. blockDim.x == HEAD_DIM (== head_dim lanes).
+    const int64_t t = blockIdx.x;
+    const int64_t c = (int64_t) blockIdx.y;
+    if (t >= args.n_tokens || c >= args.n_comp) {
+        return;
+    }
+    const int lane = threadIdx.x;  // 0..HEAD_DIM-1
+
+    // shared reduction buffer (one warp-sum slot per 32 lanes)
+    __shared__ float s_red[HEAD_DIM / 32 > 0 ? HEAD_DIM / 32 : 1];
+
+    // k[d, c] for this comp row (shared across all heads/tokens) — load once per lane.
+    const float kv = dsv4_idx_load<kT>(k + (uint64_t) lane * args.nb_k0 + (uint64_t) c * args.nb_k1);
+
+    float logit = 0.0f;
+    for (int64_t h = 0; h < args.n_head; ++h) {
+        const float qv = dsv4_idx_load<qT>(
+            q + (uint64_t) lane * args.nb_q0 + (uint64_t) t * args.nb_q1 + (uint64_t) h * args.nb_q2);
+        float dot = qv * kv;
+        // warp reduce
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            dot += __shfl_down_sync(0xffffffff, dot, o);
+        }
+        // block reduce across warps
+        if (HEAD_DIM > 32) {
+            if ((lane & 31) == 0) {
+                s_red[lane >> 5] = dot;
+            }
+            __syncthreads();
+            if (lane == 0) {
+                float full = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < HEAD_DIM / 32; ++w) {
+                    full += s_red[w];
+                }
+                dot = full;
+            }
+            __syncthreads();
+        }
+        if (lane == 0) {
+            const float r = dot > 0.0f ? dot : 0.0f;   // relu
+            const float wv = *((const float *) (weights + (uint64_t) h * args.nb_w0 + (uint64_t) t * args.nb_w1));
+            logit += wv * r;
+        }
+    }
+
+    if (lane == 0) {
+        *((float *) (dst + (uint64_t) c * args.nb0 + (uint64_t) t * args.nb1)) = logit;
+    }
+}
+
 // Fused split_sinkhorn + weighted_sum (one block per token): thread 0 computes the
 // 24-value sinkhorn split (also written to the split dst so the later post/comb views
 // stay valid), then all threads do the pre-weighted sum over n_embd*n_hc.
@@ -756,6 +850,73 @@ bool ggml_cuda_op_dsv4_hc_weighted_sum(ggml_backend_cuda_context & ctx, ggml_ten
         (const char *) x->data,
         (const char *) weights->data,
         (char *) dst->data);
+
+    return true;
+}
+
+bool ggml_cuda_op_dsv4_indexer_logits_supported(const ggml_tensor * dst) {
+    const ggml_tensor * k = dst->src[0];
+    const ggml_tensor * q = dst->src[1];
+    const ggml_tensor * w = dst->src[2];
+    if (!k || !q || !w) return false;
+    if (w->type != GGML_TYPE_F32) return false;
+    if (dst->type != GGML_TYPE_F32) return false;
+    // only the head_dim==128 shape is instantiated (DSV4 indexer key_length)
+    if (k->ne[0] != 128 || q->ne[0] != 128) return false;
+    const bool kok = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32;
+    const bool qok = q->type == GGML_TYPE_F16 || q->type == GGML_TYPE_F32;
+    return kok && qok;
+}
+
+bool ggml_cuda_op_dsv4_indexer_logits(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * k = dst->src[0];   // [head_dim, n_comp, 1]
+    const ggml_tensor * q = dst->src[1];   // [head_dim, n_tokens, n_head]
+    const ggml_tensor * w = dst->src[2];   // [n_head, n_tokens]
+
+    GGML_ASSERT(w->type   == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t head_dim = k->ne[0];
+    const int64_t n_comp   = k->ne[1];
+    const int64_t n_tokens = q->ne[1];
+    const int64_t n_head   = q->ne[2];
+    GGML_ASSERT(head_dim == 128);
+
+    ggml_cuda_kargs_dsv4_indexer_logits args = {
+        /*.head_dim =*/ head_dim,
+        /*.n_comp   =*/ n_comp,
+        /*.n_tokens =*/ n_tokens,
+        /*.n_head   =*/ n_head,
+        /*.nb_k0    =*/ k->nb[0],
+        /*.nb_k1    =*/ k->nb[1],
+        /*.nb_q0    =*/ q->nb[0],
+        /*.nb_q1    =*/ q->nb[1],
+        /*.nb_q2    =*/ q->nb[2],
+        /*.nb_w0    =*/ w->nb[0],
+        /*.nb_w1    =*/ w->nb[1],
+        /*.nb0      =*/ dst->nb[0],
+        /*.nb1      =*/ dst->nb[1],
+    };
+
+    const cudaStream_t stream = ctx.stream();
+    const dim3 grid((unsigned) n_tokens, (unsigned) n_comp, 1);
+    const dim3 block(128, 1, 1);
+
+    const bool kf16 = k->type == GGML_TYPE_F16;
+    const bool qf16 = q->type == GGML_TYPE_F16;
+
+    auto launch = [&](auto kt_tag, auto qt_tag) {
+        using kT = decltype(kt_tag);
+        using qT = decltype(qt_tag);
+        kernel_dsv4_indexer_logits<kT, qT, 128><<<grid, block, 0, stream>>>(
+            args, (const char *) k->data, (const char *) q->data,
+            (const char *) w->data, (char *) dst->data);
+    };
+
+    if (kf16 && qf16)      launch(half{},  half{});
+    else if (kf16 && !qf16) launch(half{},  float{});
+    else if (!kf16 && qf16) launch(float{}, half{});
+    else                    launch(float{}, float{});
 
     return true;
 }
