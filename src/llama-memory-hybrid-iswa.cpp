@@ -290,7 +290,49 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 const bool first_split = balloc.get_n_used() == 0;
                 const bool starts_at_zero = batch.pos == nullptr || batch.pos[0] == 0;
                 const bool decode_regime = !first_split || !starts_at_zero;
+
+                // [DSV4_RESUMED_UB] THE chunked-prefill forward-width cap. The 512 clamp was meant for
+                // true DECODE (1 new token per seq -> one compressor update/token -> graph-arena risk on
+                // long ctx). But `decode_regime` is also true for the 2nd+ chunk of a CHUNKED PREFILL
+                // (multi-token, pos>0 resumed prefill) -> it was clamping every resumed prefill chunk to
+                // 512 tokens, so the MoE never saw -ub tokens in-server (M~512 -> ~12 tok/expert,
+                // tile-starved) and the standalone large-batch gain (91 TF/s @ 192 tok/expert) never
+                // materialized. The build has a full RESUMED-CHUNK path (deepseek4.cpp ~2743,
+                // n_tokens>1 && !is_prefill) that handles wide resumed chunks correctly.
+                //
+                // Distinguish TRUE DECODE from a RESUMED-PREFILL chunk: count the remaining tokens still
+                // to be split (batch.n_tokens - n_used) and the distinct sequences. A resumed prefill has
+                // many remaining tokens for few sequences (tokens_per_seq >> 1); decode has ~1 token/seq.
+                // Only clamp when this is genuinely decode-sized. Default keeps the wide prefill; set
+                // DSV4_RESUMED_UB_CAP=1 to restore the old always-512 behaviour for A/B.
+                bool clamp_to_decode = decode_regime;
                 if (decode_regime) {
+                    static const bool force_old_cap = getenv("DSV4_RESUMED_UB_CAP") != nullptr;
+                    if (!force_old_cap) {
+                        // Distinguish TRUE DECODE from a RESUMED-PREFILL chunk by the whole batch's
+                        // token-per-sequence density. A chunked prefill submits the full remaining
+                        // prompt in ONE batch (many tokens, few sequences) and the splitter walks it in
+                        // n_ubatch pieces; decode submits ~1 token per in-flight sequence. So
+                        // tokens_per_seq >> 1 => prefill continuation -> keep the full -ub width.
+                        std::set<llama_seq_id> seqs;
+                        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                            seqs.insert(batch.seq_id ? batch.seq_id[i][0] : (llama_seq_id) i);
+                        }
+                        const uint32_t n_seqs_b = (uint32_t) std::max<size_t>(seqs.size(), 1);
+                        const bool resumed_prefill = (uint32_t) batch.n_tokens > n_seqs_b * 2;
+                        if (resumed_prefill) {
+                            clamp_to_decode = false;
+                        }
+                        if (getenv("DSV4_PHASE_PROF") || getenv("DSV4_PREFILL_PROF")) {
+                            fprintf(stderr, "DSV4_UBCAP: batch_n_tokens=%d n_seqs=%u resumed_prefill=%d -> n_ubatch_dsv4=%u (cap=%u)\n",
+                                    batch.n_tokens, n_seqs_b, (int) resumed_prefill,
+                                    clamp_to_decode ? std::min<uint32_t>(n_ubatch, DSV4_COMPRESSED_DECODE_UBATCH_MAX) : n_ubatch,
+                                    DSV4_COMPRESSED_DECODE_UBATCH_MAX);
+                            fflush(stderr);
+                        }
+                    }
+                }
+                if (clamp_to_decode) {
                     // Non-prefill compressed-attention chunks build one
                     // compressor update per token and can otherwise exhaust the
                     // graph metadata arena on long contexts.
