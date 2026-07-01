@@ -16,7 +16,9 @@ using namespace dsv4::w4a16;
 #ifndef BN
 #define BN 64
 #endif
+#ifndef BK
 #define BK 16
+#endif
 #define M 2048
 #define N 2048
 #define K 2048
@@ -61,14 +63,17 @@ __global__ void gemm_cpa(const __nv_bfloat16* __restrict__ A, const uint8_t* __r
         if(s+1<nsteps){ loadtile(s+1,cur^1); asm volatile("cp.async.commit_group;\n"); asm volatile("cp.async.wait_group 1;\n"); }
         else asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();
-        uint32_t a0,a1,a2,a3;
-        ldm_x4(a0,a1,a2,a3, smem_u32(&Araw[cur][(wib*16+(lane%16))*BK + (lane/16)*8]));
         const uint8_t* Bs=Braw[cur];
         #pragma unroll
-        for(int nt=0;nt<NNT;nt++){ int nn=nt*8+g;   // dequant B directly into fragment regs (no smem round-trip)
-            uint32_t b0=pack2b(dequant_w(Bs[(t*2+0)*BN+nn],sbyte), dequant_w(Bs[(t*2+1)*BN+nn],sbyte));
-            uint32_t b1=pack2b(dequant_w(Bs[(t*2+8)*BN+nn],sbyte), dequant_w(Bs[(t*2+9)*BN+nn],sbyte));
-            mma_m16n8k16_bf16_f32(acc[nt][0],acc[nt][1],acc[nt][2],acc[nt][3], a0,a1,a2,a3, b0,b1); }
+        for(int kk=0;kk<BK;kk+=16){   // reuse the loaded BKxBN tile across BK/16 MMA k-steps
+            uint32_t a0,a1,a2,a3;
+            ldm_x4(a0,a1,a2,a3, smem_u32(&Araw[cur][(wib*16+(lane%16))*BK + kk + (lane/16)*8]));
+            #pragma unroll
+            for(int nt=0;nt<NNT;nt++){ int nn=nt*8+g;   // dequant B directly into fragment regs
+                uint32_t b0=pack2b(dequant_w(Bs[(kk+t*2+0)*BN+nn],sbyte), dequant_w(Bs[(kk+t*2+1)*BN+nn],sbyte));
+                uint32_t b1=pack2b(dequant_w(Bs[(kk+t*2+8)*BN+nn],sbyte), dequant_w(Bs[(kk+t*2+9)*BN+nn],sbyte));
+                mma_m16n8k16_bf16_f32(acc[nt][0],acc[nt][1],acc[nt][2],acc[nt][3], a0,a1,a2,a3, b0,b1); }
+        }
         __syncthreads();
     }
     const float comp=0x1p119f; int r0=wib*16;
