@@ -93,8 +93,17 @@ with b12x output as the bit-parity oracle.
       ALSO caught: the 256x512x1024 test was too small — only 32 blocks under-fill 48 SMs, so
       grid-size/occupancy confounded it (naive's 1024 tiny blocks looked faster). Must measure
       perf at GPU-saturating sizes. test_w4a16_ldmatrix.cu (default now 2048^3).
-- [ ] cp.async double-buffered prefetch (overlap next-tile load w/ current MMA) — hide the
-      remaining load latency behind the MMA. Next lever toward b12x 57-91.
+- [~] **ncu re-profile after ldmatrix:** Compute 26.8%, Memory **68.8%** (was 27.5%),
+      cycles/inst 32.3 (was 69.6), scoreboard stall 30.5% (was 94%). ldmatrix worked; kernel
+      is now MEMORY-bound with compute idle → cp.async is the profiler-indicated next lever.
+- [x] **Lever 5 cp.async double-buffered prefetch — +15%, 11.8 → 13.6 TFLOP/s** (2048^3,
+      BM128/BN64, parity 2800/2800, pipeline correct first try). Raw A(bf16)+B(fp4) cp.async'd
+      16B-vectorized into 2 smem buffers, next tile prefetched behind current MMA. Modest gain
+      (vs ldmatrix's 4.4x) — the dequant->smem step with 2 __syncthreads likely serializes and
+      caps overlap. test_w4a16_cpasync.cu. Running total: 5.0x over naive.
+- [ ] Re-profile → likely dequant-in-loop / syncthreads serialization is next; overlap dequant
+      or dequant-to-registers. Then register-blocked wider warp tiles, occupancy tune.
+- [ ] MoE routing/grouping/top-k + ggml op wiring → decode 38.5
 - [ ] Register-blocked wider warp tiles + occupancy/_W4A16_REGS_SM121 re-tune
 - [ ] MoE routing/grouping/top-k + ggml op wiring → decode 38.5
 - [ ] MoE routing/grouping/top-k (prepare.py 1039 / route_pack.py 390)
