@@ -1,0 +1,61 @@
+# DSV4 W4A16 fused-MoE — native CuTe C++ port (resume spec)
+
+Branch: `feat/dsv4-w4a16-native-port` (off `feat/dsv4-sparse-mla-mma`).
+
+## Goal
+Port b12x's SM121 W4A16 fused-MoE kernel (the one that gives vLLM **decode 38.5 / prefill
+~1570 on GB10**) into native ggml-cuda, so llama.cpp reaches the SAME verified numbers.
+NOT a from-scratch design — a faithful **source→source translation** of Aiden's kernel,
+with b12x output as the bit-parity oracle.
+
+## Why this is a translation, not invention (de-risk, all GREEN)
+- b12x fast path = **cute-dsl (CUTLASS 4.x Python DSL)**, 329 py / 3 cu. Kernels are
+  `@cute.jit` funcs → `cute.compile` → cubin. NOT a linkable .so.
+- **Rejected**: C→Python bridge (arch damage), cubin-blob bridge (opaque, shape-locked,
+  non-upstreamable). **Chosen**: native CuTe C++ port, **static AOT (nvcc)**. JIT (NVRTC)
+  deferred — our serving config is fixed → shapes bounded → static suffices.
+- Same abstraction framework confirmed on-box: CuTe C++ headers at
+  `/home/user/work/flash-attention/csrc/cutlass/include/cute` — layout/tensor/mma_atom/
+  copy_atom ✓, `arch/mma_sm80.hpp` (std bf16 m16n8k16) ✓, `mma_traits_sm120.hpp` +
+  `numeric_types.hpp` (e2m1) ✓, `copy_sm90_tma.hpp` ✓. Every primitive Aiden uses has a
+  C++ counterpart → no missing infra, only translation labor.
+- **Key finding**: the hot MMA is **standard bf16 `mma.sync.m16n8k16`** (Ampere+), NOT an
+  exotic sm121-only block-scaled MMA. FP4 (`e2m1`) appears only in weight *unpack* (cvt/bit
+  ops), never in the multiply. W4A16 = 4-bit weight dequantized to bf16, standard bf16 MMA.
+  → no MLIR-only atom blocker.
+
+## Source of truth (b12x, extracted at ~/work/dsv4-serve/build/b12x)
+- MoE kernel: `b12x/moe/fused/w4a16/kernel.py` (5290 L) + host.py/prepare.py/route_pack.py
+- Primitives: `b12x/cute/fp4.py` — `bf16_mma_m16n8k16_f32` @2271,
+  `packed_dequant_e2m1x4_to_bfloat2x2` @1963, `packed_dequant_e4m3x4_*` (scale) @2045+
+- SM121 tuning: `_W4A16_REGS_SM121`, tile-config selection in kernel.py:108-347
+
+## Strategy: correct-first, then fast
+1. **Primitives** (DONE, this commit): FP4→bf16 unpack + bf16 MMA warp op, faithful PTX
+   translation → `ggml/src/ggml-cuda/dsv4-w4a16/dsv4-w4a16-primitives.cuh`.
+2. **Correctness**: naive native W4A16 MoE using std bf16 MMA + these primitives, wired to a
+   custom ggml op. Gate = **bit-parity vs b12x output** (per-expert GEMM).
+3. **Fast**: reconstruct Aiden's orchestration in CuTe C++ (smem swizzle, multi-stage
+   cp.async/TMA pipeline, warp-spec, `_W4A16_REGS_SM121` occupancy). Gate = t/s toward 38.5.
+
+## Parity plan
+- Foundational primitive: e2m1 has 16 codes {±0,±.5,±1,±1.5,±2,±3,±4,±6}; the bit-trick is
+  host-replicable → self-contained unit test (no b12x runtime needed). See test file.
+- Kernel level: dump b12x per-expert GEMM inputs/outputs (fixed seed) → compare native.
+
+## Status
+- [x] De-risk (framework/atoms/instruction-class) — GREEN
+- [x] Branch + spec
+- [x] Foundational primitives translated (bf16 MMA, e2m1→bf16 unpack), PTX verbatim
+- [x] **nvcc compile-check @ sm_121a — PASS** (nvcc 13.0; MMA executes no-error)
+- [~] Parity: sign bit correct. KEY LEARNING — e2m1 bit-trick emits a **pre-scale
+      intermediate** (exp bias deferred to block-scale multiply, kernel.py:710). Raw output
+      != FP4 table; full value needs the scale-dequant primitive. Real oracle = bit-exact
+      vs b12x `packed_dequant_e2m1x4_to_bfloat2x2` output.
+- [ ] Port scale-dequant primitive (e8m0/e4m3) + multiply-combine → full-value parity
+- [ ] Naive correct W4A16 MoE op + b12x bit-parity
+- [ ] Orchestration port (pipeline/swizzle/occupancy) → perf toward 38.5
+
+## Resume pointer
+Read this doc + `dsv4-w4a16-primitives.cuh`. Next: nvcc compile-check, then host parity test,
+then the naive correct MoE op. Oracle = b12x in image `sparkrun-vllm-ds4-gb10:gb10-local`.
