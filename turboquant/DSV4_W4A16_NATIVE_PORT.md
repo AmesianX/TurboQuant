@@ -88,11 +88,15 @@ with b12x output as the bit-parity oracle.
       warp cycles/inst 69.6, **94% of stalls = short-scoreboard (smem-load → MMA dependency)**.
       Latency-bound on feeding the MMA: pack2 does ~12 scalar bf16 smem loads/MMA and the MMA
       stalls ~65 cyc waiting. Explains why levers 1-3 (occ/reuse/dequant) did nothing.
-- [ ] **Lever 4 (profiler-directed): `ldmatrix`** — load whole MMA fragment from smem in ONE
-      instr (vs 12 scalar pack2 loads) → kills the scoreboard stall. This is b12x's fragment
-      feed. Then cp.async prefetch pipeline to hide remaining latency. THE real perf lever.
-- [ ] cp.async double-buffered prefetch (overlap next-tile load w/ current MMA)
-- [ ] Occupancy/register re-tune (_W4A16_REGS_SM121) — revisit after ldmatrix+pipeline
+- [x] **Lever 4 `ldmatrix` — WIN, 4.4x.** A: ldmatrix.x4, B: ldmatrix.x2.trans (addressing
+      correct first try, parity 2800/2800). **2.7 → 11.8 TFLOP/s @ 2048^3, BM128/BN64.**
+      ALSO caught: the 256x512x1024 test was too small — only 32 blocks under-fill 48 SMs, so
+      grid-size/occupancy confounded it (naive's 1024 tiny blocks looked faster). Must measure
+      perf at GPU-saturating sizes. test_w4a16_ldmatrix.cu (default now 2048^3).
+- [ ] cp.async double-buffered prefetch (overlap next-tile load w/ current MMA) — hide the
+      remaining load latency behind the MMA. Next lever toward b12x 57-91.
+- [ ] Register-blocked wider warp tiles + occupancy/_W4A16_REGS_SM121 re-tune
+- [ ] MoE routing/grouping/top-k + ggml op wiring → decode 38.5
 - [ ] MoE routing/grouping/top-k (prepare.py 1039 / route_pack.py 390)
 - [ ] ggml custom op wiring + end-to-end serve parity → decode 38.5
 - [ ] MoE routing/grouping + top-k epilogue (prepare.py / route_pack.py)
