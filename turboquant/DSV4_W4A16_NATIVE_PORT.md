@@ -84,8 +84,15 @@ with b12x output as the bit-parity oracle.
 - [ ] **Lever 2 (real one): block-tiled GEMM w/ smem A+B reuse** — load a block-tile of A
       and dequant a block-tile of B into smem ONCE, all warps reuse for a big output tile.
       Classic AI boost. Bigger rewrite = the actual perf 몸통.
-- [ ] cp.async double-buffered load (overlap global load w/ MMA) — after reuse structure
-- [ ] Occupancy re-tune (_W4A16_REGS_SM121) — revisit AFTER reuse (may matter then)
+- [x] **ncu PROFILE (sudo) — real bottleneck FOUND.** Compute SOL 12.5%, Memory 27.5%,
+      warp cycles/inst 69.6, **94% of stalls = short-scoreboard (smem-load → MMA dependency)**.
+      Latency-bound on feeding the MMA: pack2 does ~12 scalar bf16 smem loads/MMA and the MMA
+      stalls ~65 cyc waiting. Explains why levers 1-3 (occ/reuse/dequant) did nothing.
+- [ ] **Lever 4 (profiler-directed): `ldmatrix`** — load whole MMA fragment from smem in ONE
+      instr (vs 12 scalar pack2 loads) → kills the scoreboard stall. This is b12x's fragment
+      feed. Then cp.async prefetch pipeline to hide remaining latency. THE real perf lever.
+- [ ] cp.async double-buffered prefetch (overlap next-tile load w/ current MMA)
+- [ ] Occupancy/register re-tune (_W4A16_REGS_SM121) — revisit after ldmatrix+pipeline
 - [ ] MoE routing/grouping/top-k (prepare.py 1039 / route_pack.py 390)
 - [ ] ggml custom op wiring + end-to-end serve parity → decode 38.5
 - [ ] MoE routing/grouping + top-k epilogue (prepare.py / route_pack.py)
