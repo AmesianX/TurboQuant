@@ -48,12 +48,13 @@ with b12x output as the bit-parity oracle.
 - [x] Branch + spec
 - [x] Foundational primitives translated (bf16 MMA, e2m1→bf16 unpack), PTX verbatim
 - [x] **nvcc compile-check @ sm_121a — PASS** (nvcc 13.0; MMA executes no-error)
-- [~] Parity: sign bit correct. KEY LEARNING — e2m1 bit-trick emits a **pre-scale
-      intermediate** (exp bias deferred to block-scale multiply, kernel.py:710). Raw output
-      != FP4 table; full value needs the scale-dequant primitive. Real oracle = bit-exact
-      vs b12x `packed_dequant_e2m1x4_to_bfloat2x2` output.
-- [ ] Port scale-dequant primitive (e8m0/e4m3) + multiply-combine → full-value parity
-- [ ] Naive correct W4A16 MoE op + b12x bit-parity
+- [x] e2m1 unpack = **pre-scale intermediate** (FP4 × 2^-126), bias deferred to scale mul.
+- [x] **Scale-dequant (e8m0) + mul.bf16x2 combine ported** — e8m0 byte b -> 2^(b-120)
+      (= scale × 2^7, inf/nan handled); combine gives true_weight × 2^-119, epilogue
+      restores × 2^119. **Full-value parity 80/80** (@ sm_121a) over realistic scales.
+      LEARNING: 2^-119 intermediate underflows bf16 for true_weight < ~2^-7 (b<~106) —
+      inherent to b12x (same bf16), trained scales sit near b=127. Documented in test.
+- [ ] Naive correct W4A16 MoE op (per-expert GEMM) + b12x bit-parity
 - [ ] Orchestration port (pipeline/swizzle/occupancy) → perf toward 38.5
 
 ## Resume pointer
