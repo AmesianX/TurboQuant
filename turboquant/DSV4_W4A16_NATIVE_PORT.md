@@ -70,7 +70,16 @@ with b12x output as the bit-parity oracle.
       semantics == b12x's reference. Script: `oracle_b12x_dequant.py`.
       (NOTE: this is semantics-parity vs b12x's *reference*; bit-exact-vs-*kernel* accumulation
       order is a further optional check, but the reference is what b12x itself validates against.)
-- [ ] cp.async double-buffered smem load (currently naive per-tile dequant-to-smem)
+
+--- PERF PHASE (correct -> fast) ---
+- [x] **Baseline: tiled multi-block GEMM 256x512x1024, 91/91 parity, ~2.87 TFLOP/s** naive
+      (grid=(N/8,M/16) warps, 1 output tile each, no reuse/pipeline). @ sm_121a -O3.
+      Target: b12x ~57–91 TFLOP/s → ~20–30x climb ahead. This is the number to beat.
+- [ ] cp.async double-buffered load (overlap global load w/ MMA) — measure delta
+- [ ] Wider tiles / smem A+B reuse across warps (kill redundant global loads)
+- [ ] Occupancy tuning (_W4A16_REGS_SM121) + N-tiling per warp
+- [ ] MoE routing/grouping/top-k (prepare.py 1039 / route_pack.py 390)
+- [ ] ggml custom op wiring + end-to-end serve parity → decode 38.5
 - [ ] MoE routing/grouping + top-k epilogue (prepare.py / route_pack.py)
 - [ ] Orchestration (multi-stage pipeline / swizzle / _W4A16_REGS_SM121 occupancy) → 38.5
 - [ ] ggml custom op wiring + end-to-end serve parity
