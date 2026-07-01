@@ -75,9 +75,17 @@ with b12x output as the bit-parity oracle.
 - [x] **Baseline: tiled multi-block GEMM 256x512x1024, 91/91 parity, ~2.87 TFLOP/s** naive
       (grid=(N/8,M/16) warps, 1 output tile each, no reuse/pipeline). @ sm_121a -O3.
       Target: b12x ~57–91 TFLOP/s → ~20–30x climb ahead. This is the number to beat.
-- [ ] cp.async double-buffered load (overlap global load w/ MMA) — measure delta
-- [ ] Wider tiles / smem A+B reuse across warps (kill redundant global loads)
-- [ ] Occupancy tuning (_W4A16_REGS_SM121) + N-tiling per warp
+- [x] **Lever 1 OCCUPANCY — MEASURED, NOT the bottleneck.** WPB sweep 1/4/8/16/32 →
+      WPB=1 (baseline 2721) is FASTEST; more warps/block = slower (bigger block = less
+      sched flexibility + more smem/block). My "1 warp/block is starved" guess was wrong;
+      the data killed it. Real bottleneck = **arithmetic intensity**: naive re-dequants +
+      re-loads B once per M-tile (16x redundant), A once per N-tile → tensor cores starve
+      (~2-3% of peak). test_w4a16_gemm_occ.cu.
+- [ ] **Lever 2 (real one): block-tiled GEMM w/ smem A+B reuse** — load a block-tile of A
+      and dequant a block-tile of B into smem ONCE, all warps reuse for a big output tile.
+      Classic AI boost. Bigger rewrite = the actual perf 몸통.
+- [ ] cp.async double-buffered load (overlap global load w/ MMA) — after reuse structure
+- [ ] Occupancy re-tune (_W4A16_REGS_SM121) — revisit AFTER reuse (may matter then)
 - [ ] MoE routing/grouping/top-k (prepare.py 1039 / route_pack.py 390)
 - [ ] ggml custom op wiring + end-to-end serve parity → decode 38.5
 - [ ] MoE routing/grouping + top-k epilogue (prepare.py / route_pack.py)
