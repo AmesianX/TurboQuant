@@ -54,8 +54,15 @@ with b12x output as the bit-parity oracle.
       restores × 2^119. **Full-value parity 80/80** (@ sm_121a) over realistic scales.
       LEARNING: 2^-119 intermediate underflows bf16 for true_weight < ~2^-7 (b<~106) —
       inherent to b12x (same bf16), trained scales sit near b=127. Documented in test.
-- [ ] Naive correct W4A16 MoE op (per-expert GEMM) + b12x bit-parity
-- [ ] Orchestration port (pipeline/swizzle/occupancy) → perf toward 38.5
+- [x] **m16n8k16 bf16 MMA fragment layout verified 128/128** (@ sm_121a, vs fp32 CPU ref,
+      first try). A/B/D thread-element mapping correct → primitives compose into a real MMA.
+
+--- BRICKS (primitives) DONE. Below = 시공 / assembly ---
+- [ ] 3b: single-tile W4A16 GEMM = dequant(B) + MMA + epilogue ×2^119, vs fp32 ref
+- [ ] Per-expert K-loop GEMM (smem tiles, cp.async load) + b12x bit-parity
+- [ ] MoE routing/grouping + top-k epilogue (prepare.py / route_pack.py)
+- [ ] Orchestration (multi-stage pipeline / swizzle / _W4A16_REGS_SM121 occupancy) → 38.5
+- [ ] ggml custom op wiring + end-to-end serve parity
 
 ## Resume pointer
 Read this doc + `dsv4-w4a16-primitives.cuh`. Next: nvcc compile-check, then host parity test,
