@@ -21,10 +21,15 @@ __device__ __forceinline__ uint32_t pack2(__nv_bfloat16 lo,__nv_bfloat16 hi){
     unsigned short l=*reinterpret_cast<unsigned short*>(&lo), h=*reinterpret_cast<unsigned short*>(&hi);
     return ((uint32_t)h<<16)|(uint32_t)l; }
 __device__ __forceinline__ __nv_bfloat16 dequant_w(uint8_t code,uint8_t sbyte){
+#ifdef NODEQ
+    return __float2bfloat16((float)(code & 7));   // isolation: skip real dequant
+#else
     uint32_t e_lo,e_hi; dequant_e2m1x4_to_bf16x4((uint32_t)code<<12,e_lo,e_hi);
     uint32_t s_lo,s_hi; dequant_e8m0x4_to_bf16x4((uint32_t)sbyte,s_lo,s_hi);
     uint32_t prod=mul_bf16x2(e_hi&0xFFFFu, s_lo&0xFFFFu);
-    unsigned short lo16=prod&0xFFFFu; return *reinterpret_cast<__nv_bfloat16*>(&lo16); }
+    unsigned short lo16=prod&0xFFFFu; return *reinterpret_cast<__nv_bfloat16*>(&lo16);
+#endif
+}
 
 __global__ void gemm_occ(const __nv_bfloat16* __restrict__ A, const uint8_t* __restrict__ Bc,
                          uint8_t sbyte, float* __restrict__ D){
