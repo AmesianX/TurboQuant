@@ -138,7 +138,12 @@ then the naive correct MoE op. Oracle = b12x in image `sparkrun-vllm-ds4-gb10:gb
 | BK=32 tile reuse | 18.8 | +8% | 25% |
 
 ## Remaining levers (harder restructures, ~3x headroom to b12x-class)
-- [ ] 2D warp-tiling (split warps across M AND N) → cut A-redundancy without register blow-up
-- [ ] Register-blocked wider warp output tiles (more MMAs per fragment load)
-- [ ] Deeper (3-4 stage) cp.async pipeline
+- [x] **Lever 8 2D warp-tiling + register blocking — +70%, 18.8 → 32.0 TFLOP/s** (42% of peak).
+      Warps WMxWN, each warp does an RM x RN register-blocked grid of MMA tiles reusing A-frags
+      across RN and B-frags across RM. Best: BM128/BN128/BK32/WM2/WN2 → RM4 RN8, 4 warps, 32 MMA
+      tiles/warp. Parity 2800/2800. test_w4a16_wt.cu. 11.8x over naive; ~1.6-1.9x to b12x-class.
+- [ ] Deeper (3-4 stage) cp.async pipeline; RM/RN + swizzle fine-tune → toward 50-60
 - [ ] Then MoE routing/top-k + ggml op wiring → decode 38.5
+
+## Perf trajectory (updated)
+naive 2.7 → ldmatrix 11.8 → cp.async 13.6 → B-direct 17.3 → BK32 18.8 → **warp-tile 32.0** (42% of 75.9 peak)
