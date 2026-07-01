@@ -44,4 +44,39 @@ __device__ __forceinline__ float fp4_dot8_sum_prescale(
     return __low2float(acc) + __high2float(acc);   // lo + hi -> f32 (b12x reduce)
 }
 
+// b12x fp4_dot4_sum (FC2 8-elem dot): u = 4 FP4 bytes (8 codes); x0..x3 = 4 f16x2 (8 acts).
+// Returns dot * 2^-14 (caller compensates). Bit-trick decode (b12x-faithful).
+__device__ __forceinline__ float fp4_dot4_sum_prescale(
+        uint32_t u, uint32_t x0, uint32_t x1, uint32_t x2, uint32_t x3) {
+    const uint32_t xs[4] = {x0,x1,x2,x3};
+    const uint32_t us[4] = {u & 0xFFu, (u>>8)&0xFFu, (u>>16)&0xFFu, (u>>24)&0xFFu};
+    __half2 acc = __floats2half2_rn(0.f, 0.f);
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint32_t hb = e2m1_byte_to_f16x2_prescale(us[i]);
+        __half2 h = *reinterpret_cast<__half2*>(&hb);
+        __half2 x = *reinterpret_cast<const __half2*>(&xs[i]);
+        acc = __hfma2(h, x, acc);
+    }
+    return __low2float(acc) + __high2float(acc);
+}
+
+// b12x fp4_dot8_dual_sum: fused up+gate, shared activations, 2 accumulator chains.
+// up = dot(up_w, x), gate = dot(gate_w, x). Both * 2^-14.
+__device__ __forceinline__ void fp4_dot8_dual_sum_prescale(
+        float & up, float & gate,
+        uint32_t up_a, uint32_t up_b, uint32_t gate_a, uint32_t gate_b,
+        uint32_t x0, uint32_t x1, uint32_t x2, uint32_t x3,
+        uint32_t x4, uint32_t x5, uint32_t x6, uint32_t x7) {
+    up   = fp4_dot8_sum_prescale(up_a,  up_b,  x0,x1,x2,x3,x4,x5,x6,x7);
+    gate = fp4_dot8_sum_prescale(gate_a,gate_b,x0,x1,x2,x3,x4,x5,x6,x7);
+}
+
+// b12x warp_reduce: butterfly sum over 32 lanes (log2(32)=5 shuffle steps).
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
 }}} // namespace
