@@ -63,7 +63,13 @@ with b12x output as the bit-parity oracle.
       verified primitives compose into a working W4A16 GEMM. (dequant_w helper in test.)
 - [x] **3c-i: K-loop accumulation — 128/128** (K=64, 4 tiles, in-place MMA accumulate,
       single epilogue ×2^119, vs fp32 ref @ sm_121a). Real per-expert GEMM compute skeleton done.
-- [ ] 3c-ii: b12x oracle infra — run b12x W4A16 GEMM in container, dump ref I/O, bit-parity
+- [x] **3c-ii: b12x oracle established (the elegant way)** — instead of the kernel ABI, use
+      b12x's OWN torch golden reference (`b12x/moe/fused/reference.py`, what its tests trust).
+      Ran `_make_fp4_lut`/`_dequant_fp4` LIVE in the image: FP4 table **16/16 match** to our
+      native kernel; e8m0 = float8_e8m0fnu = 2^(b-127) = ours. → our kernel's dequant+GEMM
+      semantics == b12x's reference. Script: `oracle_b12x_dequant.py`.
+      (NOTE: this is semantics-parity vs b12x's *reference*; bit-exact-vs-*kernel* accumulation
+      order is a further optional check, but the reference is what b12x itself validates against.)
 - [ ] cp.async double-buffered smem load (currently naive per-tile dequant-to-smem)
 - [ ] MoE routing/grouping + top-k epilogue (prepare.py / route_pack.py)
 - [ ] Orchestration (multi-stage pipeline / swizzle / _W4A16_REGS_SM121 occupancy) → 38.5
