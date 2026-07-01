@@ -120,3 +120,25 @@ with b12x output as the bit-parity oracle.
 ## Resume pointer
 Read this doc + `dsv4-w4a16-primitives.cuh`. Next: nvcc compile-check, then host parity test,
 then the naive correct MoE op. Oracle = b12x in image `sparkrun-vllm-ds4-gb10:gb10-local`.
+
+## Perf calibration (2026-07-01)
+- **GB10 raw bf16 MMA peak (register-only microbench) = 75.9 TFLOP/s** (bench_mma_peak.cu).
+- Our W4A16 GEMM = 18.8 TFLOP/s = **25% of peak**. Real headroom (~3x to b12x-class, ~4x to peak).
+- b12x's 91 TFLOP/s > bf16 peak → that's the FP4 path; realistic W4A16(bf16) target ~50-60 (65-80% of peak).
+- Diminishing per-lever returns are because the SIMPLE levers are exhausted, NOT because we're near
+  the ceiling. Remaining 3x needs the harder restructures below (b12x's actual techniques).
+
+## Perf trajectory
+| lever | TFLOP/s | vs prev | % of 76 peak |
+|---|---|---|---|
+| naive | 2.7 | — | 4% |
+| ldmatrix | 11.8 | +340% | 16% |
+| cp.async | 13.6 | +15% | 18% |
+| B-direct (dequant→regs) | 17.3 | +27% | 23% |
+| BK=32 tile reuse | 18.8 | +8% | 25% |
+
+## Remaining levers (harder restructures, ~3x headroom to b12x-class)
+- [ ] 2D warp-tiling (split warps across M AND N) → cut A-redundancy without register blow-up
+- [ ] Register-blocked wider warp output tiles (more MMAs per fragment load)
+- [ ] Deeper (3-4 stage) cp.async pipeline
+- [ ] Then MoE routing/top-k + ggml op wiring → decode 38.5
