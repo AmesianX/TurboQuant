@@ -58,8 +58,10 @@ with b12x output as the bit-parity oracle.
       first try). A/B/D thread-element mapping correct → primitives compose into a real MMA.
 
 --- BRICKS (primitives) DONE. Below = 시공 / assembly ---
-- [ ] 3b: single-tile W4A16 GEMM = dequant(B) + MMA + epilogue ×2^119, vs fp32 ref
-- [ ] Per-expert K-loop GEMM (smem tiles, cp.async load) + b12x bit-parity
+- [x] **3b: single-tile W4A16 GEMM assembled — 128/128** (@ sm_121a). FP4+e8m0 -> dequant
+      -> bf16 smem tile -> MMA (3a layout) -> epilogue ×2^119, vs fp32 ref. First pour: the
+      verified primitives compose into a working W4A16 GEMM. (dequant_w helper in test.)
+- [ ] Per-expert K-loop GEMM (real tile_k, smem tiles, cp.async load) + b12x bit-parity
 - [ ] MoE routing/grouping + top-k epilogue (prepare.py / route_pack.py)
 - [ ] Orchestration (multi-stage pipeline / swizzle / _W4A16_REGS_SM121 occupancy) → 38.5
 - [ ] ggml custom op wiring + end-to-end serve parity
