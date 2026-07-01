@@ -101,8 +101,13 @@ with b12x output as the bit-parity oracle.
       16B-vectorized into 2 smem buffers, next tile prefetched behind current MMA. Modest gain
       (vs ldmatrix's 4.4x) — the dequant->smem step with 2 __syncthreads likely serializes and
       caps overlap. test_w4a16_cpasync.cu. Running total: 5.0x over naive.
-- [ ] Re-profile → likely dequant-in-loop / syncthreads serialization is next; overlap dequant
-      or dequant-to-registers. Then register-blocked wider warp tiles, occupancy tune.
+- [x] **Lever 6 B-direct dequant-to-registers — +27%, 13.6 → 17.3 TFLOP/s** (BM128/BN32).
+      Profiler said MIO-queue-full (35.7%): B's smem round-trip (Braw read→Bdeq write→ldmatrix
+      read = 3 smem passes) overloaded the MIO pipe. Fix: drop Bdeq+ldmatrix-for-B, dequant raw
+      FP4 straight into the B fragment registers (dequant is cheap/compute-idle). Removed a
+      __syncthreads too. BN32 best (lower reg/MIO pressure). Parity 2800/2800. 6.4x over naive.
+- [ ] Re-profile → next bottleneck. Candidates: register-blocked wider warp tiles, deeper
+      (3-stage) pipeline, A-load reuse across N-blocks, occupancy/_W4A16_REGS_SM121.
 - [ ] MoE routing/grouping/top-k + ggml op wiring → decode 38.5
 - [ ] Register-blocked wider warp tiles + occupancy/_W4A16_REGS_SM121 re-tune
 - [ ] MoE routing/grouping/top-k + ggml op wiring → decode 38.5
