@@ -95,7 +95,7 @@ __global__ void prep(ElementInput*A,ElementInput*B,ElementSF*SFA,ElementSF*SFB,E
    int*m_indptr,const int* sfa_off,int n,int k,int ng,PS*ps,
    ElementInput const**Ap,ElementInput const**Bp,ElementSF const**SFAp,ElementSF const**SFBp,
    ElementD**Dp,StrideA*sa,StrideB*sb,StrideD*sd,LayoutSFA*lsa,LayoutSFB*lsb,
-   const float* gscaleB,float* alpha_grp,const float** alpha_ptr_grp,const float* gscaleA_ptr,int sfb_words_per_grp){
+   const float* gscaleB,float* alpha_grp,const float** alpha_ptr_grp,const float* gscaleA_ptr,int sfb_words_per_grp,int64_t b_estride_bytes){
   float gscaleA=gscaleA_ptr[0];
   int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=ng)return;
   int mo=m_indptr[i], m=m_indptr[i+1]-mo;
@@ -105,7 +105,7 @@ __global__ void prep(ElementInput*A,ElementInput*B,ElementSF*SFA,ElementSF*SFB,E
   sb[i]=cutlass::make_cute_packed_stride(StrideB{},{n,k,1});
   sd[i]=cutlass::make_cute_packed_stride(StrideD{},{m,n,1});
   Ap[i]=reinterpret_cast<ElementInput const*>(reinterpret_cast<uint8_t const*>(A)+(int64_t(mo)*k>>1));
-  Bp[i]=reinterpret_cast<ElementInput const*>(reinterpret_cast<uint8_t const*>(B)+(int64_t(i)*n*k>>1));
+  Bp[i]=reinterpret_cast<ElementInput const*>(reinterpret_cast<uint8_t const*>(B)+int64_t(i)*b_estride_bytes);
   Dp[i]=D+int64_t(mo)*n;
   lsa[i]=Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(mm,n,k,1));
   SFAp[i]=SFA + sfa_off[i];
@@ -117,6 +117,9 @@ __global__ void prep(ElementInput*A,ElementInput*B,ElementSF*SFA,ElementSF*SFB,E
 
 // ---- grouped GEMM runner (validated) ----------------------------------------
 struct GroupedGemm {
+  // [fc1-fused-layout] per-expert byte stride of the packed B (weight) buffer;
+  // <=0 => legacy tight (n*k)/2. Set by the loader when fc1 is stored fused.
+  int64_t b_estride_bytes = 0;
   int ng=0,n=0,k=0,sfb_words=0;
   typename ProblemShape::UnderlyingProblemShape* ps=nullptr;
   const ElementInput **Ap=nullptr,**Bp=nullptr; const ElementSF **SFAp=nullptr,**SFBp=nullptr; ElementD** Dp=nullptr;
@@ -156,7 +159,8 @@ struct GroupedGemm {
        const_cast<ElementInput*>(A),const_cast<ElementInput*>(B),
        const_cast<ElementSF*>(SFA),const_cast<ElementSF*>(SFB),D,
        const_cast<int*>(m_indptr),d_sfa_off,n,k,ng,ps,Ap,Bp,SFAp,SFBp,Dp,sa,sb,sd,lsa,lsb,
-       const_cast<float*>(gscaleB),alpha_grp,alpha_ptr_grp,gscaleA_ptr,sfb_words);
+       const_cast<float*>(gscaleB),alpha_grp,alpha_ptr_grp,gscaleA_ptr,sfb_words,
+       b_estride_bytes>0 ? b_estride_bytes : ((int64_t)n*k>>1));
     cutlass::KernelHardwareInfo hw; hw.device_id=0; hw.sm_count=sm_count;
     decltype(std::declval<typename Gemm::Arguments>().epilogue.thread) fa;
     fa.alpha=0.f; fa.beta=0.f; fa.alpha_ptr=nullptr; fa.beta_ptr=nullptr;
@@ -426,6 +430,12 @@ struct LayerWeights {
   // cudaMalloc/cudaFree -> CUDA-graph capture safe. Sized to the largest `rows`
   // (= M*U) seen on the HP path; grown if a bigger small-batch arrives.
   float  *d_act_decode=nullptr; size_t act_decode_elems=0;
+  // [fc1-fused-layout] bytes between consecutive experts in dq_gate/dq_up. 0 = legacy
+  // (separate gate/up tensors, stride (n_ff*n_embd)/2). Non-zero = the CUTLASS fused-fc1
+  // interleave (per expert: up rows then gate rows -> stride n_ff*n_embd), where dq_up is
+  // the buffer base and dq_gate = base + (n_ff*n_embd)/2. Shared byte-identically with the
+  // fused runner's fc1 (zero-copy alias -> no repack malloc/free, no decode UAF).
+  int64_t gu_estride = 0;
 
   // ---- PREFILL (CUTLASS grouped-GEMM) persistent arena -----------------------
   // Pre-allocated ONCE (grow-once, never freed mid-capture) so the whole prefill
@@ -559,7 +569,7 @@ __global__ void dec_gate_up_swiglu(
     const uint8_t* __restrict__ SFg, const uint8_t* __restrict__ SFu,
     const float* __restrict__ glg, const float* __restrict__ glu,
     float* __restrict__ act, int M, int U, int D, int F, float limit,
-    int expert_base, int E_local){
+    int expert_base, int E_local, int64_t gu_estride){
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int warps_per_block = blockDim.x >> 5;
@@ -575,7 +585,7 @@ __global__ void dec_gate_up_swiglu(
   const float* __restrict__ x = hidden + (int64_t)token * D;
   const int kb = D / SFVec;
   const int nbytes = D >> 1;                            // packed bytes per weight row
-  const int64_t wbase = (int64_t)e * F * D / 2;
+  const int64_t wbase = (int64_t)e * gu_estride;
   const int64_t sbase = (int64_t)e * F * kb;
   const float ge = glg[e], ue = glu[e];
   const uint8_t* __restrict__ wgr = Wg + wbase + (int64_t)j * nbytes;
@@ -667,7 +677,7 @@ __global__ void w4a16_fc1_swiglu(
     const uint8_t* __restrict__ SFg, const uint8_t* __restrict__ SFu,
     const float* __restrict__ glg, const float* __restrict__ glu,
     float* __restrict__ act, int M, int U, int D, int F, float limit,
-    int expert_base, int E_local){
+    int expert_base, int E_local, int64_t gu_estride){
   const int lane = threadIdx.x & 31;
   const int j = blockIdx.x * (blockDim.x>>5) + (threadIdx.x>>5);
   const int row = blockIdx.y;
@@ -677,7 +687,7 @@ __global__ void w4a16_fc1_swiglu(
   if(e < 0 || e >= E_local){ act[(int64_t)row*F + j] = 0.f; return; }
   const float* __restrict__ x = hidden + (int64_t)token * D;
   const int kb = D / SFVec, nbytes = D >> 1;
-  const int64_t wbase = (int64_t)e*F*D/2, sbase = (int64_t)e*F*kb;
+  const int64_t wbase = (int64_t)e*gu_estride, sbase = (int64_t)e*F*kb;
   const float ge = glg[e], ue = glu[e];
   const uint8_t* wgr = Wg + wbase + (int64_t)j*nbytes;
   const uint8_t* wur = Wu + wbase + (int64_t)j*nbytes;
@@ -985,18 +995,54 @@ void dsv4_moe_grouped_set_expert_weights_blob(int il,
     DSV4_CK(cudaMemcpy(*dptr,p,nbytes,cudaMemcpyHostToDevice));
     return p+nbytes;
   };
-  p=up_dev(qg_bytes ,(void**)&L->dq_gate);
-  p=up_dev(qg_bytes ,(void**)&L->dq_up);
+  // [fc1-fused-layout] DSV4_MOE_FC1_FUSED=1: store gate/up as ONE buffer in the CUTLASS
+  // fused-fc1 interleave (per expert: up rows then gate rows) instead of two tensors.
+  // The fused prefill runner then ALIASES this buffer (zero repack malloc/concat/free ->
+  // kills the per-layer +1.07GB fragmentation AND the decode use-after-free), and the
+  // grouped decode/GEMM paths read the same bytes with expert stride 2x (gu_estride).
+  static const bool fc1_fused = getenv("DSV4_MOE_FC1_FUSED") != nullptr;
+  if (fc1_fused) {
+    const size_t per_e = (size_t)(n_gu*k_gu)/2;            // packed bytes per expert per tensor
+    static std::vector<uint8_t> stage;                      // reused across layers (host)
+    stage.resize(qg_bytes*2);
+    const uint8_t* gsec = p;                                // blob section [0] = gate
+    const uint8_t* usec = p + qg_bytes;                     // blob section [1] = up
+    for (int e = 0; e < n_expert; e++) {
+      memcpy(stage.data() + (size_t)e*2*per_e,         usec + (size_t)e*per_e, per_e); // up first
+      memcpy(stage.data() + (size_t)e*2*per_e + per_e, gsec + (size_t)e*per_e, per_e); // then gate
+    }
+    void* dfused = nullptr;
+    DSV4_CK(cudaMalloc(&dfused, qg_bytes*2));
+    DSV4_CK(cudaMemcpy(dfused, stage.data(), qg_bytes*2, cudaMemcpyHostToDevice));
+    L->dq_up   = reinterpret_cast<decltype(L->dq_up)>((uint8_t*)dfused);          // base = expert 0 up rows
+    L->dq_gate = reinterpret_cast<decltype(L->dq_gate)>((uint8_t*)dfused + per_e); // expert 0 gate rows
+    L->gu_estride = (int64_t)2*per_e;
+    p += qg_bytes*2;                                        // consumed sections [0]+[1]
+  } else {
+    p=up_dev(qg_bytes ,(void**)&L->dq_gate);
+    p=up_dev(qg_bytes ,(void**)&L->dq_up);
+  }
   p=up_dev(qd_bytes ,(void**)&L->dq_down);
-  p=up_dev(sfg_bytes,(void**)&L->dsf_gate);
-  p=up_dev(sfg_bytes,(void**)&L->dsf_up);
-  p=up_dev(sfd_bytes,(void**)&L->dsf_down);
+  // [ep2-dp][mem] Under EP the grouped CUTLASS prefill path is HARD-GUARDED OFF (EP-unsafe
+  // histogram/OOB — see the dispatch comment) and every sub-min_m M takes the HP path, which
+  // reads only the SIMPLE (un-swizzled) SFs. The swizzled dsf_gate/up/down are therefore DEAD
+  // under EP: skip the device upload entirely (~8.6GB across 43 layers on DSV4-Flash) — this
+  // is the headroom the fused runner's own swizzled SFs need on big prefills.
+  if (g_ep) {
+    L->dsf_gate = nullptr; L->dsf_up = nullptr; L->dsf_down = nullptr;
+    p += sfg_bytes*2 + sfd_bytes;   // blob sections [3][4][5] stay host-side (simple SFs built below)
+  } else {
+    p=up_dev(sfg_bytes,(void**)&L->dsf_gate);
+    p=up_dev(sfg_bytes,(void**)&L->dsf_up);
+    p=up_dev(sfd_bytes,(void**)&L->dsf_down);
+  }
   p=up_dev(gl_bytes ,(void**)&L->dglobal_gate);
   p=up_dev(gl_bytes ,(void**)&L->dglobal_up);
   p=up_dev(gl_bytes ,(void**)&L->dglobal_down);
 
   L->gg_gate.alloc(n_expert, n_gu, k_gu, L->sfb_words_gu);
   L->gg_up.alloc  (n_expert, n_gu, k_gu, L->sfb_words_gu);
+  if (L->gu_estride) { L->gg_gate.b_estride_bytes = L->gu_estride; L->gg_up.b_estride_bytes = L->gu_estride; }
   L->gg_down.alloc(n_expert, n_d , k_d , L->sfb_words_d);
 
   // ---- HIGH-PRECISION DECODE: build simple (un-swizzled) tight SFB copies ----
@@ -1102,11 +1148,24 @@ extern "C" bool dsv4_moe_grouped_get_layer_nvfp4(
 // dsf_down_simple is also rebuilt -> freeable. Down weights MUST be kept (aliased).
 // Only valid when DSV4_MOE_FUSED commits to the fused path (no grouped fallback for
 // this layer afterward). Returns false if layer not found.
+// [fc1-fused-layout] per-expert byte stride of dq_gate/dq_up (0 = legacy separate tensors).
+// The fused runner uses this to detect the alias-able layout (== n_ff*n_embd bytes).
+extern "C" int64_t dsv4_moe_grouped_gu_estride(int il) {
+  std::lock_guard<std::mutex> lk(g_reg_mu);
+  auto it = g_registry.find(il);
+  return (it == g_registry.end() || !it->second) ? 0 : it->second->gu_estride;
+}
+
 extern "C" bool dsv4_moe_grouped_free_superseded_by_fused(int il) {
   std::lock_guard<std::mutex> lk(g_reg_mu);
   auto it = g_registry.find(il);
   if (it == g_registry.end() || !it->second) return false;
   LayerWeights* L = it->second;
+  // [fc1-fused-layout] the fused runner ALIASES dq_up/dq_gate (one shared fc1 buffer) and
+  // the grouped decode path keeps reading them + the simple SFs -> nothing is superseded,
+  // free NOTHING. (Also fixes the legacy-layout latent UAF: under the old layout this
+  // function freed dq_gate/up + dsf_*_simple that the HP decode kernels still read.)
+  if (L->gu_estride) return true;
   auto F=[](void*&p){ if(p){ cudaFree(p); p=nullptr; } };
   // gate/up packed weights (concatenated into fused fc1) -> free
   F((void*&)L->dq_gate); F((void*&)L->dq_up);
@@ -1343,7 +1402,8 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
           reinterpret_cast<const uint8_t*>(L->dq_gate),
           reinterpret_cast<const uint8_t*>(L->dq_up),
           L->dsf_gate_simple, L->dsf_up_simple,
-          L->dglobal_gate, L->dglobal_up, d_act, M, U, D, F, swiglu_limit, ep_base, ep_E_local);
+          L->dglobal_gate, L->dglobal_up, d_act, M, U, D, F, swiglu_limit, ep_base, ep_E_local,
+          L->gu_estride ? L->gu_estride : (int64_t)F*D/2);
       w4a16_fc2_scatter<<<g_dn, blk, 0, s>>>(
           d_act, d_sel, d_rw,
           reinterpret_cast<const uint8_t*>(L->dq_down),
@@ -1355,7 +1415,8 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
         reinterpret_cast<const uint8_t*>(L->dq_gate),
         reinterpret_cast<const uint8_t*>(L->dq_up),
         L->dsf_gate_simple, L->dsf_up_simple,
-        L->dglobal_gate, L->dglobal_up, d_act, M, U, D, F, swiglu_limit, ep_base, ep_E_local);
+        L->dglobal_gate, L->dglobal_up, d_act, M, U, D, F, swiglu_limit, ep_base, ep_E_local,
+        L->gu_estride ? L->gu_estride : (int64_t)F*D/2);
     dec_down_scatter<<<g_dn, blk, 0, s>>>(
         d_act, d_sel, d_rw,
         reinterpret_cast<const uint8_t*>(L->dq_down),

@@ -43,6 +43,7 @@ namespace tkc = tensorrt_llm::kernels::cutlass_kernels;
 // (dq_gate/up + dsf_*_simple). Implemented in dsv4-moe-grouped.cu. Keeps dq_down
 // (fc2 alias) and dglobal_* (read live). Halves the fused memory overhead.
 extern "C" bool dsv4_moe_grouped_free_superseded_by_fused(int il);
+extern "C" int64_t dsv4_moe_grouped_gu_estride(int il);
 
 // Defer-free retire list (shared with the grouped op): freed at the next backend
 // synchronize (ggml_backend_cuda_synchronize), NOT immediately, so a grow-realloc
@@ -198,6 +199,7 @@ __global__ void k_bf16_to_f32(const __nv_bfloat16* src, float* dst, long n) {
 
 // Per-layer PERSISTENT weights (built once, kept resident).
 struct FusedLayer {
+    bool fc1_w_aliased=false;   // [fc1-fused-layout] fc1_w aliases the grouped registry (do not free)
     int E=0, hidden=0, inter=0;
     uint8_t* fc1_w=nullptr;
     uint8_t* fc2_w=nullptr;       // alias dq_down (registry-owned, not freed here)
@@ -302,9 +304,18 @@ static cudaError_t build_fused_layer(FusedLayer* L, int il,
     const int colsD  = hidden/16;   // fc1 SF cols (K=hidden)
     const int colsF  = inter/16;    // fc2 SF cols (K=inter)
 
-    CK(cudaMalloc(&L->fc1_w, (size_t)E*2*inter*hbytes));
-    { long tot=(long)E*inter*hbytes; k_concat_fc1<<<grid_for(tot),256,0,stream>>>(
-        (const uint8_t*)dq_up,(const uint8_t*)dq_gate,L->fc1_w,E,inter,hbytes); }
+    // [fc1-fused-layout] If the loader stored gate/up in the fused interleave already
+    // (DSV4_MOE_FC1_FUSED=1: per expert up rows then gate rows, stride 2*inter*hbytes),
+    // fc1_w is EXACTLY that buffer: alias it. No 1.07GB/layer malloc, no concat, no free
+    // -> kills the repack fragmentation OOM (+46GB over 43 layers) on big prefills.
+    if (dsv4_moe_grouped_gu_estride(il) == (int64_t)2*inter*hbytes) {
+        L->fc1_w = (uint8_t*)dq_up;   // base = expert0 up rows; gate at +inter*hbytes
+        L->fc1_w_aliased = true;
+    } else {
+        CK(cudaMalloc(&L->fc1_w, (size_t)E*2*inter*hbytes));
+        { long tot=(long)E*inter*hbytes; k_concat_fc1<<<grid_for(tot),256,0,stream>>>(
+            (const uint8_t*)dq_up,(const uint8_t*)dq_gate,L->fc1_w,E,inter,hbytes); }
+    }
     L->fc2_w = (uint8_t*)dq_down;
 
     CK(cudaMalloc(&L->g_common,(size_t)E*4));
