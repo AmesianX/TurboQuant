@@ -1,4 +1,13 @@
 # DSV4 attention TP head-split (group granularity) — implementation design
+
+## STATUS 2026-07-12: LANDED & PROVEN CORRECT (commit 41794b115) — perf pending next lever
+Implemented exactly as below; 2-node greedy output EXACT vs mirrored baseline.
+Perf net-NEGATIVE today: eager 8.4 vs 10.0 / +graphs+F8 9.1 vs 11.2 — subgraph
+boundaries double (43→86/token, ~0.2ms each ≈ 17ms > 11.7ms read savings).
+**Next lever (named): whole-token-step CUDA graph capture INCLUDING the NCCL
+collectives** (NCCL supports capture; vLLM does this) — kills boundary cost for
+both split and non-split paths, flips this split positive. Reduce-folding
+alternative blocked by nonlinear hc between attention and MoE.
 2026-07-12. Goal: kill the mirrored dense-attention duplication (~2.7GB/token/rank of the
 5.7GB dense reads) → decode 13.0 → ~15.5-16 (MTP), on the road to 45~57.
 Gate: `DSV4_ATTN_SPLIT=1` (default OFF, mirrors today's behavior byte-identically).
@@ -94,3 +103,47 @@ Post-split/rank/token ≈ MoE 2.15 + dense 3.0 + head 0.5 ≈ 5.7GB → @≥200G
 Then shexp split (fold into MoE AllReduce: needs PARTIAL-folding or accept +1 reduce) →
 another 0.54GB. Ceiling after all dense levers ≈ 4.6GB ≈ 20-23ms ≈ 43-50 plain-equivalent
 with MTP → the 45~57 window. Prefill 1600 is a separate phase (W4A16 GEMM 32→50-60 TFLOP/s).
+
+---
+# PREFILL SESSION 2026-07-12 — the two memory walls, NAMED (root-caused)
+
+Ledger on this stack (FP4+EP sidecar 73GB/rank + dense ~9GB): after load, free = ~20GB.
+
+## Wall A — context-init compute reserve, slope ~6GB per 1k ub
+ub1024 fits wide, ub2048 fits (8GB left), ub4096 dies IN llama_context init (16->1GB in 2s),
+ub8192 dies too. Memory ramp captured in scratchpad memramp2.log. To name the exact buffer:
+DSV4_PREFILL_VRAM_PROBE fires only during prefill (too late); the "compute buffer size" INFO
+line is swallowed by server log level — next session: capture it (llama_context init prints)
+with real verbosity or add a stderr print at reserve.
+
+## Wall B — fused repack FRAGMENTATION, ~+1.07GB/layer, kills any big prefill
+First large prefill triggers per-layer repack (dsv4-fused/dsv4-moe-fused-run.cu:300-372):
+cudaMalloc fc1_w = E*2*inter*hidden/2 = 1.07GB/layer, THEN frees dq_gate+dq_up (2x 0.54GB).
+The freed pair CANNOT service the next layer's contiguous 1.07GB malloc -> every layer takes
+NEW memory, dead 0.54GB holes pile up: 43 layers => +46GB transient-net => OOM at ~layer 4
+with 8GB free (measured tonight: 8->3GB by layer 4). This is why 13k prefill dies even at
+ub2048 on the EP stack.
+
+## Wall B2 — LATENT USE-AFTER-FREE (audit next session!)
+dsv4_moe_grouped_free_superseded_by_fused (dsv4-moe-grouped.cu:1105) frees dq_gate/dq_up +
+dsf_*_simple — but the grouped HP DECODE path (dec_gate_up_swiglu / w4a16_fc1_swiglu) READS
+exactly those. After the first big prefill (repack+free), any decode on that layer reads
+freed pointers. Tonight's decode benches never hit it (40-tok prompts < min_m 256 = repack
+never fired). Verify + fix before shipping fused prefill + grouped decode together.
+
+## The orthodox fix for B/B2 (one move kills both)
+Regenerate the EP sidecar in the FUSED fc1 layout (up|gate concatenated per expert, the
+exact CutlassMoeFCRunner format): repack becomes zero-copy for fc1 (like fc2 already
+aliases dq_down), no per-layer malloc, no fragmentation, no freed-source hazard — the
+grouped DECODE kernels then read up/gate as strided VIEWS into fc1_w (row offset math:
+up = rows [0,inter), gate = rows [inter,2*inter) per expert). Changes: tools/
+dsv4-nvfp4-preconvert (--fused-fc1 flag), loader blob header bump, decode kernel base/stride,
+fused repack fast-path (alias, skip concat+free). Offline sidecar regen ~73GB x2 ranks.
+
+## Also measured tonight (prefill)
+- 13k prefill @ub2048+EP: killed by Wall B before completing (no t/s number).
+- FUSED_PROF phase dump: never reached (dies in repack). After the sidecar fix, re-run:
+  DSV4_MOE_FUSED_PROF=1 DSV4_MOE_FUSED_PROF_AFTER=80 + 13k prompt (scratchpad/prefill13k.json).
+- Budget math for 1600 (do not lose): per-GPU sustained ~28 TF/s needed = MoE ~12 (FP4
+  CUTLASS, have headroom) + dense f8 ~16 + glue <15% + ub large enough (EP gives 2x
+  tok/expert: ub2048+EP == ub4096 non-EP == R4-predicted ~57 TF/s MoE).
