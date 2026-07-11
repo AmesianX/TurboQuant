@@ -790,7 +790,11 @@ static ggml_tensor * dsv4_grouped_out(
     // only its local groups; no ids remap machinery). Kept gated to leave the long-verified
     // mul_mat_id path byte-identical when the split is off.
     static const bool attn_split = getenv("DSV4_ATTN_SPLIT") != nullptr;
-    if (attn_split) {
+    // [prefill] DSV4_GROUPED_OUT_BMM=1 uses the batched form WITHOUT the TP split too:
+    // measured 13k prefill spends 8.2% in the identity mul_mat_id (2138ms) — the batched
+    // MUL_MAT is a proper GEMM at prefill M and removes the ids machinery entirely.
+    static const bool bmm_out = attn_split || getenv("DSV4_GROUPED_OUT_BMM") != nullptr;
+    if (bmm_out) {
         ggml_tensor * o4 = ggml_reshape_4d(ctx, o, group_dim, 1, n_groups, n_tokens);
         ggml_tensor * wo_a_g = ggml_reshape_3d(ctx, wo_a, group_dim, o_lora_rank, n_groups);
         ggml_tensor * low = ggml_mul_mat(ctx, wo_a_g, o4); // [o_lora_rank, 1, n_groups, n_tokens]

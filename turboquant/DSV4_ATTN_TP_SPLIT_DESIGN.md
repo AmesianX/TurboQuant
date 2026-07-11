@@ -147,3 +147,17 @@ fused repack fast-path (alias, skip concat+free). Offline sidecar regen ~73GB x2
 - Budget math for 1600 (do not lose): per-GPU sustained ~28 TF/s needed = MoE ~12 (FP4
   CUTLASS, have headroom) + dense f8 ~16 + glue <15% + ub large enough (EP gives 2x
   tok/expert: ub2048+EP == ub4096 non-EP == R4-predicted ~57 TF/s MoE).
+
+## PREFILL 94% DECOMPOSITION (2026-07-12, 13k @ub2048+EP all-eager, GPU 26.0s/wall 41.9s, DSV4_OPPROF)
+FA(D=512,f16K) 23.2% | CONT x6343 13.2% | MoE-fused 8.3% (efficient) | wo_a mul_mat_id(n=8) 8.2%
+| ROPE_TAIL 5.1% | wq_b f8 GEMM 4.4% (28 TF/s - slow) | RMS_NORM 4.1% | wo_b f8 3.2%
+| MUL/UNARY/HC/SUM_ROWS/GET_ROWS glue ~15% | rest small. Wall-GPU gap 38% (eager-inflated).
+- OPPROF (deferred events, DSV4_OPPROF=1 + GGML_CUDA_NO_GRAPHS=1) works on 2-node SPMD;
+  KERNEL_PROF hangs at init with FC1_FUSED (repro x2) — use OPPROF.
+- Levers, ranked: (1) DSV4_MLA_MMA=1 (VEC->MMA fattn, env exists, testing now);
+  (2) CONT+glue fusion; (3) wo_a as per-group GEMM — ⚠️ NOT the [gd,1,G,T] batched mm:
+  measured 3x SLOWER prefill (112.7 t/s; M=1 per batch entry = 16384 tiny GEMVs).
+  Needs permute to [gd, T, G] so M=T per group. Same trap applies to ATTN_SPLIT prefill!
+  (4) f8 dense GEMM efficiency (native FP8 GEMM branch asset).
+- ub climbing: DEAD lever for e2e now (MoE only 6-8%); ub2048 is the operating point.
+- Gate-1 numbers: 13k completes 323-327 t/s @ub2048/131k, decode-after-prefill correct.
