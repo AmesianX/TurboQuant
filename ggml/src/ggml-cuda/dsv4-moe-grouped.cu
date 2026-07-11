@@ -1161,11 +1161,16 @@ extern "C" bool dsv4_moe_grouped_free_superseded_by_fused(int il) {
   auto it = g_registry.find(il);
   if (it == g_registry.end() || !it->second) return false;
   LayerWeights* L = it->second;
-  // [fc1-fused-layout] the fused runner ALIASES dq_up/dq_gate (one shared fc1 buffer) and
-  // the grouped decode path keeps reading them + the simple SFs -> nothing is superseded,
-  // free NOTHING. (Also fixes the legacy-layout latent UAF: under the old layout this
-  // function freed dq_gate/up + dsf_*_simple that the HP decode kernels still read.)
-  if (L->gu_estride) return true;
+  // [fc1-fused-layout] the fused runner ALIASES dq_up/dq_gate (one shared fc1 buffer):
+  // weights are NOT superseded (shared) — but once fused is live, decode routes to the
+  // fused-aware HP kernels (dec_*_fused read fc1_sf/fc2_sf), so the tight SIMPLE SFs
+  // ARE superseded: free them (~8.6GB/rank across 43 layers) to make room for the
+  // fused swizzled SFs the repack just built (+~9GB). Net repack cost ≈ +0.4GB.
+  if (L->gu_estride) {
+    auto FS=[](uint8_t*&p){ if(p){ cudaFree(p); p=nullptr; } };
+    FS(L->dsf_gate_simple); FS(L->dsf_up_simple); FS(L->dsf_down_simple);
+    return true;
+  }
   auto F=[](void*&p){ if(p){ cudaFree(p); p=nullptr; } };
   // gate/up packed weights (concatenated into fused fc1) -> free
   F((void*&)L->dq_gate); F((void*&)L->dq_up);
