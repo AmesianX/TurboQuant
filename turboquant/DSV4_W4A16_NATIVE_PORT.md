@@ -1,5 +1,26 @@
 # DSV4 W4A16 fused-MoE — native CuTe C++ port (resume spec)
 
+## 2026-07-12 DECODE session — target rebased to DSpark ~57 t/s (±), quick wins landed
+- **A/B verdict: faithful b12x fp4_dot8 GEVM (`DSV4_MOE_W4A16_DECODE`, WIP wiring in
+  dsv4-moe-grouped.cu) = +2% (10.0→10.2), NOISE.** The MoE GEVM inner math is NOT the decode
+  bottleneck — the grouped op is already ~bandwidth-class (125GB/s, 17.3ms/tok = 23%).
+- **DSV4_KERNEL_PROF breakdown (904 tok, FP4+EP+fused plain):** GPU 73.7ms/tok of 100ms wall.
+  F8 dense GEMVs 39% (28.8ms, TP-mirrored = duplicated on both ranks!), MoE 23%, lm_head bf16
+  6.2% (4.66ms, 1.06GB/tok @227GB/s = saturated), shuffle/glue ~15%, attention 2.5%.
+- **Quick win 1 — EP decode CUDA graphs (`DSV4_EP_DECODE_GRAPH=1`, ggml-cuda.cu ep_decode gate):
+  10.0→10.9~11.0 (+9~10%), 5 samples, the historical SPMD deadlock did NOT reproduce** (warm-up
+  gate now exists). Old "M=1 gains little from graphs" comment was wrong.
+- **Quick win 2 — lm_head bf16→F8_E4M3_B128 load-time convert (`DSV4_LM_HEAD_F8=1`,
+  llama-model.cpp after sidecar block): 11.0→11.0~11.35 (+2.5%, matches −2.3ms prediction).**
+  Quality OK (physics/code prompts coherent). Verify via stderr line `[dsv4-lm-head-f8]`.
+- **Roadmap to ~57 (physics: MoE 2.15GB + dense-split 1.7GB + f8 head 0.13GB ≈ 4GB/rank/tok
+  @230GB/s ≈ 17.5ms):** ① dense F8 projection real TP-split (−14ms, THE body of work),
+  ② shuffle fusion (−5~8ms), ③ MoE GEVM bw tune 125→200 (−6.5ms), then MTP on top.
+- Launcher copy: `tp-serve/tp-w4a16.sh` (tp.sh + forwards W4A16_DECODE/EP_DECODE_GRAPH/LM_HEAD_F8).
+  Known-good launch env: PORT=8081 CTX=262144 UB=2048 DSV4_EP=1 DSV4_MOE_GROUPED=1
+  DSV4_MOE_FUSED=1 DSV4_MOE_SIDECAR=~/Models/DeepSeek-V4-Flash-GGUF/FP4/nvfp4_sidecar_ep.
+
+
 Branch: `feat/dsv4-w4a16-native-port` (off `feat/dsv4-sparse-mla-mma`).
 
 ## Goal

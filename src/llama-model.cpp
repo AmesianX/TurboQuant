@@ -1825,6 +1825,57 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // [dsv4-lm-head-f8] DSV4_LM_HEAD_F8=1: convert the bf16 lm_head to F8_E4M3_B128 at load
+    // time (no model-file change). The lm_head GEVM is bandwidth-bound (reads ne0*ne1 bytes
+    // every token, ~1.06 GB bf16 on DSV4-Flash); F8 halves that and lands on the existing F8
+    // MMVQ shared-LUT GEVM. Both TP ranks run the identical deterministic conversion (SPMD).
+    // The original bf16 tensor stays allocated (it shares the big model buffer) — the cost is
+    // ~0.5 GB extra resident, the win is ~2.3 ms/token off the decode floor.
+    if (getenv("DSV4_LM_HEAD_F8") != nullptr && arch == LLM_ARCH_DEEPSEEK4) {
+        if (output == nullptr || output->type != GGML_TYPE_BF16) {
+            LLAMA_LOG_WARN("%s: [dsv4-lm-head-f8] output tensor is %s (want bf16) -- skipping\n",
+                __func__, output ? ggml_type_name(output->type) : "null");
+        } else {
+            const int64_t k = output->ne[0], n = output->ne[1];
+            const size_t  row_sz = ggml_row_size(GGML_TYPE_F8_E4M3_B128, k);
+
+            ggml_init_params ip = { /*mem_size=*/ 2*ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
+            ggml_context * cvt_ctx = ggml_init(ip);
+            ggml_tensor  * out_f8  = ggml_new_tensor_2d(cvt_ctx, GGML_TYPE_F8_E4M3_B128, k, n);
+            ggml_format_name(out_f8, "%s.f8", ggml_get_name(output));
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                cvt_ctx, ggml_backend_buffer_get_type(output->buffer));
+            if (buf == nullptr) {
+                LLAMA_LOG_ERROR("%s: [dsv4-lm-head-f8] failed to allocate F8 lm_head buffer\n", __func__);
+                ggml_free(cvt_ctx);
+                return false;
+            }
+
+            // stream in bounded slabs: pull bf16 rows -> f32 -> quantize -> upload
+            const int64_t slab = 8192; // rows per chunk (~64 MiB bf16 + 128 MiB f32 host peak)
+            std::vector<ggml_bf16_t> hbf(slab * k);
+            std::vector<float>       hf32(slab * k);
+            std::vector<uint8_t>     hq(slab * row_sz);
+            for (int64_t r0 = 0; r0 < n; r0 += slab) {
+                const int64_t nr = std::min(slab, n - r0);
+                ggml_backend_tensor_get(output, hbf.data(), r0*k*sizeof(ggml_bf16_t), nr*k*sizeof(ggml_bf16_t));
+                ggml_bf16_to_fp32_row(hbf.data(), hf32.data(), nr*k);
+                ggml_quantize_chunk(GGML_TYPE_F8_E4M3_B128, hf32.data(), hq.data(), 0, nr, k, nullptr);
+                ggml_backend_tensor_set(out_f8, hq.data(), r0*row_sz, nr*row_sz);
+            }
+
+            // hand ownership to the model (freed with the other model buffers), swap the head
+            std::vector<ggml_backend_buffer_ptr> cvt_bufs;
+            cvt_bufs.emplace_back(buf);
+            pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(cvt_ctx), std::move(cvt_bufs));
+            output = out_f8;
+            // raw stderr on purpose: the server log level swallows load-phase LLAMA_LOG_INFO,
+            // and this line is the runtime proof the F8 head is active (same style as sidecar).
+            fprintf(stderr, "[dsv4-lm-head-f8] lm_head bf16 -> F8_E4M3_B128 (%lld x %lld, %.1f MiB)\n",
+                (long long) k, (long long) n, ggml_nbytes(out_f8)/1024.0/1024.0);
+        }
+    }
+
     return true;
 }
 

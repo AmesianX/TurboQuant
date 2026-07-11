@@ -64,7 +64,7 @@ SLAVE_SSH="10.0.1.2"                         # ssh target for the slave box
 # ngram isn't in need_n_rs_seq). Structural incompat with DSV4's fixed-width/graph-reuse MTP pipeline.)
 SPEC="${SPEC---spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0}"  # env-overridable: SPEC="" disables spec
 # single MTP only: SPEC="--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.0"; GRAPH_SLOTS=16 VERIFY_REUSE=1 for graph reuse
-SELF="$REPO/tp-serve/tp.sh"                  # path of this script on each box
+SELF="$REPO/tp-serve/tp-w4a16.sh"                  # path of this script on each box
 # ----------------------------------------------------------------------------
 
 # Anti-repetition default sampling. DSV4-Flash tends to loop/re-emit whole sections without hitting
@@ -127,6 +127,9 @@ env_common() {
     [ -n "${DSV4_MOE_FUSED_GRAPH_OFF:-}" ]&& export DSV4_MOE_FUSED_GRAPH_OFF
     [ -n "${DSV4_MOE_SIDECAR:-}" ]    && export DSV4_MOE_SIDECAR
     [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && export DSV4_MOE_DECODE_MAX
+    [ -n "${DSV4_MOE_W4A16_DECODE:-}" ] && export DSV4_MOE_W4A16_DECODE
+    [ -n "${DSV4_EP_DECODE_GRAPH:-}" ] && export DSV4_EP_DECODE_GRAPH
+    [ -n "${DSV4_LM_HEAD_F8:-}" ] && export DSV4_LM_HEAD_F8
     # [ep2-dp] Expert-parallel: split routed experts on the expert dim (axis2), 128/rank, so each box
     # loads HALF the MoE weight (memory headroom for large -ub). Runs the GENERIC mul_mat_id path with
     # the per-rank expert_offset -> NOT the sidecar custom op (leave DSV4_MOE_FUSED/SIDECAR unset for EP).
@@ -262,6 +265,9 @@ case "${1:-}" in
         [ -n "${DSV4_EP_DBG:-}" ]         && FWD="$FWD DSV4_EP_DBG=$DSV4_EP_DBG"
         [ -n "${DSV4_SPARSE_ATTN:-}" ]    && FWD="$FWD DSV4_SPARSE_ATTN=$DSV4_SPARSE_ATTN"
         [ -n "${DSV4_MOE_DECODE_MAX:-}" ] && FWD="$FWD DSV4_MOE_DECODE_MAX=$DSV4_MOE_DECODE_MAX"
+        [ -n "${DSV4_MOE_W4A16_DECODE:-}" ] && FWD="$FWD DSV4_MOE_W4A16_DECODE=$DSV4_MOE_W4A16_DECODE"
+        [ -n "${DSV4_EP_DECODE_GRAPH:-}" ] && FWD="$FWD DSV4_EP_DECODE_GRAPH=$DSV4_EP_DECODE_GRAPH"
+        [ -n "${DSV4_LM_HEAD_F8:-}" ] && FWD="$FWD DSV4_LM_HEAD_F8=$DSV4_LM_HEAD_F8"
         [ -n "${DSV4_MOE_PREFILL_MAX:-}" ]       && FWD="$FWD DSV4_MOE_PREFILL_MAX=$DSV4_MOE_PREFILL_MAX"
         [ -n "${DSV4_MOE_PREFILL_GRAPH_OFF:-}" ] && FWD="$FWD DSV4_MOE_PREFILL_GRAPH_OFF=$DSV4_MOE_PREFILL_GRAPH_OFF"
         [ -n "${DSV4_INDEXER_QTILE:-}" ]         && FWD="$FWD DSV4_INDEXER_QTILE=$DSV4_INDEXER_QTILE"

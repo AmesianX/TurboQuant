@@ -3686,7 +3686,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             // computes + the same inter-subgraph AllReduces with no capture-timing skew). Prefill (large
             // M) is unaffected (it routes to the fused op, not here). g_ep==0 => unchanged. [ep2-dp]
             static const bool ep_on = getenv("DSV4_EP") != nullptr;
-            const bool ep_decode = ep_on && is_decode;
+            // [ep2-dp][EXPERIMENT] DSV4_EP_DECODE_GRAPH=1 re-allows decode graph capture under EP
+            // to re-test the historical SPMD deadlock (warm-up gate now exists) and measure the
+            // eager-launch cost. Default (unset) keeps the safe eager behavior.
+            static const bool ep_decode_graph = getenv("DSV4_EP_DECODE_GRAPH") != nullptr;
+            const bool ep_decode = ep_on && is_decode && !ep_decode_graph;
             if (graph_off || (!is_decode && prefill_graph_off) || decode_unwarmed || fused_band || ep_decode) {
                 use_cuda_graph = false;
 #ifndef NDEBUG

@@ -648,6 +648,95 @@ __global__ void dec_down_scatter(
   }
 }
 
+// ============================================================================
+// FAITHFUL b12x decode variant (DSV4_MOE_W4A16_DECODE): same warp-per-output
+// structure/args/EP/scale as dec_* above, but the inner contraction uses b12x's
+// fp4_dot8 (f16x2-packed 16-elem block dot; bit-trick e2m1 decode since ptxas
+// rejects cvt.e2m1x2 on sm_121 — b12x's own GEMM technique) instead of scalar-f32.
+// Lane owns 16-K blocks strided by 32; per-block scale ue4m3(sf)*global, the dot's
+// 2^-14 prescale folded via ldexpf(...,14). A/B target vs dec_*.
+// ============================================================================
+#include "dsv4-w4a16/decode/faithful_micro_dots.cuh"
+namespace w4dec = dsv4::w4a16::decode;
+__device__ __forceinline__ uint32_t w4dec_packf16x2(float a, float b){
+  __half2 h = __floats2half2_rn(a, b); uint32_t r; memcpy(&r,&h,4); return r;
+}
+__global__ void w4a16_fc1_swiglu(
+    const float* __restrict__ hidden, const int* __restrict__ sel,
+    const uint8_t* __restrict__ Wg, const uint8_t* __restrict__ Wu,
+    const uint8_t* __restrict__ SFg, const uint8_t* __restrict__ SFu,
+    const float* __restrict__ glg, const float* __restrict__ glu,
+    float* __restrict__ act, int M, int U, int D, int F, float limit,
+    int expert_base, int E_local){
+  const int lane = threadIdx.x & 31;
+  const int j = blockIdx.x * (blockDim.x>>5) + (threadIdx.x>>5);
+  const int row = blockIdx.y;
+  if(j >= F || row >= M*U) return;
+  const int token = row / U;
+  const int e = sel[row] - expert_base;
+  if(e < 0 || e >= E_local){ act[(int64_t)row*F + j] = 0.f; return; }
+  const float* __restrict__ x = hidden + (int64_t)token * D;
+  const int kb = D / SFVec, nbytes = D >> 1;
+  const int64_t wbase = (int64_t)e*F*D/2, sbase = (int64_t)e*F*kb;
+  const float ge = glg[e], ue = glu[e];
+  const uint8_t* wgr = Wg + wbase + (int64_t)j*nbytes;
+  const uint8_t* wur = Wu + wbase + (int64_t)j*nbytes;
+  const uint8_t* sgr = SFg + sbase + (int64_t)j*kb;
+  const uint8_t* sur = SFu + sbase + (int64_t)j*kb;
+  float accg = 0.f, accu = 0.f;
+  const int nblk = D / 16;
+  for(int b = lane; b < nblk; b += 32){
+    const int byte0 = b*8, k0 = b*16;
+    uint32_t g0,g1,u0,u1; memcpy(&g0,wgr+byte0,4); memcpy(&g1,wgr+byte0+4,4);
+    memcpy(&u0,wur+byte0,4); memcpy(&u1,wur+byte0+4,4);
+    uint32_t xh[8];
+    #pragma unroll
+    for(int t=0;t<8;t++) xh[t]=w4dec_packf16x2(x[k0+t*2], x[k0+t*2+1]);
+    float dg = w4dec::fp4_dot8_sum_prescale(g0,g1, xh[0],xh[1],xh[2],xh[3],xh[4],xh[5],xh[6],xh[7]);
+    float du = w4dec::fp4_dot8_sum_prescale(u0,u1, xh[0],xh[1],xh[2],xh[3],xh[4],xh[5],xh[6],xh[7]);
+    accg += ldexpf(dg,14) * (ue4m3_decode(sgr[b]) * ge);
+    accu += ldexpf(du,14) * (ue4m3_decode(sur[b]) * ue);
+  }
+  accg = warp_reduce_sum(accg); accu = warp_reduce_sum(accu);
+  if(lane == 0){
+    float g = accg; if(limit>0.f) g = fminf(g, limit);
+    float u = accu; if(limit>0.f) u = fmaxf(-limit, fminf(u, limit));
+    act[(int64_t)row*F + j] = (g/(1.f+expf(-g))) * u;
+  }
+}
+__global__ void w4a16_fc2_scatter(
+    const float* __restrict__ act, const int* __restrict__ sel, const float* __restrict__ rw,
+    const uint8_t* __restrict__ Wd, const uint8_t* __restrict__ SFd, const float* __restrict__ gld,
+    float* __restrict__ out, int M, int U, int D, int F, int expert_base, int E_local){
+  const int lane = threadIdx.x & 31;
+  const int i = blockIdx.x * (blockDim.x>>5) + (threadIdx.x>>5);
+  const int row = blockIdx.y;
+  if(i >= D || row >= M*U) return;
+  const int token = row / U;
+  const int e = sel[row] - expert_base;
+  if(e < 0 || e >= E_local) return;
+  const float w = rw[row];
+  const float* __restrict__ a = act + (int64_t)row*F;
+  const int kb = F / SFVec, nbytes = F >> 1;
+  const int64_t wbase = (int64_t)e*D*F/2, sbase = (int64_t)e*D*kb;
+  const float de = gld[e];
+  const uint8_t* wdr = Wd + wbase + (int64_t)i*nbytes;
+  const uint8_t* sdr = SFd + sbase + (int64_t)i*kb;
+  float acc = 0.f;
+  const int nblk = F / 16;
+  for(int b = lane; b < nblk; b += 32){
+    const int byte0 = b*8, k0 = b*16;
+    uint32_t d0,d1; memcpy(&d0,wdr+byte0,4); memcpy(&d1,wdr+byte0+4,4);
+    uint32_t xh[8];
+    #pragma unroll
+    for(int t=0;t<8;t++) xh[t]=w4dec_packf16x2(a[k0+t*2], a[k0+t*2+1]);
+    float dd = w4dec::fp4_dot8_sum_prescale(d0,d1, xh[0],xh[1],xh[2],xh[3],xh[4],xh[5],xh[6],xh[7]);
+    acc += ldexpf(dd,14) * (ue4m3_decode(sdr[b]) * de);
+  }
+  acc = warp_reduce_sum(acc);
+  if(lane == 0) atomicAdd(&out[(int64_t)token*D + i], w * acc);
+}
+
 // ===== ORTHODOX SINGLE-WEIGHT-SET HP DECODE (reads the FUSED fc1/fc2 layout) ===
 // Under DSV4_MOE_FUSED the grouped dq_gate/dq_up (+ simple SFs) are freed once the
 // fused repack folds them into fc1. These decode kernels read gate/up from the FUSED
@@ -1246,6 +1335,21 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
       return true;
     }
 
+    static const bool w4a16_dec = getenv("DSV4_MOE_W4A16_DECODE") != nullptr;
+    if (w4a16_dec) {
+      // FAITHFUL b12x fp4_dot8 decode variant (A/B vs dec_* below).
+      w4a16_fc1_swiglu<<<g_gu, blk, 0, s>>>(
+          d_hidden, d_sel,
+          reinterpret_cast<const uint8_t*>(L->dq_gate),
+          reinterpret_cast<const uint8_t*>(L->dq_up),
+          L->dsf_gate_simple, L->dsf_up_simple,
+          L->dglobal_gate, L->dglobal_up, d_act, M, U, D, F, swiglu_limit, ep_base, ep_E_local);
+      w4a16_fc2_scatter<<<g_dn, blk, 0, s>>>(
+          d_act, d_sel, d_rw,
+          reinterpret_cast<const uint8_t*>(L->dq_down),
+          L->dsf_down_simple, L->dglobal_down, d_out, M, U, D, F, ep_base, ep_E_local);
+      return true;
+    }
     dec_gate_up_swiglu<<<g_gu, blk, 0, s>>>(
         d_hidden, d_sel,
         reinterpret_cast<const uint8_t*>(L->dq_gate),
