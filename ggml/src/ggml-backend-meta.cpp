@@ -669,6 +669,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // gate/up PARTIAL too (3 AllReduces) explodes the subgraph count -> OOM/deadlock at slot-init.
         // (The MIRRORED label on gate/up is a benign "lie": the data is only consumed by glu->down on
         // the same rank, never by an op that assumes cross-rank identity.) [ep2-dp]
+        // [dsv4-attn-split] batched MUL_MAT with weight AND activation split on the SAME batch
+        // dim (aligned group split: DSV4 grouped-out wo_a [gd, lora, G] x per-group heads
+        // [gd, 1, G, T]): each rank multiplies only its LOCAL groups; the output stays
+        // batch-dim-split. Distinct from the EP branch below (activation MIRRORED there).
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            return {GGML_BACKEND_SPLIT_AXIS_2, {0}, 1};
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             const bool is_down = tensor->src[0] != nullptr && strstr(tensor->src[0]->name, "down") != nullptr;
             return {is_down ? (assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL)
@@ -852,6 +859,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
+        // [dsv4-attn-split] MLA head-split: Q is head-split (AXIS_2 after permute) while the
+        // single-head latent K/V stays MIRRORED and broadcasts to every local head (kv-head
+        // dim == 1). The mask/top-k selection is per-query (no head dim) -> MIRRORED; sinks
+        // are per-head -> AXIS_0. Exact by construction: every head reads the WHOLE latent,
+        // so a rank holding a head subset computes exactly that subset's output.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(tensor->src[1]->ne[2] == 1); // single latent kv head (MLA broadcast) only
+            GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (tensor->src[4] != nullptr && src_ss[4].axis != GGML_BACKEND_SPLIT_AXIS_0) {
+                GGML_LOG_ERROR("[dsv4-attn-split] FA sinks src4='%s' op=%s axis=%s (want AXIS_0), fa='%s'\n",
+                    tensor->src[4]->name, ggml_op_name(tensor->src[4]->op),
+                    ggml_backend_meta_split_axis_name(src_ss[4].axis), tensor->name);
+            }
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, 1};
         }
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
@@ -1101,11 +1126,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
             } break;
+            case GGML_OP_DSV4_ROPE_TAIL: {
+                // [dsv4-attn-split] rope-like: src0 = x (may be head-split), src1 = positions
+                // (always MIRRORED, no split semantics -> must not vote in handle_generic).
+                // Rotation is per-head within ne[0], so the state is exactly src0's.
+                split_state = handle_rope(src_ss);
+            } break;
             case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
             case GGML_OP_DSV4_HC_WEIGHTED_SUM:
             case GGML_OP_DSV4_HC_EXPAND:
             case GGML_OP_DSV4_FP8_KV_QUANTIZE:
-            case GGML_OP_DSV4_ROPE_TAIL:
             case GGML_OP_DSV4_INDEXER_LOGITS:
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);

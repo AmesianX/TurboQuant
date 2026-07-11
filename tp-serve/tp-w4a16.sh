@@ -130,6 +130,7 @@ env_common() {
     [ -n "${DSV4_MOE_W4A16_DECODE:-}" ] && export DSV4_MOE_W4A16_DECODE
     [ -n "${DSV4_EP_DECODE_GRAPH:-}" ] && export DSV4_EP_DECODE_GRAPH
     [ -n "${DSV4_LM_HEAD_F8:-}" ] && export DSV4_LM_HEAD_F8
+    [ -n "${DSV4_ATTN_SPLIT:-}" ] && export DSV4_ATTN_SPLIT
     # [ep2-dp] Expert-parallel: split routed experts on the expert dim (axis2), 128/rank, so each box
     # loads HALF the MoE weight (memory headroom for large -ub). Runs the GENERIC mul_mat_id path with
     # the per-rank expert_offset -> NOT the sidecar custom op (leave DSV4_MOE_FUSED/SIDECAR unset for EP).
@@ -268,6 +269,7 @@ case "${1:-}" in
         [ -n "${DSV4_MOE_W4A16_DECODE:-}" ] && FWD="$FWD DSV4_MOE_W4A16_DECODE=$DSV4_MOE_W4A16_DECODE"
         [ -n "${DSV4_EP_DECODE_GRAPH:-}" ] && FWD="$FWD DSV4_EP_DECODE_GRAPH=$DSV4_EP_DECODE_GRAPH"
         [ -n "${DSV4_LM_HEAD_F8:-}" ] && FWD="$FWD DSV4_LM_HEAD_F8=$DSV4_LM_HEAD_F8"
+        [ -n "${DSV4_ATTN_SPLIT:-}" ] && FWD="$FWD DSV4_ATTN_SPLIT=$DSV4_ATTN_SPLIT"
         [ -n "${DSV4_MOE_PREFILL_MAX:-}" ]       && FWD="$FWD DSV4_MOE_PREFILL_MAX=$DSV4_MOE_PREFILL_MAX"
         [ -n "${DSV4_MOE_PREFILL_GRAPH_OFF:-}" ] && FWD="$FWD DSV4_MOE_PREFILL_GRAPH_OFF=$DSV4_MOE_PREFILL_GRAPH_OFF"
         [ -n "${DSV4_INDEXER_QTILE:-}" ]         && FWD="$FWD DSV4_INDEXER_QTILE=$DSV4_INDEXER_QTILE"

@@ -495,6 +495,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
             }
         }
+        // [dsv4-attn-split] DSV4 MLA attention TP head-split at OUTPUT-GROUP granularity
+        // (8 heads/group, grouped-LoRA: wo_a mixes heads within a group, wo_b mixes groups).
+        // Design/verified facts: turboquant/DSV4_ATTN_TP_SPLIT_DESIGN.md. Split ONLY the four
+        // per-head tensors; wq_a/attn_kv/indexer/compressor/latent-KV-cache stay MIRRORED
+        // (top-k selection and latent are shared by all heads). NextN/MTP layer already
+        // early-returned MIRRORED above. Gated: unset env == today's all-mirrored behavior.
+        {
+            static const bool dsv4_attn_split = getenv("DSV4_ATTN_SPLIT") != nullptr;
+            if (dsv4_attn_split && ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+                static const std::regex pat_dsv4_q_b ("blk\\.\\d+\\.attn_q_b\\.weight");
+                static const std::regex pat_dsv4_wo_a("blk\\.\\d+\\.attn_output_a\\.weight");
+                static const std::regex pat_dsv4_wo_b("blk\\.\\d+\\.attn_output_b\\.weight");
+                if (std::regex_match(tensor_name, pat_dsv4_q_b) ||
+                    std::regex_match(tensor_name, pat_dsv4_wo_a)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_b.weight");
+                }
+                if (std::regex_match(tensor_name, pat_dsv4_wo_b)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+                }
+                // NOTE: DSV4's sinks tensor is named WITHOUT the .weight suffix
+                static const std::regex pat_dsv4_sinks("blk\\.\\d+\\.attn_sinks(\\.weight)?");
+                if (std::regex_match(tensor_name, pat_dsv4_sinks)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output_b.weight");
+                }
+            }
+        }
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -688,6 +714,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<int64_t> & segments) -> std::vector<int64_t> {
+        // [dsv4-attn-split] DSV4 grouped-LoRA attention: split unit = one output group
+        // (group_heads heads). wq_b splits its N rows in group_heads*head_k chunks; wo_a's
+        // dim1 (= o_lora per group, concatenated) and wo_b's K rows split in n_lora_o chunks;
+        // sinks split per group_heads heads. All reference attn_output_b -> identical cuts.
+        {
+            static const bool dsv4_attn_split_g = getenv("DSV4_ATTN_SPLIT") != nullptr;
+            if (dsv4_attn_split_g && ud->model->arch == LLM_ARCH_DEEPSEEK4 && hparams.n_attn_out_groups > 0) {
+                static const std::regex pat_dsv4_q_b ("blk\\.\\d+\\.attn_q_b\\.weight");
+                static const std::regex pat_dsv4_wo_a("blk\\.\\d+\\.attn_output_a\\.weight");
+                static const std::regex pat_dsv4_wo_b("blk\\.\\d+\\.attn_output_b\\.weight");
+                const int64_t group_heads = hparams.n_head(il) / hparams.n_attn_out_groups;
+                if (std::regex_match(tensor_name, pat_dsv4_q_b)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {std::lcm<int64_t>(group_heads * hparams.n_embd_head_k(il), blck_size)};
+                }
+                if (std::regex_match(tensor_name, pat_dsv4_wo_a) || std::regex_match(tensor_name, pat_dsv4_wo_b)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {std::lcm<int64_t>(hparams.n_lora_o, blck_size)};
+                }
+                static const std::regex pat_dsv4_sinks("blk\\.\\d+\\.attn_sinks(\\.weight)?");
+                if (std::regex_match(tensor_name, pat_dsv4_sinks)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {group_heads};
+                }
+            }
+        }
+
         if (hparams.is_recurrent(il)) {
             // linear attention
             const int64_t head_dim  = hparams.ssm_d_state;

@@ -782,6 +782,22 @@ static ggml_tensor * dsv4_grouped_out(
     const int64_t group_dim   = n_embd_head * group_heads;
 
     o = ggml_cont(ctx, o);
+
+    // [dsv4-attn-split] The group routing is the IDENTITY (ids = arange), so the mul_mat_id
+    // is mathematically a batched MUL_MAT over the group dim. Under the TP head-split the
+    // batched form is required: it gives the meta backend clean aligned-AXIS_2 semantics
+    // (weight and per-group activations split on the same batch dim -> each rank multiplies
+    // only its local groups; no ids remap machinery). Kept gated to leave the long-verified
+    // mul_mat_id path byte-identical when the split is off.
+    static const bool attn_split = getenv("DSV4_ATTN_SPLIT") != nullptr;
+    if (attn_split) {
+        ggml_tensor * o4 = ggml_reshape_4d(ctx, o, group_dim, 1, n_groups, n_tokens);
+        ggml_tensor * wo_a_g = ggml_reshape_3d(ctx, wo_a, group_dim, o_lora_rank, n_groups);
+        ggml_tensor * low = ggml_mul_mat(ctx, wo_a_g, o4); // [o_lora_rank, 1, n_groups, n_tokens]
+        low = ggml_reshape_2d(ctx, low, o_lora_rank * n_groups, n_tokens);
+        return ggml_mul_mat(ctx, wo_b, low);
+    }
+
     o = ggml_reshape_3d(ctx, o, group_dim, n_groups, n_tokens);
 
     ggml_tensor * wo_a_g = ggml_reshape_3d(ctx, wo_a, group_dim, o_lora_rank, n_groups);
