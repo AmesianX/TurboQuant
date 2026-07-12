@@ -4726,6 +4726,13 @@ static std::string ggml_dsv4_opprof_key(const ggml_tensor * node) {
              + ",nq=" + std::to_string(node->src[0]->ne[1]) + ")";
     } else if (node->op == GGML_OP_DSV4_MOE_FUSED || node->op == GGML_OP_DSV4_MOE_GROUPED) {
         key += std::string("(M=") + std::to_string(node->src[0] ? node->src[0]->ne[1] : 0) + ")";
+    } else if (node->op == GGML_OP_CONT || node->op == GGML_OP_MUL || node->op == GGML_OP_UNARY
+            || node->op == GGML_OP_SUM_ROWS || node->op == GGML_OP_GET_ROWS) {
+        // [DSV4_OPPROF step#1] Break CONT/glue by OUTPUT shape so the 6343-CONT (13.2%)
+        // and ~15% glue buckets resolve to specific call sites to fuse. Profiling-only.
+        key += std::string("(") + ggml_type_name(node->type)
+             + "," + std::to_string(node->ne[0]) + "x" + std::to_string(node->ne[1])
+             + "x" + std::to_string(node->ne[2]) + ")";
     }
     return key;
 }

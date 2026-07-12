@@ -294,6 +294,9 @@ case "${1:-}" in
         [ -n "${DSV4_FP8_NATIVE:-}" ]     && FWD="$FWD DSV4_FP8_NATIVE=$DSV4_FP8_NATIVE"
         [ -n "${NCCL_DEBUG:-}" ]          && FWD="$FWD NCCL_DEBUG=$NCCL_DEBUG"
         [ -n "${NCCL_IB_GID_INDEX:-}" ]   && FWD="$FWD NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX"
+        # OPPROF needs no-graphs; BOTH ranks MUST match graph mode or the SPMD control stream mismatches (crash).
+        [ -n "${DSV4_OPPROF:-}" ]         && FWD="$FWD DSV4_OPPROF=$DSV4_OPPROF DSV4_OPPROF_TOP=${DSV4_OPPROF_TOP:-60}"
+        [ -n "${GGML_CUDA_NO_GRAPHS:-}" ] && FWD="$FWD GGML_CUDA_NO_GRAPHS=$GGML_CUDA_NO_GRAPHS"
         # don't let a slave-side failure abort under set -e before the master is started — warn and go on
         ssh "$SLAVE_SSH" "$FWD $SELF START" || echo "[WARN] slave START failed ($SLAVE_SSH) — starting master anyway"
         sleep 3
