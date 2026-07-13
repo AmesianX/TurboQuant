@@ -411,6 +411,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
+    const std::regex pattern_ffn_up_gate_shexp("blk\\.\\d*\\.ffn_(up|gate)_shexp\\.weight");
+    const std::regex pattern_ffn_down_shexp   ("blk\\.\\d*\\.ffn_down_shexp\\.weight");
+
     const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.weight");
     const std::regex pattern_ffn_up_gate_bias  ("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.bias");
     const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
@@ -610,6 +613,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         static const bool dsv4_sidecar  = getenv("DSV4_MOE_SIDECAR") != nullptr;
         if (dsv4_ep && !dsv4_sidecar && tensor_name.find("_exps.weight") != std::string::npos) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+        }
+
+        // [DSV4_SHEXP_SPLIT] The shared expert is a plain dense FFN and we MIRROR it: 25.2 MB/layer
+        // that BOTH ranks stream every single token (3.9 ms of a 53.6 ms step, graph-mode measured).
+        // Split it Megatron-style. It is the ONLY dense block we can split for free: its PARTIAL
+        // lands right next to the MoE-down PARTIAL, joined by a plain ggml_add (deepseek4.cpp:3062),
+        // so DSV4_FOLD_PARTIAL_ADD collapses the two reduces into one. Splitting any other dense
+        // block buys bytes but pays an extra AllReduce per layer -- 43 x 0.15 ms = 6.5 ms, which is
+        // more than the bytes are worth. That is exactly why DSV4_ATTN_SPLIT was net-negative until
+        // the collectives got 4x cheaper.
+        static const bool dsv4_shexp_split = getenv("DSV4_SHEXP_SPLIT") != nullptr;
+        if (dsv4_shexp_split) {
+            if (std::regex_match(tensor_name, pattern_ffn_up_gate_shexp)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_shexp)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
         }
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");

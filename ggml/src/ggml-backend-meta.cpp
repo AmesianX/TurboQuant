@@ -2322,7 +2322,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+
+                // [DSV4_FOLD_PARTIAL_ADD] A PARTIAL whose ONLY consumer is an ADD that is ITSELF
+                // PARTIAL does not need a reduce of its own: a sum of partials is the partial of the
+                // sum, so reducing the ADD once yields the same result as reducing both operands.
+                // Cutting here instead would emit TWO AllReduces where one suffices.
+                //
+                // This is what makes splitting the shared expert free. DSV4 computes
+                //   cur = moe_out + ffn_shexp        (deepseek4.cpp:3062)
+                // and with DSV4_SHEXP_SPLIT both operands are PARTIAL and adjacent. Without this
+                // fold the split adds one collective per layer (43 x 0.15 ms = 6.5 ms) and loses to
+                // the 3.9 ms of weight reads it saves -- the same arithmetic that made ATTN_SPLIT
+                // net-negative for a month.
+                bool folds_into_add = false;
+                if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && i + 1 < cgraph->n_nodes) {
+                    static const bool fold = getenv("DSV4_FOLD_PARTIAL_ADD") != nullptr;
+                    if (fold) {
+                        ggml_tensor * consumer = nullptr;
+                        int n_uses = 0;
+                        for (int j = i + 1; j < cgraph->n_nodes && n_uses < 2; j++) {
+                            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                                if (cgraph->nodes[j]->src[s] == node) {
+                                    n_uses++;
+                                    consumer = cgraph->nodes[j];
+                                    break;
+                                }
+                            }
+                        }
+                        folds_into_add = n_uses == 1 && consumer != nullptr && consumer->op == GGML_OP_ADD &&
+                            ggml_backend_meta_get_split_state(consumer, /*assume_sync =*/ false).axis ==
+                                GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                    }
+                }
+
+                const bool new_subgraph = i + 1 == cgraph->n_nodes ||
+                    (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && !folds_into_add);
                 if (!new_subgraph) {
                     continue;
                 }

@@ -324,6 +324,9 @@ case "${1:-}" in
         # Changes the K>1 verify graph SHAPE -- if only one rank takes the uniform path the two
         # build different graphs and the SPMD control stream mismatches.
         [ -n "${VERIFY_REUSE:-}" ]        && FWD="$FWD VERIFY_REUSE=$VERIFY_REUSE"
+        # Change the SPLIT LAYOUT + the collective placement -- both ranks must agree exactly.
+        [ -n "${DSV4_SHEXP_SPLIT:-}" ]     && FWD="$FWD DSV4_SHEXP_SPLIT=$DSV4_SHEXP_SPLIT"
+        [ -n "${DSV4_FOLD_PARTIAL_ADD:-}" ] && FWD="$FWD DSV4_FOLD_PARTIAL_ADD=$DSV4_FOLD_PARTIAL_ADD"
         # Change WEIGHT TYPES, so the two ranks would build graphs with different tensor types.
         [ -n "${DSV4_AUX_F8:-}" ]         && FWD="$FWD DSV4_AUX_F8=$DSV4_AUX_F8"
         [ -n "${DSV4_AUX_BF16:-}" ]       && FWD="$FWD DSV4_AUX_BF16=$DSV4_AUX_BF16"
