@@ -85,8 +85,11 @@ public:
 
     bool has_dsv4_compressed_kv() const;
     uint32_t get_dsv4_n_comp(int32_t il) const;
-    ggml_tensor * get_dsv4_attn_k (ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
-    ggml_tensor * get_dsv4_index_k(ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
+    uint32_t get_dsv4_n_raw() const;
+    ggml_tensor * get_dsv4_attn_k   (ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
+    ggml_tensor * get_dsv4_attn_raw (ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
+    ggml_tensor * get_dsv4_attn_kall(ggml_context * ctx, int32_t il, llama_seq_id seq_id, int64_t n_comp_rows) const;
+    ggml_tensor * get_dsv4_index_k  (ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
 
 private:
     const llama_hparams & hparams;
@@ -100,6 +103,14 @@ private:
         ggml_tensor * index_k = nullptr;
     };
 
+    // [DSV4_KV_ADJACENT] unified page layout: each attn_k plane is
+    //   [ raw SWA window mirror : dsv4_n_raw rows | compressed rows : n_comp | scratch : 1 ]
+    // so the attention's k_all = raw ++ compressed is a plain VIEW of one contiguous region
+    // instead of a per-token ggml_concat that physically copies the whole compressed cache
+    // (O(context) bytes per layer per token). The mirror is written by the same set_rows that
+    // fills the SWA cache (deepseek4.cpp), at the SAME cell index, so the SWA mask still applies
+    // unchanged. dsv4_n_raw == the SWA cache size (n_swa=128 -> 768 cells: ~36 MB total).
+    uint32_t dsv4_n_raw     = 0;
     uint32_t dsv4_n_seq_max = 0;
     std::vector<dsv4_cache_layer> dsv4_cache_layers;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> dsv4_ctxs_bufs;
@@ -158,8 +169,11 @@ public:
 
     bool has_dsv4_compressed_kv() const;
     uint32_t get_dsv4_n_comp(int32_t il) const;
-    ggml_tensor * get_dsv4_attn_k (ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
-    ggml_tensor * get_dsv4_index_k(ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
+    uint32_t get_dsv4_n_raw() const;
+    ggml_tensor * get_dsv4_attn_k   (ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
+    ggml_tensor * get_dsv4_attn_raw (ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
+    ggml_tensor * get_dsv4_attn_kall(ggml_context * ctx, int32_t il, llama_seq_id seq_id, int64_t n_comp_rows) const;
+    ggml_tensor * get_dsv4_index_k  (ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
 
 private:
     llama_memory_hybrid_iswa * mem = nullptr;

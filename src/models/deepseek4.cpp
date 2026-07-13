@@ -1917,6 +1917,24 @@ static ggml_tensor * dsv4_build_indexer_scores_decode(
     k = ggml_permute(ctx, k, 0, 2, 1, 3); // [head_dim, n_comp, 1]
     q = ggml_permute(ctx, q, 0, 2, 1, 3); // [head_dim, n_tokens, n_heads]
 
+    ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x); // [n_heads, n_tokens]
+    const float scale = 1.0f / std::sqrt(float(n_index_head_size) * float(n_index_head));
+    weights = dsv4_mul_scalar(ctx, weights, scale);
+
+    // [DSV4_INDEXER_FUSED] The decode indexer logits are THE long-context hog. `ggml_mul_mat(k, q)`
+    // broadcasts the head-shared K over q's 64 head channels, so the [128 x n_comp] index cache is
+    // re-read ONCE PER HEAD: at n_comp=6400 that is 64 x 1.6 MB = 102 MB per layer per token, 2.1 GB
+    // across the 21 c4a layers — measured 12.1 ms/token at 24.7k ctx (15% of the step, and it grows
+    // linearly with context). The kernel is not slow (170 GB/s); it is reading 64x too much.
+    //
+    // The fused op streams K once and dots it against all 64 query heads, folding relu, the
+    // per-head weight and the head-sum into the same kernel — the same math, 1/64 of the traffic.
+    // Same gate as the prefill path. Default OFF = the explicit chain (byte-identical).
+    static const bool indexer_fused = getenv("DSV4_INDEXER_FUSED") != nullptr;
+    if (indexer_fused) {
+        return ggml_dsv4_indexer_logits(ctx, k, q, weights); // [n_comp, n_tokens]
+    }
+
     // [DSV4_INDEXER_BF16] same lever as the prefill path (see dsv4_build_indexer_scores_prefill):
     // route the indexer logits GEMM through BF16 tensor cores. Decode n_comp is large at long ctx,
     // so this also helps the MTP/multi-slot decode indexer. Default OFF = byte-identical F32.
@@ -1929,13 +1947,10 @@ static ggml_tensor * dsv4_build_indexer_scores_decode(
     ggml_tensor * score = ggml_mul_mat(ctx, k, q); // [n_comp, n_tokens, n_heads]
     score = ggml_relu(ctx, score);
 
-    ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x); // [n_heads, n_tokens]
-    const float scale = 1.0f / std::sqrt(float(n_index_head_size) * float(n_index_head));
-    weights = dsv4_mul_scalar(ctx, weights, scale);
-    weights = ggml_reshape_3d(ctx, weights, 1, n_index_head, n_tokens);
-    weights = ggml_permute(ctx, weights, 0, 2, 1, 3); // [1, n_tokens, n_heads]
+    ggml_tensor * w3 = ggml_reshape_3d(ctx, weights, 1, n_index_head, n_tokens);
+    w3 = ggml_permute(ctx, w3, 0, 2, 1, 3); // [1, n_tokens, n_heads]
 
-    score = ggml_mul(ctx, score, weights);
+    score = ggml_mul(ctx, score, w3);
     score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 2, 0, 3)); // [n_heads, n_comp, n_tokens]
     score = ggml_sum_rows(ctx, score);
     return ggml_reshape_2d(ctx, score, n_comp, n_tokens);
@@ -2061,6 +2076,18 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     auto * inp_attn = inp_mem->get_attn();
     auto * inp_rs   = inp_mem->get_recr();
     const auto * mctx_dsv4 = inp_mem->mctx;
+
+    // [DSV4_KV_ADJACENT] unified page layout: the raw SWA window is mirrored into the front of each
+    // compressed-cache plane, so k_all = [raw | comp] is a VIEW, not a per-token concat copy.
+    // Requires a unified KV cache (n_stream==1): with per-stream KV the SWA row indices are global
+    // across streams and would not address a single plane's raw region. Set DSV4_KV_ADJACENT=0 to
+    // fall back to the concat path (the mirror is still written, so the two paths stay in sync).
+    static const bool dsv4_kv_adjacent_env = []{
+        const char * e = getenv("DSV4_KV_ADJACENT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool dsv4_kv_adjacent = dsv4_kv_adjacent_env && cparams.kv_unified;
+
     dsv4_graph_inputs * inp_dsv4 = nullptr;
     auto get_dsv4_inputs = [&]() {
         if (inp_dsv4 == nullptr) {
@@ -2162,6 +2189,34 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_build_forward_expand(gf, q);
         ggml_build_forward_expand(gf, kv);
         ggml_build_forward_expand(gf, mctx_swa->cpy_k(ctx0, kv, inp_attn->get_k_idxs_swa(), il));
+
+        // [DSV4_KV_ADJACENT] mirror the same raw K row into the front (raw) region of this layer's
+        // compressed-cache plane, at the SAME SWA cell index. That makes the attention's
+        //     k_all = [raw window | compressed rows]
+        // one CONTIGUOUS region, so k_all is a ggml VIEW instead of a ggml_concat that physically
+        // copies (n_raw + n_comp_view) x 1152 B per layer per token — a copy that grows with context
+        // (at 128k ctx it is ~790 MB/token). Cost of the mirror: one extra 1152-byte set_rows per
+        // compressed layer per token. See llama-memory-hybrid-iswa.h (dsv4_n_raw).
+        if (compress_ratio != 0 && dsv4_kv_adjacent && mctx_dsv4 != nullptr && mctx_dsv4->has_dsv4_compressed_kv()) {
+            ggml_tensor * k_idxs = inp_attn->get_k_idxs_swa();
+            // kv is [n_embd_head_k, 1, n_tokens] -> the set_rows source is [n_embd_head_k, n_tokens]
+            ggml_tensor * k_src = ggml_view_2d(ctx0, kv, kv->ne[0]*kv->ne[1], n_tokens, kv->nb[2], 0);
+
+            const int64_t n_seq_tok = ubatch.n_seq_tokens;
+            for (int64_t s = 0; s < n_seqs; ++s) {
+                // tokens of sequence s are contiguous: [s*n_seq_tokens, (s+1)*n_seq_tokens)
+                ggml_tensor * src_s  = ggml_view_2d(ctx0, k_src, k_src->ne[0], n_seq_tok,
+                        k_src->nb[1], s*n_seq_tok*k_src->nb[1]);
+                ggml_tensor * idxs_s = ggml_view_1d(ctx0, k_idxs, n_seq_tok,
+                        s*n_seq_tok*ggml_element_size(k_idxs));
+
+                for (int32_t is = 0; is < ubatch.n_seq_id[s*n_seq_tok]; ++is) {
+                    const llama_seq_id sid = ubatch.seq_id[s*n_seq_tok][is];
+                    ggml_tensor * raw = mctx_dsv4->get_dsv4_attn_raw(ctx0, il, sid);
+                    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, raw, src_s, idxs_s));
+                }
+            }
+        }
 
         if (compress_ratio == 0) {
             ggml_tensor * k_cache = mctx_swa->get_k(ctx0, il);
@@ -2585,11 +2640,22 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                     store_attn_cache_rows(dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before);
                 }
 
-                ggml_tensor * k_raw = mctx_swa->get_k(ctx0, il);
-                k_raw = ggml_reshape_3d(ctx0, k_raw, n_embd_head_k, 1, k_raw->ne[2]);
+                ggml_tensor * k_raw_c = mctx_swa->get_k(ctx0, il);
+                ggml_tensor * k_raw = ggml_reshape_3d(ctx0, k_raw_c, n_embd_head_k, 1, k_raw_c->ne[2]);
                 k_all = k_raw;
                 v_all = k_raw;
                 attn_mask = inp_attn->self_kq_mask_swa;
+
+                // [DSV4_KV_ADJACENT] the raw window can be taken from the mirror inside the
+                // compressed-cache plane (making k_all a view) ONLY when the SWA cache's live row
+                // count covers the WHOLE mirrored region — the mirror is addressed by cell index, so
+                // a partial view [0, n_kv) would not sit adjacent to the compressed rows. n_kv is the
+                // 256-padded used-cell count and equals the cache size in steady state (the ring
+                // wraps within the first ~768 tokens); until then we take the concat path, which is
+                // correct and identical to the pre-existing behaviour.
+                const bool kv_adjacent = dsv4_kv_adjacent &&
+                        k_raw_c->ne[3] == 1 &&
+                        k_raw->ne[2] == (int64_t) mctx_dsv4->get_dsv4_n_raw();
 
                 // DSV4 sparse-attention (DSV4_SPARSE_ATTN=1): GATHER only the top-k selected comp
                 // rows per query instead of -inf-masking the rest and scanning the full compressed
@@ -2693,8 +2759,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             comp_mask = block_mask;
                         }
                     } else {
-                    ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_view);
-                    k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
+                    if (kv_adjacent) {
+                        // one contiguous [raw | comp] region -> a VIEW. No copy, no concat kernel.
+                        k_all = mctx_dsv4->get_dsv4_attn_kall(ctx0, il, seq_id, n_comp_view);
+                    } else {
+                        ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_view);
+                        k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
+                    }
                     v_all = k_all;
 
                     if (compress_ratio == 4) {

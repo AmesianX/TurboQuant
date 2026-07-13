@@ -18,7 +18,9 @@
 namespace {
 
 constexpr uint32_t DSV4_COMPRESSED_KV_STATE_MAGIC   = 0x44535634; // "DSV4"
-constexpr uint32_t DSV4_COMPRESSED_KV_STATE_VERSION = 1;
+// v2: the attn_k plane gained a front raw-window mirror (see dsv4_n_raw) — the state now carries
+// n_raw in the header and the mirror rows after each layer's compressed rows.
+constexpr uint32_t DSV4_COMPRESSED_KV_STATE_VERSION = 2;
 constexpr uint32_t DSV4_COMPRESSED_DECODE_UBATCH_MAX = 512;
 
 struct dsv4_row_range {
@@ -172,6 +174,11 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     dsv4_n_seq_max = n_seq_max;
     dsv4_cache_layers.resize(hparams.n_layer);
 
+    // [DSV4_KV_ADJACENT] front-pad every attn_k plane with the SWA window so that the attention's
+    // k_all = [raw window | compressed rows] is one contiguous region (a view, not a concat copy).
+    // The mirror rows are addressed by the SWA cell index, so dsv4_n_raw must be the SWA cache size.
+    dsv4_n_raw = mem_attn->get_swa()->get_size();
+
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
             return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
@@ -227,17 +234,20 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
 
         auto & cache = dsv4_cache_layers[il];
         cache.n_comp = n_comp;
-        // +1 scratch row at index n_comp: the phase-uniform decode graph writes its
-        // off-boundary (discarded) compress results there, keeping the graph topology
+        // attn_k plane layout: [ raw SWA mirror : dsv4_n_raw | compressed : n_comp | scratch : 1 ].
+        //
+        // The scratch row (index n_comp of the COMPRESSED region) takes the phase-uniform decode
+        // graph's off-boundary (discarded) compress results, keeping the graph topology
         // token-invariant. Views are capped at n_comp, so scratch is never visible.
         //
+        // The raw region is the SWA window mirror — see dsv4_n_raw. It makes k_all a view.
+        //
         // Both side caches are pinned to F16 regardless of -ctk:
-        //  - attn_k rows are concat'd with SWA cache rows in the graph
-        //    (deepseek4.cpp: k_all = concat(k_raw, kv_comp_cache)), and the SWA cache
-        //    is force-upgraded to F16 in llama_kv_cache_iswa — the types must match.
+        //  - attn_k rows are attended together with SWA cache rows in the graph, and the SWA
+        //    cache is force-upgraded to F16 in llama_kv_cache_iswa — the types must match.
         //  - index_k feeds regular mul_mat (indexer scores) and its row width
         //    (indexer_head_size=128) is smaller than the TBQ*_0 block size (256).
-        cache.attn_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hparams.n_embd_head_k(il), n_comp + 1, dsv4_n_seq_max);
+        cache.attn_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hparams.n_embd_head_k(il), dsv4_n_raw + n_comp + 1, dsv4_n_seq_max);
         ggml_format_name(cache.attn_k, "cache_dsv4_attn_k_l%d", il);
 
         if (ratio == 4) {
@@ -671,7 +681,9 @@ void llama_memory_hybrid_iswa::dsv4_clear_seq(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < dsv4_n_seq_max);
 
     for (const auto & layer : dsv4_cache_layers) {
-        dsv4_zero_cache_rows(layer.attn_k,  seq_id, 0, layer.n_comp);
+        // attn_k rows are offset by the raw-window mirror; clear the mirror too (a full-sequence
+        // clear is rare — unlike dsv4_clear_rows, which runs every MTP rollback).
+        dsv4_zero_cache_rows(layer.attn_k,  seq_id, 0, dsv4_n_raw + layer.n_comp);
         dsv4_zero_cache_rows(layer.index_k, seq_id, 0, layer.n_comp);
     }
 }
@@ -701,7 +713,11 @@ void llama_memory_hybrid_iswa::dsv4_clear_rows(llama_seq_id seq_id, int32_t il, 
     }
     const uint32_t n_rows = row_end - range.begin;
 
-    dsv4_zero_cache_rows(layer.attn_k,  seq_id, range.begin, n_rows);
+    // the raw-window mirror is NOT cleared here: a raw row is only ever visible to the attention
+    // if the SWA cache holds a live token in that cell, and every such cell is (re)written by the
+    // same ubatch that writes the SWA cache. Zeroing it per rollback would undo the high-water
+    // clamp above (36 MB of pointless writes per seq_rm).
+    dsv4_zero_cache_rows(layer.attn_k,  seq_id, dsv4_n_raw + range.begin, n_rows);
     dsv4_zero_cache_rows(layer.index_k, seq_id, range.begin, n_rows);
 }
 
@@ -718,8 +734,13 @@ void llama_memory_hybrid_iswa::dsv4_copy_rows(llama_seq_id seq_id_src, llama_seq
     const auto & layer = dsv4_cache_layers[il];
     const auto range = dsv4_make_row_range(layer.n_comp, ratio, p0, p1);
 
-    dsv4_copy_cache_rows(layer.attn_k,  seq_id_src, seq_id_dst, range.begin, range.size());
+    dsv4_copy_cache_rows(layer.attn_k,  seq_id_src, seq_id_dst, dsv4_n_raw + range.begin, range.size());
     dsv4_copy_cache_rows(layer.index_k, seq_id_src, seq_id_dst, range.begin, range.size());
+
+    // the SWA cache shares cells between the two sequences after a seq_cp, so the destination
+    // plane's raw-window mirror must hold them as well — the mask will make them visible to dst
+    // queries, but nothing will rewrite them.
+    dsv4_copy_cache_rows(layer.attn_k, seq_id_src, seq_id_dst, 0, dsv4_n_raw);
 }
 
 uint32_t llama_memory_hybrid_iswa::dsv4_n_state_rows(int32_t il, llama_seq_id seq_id) const {
@@ -749,6 +770,11 @@ void llama_memory_hybrid_iswa::dsv4_state_write(llama_io_write_i & io, llama_seq
 
     std::vector<llama_seq_id> seq_ids;
     auto seq_has_rows = [&](llama_seq_id seq) {
+        // a live sequence with no compressed row yet (context < compress_ratio) still owns raw
+        // SWA cells, and its raw-window mirror must be part of the state
+        if (dsv4_n_raw > 0 && mem_attn->seq_pos_max(seq) >= 0) {
+            return true;
+        }
         for (int32_t il = 0; il < (int32_t) dsv4_cache_layers.size(); ++il) {
             if (dsv4_n_state_rows(il, seq) > 0) {
                 return true;
@@ -773,11 +799,13 @@ void llama_memory_hybrid_iswa::dsv4_state_write(llama_io_write_i & io, llama_seq
     const uint32_t version = DSV4_COMPRESSED_KV_STATE_VERSION;
     const uint32_t n_layer = hparams.n_layer;
     const uint32_t n_seq   = seq_ids.size();
+    const uint32_t n_raw   = dsv4_n_raw;
 
     io.write(&magic,   sizeof(magic));
     io.write(&version, sizeof(version));
     io.write(&n_layer, sizeof(n_layer));
     io.write(&n_seq,   sizeof(n_seq));
+    io.write(&n_raw,   sizeof(n_raw));
 
     for (uint32_t il = 0; il < n_layer; ++il) {
         const auto & layer = dsv4_cache_layers[il];
@@ -815,7 +843,13 @@ void llama_memory_hybrid_iswa::dsv4_state_write(llama_io_write_i & io, llama_seq
                 const uint64_t row_size = dsv4_cache_row_size(layer.attn_k);
                 io.write(&n_rows, sizeof(n_rows));
                 if (n_rows > 0) {
-                    io.write_tensor(layer.attn_k, dsv4_cache_offset(layer.attn_k, seq, 0), (size_t) n_rows*row_size);
+                    io.write_tensor(layer.attn_k,
+                            dsv4_cache_offset(layer.attn_k, seq, dsv4_n_raw), (size_t) n_rows*row_size);
+                }
+                // the raw-window mirror: the SWA cache's own state does not restore it
+                if (dsv4_n_raw > 0) {
+                    io.write_tensor(layer.attn_k,
+                            dsv4_cache_offset(layer.attn_k, seq, 0), (size_t) dsv4_n_raw*row_size);
                 }
             }
 
@@ -841,11 +875,13 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
     uint32_t version;
     uint32_t n_layer;
     uint32_t n_seq;
+    uint32_t n_raw;
 
     io.read(&magic,   sizeof(magic));
     io.read(&version, sizeof(version));
     io.read(&n_layer, sizeof(n_layer));
     io.read(&n_seq,   sizeof(n_seq));
+    io.read(&n_raw,   sizeof(n_raw));
 
     if (magic != DSV4_COMPRESSED_KV_STATE_MAGIC) {
         throw std::runtime_error("failed to restore DeepSeek V4 compressed KV cache: bad magic");
@@ -855,6 +891,9 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
     }
     if (n_layer != hparams.n_layer || n_layer != dsv4_cache_layers.size()) {
         throw std::runtime_error("failed to restore DeepSeek V4 compressed KV cache: mismatched layer count");
+    }
+    if (n_raw != dsv4_n_raw) {
+        throw std::runtime_error("failed to restore DeepSeek V4 compressed KV cache: mismatched raw window size");
     }
 
     struct layer_meta {
@@ -936,15 +975,20 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
             // here breaks ON_DEVICE checkpoints (the tensor bytes live in device
             // storage, not the host stream); read_tensor handles both io kinds.
             if (layer.attn_k != nullptr) {
+                const size_t row_size = dsv4_cache_row_size(layer.attn_k);
+
                 uint32_t n_rows;
                 io.read(&n_rows, sizeof(n_rows));
                 if (n_rows > layer.n_comp) {
                     throw std::runtime_error("failed to restore DeepSeek V4 compressed KV cache: too many attention rows");
                 }
                 if (n_rows > 0) {
-                    const size_t row_size = dsv4_cache_row_size(layer.attn_k);
                     io.read_tensor(layer.attn_k,
-                            dsv4_cache_offset(layer.attn_k, dst_seq_id, 0), (size_t) n_rows*row_size);
+                            dsv4_cache_offset(layer.attn_k, dst_seq_id, dsv4_n_raw), (size_t) n_rows*row_size);
+                }
+                if (dsv4_n_raw > 0) {
+                    io.read_tensor(layer.attn_k,
+                            dsv4_cache_offset(layer.attn_k, dst_seq_id, 0), (size_t) dsv4_n_raw*row_size);
                 }
             }
 
@@ -987,6 +1031,11 @@ uint32_t llama_memory_hybrid_iswa::get_dsv4_n_comp(int32_t il) const {
     return dsv4_cache_layers[il].n_comp;
 }
 
+uint32_t llama_memory_hybrid_iswa::get_dsv4_n_raw() const {
+    return dsv4_n_raw;
+}
+
+// the COMPRESSED region of the plane: [n_comp + 1 (scratch)] rows, row 0 == compressed row 0.
 ggml_tensor * llama_memory_hybrid_iswa::get_dsv4_attn_k(ggml_context * ctx, int32_t il, llama_seq_id seq_id) const {
     GGML_ASSERT(il >= 0 && il < (int32_t) dsv4_cache_layers.size());
     GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < dsv4_n_seq_max);
@@ -994,7 +1043,35 @@ ggml_tensor * llama_memory_hybrid_iswa::get_dsv4_attn_k(ggml_context * ctx, int3
     ggml_tensor * t = dsv4_cache_layers[il].attn_k;
     GGML_ASSERT(t != nullptr);
 
-    return ggml_view_2d(ctx, t, t->ne[0], t->ne[1], t->nb[1], seq_id*t->nb[2]);
+    return ggml_view_2d(ctx, t, t->ne[0], t->ne[1] - dsv4_n_raw, t->nb[1],
+            seq_id*t->nb[2] + (size_t) dsv4_n_raw*t->nb[1]);
+}
+
+// the RAW region of the plane: [dsv4_n_raw] rows, indexed by SWA cell (set_rows destination).
+ggml_tensor * llama_memory_hybrid_iswa::get_dsv4_attn_raw(ggml_context * ctx, int32_t il, llama_seq_id seq_id) const {
+    GGML_ASSERT(il >= 0 && il < (int32_t) dsv4_cache_layers.size());
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < dsv4_n_seq_max);
+
+    ggml_tensor * t = dsv4_cache_layers[il].attn_k;
+    GGML_ASSERT(t != nullptr);
+
+    return ggml_view_2d(ctx, t, t->ne[0], dsv4_n_raw, t->nb[1], seq_id*t->nb[2]);
+}
+
+// raw ++ compressed as ONE tensor — the whole point of the layout: no concat, no copy.
+ggml_tensor * llama_memory_hybrid_iswa::get_dsv4_attn_kall(ggml_context * ctx, int32_t il, llama_seq_id seq_id, int64_t n_comp_rows) const {
+    GGML_ASSERT(il >= 0 && il < (int32_t) dsv4_cache_layers.size());
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < dsv4_n_seq_max);
+
+    ggml_tensor * t = dsv4_cache_layers[il].attn_k;
+    GGML_ASSERT(t != nullptr);
+    GGML_ASSERT(n_comp_rows >= 0 && (int64_t) dsv4_n_raw + n_comp_rows <= t->ne[1]);
+
+    const int64_t n_rows = (int64_t) dsv4_n_raw + n_comp_rows;
+
+    ggml_tensor * v = ggml_view_2d(ctx, t, t->ne[0], n_rows, t->nb[1], seq_id*t->nb[2]);
+
+    return ggml_reshape_3d(ctx, v, t->ne[0], 1, n_rows);
 }
 
 ggml_tensor * llama_memory_hybrid_iswa::get_dsv4_index_k(ggml_context * ctx, int32_t il, llama_seq_id seq_id) const {
@@ -1093,9 +1170,24 @@ uint32_t llama_memory_hybrid_iswa_context::get_dsv4_n_comp(int32_t il) const {
     return mem->get_dsv4_n_comp(il);
 }
 
+uint32_t llama_memory_hybrid_iswa_context::get_dsv4_n_raw() const {
+    GGML_ASSERT(mem != nullptr);
+    return mem->get_dsv4_n_raw();
+}
+
 ggml_tensor * llama_memory_hybrid_iswa_context::get_dsv4_attn_k(ggml_context * ctx, int32_t il, llama_seq_id seq_id) const {
     GGML_ASSERT(mem != nullptr);
     return mem->get_dsv4_attn_k(ctx, il, seq_id);
+}
+
+ggml_tensor * llama_memory_hybrid_iswa_context::get_dsv4_attn_raw(ggml_context * ctx, int32_t il, llama_seq_id seq_id) const {
+    GGML_ASSERT(mem != nullptr);
+    return mem->get_dsv4_attn_raw(ctx, il, seq_id);
+}
+
+ggml_tensor * llama_memory_hybrid_iswa_context::get_dsv4_attn_kall(ggml_context * ctx, int32_t il, llama_seq_id seq_id, int64_t n_comp_rows) const {
+    GGML_ASSERT(mem != nullptr);
+    return mem->get_dsv4_attn_kall(ctx, il, seq_id, n_comp_rows);
 }
 
 ggml_tensor * llama_memory_hybrid_iswa_context::get_dsv4_index_k(ggml_context * ctx, int32_t il, llama_seq_id seq_id) const {
