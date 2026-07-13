@@ -310,6 +310,9 @@ case "${1:-}" in
         [ -n "${NCCL_MAX_NCHANNELS:-}" ]  && FWD="$FWD NCCL_MAX_NCHANNELS=$NCCL_MAX_NCHANNELS"
         [ -n "${NCCL_NET_GDR_LEVEL:-}" ]  && FWD="$FWD NCCL_NET_GDR_LEVEL=$NCCL_NET_GDR_LEVEL"
         [ -n "${NCCL_BUFFSIZE:-}" ]       && FWD="$FWD NCCL_BUFFSIZE=$NCCL_BUFFSIZE"
+        # Changes the K>1 verify graph SHAPE -- if only one rank takes the uniform path the two
+        # build different graphs and the SPMD control stream mismatches.
+        [ -n "${VERIFY_REUSE:-}" ]        && FWD="$FWD VERIFY_REUSE=$VERIFY_REUSE"
         # BOTH ranks MUST agree on step-graph capture or their NCCL calls desynchronize -> hang.
         [ -n "${DSV4_STEP_GRAPH:-}" ]     && FWD="$FWD DSV4_STEP_GRAPH=$DSV4_STEP_GRAPH"
         [ -n "${DSV4_STEP_GRAPH_SLOTS:-}" ] && FWD="$FWD DSV4_STEP_GRAPH_SLOTS=$DSV4_STEP_GRAPH_SLOTS"

@@ -95,10 +95,23 @@ LOG="/tmp/tp_${ROLE}.log"
 env_common() {
     [ -d "$HOME/nccl-align" ] && export LD_LIBRARY_PATH="$HOME/nccl-align:${LD_LIBRARY_PATH:-}"
     export NCCL_SOCKET_IFNAME="$IFACE"          # TCP bootstrap rendezvous only
-    # [RDMA] data plane over RoCE (was implicitly socket/single-rail). 4x ConnectX-7 200G rails,
-    # RoCE v2 (GID 3). This is the fix for slow prefill: AllReduce was crawling over TCP/1-NIC
-    # instead of the 800G RDMA fabric NVIDIA put on the box for exactly this 2-Spark TP. [prefill]
-    export NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1}"
+    # [RDMA] data plane over RoCE. 4x ConnectX-7 200G rails, RoCE v2 (GID 3).
+    #
+    # DISCOVER the HCAs, never hardcode them. This list used to read rocep1s0f0,... and a driver
+    # update renamed the devices to mlx5_*, so it matched nothing: NCCL logged "NET/IB : No device
+    # found" and fell back to "Using network Socket". Every AllReduce of this 2-node TP was going
+    # over TCP while four ACTIVE 200 Gb/s rails sat idle -- a 16 KB reduce cost 0.63 ms instead of
+    # tens of us, and there are 42 of them per token.
+    #
+    # Measured on 2026-07-13 (same build, same prompt, controlled A/B):
+    #   plain decode  10.78 -> 13.69 t/s (+27%)   13k prefill  358 -> 425 t/s (+19%)
+    # It also flips DSV4_ATTN_SPLIT from net-negative to +16.5%.
+    #
+    # Verify after ANY driver/image change: NCCL_DEBUG=INFO must print "Using network IB".
+    if [ -z "${NCCL_IB_HCA:-}" ]; then
+        _hca="$(ls /sys/class/infiniband 2>/dev/null | paste -sd, -)"
+        [ -n "$_hca" ] && export NCCL_IB_HCA="$_hca"
+    fi
     export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
     export NCCL_IB_DISABLE=0
     export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-SYS}"
