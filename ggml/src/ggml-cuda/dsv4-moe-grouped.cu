@@ -538,10 +538,25 @@ extern "C" void dsv4_moe_grouped_retire_ptr(void* p){ dsv4_retire(p); }
 // ============================================================================
 // E2M1 nibble decode: bit3 = sign, bits[2:0] = magnitude code.
 // magnitude codes 0..7 -> {0, .5, 1, 1.5, 2, 3, 4, 6}.
+// e2m1 (FP4): [s | e1 e0 | m0] -> {0, .5, 1, 1.5, 2, 3, 4, 6} and their negatives.
+//
+// This used to be `static const float MAG[8]` indexed by the nibble. In device code that array is
+// NOT a register file -- it is a memory lookup, and the index differs per lane so it cannot even
+// broadcast. The MoE GEVM decodes ~4.3e9 FP4 values per token, so the kernel was bound by that LUT,
+// not by DRAM: which is exactly why widening the weight loads to 16 B (DSV4_MOE_VEC16) and why
+// swapping in b12x's own fp4_dot8 inner product BOTH moved the MoE time by less than 1%.
+//
+// Build the float bits directly instead. Zero memory traffic, ~4 ALU ops.
+//   e == 0 : value = 0.5 * m                      (0 or 0.5)
+//   e >= 1 : value = (1 + 0.5*m) * 2^(e-1)        (1, 1.5, 2, 3, 4, 6)
 __device__ __forceinline__ float e2m1_decode(uint8_t nib){
-  static const float MAG[8] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f};
-  float v = MAG[nib & 0x7];
-  return (nib & 0x8) ? -v : v;
+  const uint32_t e = (nib >> 1) & 0x3;
+  const uint32_t m =  nib       & 0x1;
+  const uint32_t norm = (((e - 1u) + 127u) << 23) | (m << 22);   // (1 + m/2) * 2^(e-1)
+  const uint32_t sub  = m ? 0x3F000000u : 0u;                    // 0.5 or 0
+  uint32_t bits = (e != 0u) ? norm : sub;
+  bits |= ((uint32_t) (nib & 0x8)) << 28;                        // sign
+  return __int_as_float((int) bits);
 }
 // raw ue4m3 (float_ue4m3_t) storage byte -> float. E4M3 unsigned: 4 exp bits, 3 mant,
 // bias 7. Build via cutlass ElementSF bitcast for exactness.
@@ -788,7 +803,7 @@ __global__ void dec_gate_up_swiglu_fused(
     const uint8_t* __restrict__ fc1_w, const uint8_t* __restrict__ fc1_sf,
     const float* __restrict__ g_common,
     float* __restrict__ act, int M, int U, int D, int F, int inter,
-    int sf1_stride, int sf1_cols, float limit, int expert_base, int E_local){
+    int sf1_stride, int sf1_cols, float limit, int expert_base, int E_local, int vec16){
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int warps_per_block = blockDim.x >> 5;
@@ -811,6 +826,42 @@ __global__ void dec_gate_up_swiglu_fused(
   const uint8_t* __restrict__ wur = fc1_w + wbase + (int64_t)up_row   * nbytes;
   const uint8_t* __restrict__ wgr = fc1_w + wbase + (int64_t)gate_row * nbytes;
   float accg = 0.f, accu = 0.f;
+  if (vec16) {
+    // [DSV4_MOE_VEC16] 16-byte (uint4) weight loads. The scalar loop below pulls ONE BYTE per lane,
+    // so a warp asks the memory system for 32 B at a time -- not enough requests in flight to fill
+    // DRAM. That, not the inner math, is what pinned this GEVM at 129 GB/s: swapping in b12x's own
+    // fp4_dot8 dot product changed the MoE time by 0.05 ms (16.49 -> 16.53). With uint4 loads a warp
+    // pulls 512 B per step. nbytes is 2048 (fc1) / 1024 (fc2) and every base is 16 B aligned.
+    // 32 elements per chunk span exactly 2 SF blocks (SFVec = 16), so the swizzled scale lookup --
+    // which the scalar loop redid on every one of its 64 iterations -- happens twice.
+    const int n16 = nbytes >> 4;
+    for (int p = lane; p < n16; p += 32) {
+      const uint4 wg4 = reinterpret_cast<const uint4 *>(wgr)[p];
+      const uint4 wu4 = reinterpret_cast<const uint4 *>(wur)[p];
+      const int   c0   = 32 * p;
+      const int   blk0 = c0 >> 4;
+      const float sg0 = ue4m3_decode(fc1_sf[sfbase + dsv4_sf_swizzled_index(gate_row, blk0,     sf1_cols)]) * gc;
+      const float su0 = ue4m3_decode(fc1_sf[sfbase + dsv4_sf_swizzled_index(up_row,   blk0,     sf1_cols)]) * gc;
+      const float sg1 = ue4m3_decode(fc1_sf[sfbase + dsv4_sf_swizzled_index(gate_row, blk0 + 1, sf1_cols)]) * gc;
+      const float su1 = ue4m3_decode(fc1_sf[sfbase + dsv4_sf_swizzled_index(up_row,   blk0 + 1, sf1_cols)]) * gc;
+      const uint32_t gw[4] = { wg4.x, wg4.y, wg4.z, wg4.w };
+      const uint32_t uw[4] = { wu4.x, wu4.y, wu4.z, wu4.w };
+      #pragma unroll
+      for (int q = 0; q < 4; q++) {
+        const float sg = (q < 2) ? sg0 : sg1;   // 4 bytes = 8 elements per word
+        const float su = (q < 2) ? su0 : su1;
+        #pragma unroll
+        for (int t = 0; t < 4; t++) {
+          const uint8_t bg = (uint8_t) (gw[q] >> (8 * t));
+          const uint8_t bu = (uint8_t) (uw[q] >> (8 * t));
+          const int     c  = c0 + 8 * q + 2 * t;
+          const float   x0 = x[c], x1 = x[c + 1];
+          accg += e2m1_decode(bg & 0xF) * sg * x0 + e2m1_decode(bg >> 4) * sg * x1;
+          accu += e2m1_decode(bu & 0xF) * su * x0 + e2m1_decode(bu >> 4) * su * x1;
+        }
+      }
+    }
+  } else {
   for(int p = lane; p < nbytes; p += 32){
     int c = 2 * p;
     int blk = c / SFVec;                               // SF K-block index (colIdx)
@@ -820,6 +871,7 @@ __global__ void dec_gate_up_swiglu_fused(
     float x0 = x[c], x1 = x[c+1];
     accg += e2m1_decode(bg & 0xF) * sg * x0 + e2m1_decode(bg >> 4) * sg * x1;
     accu += e2m1_decode(bu & 0xF) * su * x0 + e2m1_decode(bu >> 4) * su * x1;
+  }
   }
   accg = warp_reduce_sum(accg);
   accu = warp_reduce_sum(accu);
@@ -840,7 +892,7 @@ __global__ void dec_down_scatter_fused(
     const float* __restrict__ rw, const uint8_t* __restrict__ fc2_w,
     const uint8_t* __restrict__ fc2_sf, const float* __restrict__ g_down,
     float* __restrict__ out, int M, int U, int D, int F,
-    int sf2_stride, int sf2_cols, int expert_base, int E_local){
+    int sf2_stride, int sf2_cols, int expert_base, int E_local, int vec16){
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int warps_per_block = blockDim.x >> 5;
@@ -859,12 +911,35 @@ __global__ void dec_down_scatter_fused(
   const float de = g_down[e];
   const uint8_t* __restrict__ wdr = fc2_w + wbase + (int64_t)i * nbytes;
   float acc = 0.f;
+  if (vec16) {
+    // [DSV4_MOE_VEC16] see dec_gate_up_swiglu_fused -- one byte per lane cannot fill DRAM.
+    const int n16 = nbytes >> 4;
+    for (int p = lane; p < n16; p += 32) {
+      const uint4 wd4 = reinterpret_cast<const uint4 *>(wdr)[p];
+      const int   c0   = 32 * p;
+      const int   blk0 = c0 >> 4;
+      const float sd0 = ue4m3_decode(fc2_sf[sfbase + dsv4_sf_swizzled_index(i, blk0,     sf2_cols)]) * de;
+      const float sd1 = ue4m3_decode(fc2_sf[sfbase + dsv4_sf_swizzled_index(i, blk0 + 1, sf2_cols)]) * de;
+      const uint32_t dw[4] = { wd4.x, wd4.y, wd4.z, wd4.w };
+      #pragma unroll
+      for (int q = 0; q < 4; q++) {
+        const float sd = (q < 2) ? sd0 : sd1;
+        #pragma unroll
+        for (int t = 0; t < 4; t++) {
+          const uint8_t bd = (uint8_t) (dw[q] >> (8 * t));
+          const int     c  = c0 + 8 * q + 2 * t;
+          acc += e2m1_decode(bd & 0xF) * sd * a[c] + e2m1_decode(bd >> 4) * sd * a[c + 1];
+        }
+      }
+    }
+  } else {
   for(int p = lane; p < nbytes; p += 32){
     int c = 2 * p;
     int blk = c / SFVec;
     float sd = ue4m3_decode(fc2_sf[sfbase + dsv4_sf_swizzled_index(i, blk, sf2_cols)]) * de;
     uint8_t bd = wdr[p];
     acc += e2m1_decode(bd & 0xF) * sd * a[c] + e2m1_decode(bd >> 4) * sd * a[c+1];
+  }
   }
   acc = warp_reduce_sum(acc);
   if(lane == 0){
@@ -1381,6 +1456,9 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
                   "fused/grouped decode dim mismatch");
       // Per-expert SWIZZLED_128x4 SF strides + unpadded K-block col counts (mirror
       // of dsv4-moe-fused-run.cu build: padN=padUp(rows,128), padC=padUp(cols,4)).
+      // [DSV4_MOE_VEC16] 16-byte weight loads in the decode GEVM (see the kernels). Default ON
+      // once measured; DSV4_MOE_VEC16=0 restores the byte-load loop for an A/B.
+      static const bool moe_vec16 = !getenv("DSV4_MOE_VEC16_OFF");
       auto padUp=[](int x,int a){ return (x + a - 1)/a*a; };
       const int colsD = D / SFVec, colsF = F / SFVec;
       const int sf1_stride = padUp(2*F,128) * padUp(colsD,4); // fc1: rows=2*inter, K=D
@@ -1390,12 +1468,12 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
           reinterpret_cast<const uint8_t*>(fc1_w),
           reinterpret_cast<const uint8_t*>(fc1_sf),
           fu_gcommon, d_act, M, U, D, F, /*inter=*/F,
-          sf1_stride, colsD, swiglu_limit, ep_base, ep_E_local);
+          sf1_stride, colsD, swiglu_limit, ep_base, ep_E_local, moe_vec16);
       dec_down_scatter_fused<<<g_dn, blk, 0, s>>>(
           d_act, d_sel, d_rw,
           reinterpret_cast<const uint8_t*>(fc2_w),
           reinterpret_cast<const uint8_t*>(fc2_sf),
-          fu_gdown, d_out, M, U, D, F, sf2_stride, colsF, ep_base, ep_E_local);
+          fu_gdown, d_out, M, U, D, F, sf2_stride, colsF, ep_base, ep_E_local, moe_vec16);
       return true;
     }
 

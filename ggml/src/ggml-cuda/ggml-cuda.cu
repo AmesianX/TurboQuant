@@ -5099,8 +5099,28 @@ static std::string ggml_dsv4_opprof_key(const ggml_tensor * node) {
              + ",nq=" + std::to_string(node->src[0]->ne[1]) + ")";
     } else if (node->op == GGML_OP_DSV4_MOE_FUSED || node->op == GGML_OP_DSV4_MOE_GROUPED) {
         key += std::string("(M=") + std::to_string(node->src[0] ? node->src[0]->ne[1] : 0) + ")";
+    } else if (node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_CPY || node->op == GGML_OP_CONCAT) {
+        // These write INTO a cache/state tensor. Bill them by what they touch AND by the size of the
+        // destination -- a set_rows whose kernel is sized by the whole cache instead of the rows it
+        // writes is the classic DSV4 footgun (see the dsv4_clear_rows bug), and a shape-blind key
+        // hides it completely.
+        key += std::string("(") + ggml_type_name(node->type)
+             + " out " + std::to_string(node->ne[0]) + "x" + std::to_string(node->ne[1])
+             + "x" + std::to_string(node->ne[2]);
+        if (node->src[0]) {
+            key += std::string(" src0 ") + std::to_string(node->src[0]->ne[0])
+                 + "x" + std::to_string(node->src[0]->ne[1]) + "x" + std::to_string(node->src[0]->ne[2]);
+        }
+        if (node->src[1]) {
+            key += std::string(" src1 ") + std::to_string(node->src[1]->ne[0])
+                 + "x" + std::to_string(node->src[1]->ne[1]);
+        }
+        key += ")";
     } else if (node->op == GGML_OP_CONT || node->op == GGML_OP_MUL || node->op == GGML_OP_UNARY
-            || node->op == GGML_OP_SUM_ROWS || node->op == GGML_OP_GET_ROWS) {
+            || node->op == GGML_OP_SUM_ROWS || node->op == GGML_OP_GET_ROWS
+            || node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD || node->op == GGML_OP_SOFT_MAX
+            || node->op == GGML_OP_ARGSORT || node->op == GGML_OP_DSV4_ROPE_TAIL
+            || node->op == GGML_OP_DSV4_FP8_KV_QUANTIZE || node->op == GGML_OP_DSV4_HC_EXPAND) {
         // [DSV4_OPPROF step#1] Break CONT/glue by OUTPUT shape so the 6343-CONT (13.2%)
         // and ~15% glue buckets resolve to specific call sites to fuse. Profiling-only.
         key += std::string("(") + ggml_type_name(node->type)
