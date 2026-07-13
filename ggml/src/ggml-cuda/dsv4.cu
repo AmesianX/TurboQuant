@@ -1025,12 +1025,17 @@ bool ggml_cuda_op_dsv4_indexer_logits(ggml_backend_cuda_context & ctx, ggml_tens
     const bool kf16 = k->type == GGML_TYPE_F16;
     const bool qf16 = q->type == GGML_TYPE_F16;
 
-    // [DSV4_INDEXER_WMMA] tensor-core (bf16/F32-accumulate) dot for the indexer logits. Default ON
-    // (the whole point of the fused op is the tensor-core compute); set DSV4_INDEXER_NO_WMMA=1 to
-    // fall back to the CUDA-core block-reduce kernel (v1, for A/B and debugging).
+    // [DSV4_INDEXER_WMMA] tensor-core (bf16/F32-accumulate) dot for the indexer logits.
+    //
+    // The WMMA kernel tiles 16(comp) x 16(token) with ONE WARP per tile. That is right for prefill
+    // and wrong for decode: at n_tokens == 1 it discards 15/16 of every tile and the grid collapses
+    // to (1, n_comp/16) single-warp blocks. The CUDA-core block-reduce kernel launches
+    // (n_tokens, n_comp) blocks of 128 lanes instead, which at decode is 16x the parallelism.
+    // Measured end-to-end, 2x GB10, plain decode, 24.7k ctx: WMMA 8.26 t/s vs CUDA-core 10.11 t/s.
+    // So pick by n_tokens. DSV4_INDEXER_NO_WMMA=1 forces the CUDA-core path everywhere (A/B).
     static const bool no_wmma = getenv("DSV4_INDEXER_NO_WMMA") != nullptr;
 
-    if (!no_wmma) {
+    if (!no_wmma && n_tokens >= DSV4_IDX_TILE) {
         // one warp per 16(comp) x 16(token) output tile
         const dim3 grid((unsigned) ((n_tokens + DSV4_IDX_TILE - 1) / DSV4_IDX_TILE),
                         (unsigned) ((n_comp   + DSV4_IDX_TILE - 1) / DSV4_IDX_TILE), 1);

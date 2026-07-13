@@ -1854,9 +1854,12 @@ static ggml_tensor * dsv4_build_indexer_scores_prefill(
     //   logits[c,t] = sum_h weights[h,t] * relu(dot_d(q[d,t,h], k[d,c]))
     // in ONE kernel, so the O(n_comp*ub*n_head) score tensor AND its O(ub^2) cont-transpose are
     // never materialized (the prefill memory+compute wall). Replaces mul_mat+relu+mul+cont+sum_rows.
-    // Default OFF = the explicit chain (byte-identical). Gate: DSV4_INDEXER_FUSED=1. The fused path
-    // requires the F32/F16 k/q (head_dim==128); it falls back to the chain otherwise via supports_op.
-    static const bool indexer_fused = getenv("DSV4_INDEXER_FUSED") != nullptr;
+    // Default ON (same gate as the decode path, which is where it is worth +31%; prefill measured
+    // 227.6 -> 232 t/s). DSV4_INDEXER_FUSED=0 restores the explicit chain. The fused path requires
+    // F32/F16 k/q (head_dim==128); it falls back to the chain otherwise via supports_op.
+    static const bool indexer_fused = []{
+        const char * e = getenv("DSV4_INDEXER_FUSED"); return e == nullptr || atoi(e) != 0;
+    }();
     if (indexer_fused) {
         ggml_tensor * logits = ggml_dsv4_indexer_logits(ctx, k3, q3, weights); // [n_comp, n_tokens]
         return ggml_add(ctx, logits, causal_mask);
@@ -1929,8 +1932,12 @@ static ggml_tensor * dsv4_build_indexer_scores_decode(
     //
     // The fused op streams K once and dots it against all 64 query heads, folding relu, the
     // per-head weight and the head-sum into the same kernel — the same math, 1/64 of the traffic.
-    // Same gate as the prefill path. Default OFF = the explicit chain (byte-identical).
-    static const bool indexer_fused = getenv("DSV4_INDEXER_FUSED") != nullptr;
+    //
+    // Default ON: measured 7.73 -> 10.11 t/s (+31%) at 24.7k ctx, greedy output bit-identical to the
+    // explicit chain. DSV4_INDEXER_FUSED=0 restores the chain.
+    static const bool indexer_fused = []{
+        const char * e = getenv("DSV4_INDEXER_FUSED"); return e == nullptr || atoi(e) != 0;
+    }();
     if (indexer_fused) {
         return ggml_dsv4_indexer_logits(ctx, k, q, weights); // [n_comp, n_tokens]
     }
@@ -2014,7 +2021,9 @@ static ggml_tensor * dsv4_build_indexer_mask_tiled_prefill(
     // MULTIPLIES the graph (per-tile fused-op + argsort + get_rows/set_rows + concat) -> the 3x node
     // blowup the VRAM probe saw on the resumed chunk. Force the whole-ub (untiled) path when fused so
     // the resumed chunk builds ONE fused op + one argsort + one mask, same as the is_prefill chunk.
-    static const bool indexer_fused_q = getenv("DSV4_INDEXER_FUSED") != nullptr;
+    static const bool indexer_fused_q = []{
+        const char * e = getenv("DSV4_INDEXER_FUSED"); return e == nullptr || atoi(e) != 0;
+    }();
     if (indexer_fused_q || qtile <= 0 || qtile >= n_tokens) {
         // No tiling: whole-ubatch path. With DSV4_INDEXER_FUSED the score chain inside
         // _scores_prefill is the single fused op -> O(n_comp*ub) memory, no qtile needed.

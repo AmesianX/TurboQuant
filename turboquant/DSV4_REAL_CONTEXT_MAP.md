@@ -46,6 +46,30 @@ Wired into decode behind the same `DSV4_INDEXER_FUSED` gate.
 
     7.73 -> 8.26 t/s at 24.7k ctx (+6.9%), greedy output sha IDENTICAL.
 
+Its WMMA kernel tiles 16(comp) x 16(token) with ONE WARP per tile — right for prefill, wrong for
+decode: at n_tokens==1 it discards 15/16 of every tile and the grid collapses to single-warp blocks.
+The CUDA-core block-reduce path launches (n_tokens, n_comp) blocks of 128 lanes = 16x the
+parallelism. Now selected automatically by n_tokens (dsv4.cu).
+
+    7.73 -> 10.11 t/s (+30.8%), sha still IDENTICAL.
+
+## Measured lever table (24.7k ctx, plain decode, TP=2 RDMA, 3 runs each, median)
+
+| config | decode t/s | verdict |
+|---|---|---|
+| baseline | 7.73 | |
+| + DSV4_INDEXER_FUSED (WMMA path) | 8.26 | +6.9% |
+| + CUDA-core path (now automatic) | 10.11 | **+30.8%**, sha identical |
+| + DSV4_LM_HEAD_F8 | **10.32** | **+33.5%**, sha identical |
+| + DSV4_SPARSE_ATTN | 5.18 | **-50% — REGRESSION, keep it OFF** |
+| defaults after this commit (no env) | 10.21 | confirms the auto-select |
+
+DSV4_SPARSE_ATTN (gather the top-512 comp rows instead of -inf-masking the other 5888) is HALF THE
+SPEED of the dense masked scan. Do not turn it on. Measured, not assumed.
+
+DSV4_LM_HEAD_F8 stays opt-in: it is +2% but costs 509 MB resident (the bf16 original stays mapped).
+Add it to tp.sh only if the CTX in use has the headroom.
+
 ## The measured hardware roof (do not use 273)
 
 | | GB/s | % of the 273 GB/s spec |
