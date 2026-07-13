@@ -3814,6 +3814,233 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         GGML_ASSERT(stat == cudaSuccess);
     }
 }
+
+// ============================================================================================
+// [DSV4_STEP_GRAPH] Whole-token-step CUDA graph: every subgraph AND every NCCL AllReduce
+// between them captured into ONE graph, replayed with a single launch per token.
+//
+// Under 2-node SPMD TP the meta backend runs a token as N subgraphs separated by N-1 cross-rank
+// AllReduces (N = 43 on DSV4: one PARTIAL per MoE-down). Each subgraph is its own CUDA graph
+// launch, so the GPU returns to the host N times per token and idles while the host enqueues the
+// next piece. The AllReduce *payload* is trivial (a 16 KB partial, tens of us); the *boundary* is
+// what costs ~0.2 ms, and it is what makes every further TP split (ATTN_SPLIT, shexp) net-negative:
+// a split buys weight-read bandwidth but pays another boundary per layer.
+//
+// NCCL >= 2.9.6 records collectives issued on a capturing stream like any other kernel, and this
+// backend already issues them on the compute stream, so the whole step is capturable.
+//
+// Every gate below is STRUCTURAL, never timing- or rank-dependent: both ranks must reach the same
+// capture/replay decision on the same step or their NCCL calls desynchronize and the job hangs.
+//   - capture only after the step has been byte-identical for STEP_GRAPH_WARMUP steps, so the CUDA
+//     memory pool is warm (a pool cudaMalloc inside a capture is illegal and aborts);
+//   - capture only while every reduced tensor is small enough to take the allreduce's pool-free
+//     direct-F32 path (the BF16-compress path allocates from the pool -> illegal under capture).
+// ============================================================================================
+#define GGML_CUDA_STEP_GRAPH_WARMUP     3
+// MTP interleaves trunk / draft / verify steps of several distinct shapes, so a token touches more
+// than one step structure. Too small a cache and the surplus shapes fall back to the per-subgraph
+// path forever (measured: 8 slots => 48% of steps rejected as slots_full). Override to retune.
+#define GGML_CUDA_STEP_GRAPH_MAX_SLOTS_DEFAULT 64
+#define GGML_CUDA_STEP_GRAPH_REDUCE_MAX 32768 // keep in sync with the small-tensor F32 band in
+                                              // ggml_backend_cuda_comm_allreduce_tensor
+
+struct ggml_cuda_step_graph {
+    cudaGraph_t     graph    = nullptr;
+    cudaGraphExec_t instance = nullptr;
+    std::vector<ggml_cuda_graph::node_properties> props;
+    int             stable   = 0; // consecutive steps whose properties did not change
+};
+
+static std::unordered_map<uint64_t, ggml_cuda_step_graph> g_step_graphs;
+static ggml_cuda_step_graph *                             g_step_active   = nullptr;
+static ggml_backend_cuda_context *                        g_step_cuda_ctx = nullptr;
+
+// Only a step that REPLAYS pays off; a step that re-captures pays cudaGraphInstantiate on top of
+// the work. DSV4_STEP_GRAPH_STATS reports the mix so a win can be told apart from a wash.
+struct ggml_cuda_step_graph_stats {
+    uint64_t begin = 0, replay = 0, capture = 0, changed = 0, warmup = 0, reject = 0, slots_full = 0;
+};
+static ggml_cuda_step_graph_stats g_step_stats;
+
+static void ggml_cuda_step_graph_report(void) {
+    const ggml_cuda_step_graph_stats & s = g_step_stats;
+    fprintf(stderr, "[step-graph] begin=%llu replay=%llu capture=%llu changed=%llu warmup=%llu "
+                    "reject=%llu slots_full=%llu slots=%zu\n",
+            (unsigned long long) s.begin, (unsigned long long) s.replay, (unsigned long long) s.capture,
+            (unsigned long long) s.changed, (unsigned long long) s.warmup, (unsigned long long) s.reject,
+            (unsigned long long) s.slots_full, g_step_graphs.size());
+    fflush(stderr);
+}
+
+static uint64_t ggml_cuda_step_graph_key(ggml_cgraph ** cgraphs, size_t n_cgraphs) {
+    uint64_t k = 1469598103934665603ull;
+    const auto mix = [&k](uint64_t v) { k ^= v; k *= 1099511628211ull; };
+    mix((uint64_t) n_cgraphs);
+    for (size_t i = 0; i < n_cgraphs; i++) {
+        mix((uint64_t) (uintptr_t) cgraphs[i]->nodes[0]);
+        mix((uint64_t) (uint32_t) cgraphs[i]->n_nodes);
+    }
+    return k;
+}
+
+// Same property set the per-subgraph path compares (ggml_cuda_graph_update_required), gathered
+// across all subgraphs of the step. Deliberately does NOT share that function's per-key state:
+// consuming its uid fast-path here would leave the per-subgraph path believing nothing changed.
+static bool ggml_cuda_step_graph_props_changed(ggml_cuda_step_graph * sg, ggml_cgraph ** cgraphs, size_t n_cgraphs) {
+    size_t n_nodes_total = 0;
+    for (size_t i = 0; i < n_cgraphs; i++) {
+        n_nodes_total += cgraphs[i]->n_nodes;
+    }
+
+    bool changed = false;
+    if (sg->props.size() != n_nodes_total) {
+        sg->props.resize(n_nodes_total);
+        changed = true;
+    }
+
+    size_t p = 0;
+    for (size_t i = 0; i < n_cgraphs; i++) {
+        ggml_cgraph * cg = cgraphs[i];
+        for (int j = 0; j < cg->n_nodes; j++, p++) {
+            ggml_cuda_graph::node_properties prop = {};
+            memcpy(&prop.node, cg->nodes[j], sizeof(ggml_tensor));
+
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (cg->nodes[j]->src[s]) {
+                    prop.node_src_data_ptrs[s] = cg->nodes[j]->src[s]->data;
+                    memcpy(prop.node_src_ne[s], cg->nodes[j]->src[s]->ne, sizeof(prop.node_src_ne[s]));
+                    memcpy(prop.node_src_nb[s], cg->nodes[j]->src[s]->nb, sizeof(prop.node_src_nb[s]));
+                }
+            }
+
+            if (changed || memcmp(&sg->props[p], &prop, sizeof(prop)) != 0) {
+                sg->props[p] = prop;
+                changed = true;
+            }
+        }
+    }
+
+    return changed;
+}
+
+static void ggml_cuda_step_graph_reset(ggml_cuda_step_graph * sg) {
+    if (sg->instance) {
+        CUDA_CHECK(cudaGraphExecDestroy(sg->instance));
+        sg->instance = nullptr;
+    }
+    if (sg->graph) {
+        CUDA_CHECK(cudaGraphDestroy(sg->graph));
+        sg->graph = nullptr;
+    }
+    sg->stable = 0;
+}
+
+static int ggml_backend_cuda_step_graph_begin(void * comm_ctx_v, ggml_cgraph ** cgraphs, size_t n_cgraphs) {
+    static const bool enabled = getenv("DSV4_STEP_GRAPH") != nullptr;
+    if (!enabled || comm_ctx_v == nullptr || cgraphs == nullptr || n_cgraphs < 2) {
+        return 0;
+    }
+    GGML_ASSERT(g_step_active == nullptr && "step graph capture left open");
+
+    static const bool stats = getenv("DSV4_STEP_GRAPH_STATS") != nullptr;
+    g_step_stats.begin++;
+    if (stats && (g_step_stats.begin % 512) == 0) {
+        ggml_cuda_step_graph_report();
+    }
+
+    ggml_backend_cuda_comm_context * comm_ctx = (ggml_backend_cuda_comm_context *) comm_ctx_v;
+    static const int tp_rank = getenv("GGML_TP_RANK") ? atoi(getenv("GGML_TP_RANK")) : 0;
+    const size_t bidx = (size_t) tp_rank < comm_ctx->backends.size() ? (size_t) tp_rank : 0;
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[bidx]->context;
+
+    // The tensor reduced after subgraph i is its last node. Stay inside the allreduce's pool-free
+    // band, otherwise the capture would hit a pool allocation and abort.
+    for (size_t i = 0; i + 1 < n_cgraphs; i++) {
+        const ggml_tensor * red = cgraphs[i]->nodes[cgraphs[i]->n_nodes - 1];
+        if (red->type != GGML_TYPE_F32 || ggml_nelements(red) >= GGML_CUDA_STEP_GRAPH_REDUCE_MAX) {
+            g_step_stats.reject++;
+            return 0;
+        }
+    }
+
+    const uint64_t key = ggml_cuda_step_graph_key(cgraphs, n_cgraphs);
+
+    static const size_t max_slots = getenv("DSV4_STEP_GRAPH_SLOTS")
+        ? (size_t) atoi(getenv("DSV4_STEP_GRAPH_SLOTS")) : GGML_CUDA_STEP_GRAPH_MAX_SLOTS_DEFAULT;
+
+    auto it = g_step_graphs.find(key);
+    if (it == g_step_graphs.end() && g_step_graphs.size() >= max_slots) {
+        g_step_stats.slots_full++;
+        return 0; // a churning key set (shape sweep) must not grow the cache without bound
+    }
+    ggml_cuda_step_graph * sg = &g_step_graphs[key];
+
+    if (ggml_cuda_step_graph_props_changed(sg, cgraphs, n_cgraphs)) {
+        ggml_cuda_step_graph_reset(sg); // the captured graph describes a layout that no longer exists
+        g_step_stats.changed++;
+        return 0;
+    }
+
+    if (++sg->stable < GGML_CUDA_STEP_GRAPH_WARMUP) {
+        g_step_stats.warmup++;
+        return 0; // keep running eagerly until the pools and the NCCL connections are warm
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    if (sg->instance != nullptr) {
+        CUDA_CHECK(cudaGraphLaunch(sg->instance, cuda_ctx->stream()));
+        g_step_stats.replay++;
+        return 2;
+    }
+
+    g_step_stats.capture++;
+
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+
+    g_step_active   = sg;
+    g_step_cuda_ctx = cuda_ctx;
+
+    return 1;
+}
+
+static void ggml_backend_cuda_step_graph_end(void * comm_ctx_v) {
+    GGML_UNUSED(comm_ctx_v);
+    if (g_step_active == nullptr) {
+        return;
+    }
+
+    ggml_cuda_step_graph *      sg       = g_step_active;
+    ggml_backend_cuda_context * cuda_ctx = g_step_cuda_ctx;
+    g_step_active   = nullptr;
+    g_step_cuda_ctx = nullptr;
+
+    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &sg->graph));
+
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            ggml_cuda_lock_cv.notify_all();
+        }
+    }
+
+    CUDA_CHECK(cudaGraphInstantiate(&sg->instance, sg->graph, NULL, NULL, 0));
+
+    // Nothing ran during the capture -- this launch is what actually executes the step.
+    CUDA_CHECK(cudaGraphLaunch(sg->instance, cuda_ctx->stream()));
+
+    if (getenv("GGML_TP_DBG") || getenv("DSV4_GRAPH_PROBE")) {
+        size_t n_graph_nodes = 0;
+        cudaGraphGetNodes(sg->graph, nullptr, &n_graph_nodes);
+        fprintf(stderr, "[step-graph] captured whole token step: %zu device nodes, %zu slots\n",
+                n_graph_nodes, g_step_graphs.size());
+        fflush(stderr);
+    }
+}
 #endif // USE_CUDA_GRAPH
 
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
@@ -5059,6 +5286,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+    // [DSV4_STEP_GRAPH] The meta backend is capturing the whole token step -- this subgraph and the
+    // collectives around it belong to that outer graph. Opening a nested capture here is illegal and
+    // launching a per-subgraph instance would defeat the point: just record the kernels.
+    {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx->stream(), &cap));
+        if (cap == cudaStreamCaptureStatusActive) {
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, /*use_cuda_graph =*/ false,
+                                                 /*cuda_graph_update_required =*/ false,
+                                                 ggml_cuda_graph_get_key(cgraph));
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -6255,6 +6496,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
+#ifdef USE_CUDA_GRAPH
+    if (strcmp(name, "ggml_backend_step_graph_begin") == 0) {
+        return (void *)ggml_backend_cuda_step_graph_begin;
+    }
+    if (strcmp(name, "ggml_backend_step_graph_end") == 0) {
+        return (void *)ggml_backend_cuda_step_graph_end;
+    }
+#endif // USE_CUDA_GRAPH
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_split_buffer_type;
     }

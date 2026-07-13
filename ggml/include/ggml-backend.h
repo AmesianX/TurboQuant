@@ -207,6 +207,14 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // [DSV4_STEP_GRAPH] Capture a whole token step -- every subgraph AND the collectives between
+    // them -- into a single device graph, so the step costs one launch instead of one per subgraph.
+    // begin() returns: 0 = not capturing, run the subgraphs as usual;
+    //                  1 = capture open, run the subgraphs then call end();
+    //                  2 = the cached step graph was replayed, skip the subgraphs entirely.
+    typedef int    (*ggml_backend_step_graph_begin_t)(void * comm_ctx, struct ggml_cgraph ** cgraphs, size_t n_cgraphs);
+    typedef void   (*ggml_backend_step_graph_end_t)  (void * comm_ctx);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

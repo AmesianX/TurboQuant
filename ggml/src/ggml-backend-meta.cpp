@@ -1890,6 +1890,11 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // [DSV4_STEP_GRAPH] Optional: capture the whole token step (all subgraphs + the AllReduces
+    // between them) into one device graph. Null when the backend does not offer it.
+    ggml_backend_step_graph_begin_t      step_graph_begin = nullptr;
+    ggml_backend_step_graph_end_t        step_graph_end   = nullptr;
+
     // Cross-node SPMD tensor parallelism (feat/tp-2node-dsv4): when GGML_TP_NRANKS>1,
     // this process owns ONE local backend but the weights are split into tp_nranks
     // LOGICAL slices; this rank materializes/computes only slice tp_rank, and the
@@ -1939,10 +1944,17 @@ struct ggml_backend_meta_context {
             }
         }
         if (comm_ctx != nullptr) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+
+            // Optional -- absent on backends without device-graph capture.
+            step_graph_begin = (ggml_backend_step_graph_begin_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_graph_begin");
+            step_graph_end   = (ggml_backend_step_graph_end_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_graph_end");
         }
     }
 
@@ -2610,6 +2622,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             (int) backend_ctx->is_spmd(), backend_ctx->n_subgraphs, n_backends, (void *) backend_ctx->comm_ctx);
         fflush(stderr);
     }
+    // [DSV4_STEP_GRAPH] A token is n_subgraphs graph launches separated by n_subgraphs-1 AllReduces,
+    // so the GPU returns to the host once per layer and idles there. Hand the whole step to the
+    // backend to capture as ONE device graph; after warmup it replays with a single launch and the
+    // collectives ride inside it. The decision is structural, so both SPMD ranks take the same branch.
+    int step_mode = 0; // 0 = run normally, 1 = capture open (close it after the loop), 2 = replayed
+    if (backend_ctx->step_graph_begin != nullptr && backend_ctx->comm_ctx != nullptr &&
+        backend_ctx->is_spmd() && backend_ctx->n_subgraphs > 1) {
+        std::vector<ggml_cgraph *> step_cgraphs;
+        step_cgraphs.reserve(backend_ctx->n_subgraphs);
+        for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+            for (size_t j = 0; j < n_backends; j++) {
+                if (!ggml_meta_tp_buf_is_local(j)) { continue; }
+                step_cgraphs.push_back(backend_ctx->backend_configs[j].cgraphs[i].cgraph_main);
+            }
+        }
+        if (step_cgraphs.size() == backend_ctx->n_subgraphs) {
+            step_mode = backend_ctx->step_graph_begin(backend_ctx->comm_ctx,
+                                                     step_cgraphs.data(), step_cgraphs.size());
+            if (step_mode == 2) {
+                return GGML_STATUS_SUCCESS; // the whole token replayed from the cached step graph
+            }
+        }
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             if (!ggml_meta_tp_buf_is_local(j)) { continue; } // SPMD: this rank only runs its own slice
@@ -2635,7 +2671,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                // [DIAGNOSTIC ONLY -- PRODUCES WRONG OUTPUT] Skip the cross-rank reduce to price it.
+                // Each rank then keeps its own partial instead of the sum, so the model talks
+                // nonsense; the only thing to read off this run is t/s. This is how we tell a
+                // collective-latency-bound step apart from a bandwidth-bound one.
+                static const bool no_reduce = getenv("DSV4_TP_NO_REDUCE") != nullptr;
+                backend_allreduce_success = no_reduce
+                    ? true
+                    : backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
                 if (backend_ctx->is_spmd() && getenv("GGML_TP_DBG")) {
                     ggml_tensor * nd = nodes.empty() ? nullptr : nodes[0];
                     fprintf(stderr, "[tp] rank=%d subgraph=%zu/%zu allreduce node=%s ne=[%lld,%lld] nodes=%zu ok=%d\n",
@@ -2659,6 +2702,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+
+    if (step_mode == 1) {
+        // Nothing above actually ran -- it was recorded. This closes the capture and launches it.
+        backend_ctx->step_graph_end(backend_ctx->comm_ctx);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
