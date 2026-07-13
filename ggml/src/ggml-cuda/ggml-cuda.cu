@@ -3859,15 +3859,24 @@ static ggml_backend_cuda_context *                        g_step_cuda_ctx = null
 // the work. DSV4_STEP_GRAPH_STATS reports the mix so a win can be told apart from a wash.
 struct ggml_cuda_step_graph_stats {
     uint64_t begin = 0, replay = 0, capture = 0, changed = 0, warmup = 0, reject = 0, slots_full = 0;
+    // A step through all 43 layers reads the whole weight set; a NextN/MTP draft step touches one
+    // layer. Counting them apart is the only way to see whether speculation is buying anything:
+    // what matters per accepted token is the number of FULL steps, not the number of forwards.
+    uint64_t full_steps = 0, small_steps = 0;
 };
 static ggml_cuda_step_graph_stats g_step_stats;
 
+// A full DSV4 token step is ~43 subgraphs (one PARTIAL per MoE-down); a draft step is a handful.
+#define GGML_CUDA_STEP_GRAPH_FULL_MIN_SUBGRAPHS 16
+
 static void ggml_cuda_step_graph_report(void) {
     const ggml_cuda_step_graph_stats & s = g_step_stats;
-    fprintf(stderr, "[step-graph] begin=%llu replay=%llu capture=%llu changed=%llu warmup=%llu "
-                    "reject=%llu slots_full=%llu slots=%zu\n",
-            (unsigned long long) s.begin, (unsigned long long) s.replay, (unsigned long long) s.capture,
-            (unsigned long long) s.changed, (unsigned long long) s.warmup, (unsigned long long) s.reject,
+    fprintf(stderr, "[step-graph] begin=%llu FULL=%llu small=%llu | replay=%llu capture=%llu "
+                    "changed=%llu warmup=%llu reject=%llu slots_full=%llu slots=%zu\n",
+            (unsigned long long) s.begin, (unsigned long long) s.full_steps,
+            (unsigned long long) s.small_steps, (unsigned long long) s.replay,
+            (unsigned long long) s.capture, (unsigned long long) s.changed,
+            (unsigned long long) s.warmup, (unsigned long long) s.reject,
             (unsigned long long) s.slots_full, g_step_graphs.size());
     fflush(stderr);
 }
@@ -3942,9 +3951,15 @@ static int ggml_backend_cuda_step_graph_begin(void * comm_ctx_v, ggml_cgraph ** 
     }
     GGML_ASSERT(g_step_active == nullptr && "step graph capture left open");
 
-    static const bool stats = getenv("DSV4_STEP_GRAPH_STATS") != nullptr;
+    static const int stats_every = getenv("DSV4_STEP_GRAPH_STATS")
+        ? atoi(getenv("DSV4_STEP_GRAPH_STATS")) : 0;
     g_step_stats.begin++;
-    if (stats && (g_step_stats.begin % 512) == 0) {
+    if (n_cgraphs >= GGML_CUDA_STEP_GRAPH_FULL_MIN_SUBGRAPHS) {
+        g_step_stats.full_steps++;
+    } else {
+        g_step_stats.small_steps++;
+    }
+    if (stats_every > 0 && (g_step_stats.begin % (uint64_t) stats_every) == 0) {
         ggml_cuda_step_graph_report();
     }
 
@@ -4944,9 +4959,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 static std::string ggml_dsv4_opprof_key(const ggml_tensor * node) {
     std::string key = ggml_op_name(node->op);
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        // Carry the node name: a shape alone does not say WHICH mul_mat is burning the time, and
+        // the top decode op turned out to be an f32 one that no weight tensor explains.
         key += std::string("(") + ggml_type_name(node->src[0]->type)
              + "," + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1])
-             + ",n=" + std::to_string(node->src[1]->ne[1]) + ")";
+             + ",n=" + std::to_string(node->src[1]->ne[1])
+             + " " + (node->name[0] ? node->name : "?")
+             + " <- " + (node->src[0]->name[0] ? node->src[0]->name : "?") + ")";
     } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
         key += std::string("(K=") + ggml_type_name(node->src[1]->type)
              + ",D=" + std::to_string(node->src[0]->ne[0])
