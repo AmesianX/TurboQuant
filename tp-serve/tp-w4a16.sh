@@ -95,10 +95,18 @@ LOG="/tmp/tp_${ROLE}.log"
 env_common() {
     [ -d "$HOME/nccl-align" ] && export LD_LIBRARY_PATH="$HOME/nccl-align:${LD_LIBRARY_PATH:-}"
     export NCCL_SOCKET_IFNAME="$IFACE"          # TCP bootstrap rendezvous only
-    # [RDMA] data plane over RoCE (was implicitly socket/single-rail). 4x ConnectX-7 200G rails,
-    # RoCE v2 (GID 3). This is the fix for slow prefill: AllReduce was crawling over TCP/1-NIC
-    # instead of the 800G RDMA fabric NVIDIA put on the box for exactly this 2-Spark TP. [prefill]
-    export NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1}"
+    # [RDMA] data plane over RoCE. 4x ConnectX-7 200G rails, RoCE v2 (GID 3).
+    #
+    # DISCOVER the HCAs, never hardcode them: this list used to read rocep1s0f0,... and a driver
+    # update renamed the devices to mlx5_*. NCCL matched nothing, said "NET/IB : No device found",
+    # and silently fell back to "Using network Socket" -- every AllReduce went over TCP. A 16 KB
+    # reduce then cost 0.63 ms instead of tens of us, which is 40% of decode (measured: skipping
+    # the reduces takes plain decode 10.7 -> 15.0 t/s). Verify with NCCL_DEBUG=INFO after any
+    # driver change: the log MUST say "Using network IB", not Socket.
+    if [ -z "${NCCL_IB_HCA:-}" ]; then
+        _hca="$(ls /sys/class/infiniband 2>/dev/null | paste -sd, -)"
+        [ -n "$_hca" ] && export NCCL_IB_HCA="$_hca"
+    fi
     export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
     export NCCL_IB_DISABLE=0
     export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-SYS}"
@@ -294,6 +302,20 @@ case "${1:-}" in
         [ -n "${DSV4_FP8_NATIVE:-}" ]     && FWD="$FWD DSV4_FP8_NATIVE=$DSV4_FP8_NATIVE"
         [ -n "${NCCL_DEBUG:-}" ]          && FWD="$FWD NCCL_DEBUG=$NCCL_DEBUG"
         [ -n "${NCCL_IB_GID_INDEX:-}" ]   && FWD="$FWD NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX"
+        # NCCL topology/tuning must be SYMMETRIC across ranks. Overriding these on the master only
+        # makes the ranks disagree on the rail count and the bootstrap exchange mismatches:
+        # "Message truncated : received 32768 bytes instead of 1024" -> NCCL internal error.
+        [ -n "${NCCL_IB_HCA:-}" ]         && FWD="$FWD NCCL_IB_HCA=$NCCL_IB_HCA"
+        [ -n "${NCCL_MIN_NCHANNELS:-}" ]  && FWD="$FWD NCCL_MIN_NCHANNELS=$NCCL_MIN_NCHANNELS"
+        [ -n "${NCCL_MAX_NCHANNELS:-}" ]  && FWD="$FWD NCCL_MAX_NCHANNELS=$NCCL_MAX_NCHANNELS"
+        [ -n "${NCCL_NET_GDR_LEVEL:-}" ]  && FWD="$FWD NCCL_NET_GDR_LEVEL=$NCCL_NET_GDR_LEVEL"
+        [ -n "${NCCL_BUFFSIZE:-}" ]       && FWD="$FWD NCCL_BUFFSIZE=$NCCL_BUFFSIZE"
+        # BOTH ranks MUST agree on step-graph capture or their NCCL calls desynchronize -> hang.
+        [ -n "${DSV4_STEP_GRAPH:-}" ]     && FWD="$FWD DSV4_STEP_GRAPH=$DSV4_STEP_GRAPH"
+        [ -n "${DSV4_STEP_GRAPH_SLOTS:-}" ] && FWD="$FWD DSV4_STEP_GRAPH_SLOTS=$DSV4_STEP_GRAPH_SLOTS"
+        [ -n "${DSV4_STEP_GRAPH_STATS:-}" ] && FWD="$FWD DSV4_STEP_GRAPH_STATS=$DSV4_STEP_GRAPH_STATS"
+        # Same rule, harder: if only one rank skips the reduce, the other blocks in NCCL forever.
+        [ -n "${DSV4_TP_NO_REDUCE:-}" ]   && FWD="$FWD DSV4_TP_NO_REDUCE=$DSV4_TP_NO_REDUCE"
         # OPPROF needs no-graphs; BOTH ranks MUST match graph mode or the SPMD control stream mismatches (crash).
         [ -n "${DSV4_OPPROF:-}" ]         && FWD="$FWD DSV4_OPPROF=$DSV4_OPPROF DSV4_OPPROF_TOP=${DSV4_OPPROF_TOP:-60}"
         [ -n "${GGML_CUDA_NO_GRAPHS:-}" ] && FWD="$FWD GGML_CUDA_NO_GRAPHS=$GGML_CUDA_NO_GRAPHS"
