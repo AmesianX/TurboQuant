@@ -342,6 +342,7 @@ case "${1:-}" in
         # OPPROF needs no-graphs; BOTH ranks MUST match graph mode or the SPMD control stream mismatches (crash).
         [ -n "${DSV4_OPPROF:-}" ]         && FWD="$FWD DSV4_OPPROF=$DSV4_OPPROF DSV4_OPPROF_TOP=${DSV4_OPPROF_TOP:-60}"
         [ -n "${GGML_CUDA_NO_GRAPHS:-}" ] && FWD="$FWD GGML_CUDA_NO_GRAPHS=$GGML_CUDA_NO_GRAPHS"
+        [ -n "${GGML_CUDA_GRAPH_OPT:-}" ]  && FWD="$FWD GGML_CUDA_GRAPH_OPT=$GGML_CUDA_GRAPH_OPT"
         # don't let a slave-side failure abort under set -e before the master is started — warn and go on
         ssh "$SLAVE_SSH" "$FWD $SELF START" || echo "[WARN] slave START failed ($SLAVE_SSH) — starting master anyway"
         sleep 3
