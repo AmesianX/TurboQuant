@@ -107,9 +107,15 @@ env_common() {
     #   plain decode  10.78 -> 13.69 t/s (+27%)   13k prefill  358 -> 425 t/s (+19%)
     # It also flips DSV4_ATTN_SPLIT from net-negative to +16.5%.
     #
+    # ONE rail by default, not all four. Measured: 1 = 2 = 4 rails (421/418/428 t/s prefill, and the
+    # decode reduce is 16 KB -- latency-bound, so extra rails buy nothing). Four rails DO cost
+    # something: NCCL registers per-rail buffers in the same unified memory the model already fills,
+    # and the box OOMs at CTX=262144. Set NCCL_IB_HCA=mlx5_0,mlx5_1,... by hand if a future workload
+    # is ever wire-bandwidth-bound.
+    #
     # Verify after ANY driver/image change: NCCL_DEBUG=INFO must print "Using network IB".
     if [ -z "${NCCL_IB_HCA:-}" ]; then
-        _hca="$(ls /sys/class/infiniband 2>/dev/null | paste -sd, -)"
+        _hca="$(ls /sys/class/infiniband 2>/dev/null | head -1)"
         [ -n "$_hca" ] && export NCCL_IB_HCA="$_hca"
     fi
     export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"

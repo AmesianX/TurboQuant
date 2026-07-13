@@ -103,8 +103,11 @@ env_common() {
     # reduce then cost 0.63 ms instead of tens of us, which is 40% of decode (measured: skipping
     # the reduces takes plain decode 10.7 -> 15.0 t/s). Verify with NCCL_DEBUG=INFO after any
     # driver change: the log MUST say "Using network IB", not Socket.
+    # ONE rail by default: measured 1 = 2 = 4 rails, and four rails OOM the box at CTX=262144 (NCCL
+    # registers per-rail buffers in the unified memory the model already fills). Override by hand
+    # (NCCL_IB_HCA=mlx5_0,mlx5_1,...) only for a genuinely wire-bandwidth-bound workload.
     if [ -z "${NCCL_IB_HCA:-}" ]; then
-        _hca="$(ls /sys/class/infiniband 2>/dev/null | paste -sd, -)"
+        _hca="$(ls /sys/class/infiniband 2>/dev/null | head -1)"
         [ -n "$_hca" ] && export NCCL_IB_HCA="$_hca"
     fi
     export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"

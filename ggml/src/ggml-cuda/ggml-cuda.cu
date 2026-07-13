@@ -124,13 +124,26 @@ namespace dsv4_opprof {
         int64_t dump_after = 0;     // auto-dump once after this many timed ops (0 = exit-only)
         int64_t seen = 0;           // total timed ops recorded
         bool dumped = false;        // one-shot guard for the auto-dump
+
+        // DSV4_OPPROF_SKIP: throw away everything timed before op N.
+        //
+        // Without this the table is a COLD profile and is worthless. The default dump fires after
+        // 8000 timed ops -- about six forwards -- which is still warmup + the prompt prefill, so
+        // every kernel's FIRST launch (module load / JIT / first-touch of its weights) lands in the
+        // table. It shows up as single calls costing hundreds of ms: with node names in the key,
+        // `blk.0.hc_attn_fn` measured 237 ms and `blk.0.attn_q_a` 78 ms for ONE call, and the totals
+        // came out 6x the real pass. Skip the warmup and the table describes the steady-state step.
+        int64_t skip = 0;
+        bool    skipped = false;
+
         profiler() {
             enabled = getenv("DSV4_OPPROF") != nullptr;
+            if (const char* s = getenv("DSV4_OPPROF_SKIP")) skip = atoll(s);
             // Auto-dump after N timed ops so the table prints WITHOUT a clean shutdown (the server is
-            // stopped via SIGKILL, which would skip the dtor). One full forward ~= a few thousand ops;
-            // default 8000 captures ~one 13k prefill forward's worth of distinct ops. 0 disables.
+            // stopped via SIGKILL, which would skip the dtor). One full forward ~= a few thousand ops.
             if (const char* d = getenv("DSV4_OPPROF_DUMP_AFTER")) dump_after = atoll(d);
             else if (enabled) dump_after = 8000;
+            if (skip > 0) dump_after += skip;   // count the window AFTER the discarded warmup
         }
         void dump_locked(const char * why) {
             cudaDeviceSynchronize();
@@ -151,6 +164,14 @@ namespace dsv4_opprof {
 
         // Drain any pending event pairs whose stop event has completed (lazy, non-blocking).
         void drain_locked(bool force) {
+            // Everything accumulated so far is warmup (cold kernels, prompt prefill) -- drop it.
+            if (skip > 0 && !skipped && seen >= skip) {
+                acc.clear();
+                skipped = true;
+                fprintf(stderr, "[DSV4_OPPROF] warmup discarded at %lld ops; profiling the warm step from here\n",
+                        (long long) seen);
+                fflush(stderr);
+            }
             size_t kept = 0;
             for (size_t i = 0; i < pending.size(); ++i) {
                 entry & en = pending[i];
@@ -4958,14 +4979,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 // [DSV4_OPPROF] Build a stable op-class key (op name + shape signature for the heavy GEMM/attn ops).
 static std::string ggml_dsv4_opprof_key(const ggml_tensor * node) {
     std::string key = ggml_op_name(node->op);
+    // DSV4_OPPROF_BYOP: aggregate by op only. The decode step has no single hog -- it has ~1365
+    // nodes, and shape/name keys shatter the cost into hundreds of classes that each look small.
+    // Rolling them up by op is what shows that the long tail IS the bottleneck.
+    static const bool byop = getenv("DSV4_OPPROF_BYOP") != nullptr;
+    if (byop) return key;
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
-        // Carry the node name: a shape alone does not say WHICH mul_mat is burning the time, and
-        // the top decode op turned out to be an f32 one that no weight tensor explains.
+        // DSV4_OPPROF_NAMES: also key on the node name. Off by default -- it shatters one op class
+        // per layer (605 classes), which hides the shape-level totals we actually optimize against.
+        static const bool names = getenv("DSV4_OPPROF_NAMES") != nullptr;
         key += std::string("(") + ggml_type_name(node->src[0]->type)
              + "," + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1])
-             + ",n=" + std::to_string(node->src[1]->ne[1])
-             + " " + (node->name[0] ? node->name : "?")
-             + " <- " + (node->src[0]->name[0] ? node->src[0]->name : "?") + ")";
+             + ",n=" + std::to_string(node->src[1]->ne[1]);
+        if (names) {
+            key += std::string(" ") + (node->name[0] ? node->name : "?")
+                 + " <- " + (node->src[0]->name[0] ? node->src[0]->name : "?");
+        }
+        key += ")";
     } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
         key += std::string("(K=") + ggml_type_name(node->src[1]->type)
              + ",D=" + std::to_string(node->src[0]->ne[0])
