@@ -29,6 +29,20 @@ CTX="${CTX:-524288}" # 512K (agent daily-driver). 0=full 1M (brag, slow prefill)
 UB="${UB:-256}" # DSV4 ceiling: compressor builds ~O(n^2) graph objects, UB>256 OOMs the arena. Slow prefill is inherent.
                 # Bigger = faster prefill, more memory. CEILING 2048 (user: >2048 explodes memory). Raise only with
                 # freed headroom (smaller CTX). Both ranks MUST match (graph shape) — forwarded via ALLRESTART FWD.
+# [RDMA] Pick the RoCE HCA HERE, at top level, NOT inside env_common(): ALLRESTART builds the
+# slave's env (FWD) BEFORE env_common() ever runs, so a value set in env_common is invisible to the
+# forwarding and the two ranks choose it independently -- which desynchronizes them and the master
+# dies in the warmup ncclAllReduce with "remote process exited". Decide once, HERE, and forward it.
+# Glob, not `ls | head -1`: under `set -o pipefail` head can SIGPIPE ls and kill the whole script.
+# One rail: measured 1 = 2 = 4 rails, and four OOM the box at CTX=262144.
+if [ -z "${NCCL_IB_HCA:-}" ]; then
+    for _d in /sys/class/infiniband/*; do
+        [ -e "$_d" ] || continue
+        NCCL_IB_HCA="${_d##*/}"; break
+    done
+fi
+export NCCL_IB_HCA="${NCCL_IB_HCA:-}"
+
 PARALLEL="${PARALLEL:-2}"  # server slots (--parallel). 1 = single stream. 2 = multi-slot concurrent serving
                 # (PARALLEL>1 auto-sets DSV4_MULTISLOT=1 below — the batched-decode path; without it 2 slots
                 # just contend and run SLOWER than single). MEASURED @1M Q4: single ~16 t/s, multi-slot 2-concurrent
@@ -103,13 +117,7 @@ env_common() {
     # reduce then cost 0.63 ms instead of tens of us, which is 40% of decode (measured: skipping
     # the reduces takes plain decode 10.7 -> 15.0 t/s). Verify with NCCL_DEBUG=INFO after any
     # driver change: the log MUST say "Using network IB", not Socket.
-    # ONE rail by default: measured 1 = 2 = 4 rails, and four rails OOM the box at CTX=262144 (NCCL
-    # registers per-rail buffers in the unified memory the model already fills). Override by hand
-    # (NCCL_IB_HCA=mlx5_0,mlx5_1,...) only for a genuinely wire-bandwidth-bound workload.
-    if [ -z "${NCCL_IB_HCA:-}" ]; then
-        _hca="$(ls /sys/class/infiniband 2>/dev/null | head -1)"
-        [ -n "$_hca" ] && export NCCL_IB_HCA="$_hca"
-    fi
+    # NCCL_IB_HCA is chosen at the TOP of this script (before FWD) so both ranks get the same one.
     export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
     export NCCL_IB_DISABLE=0
     export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-SYS}"
@@ -316,6 +324,9 @@ case "${1:-}" in
         # Changes the K>1 verify graph SHAPE -- if only one rank takes the uniform path the two
         # build different graphs and the SPMD control stream mismatches.
         [ -n "${VERIFY_REUSE:-}" ]        && FWD="$FWD VERIFY_REUSE=$VERIFY_REUSE"
+        # Change WEIGHT TYPES, so the two ranks would build graphs with different tensor types.
+        [ -n "${DSV4_AUX_F8:-}" ]         && FWD="$FWD DSV4_AUX_F8=$DSV4_AUX_F8"
+        [ -n "${DSV4_AUX_BF16:-}" ]       && FWD="$FWD DSV4_AUX_BF16=$DSV4_AUX_BF16"
         # BOTH ranks MUST agree on step-graph capture or their NCCL calls desynchronize -> hang.
         [ -n "${DSV4_STEP_GRAPH:-}" ]     && FWD="$FWD DSV4_STEP_GRAPH=$DSV4_STEP_GRAPH"
         [ -n "${DSV4_STEP_GRAPH_SLOTS:-}" ] && FWD="$FWD DSV4_STEP_GRAPH_SLOTS=$DSV4_STEP_GRAPH_SLOTS"

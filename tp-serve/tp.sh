@@ -29,6 +29,20 @@ CTX="${CTX:-524288}" # 512K (agent daily-driver). 0=full 1M (brag, slow prefill)
 UB="${UB:-256}" # DSV4 ceiling: compressor builds ~O(n^2) graph objects, UB>256 OOMs the arena. Slow prefill is inherent.
                 # Bigger = faster prefill, more memory. CEILING 2048 (user: >2048 explodes memory). Raise only with
                 # freed headroom (smaller CTX). Both ranks MUST match (graph shape) — forwarded via ALLRESTART FWD.
+# [RDMA] Pick the RoCE HCA HERE, at top level, NOT inside env_common(): ALLRESTART builds the
+# slave's env (FWD) BEFORE env_common() ever runs, so a value set in env_common is invisible to the
+# forwarding and the two ranks choose it independently -- which desynchronizes them and the master
+# dies in the warmup ncclAllReduce with "remote process exited". Decide once, HERE, and forward it.
+# Glob, not `ls | head -1`: under `set -o pipefail` head can SIGPIPE ls and kill the whole script.
+# One rail: measured 1 = 2 = 4 rails, and four OOM the box at CTX=262144.
+if [ -z "${NCCL_IB_HCA:-}" ]; then
+    for _d in /sys/class/infiniband/*; do
+        [ -e "$_d" ] || continue
+        NCCL_IB_HCA="${_d##*/}"; break
+    done
+fi
+export NCCL_IB_HCA="${NCCL_IB_HCA:-}"
+
 PARALLEL="${PARALLEL:-2}"  # server slots (--parallel). 1 = single stream. 2 = multi-slot concurrent serving
                 # (PARALLEL>1 auto-sets DSV4_MULTISLOT=1 below — the batched-decode path; without it 2 slots
                 # just contend and run SLOWER than single). MEASURED @1M Q4: single ~16 t/s, multi-slot 2-concurrent
@@ -114,10 +128,7 @@ env_common() {
     # is ever wire-bandwidth-bound.
     #
     # Verify after ANY driver/image change: NCCL_DEBUG=INFO must print "Using network IB".
-    if [ -z "${NCCL_IB_HCA:-}" ]; then
-        _hca="$(ls /sys/class/infiniband 2>/dev/null | head -1)"
-        [ -n "$_hca" ] && export NCCL_IB_HCA="$_hca"
-    fi
+    # NCCL_IB_HCA is chosen at the TOP of this script (before FWD) so both ranks get the same one.
     export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
     export NCCL_IB_DISABLE=0
     export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-SYS}"
@@ -296,6 +307,8 @@ case "${1:-}" in
         [ -n "${DSV4_PREFILL_PROF:-}" ]   && FWD="$FWD DSV4_PREFILL_PROF=$DSV4_PREFILL_PROF"
         [ -n "${DSV4_KERNEL_PROF:-}" ]    && FWD="$FWD DSV4_KERNEL_PROF=$DSV4_KERNEL_PROF"
         [ -n "${DSV4_FP8_NATIVE:-}" ]     && FWD="$FWD DSV4_FP8_NATIVE=$DSV4_FP8_NATIVE"
+        # Both ranks MUST use the same rail set or the NCCL bootstrap mismatches.
+        [ -n "${NCCL_IB_HCA:-}" ]         && FWD="$FWD NCCL_IB_HCA=$NCCL_IB_HCA"
         [ -n "${NCCL_DEBUG:-}" ]          && FWD="$FWD NCCL_DEBUG=$NCCL_DEBUG"
         [ -n "${NCCL_IB_GID_INDEX:-}" ]   && FWD="$FWD NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX"
         # don't let a slave-side failure abort under set -e before the master is started — warn and go on

@@ -1929,6 +1929,119 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // [dsv4-aux-quant] Every DENSE projection in the DSV4-Flash gguf is F8, but the DSA
+    // compressor/indexer weights ship as BF16 and the router / hyper-connection mixers as F32.
+    // They are MIRRORED, so each rank streams all of them EVERY token:
+    //
+    //   BF16 attn_compress_{kv,gate}   (4096x1024)x21 + (4096x512)x20   520 MB
+    //   BF16 indexer compress_{kv,gate} + proj                           99 MB
+    //   F32  ffn_gate_inp (router)     (4096x256)x44                    184 MB
+    //   F32  hc_{attn,ffn}_fn          (16384x24)x86                    135 MB
+    //                                                             ------------
+    //                                                             938 MB = 5.4 ms of a 56 ms step
+    //
+    // Convert at load, as with the lm_head: no model-file change, both SPMD ranks run the identical
+    // deterministic conversion. DSV4_AUX_F8 halves the BF16 ones; DSV4_AUX_BF16 halves the F32 ones.
+    //
+    // The router is deliberately NOT taken to F8: its output picks WHICH experts run, so a rounding
+    // flip is a different computation, not a slightly less precise one. BF16 keeps the top-k order.
+    // The compressor/indexer feed a top-k too (which KV survives), so gate this behind a quality
+    // check before trusting it in production.
+    if ((getenv("DSV4_AUX_F8") != nullptr || getenv("DSV4_AUX_BF16") != nullptr) && arch == LLM_ARCH_DEEPSEEK4) {
+        const bool aux_f8   = getenv("DSV4_AUX_F8")   != nullptr;
+        const bool aux_bf16 = getenv("DSV4_AUX_BF16") != nullptr;
+
+        struct cvt_job { ggml_tensor ** slot; ggml_tensor * src; ggml_type dst_type; };
+        std::vector<cvt_job> jobs;
+
+        const auto want = [&](ggml_tensor ** slot) {
+            ggml_tensor * t = slot ? *slot : nullptr;
+            if (t == nullptr || ggml_n_dims(t) != 2) return;
+            // F8_E4M3_B128 blocks along ne0; a partial block would corrupt the tail.
+            if (t->ne[0] % 128 != 0) return;
+            if (aux_f8 && t->type == GGML_TYPE_BF16) jobs.push_back({ slot, t, GGML_TYPE_F8_E4M3_B128 });
+            if (aux_bf16 && t->type == GGML_TYPE_F32) jobs.push_back({ slot, t, GGML_TYPE_BF16 });
+        };
+
+        for (auto & l : layers) {
+            want(&l.attn_compressor_kv);      want(&l.attn_compressor_gate);
+            want(&l.indexer_compressor_kv);   want(&l.indexer_compressor_gate);
+            want(&l.indexer_proj);            want(&l.indexer_attn_q_b);
+            want(&l.hc_attn_fn);              want(&l.hc_ffn_fn);
+            want(&l.ffn_gate_inp);
+        }
+
+        if (!jobs.empty()) {
+            ggml_init_params ip = { (jobs.size() + 1) * ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
+            ggml_context * cvt_ctx = ggml_init(ip);
+
+            std::vector<ggml_tensor *> dsts;
+            dsts.reserve(jobs.size());
+            for (const auto & j : jobs) {
+                ggml_tensor * d = ggml_new_tensor_2d(cvt_ctx, j.dst_type, j.src->ne[0], j.src->ne[1]);
+                ggml_format_name(d, "%s.q", ggml_get_name(j.src));
+                dsts.push_back(d);
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                cvt_ctx, ggml_backend_buffer_get_type(jobs[0].src->buffer));
+            if (buf == nullptr) {
+                LLAMA_LOG_ERROR("%s: [dsv4-aux-quant] failed to allocate the converted-weight buffer\n", __func__);
+                ggml_free(cvt_ctx);
+                return false;
+            }
+
+            size_t before = 0, after = 0;
+            std::vector<float>   hf32;
+            std::vector<uint8_t> hsrc, hdst;
+            for (size_t i = 0; i < jobs.size(); i++) {
+                const cvt_job & j   = jobs[i];
+                ggml_tensor   * dst = dsts[i];
+                const int64_t   k   = j.src->ne[0];
+                const int64_t   n   = j.src->ne[1];
+
+                const auto * st = ggml_get_type_traits(j.src->type);
+                const size_t src_row = ggml_row_size(j.src->type, k);
+                const size_t dst_row = ggml_row_size(j.dst_type,  k);
+
+                const int64_t slab = std::max<int64_t>(1, std::min<int64_t>(n, (64u << 20) / std::max<size_t>(1, src_row)));
+                hsrc.resize(slab * src_row);
+                hf32.resize(slab * k);
+                hdst.resize(slab * dst_row);
+
+                for (int64_t r0 = 0; r0 < n; r0 += slab) {
+                    const int64_t nr = std::min(slab, n - r0);
+                    ggml_backend_tensor_get(j.src, hsrc.data(), r0*src_row, nr*src_row);
+                    if (j.src->type == GGML_TYPE_F32) {
+                        // F32 has no to_float in its traits (it IS float) -- calling it segfaults.
+                        std::memcpy(hf32.data(), hsrc.data(), (size_t) nr*k*sizeof(float));
+                    } else {
+                        GGML_ASSERT(st->to_float != nullptr);
+                        st->to_float(hsrc.data(), hf32.data(), nr*k);
+                    }
+                    if (j.dst_type == GGML_TYPE_BF16) {
+                        ggml_fp32_to_bf16_row(hf32.data(), (ggml_bf16_t *) hdst.data(), nr*k);
+                    } else {
+                        ggml_quantize_chunk(j.dst_type, hf32.data(), hdst.data(), 0, nr, k, nullptr);
+                    }
+                    ggml_backend_tensor_set(dst, hdst.data(), r0*dst_row, nr*dst_row);
+                }
+
+                before += ggml_nbytes(j.src);
+                after  += ggml_nbytes(dst);
+                *j.slot = dst;   // the graph builder reads the slot, so this is the whole switch
+            }
+
+            std::vector<ggml_backend_buffer_ptr> cvt_bufs;
+            cvt_bufs.emplace_back(buf);
+            pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(cvt_ctx), std::move(cvt_bufs));
+
+            fprintf(stderr, "[dsv4-aux-quant] converted %zu aux weights: %.0f -> %.0f MiB per rank per token"
+                            " (~%.1f ms at 220 GB/s)\n",
+                jobs.size(), before/1048576.0, after/1048576.0, (before - after) / 220e9 * 1e3);
+        }
+    }
+
     return true;
 }
 
