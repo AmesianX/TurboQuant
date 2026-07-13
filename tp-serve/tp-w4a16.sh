@@ -329,6 +329,8 @@ case "${1:-}" in
         [ -n "${DSV4_AUX_BF16:-}" ]       && FWD="$FWD DSV4_AUX_BF16=$DSV4_AUX_BF16"
         # BOTH ranks MUST agree on step-graph capture or their NCCL calls desynchronize -> hang.
         [ -n "${DSV4_STEP_GRAPH:-}" ]     && FWD="$FWD DSV4_STEP_GRAPH=$DSV4_STEP_GRAPH"
+        [ -n "${DSV4_STEP_TIME:-}" ]      && FWD="$FWD DSV4_STEP_TIME=$DSV4_STEP_TIME"
+        [ -n "${DSV4_STEP_OPPROF:-}" ]    && FWD="$FWD DSV4_STEP_OPPROF=$DSV4_STEP_OPPROF DSV4_OPPROF_TOP=${DSV4_OPPROF_TOP:-25}"
         [ -n "${DSV4_STEP_GRAPH_SLOTS:-}" ] && FWD="$FWD DSV4_STEP_GRAPH_SLOTS=$DSV4_STEP_GRAPH_SLOTS"
         [ -n "${DSV4_STEP_GRAPH_STATS:-}" ] && FWD="$FWD DSV4_STEP_GRAPH_STATS=$DSV4_STEP_GRAPH_STATS"
         # Same rule, harder: if only one rank skips the reduce, the other blocks in NCCL forever.

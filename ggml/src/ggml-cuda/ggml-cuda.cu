@@ -3876,6 +3876,51 @@ static std::unordered_map<uint64_t, ggml_cuda_step_graph> g_step_graphs;
 static ggml_cuda_step_graph *                             g_step_active   = nullptr;
 static ggml_backend_cuda_context *                        g_step_cuda_ctx = nullptr;
 
+static std::string ggml_dsv4_opprof_key(const ggml_tensor * node);
+
+// ============================================================================================
+// [DSV4_STEP_OPPROF] Per-op GPU time OF THE REAL (graph-mode) STEP.
+//
+// DSV4_OPPROF cannot do this: it only times PURE-EAGER passes, and its own comment says recording
+// timing events mid-capture is illegal. That is wrong -- cudaEventRecord() during capture is legal
+// and becomes an event-record node; what is illegal is QUERYING an event mid-capture. Because
+// nobody recorded events into the graph, every profile we ever took was of an eager pass, where
+// each op's event pair swallows the launch GAP: it billed a no-op CONT at 4.7 us when the same
+// CONT costs ~1 us inside a replayed graph (measured: deleting 313 of them moved the step 0.3 ms).
+// Every "the glue is 15 ms" conclusion came from that artefact.
+//
+// So: record an event pair around each node WHILE the whole-step graph is being captured. They
+// become nodes in the graph, get fresh timestamps on every replay, and are read back one replay
+// LATE (so the host never stalls and never queries a pending event). Nothing is re-executed, so
+// this is safe with NCCL in the graph -- unlike ncu, whose kernel replay would re-run collectives.
+// ============================================================================================
+struct ggml_cuda_step_op {
+    cudaEvent_t e0, e1;
+    std::string key;
+};
+static std::vector<ggml_cuda_step_op>                     g_step_ops;        // captured, never destroyed
+static bool                                               g_step_op_capture = false;
+static std::map<std::string, std::pair<double, int64_t>>  g_step_op_acc;
+static int64_t                                            g_step_op_replays = 0;
+
+static void ggml_cuda_step_opprof_report(void) {
+    std::vector<std::pair<std::string, std::pair<double, int64_t>>> v(g_step_op_acc.begin(), g_step_op_acc.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+    double total = 0.0;
+    for (const auto & e : v) total += e.second.first;
+    const double r = (double) std::max<int64_t>(1, g_step_op_replays);
+    static const int top = getenv("DSV4_OPPROF_TOP") ? atoi(getenv("DSV4_OPPROF_TOP")) : 25;
+    fprintf(stderr, "\n[DSV4_STEP_OPPROF] REAL graph-mode step: %.2f ms/token over %zu op-classes"
+                    " (%lld replays, %zu timed nodes)\n",
+            total / r, v.size(), (long long) g_step_op_replays, g_step_ops.size());
+    for (int k = 0; k < (int) v.size() && k < top; k++) {
+        fprintf(stderr, "  %8.3f ms %5.1f%% %6.1fx  %s\n",
+                v[k].second.first / r, 100.0 * v[k].second.first / total,
+                v[k].second.second / r, v[k].first.c_str());
+    }
+    fflush(stderr);
+}
+
 // Only a step that REPLAYS pays off; a step that re-captures pays cudaGraphInstantiate on top of
 // the work. DSV4_STEP_GRAPH_STATS reports the mix so a win can be told apart from a wash.
 struct ggml_cuda_step_graph_stats {
@@ -4025,6 +4070,52 @@ static int ggml_backend_cuda_step_graph_begin(void * comm_ctx_v, ggml_cgraph ** 
     ggml_cuda_set_device(cuda_ctx->device);
 
     if (sg->instance != nullptr) {
+        // Read the PREVIOUS replay's per-op events (finished long ago -- no stall, no illegal query).
+        static const bool step_opprof = getenv("DSV4_STEP_OPPROF") != nullptr;
+        if (step_opprof && !g_step_ops.empty()) {
+            if (g_step_op_replays > 0) {
+                for (const auto & en : g_step_ops) {
+                    float ms = 0.0f;
+                    if (cudaEventElapsedTime(&ms, en.e0, en.e1) == cudaSuccess) {
+                        auto & s = g_step_op_acc[en.key];
+                        s.first += ms;
+                        s.second += 1;
+                    }
+                }
+            }
+            g_step_op_replays++;
+            if (g_step_op_replays == 64) {
+                ggml_cuda_step_opprof_report();
+            }
+        }
+
+        // DSV4_STEP_TIME: the ONLY honest measurement of the real (graph-mode) step. DSV4_OPPROF
+        // must run eager, and in eager mode its per-op event pairs swallow the launch GAP -- it
+        // reported 4.7 us for a no-op CONT that costs ~1 us once the step is a captured graph.
+        // Bracket the whole replay instead: this is GPU time for the entire token, launch-gap free.
+        static const bool step_time = getenv("DSV4_STEP_TIME") != nullptr;
+        if (step_time) {
+            static cudaEvent_t e0 = nullptr, e1 = nullptr;
+            static double acc_ms = 0.0; static int64_t acc_n = 0;
+            if (e0 == nullptr) { CUDA_CHECK(cudaEventCreate(&e0)); CUDA_CHECK(cudaEventCreate(&e1)); }
+            if (acc_n > 0) {   // read the PREVIOUS launch (already finished by now -- no stall)
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess) {
+                    acc_ms += ms;
+                    if (acc_n % 64 == 0) {
+                        fprintf(stderr, "[step-time] whole-token GPU: %.2f ms (avg over %lld replays)\n",
+                                acc_ms / (double) acc_n, (long long) acc_n);
+                        fflush(stderr);
+                    }
+                }
+            }
+            CUDA_CHECK(cudaEventRecord(e0, cuda_ctx->stream()));
+            CUDA_CHECK(cudaGraphLaunch(sg->instance, cuda_ctx->stream()));
+            CUDA_CHECK(cudaEventRecord(e1, cuda_ctx->stream()));
+            acc_n++;
+            g_step_stats.replay++;
+            return 2;
+        }
         CUDA_CHECK(cudaGraphLaunch(sg->instance, cuda_ctx->stream()));
         g_step_stats.replay++;
         return 2;
@@ -4037,6 +4128,11 @@ static int ggml_backend_cuda_step_graph_begin(void * comm_ctx_v, ggml_cgraph ** 
         ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
     }
     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+
+    // Record the per-op event pairs INTO the graph while we capture it (see DSV4_STEP_OPPROF).
+    if (getenv("DSV4_STEP_OPPROF") != nullptr && g_step_ops.empty()) {
+        g_step_op_capture = true;
+    }
 
     g_step_active   = sg;
     g_step_cuda_ctx = cuda_ctx;
@@ -4052,8 +4148,9 @@ static void ggml_backend_cuda_step_graph_end(void * comm_ctx_v) {
 
     ggml_cuda_step_graph *      sg       = g_step_active;
     ggml_backend_cuda_context * cuda_ctx = g_step_cuda_ctx;
-    g_step_active   = nullptr;
-    g_step_cuda_ctx = nullptr;
+    g_step_active     = nullptr;
+    g_step_cuda_ctx   = nullptr;
+    g_step_op_capture = false;
 
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &sg->graph));
 
@@ -5229,6 +5326,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     auto & slot = prof.acc[key];
                     slot.first  += ms;
                     slot.second += 1;
+                } else if (g_step_op_capture) {
+                    // [DSV4_STEP_OPPROF] We are inside the whole-step capture: these event records
+                    // become NODES of the graph and get fresh timestamps on every replay. Created
+                    // once, never destroyed (the graph holds them), read back one replay late.
+                    // cudaEventRecordExternal is REQUIRED: an event recorded into a capture with the
+                    // default flags is internal to the graph and cudaEventElapsedTime() on it fails.
+                    // With the External flag the node still executes inside the graph but the event
+                    // stays readable from the host after a replay -- which is the whole point.
+                    cudaStream_t stream = cuda_ctx->stream();
+                    cudaEvent_t  e0 = nullptr, e1 = nullptr;
+                    const bool timed = (cudaEventCreate(&e0) == cudaSuccess) &&
+                                       (cudaEventCreate(&e1) == cudaSuccess);
+                    if (timed) { CUDA_CHECK(cudaEventRecordWithFlags(e0, stream, cudaEventRecordExternal)); }
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                    if (timed) {
+                        CUDA_CHECK(cudaEventRecordWithFlags(e1, stream, cudaEventRecordExternal));
+                        g_step_ops.push_back({ e0, e1, ggml_dsv4_opprof_key(node) });
+                    }
                 } else if (dsv4_opprof::g_prof.enabled && !use_cuda_graph) {
                     // [DSV4_OPPROF] Deferred per-op timing on this node's stream. Gated on
                     // !use_cuda_graph: only PURE-EAGER passes are timed (recording timing events

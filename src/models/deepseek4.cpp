@@ -467,6 +467,17 @@ static ggml_tensor * dsv4_view_state_segment(
     return ggml_view_2d(ctx, state, width, rows, width*state->nb[0], offset*state->nb[0]);
 }
 
+// ggml_cont() on an already-contiguous tensor is a full memcpy kernel that changes nothing.
+// The DSV4 decode graph emits ~400 of them per token (of 527 CONTs total) -- every one a launch,
+// in a step whose whole problem is kernel COUNT, not bytes (measured: halving the bytes of the
+// small ops bought +1.2%, because they are latency-bound). Materialize only when the layout
+// actually needs it. DSV4_KEEP_NOOP_CONT restores the old behaviour for an A/B; it changes the
+// GRAPH, so it must be set on BOTH ranks or SPMD desynchronizes.
+static ggml_tensor * dsv4_cont_if_needed(ggml_context * ctx, ggml_tensor * t) {
+    static const bool keep = getenv("DSV4_KEEP_NOOP_CONT") != nullptr;
+    return (!keep && ggml_is_contiguous(t)) ? t : ggml_cont(ctx, t);
+}
+
 static void dsv4_store_state_segment(
         ggml_context * ctx,
         ggml_cgraph  * gf,
@@ -478,7 +489,7 @@ static void dsv4_store_state_segment(
         int64_t        mem_size   = 0,   // # of recurrent cells (plane stride); only needed if cache_slot>0
         int64_t        cache_slot = 0) { // recurrent rollback snapshot plane (0 = current state)
     const int64_t n = ggml_nelements(src);
-    src = ggml_cont(ctx, src);
+    src = dsv4_cont_if_needed(ctx, src);
     src = ggml_reshape_1d(ctx, src, n);
 
     const int64_t row = cache_slot * mem_size + head;
@@ -600,7 +611,7 @@ static void dsv4_store_cache_rows_idx(
         ggml_tensor  * cache,
         ggml_tensor  * src,
         ggml_tensor  * rows) {
-    src = ggml_cont(ctx, src);
+    src = dsv4_cont_if_needed(ctx, src);
     src = ggml_reshape_2d(ctx, src, cache->ne[0], rows->ne[0]);
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache, src, rows));
 }
@@ -691,7 +702,7 @@ static dsv4_hc_mix dsv4_hc_pre(
         int            sinkhorn_iters,
         float          hc_eps) {
     const int64_t hc_dim = n_embd * n_hc;
-    ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
+    ggml_tensor * flat = dsv4_cont_if_needed(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
     flat = ggml_rms_norm(ctx, flat, norm_eps);
     // [DSV4_HC_BF16] The hyper-connection mixing GEMM (hc_*_fn, [n_embd*n_hc=16384, 24]) is stored
     // F32 in the gguf -> cublasSgemm (CUDA cores, tensor cores idle), ~7.6% of prefill at -ub=2048
@@ -752,7 +763,7 @@ static ggml_tensor * dsv4_hc_head(
         float          hc_eps) {
     const int64_t hc_dim = n_embd * n_hc;
 
-    ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
+    ggml_tensor * flat = dsv4_cont_if_needed(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
     flat = ggml_rms_norm(ctx, flat, norm_eps);
 
     // [DSV4_HC_BF16] same lever as dsv4_hc_pre — BF16 tensor-core the hc mixing GEMM. Default OFF.
@@ -781,7 +792,7 @@ static ggml_tensor * dsv4_grouped_out(
     const int64_t group_heads = n_head / n_groups;
     const int64_t group_dim   = n_embd_head * group_heads;
 
-    o = ggml_cont(ctx, o);
+    o = dsv4_cont_if_needed(ctx, o);
 
     // [dsv4-attn-split] The group routing is the IDENTITY (ids = arange), so the mul_mat_id
     // is mathematically a batched MUL_MAT over the group dim. Under the TP head-split the
