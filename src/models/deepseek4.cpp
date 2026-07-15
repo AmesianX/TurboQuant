@@ -2173,26 +2173,54 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
         cb(qr, "q_lora_norm", il);
 
+        // [DSV4_NORM_ROPE] Fusion 3 (the vLLM recipe's "fused Q norm + KV RoPE + K insert").
+        // The Q path was rms_norm -> rope_tail (2 launches) and the KV path was rms_norm -> mul(w)
+        // -> rope_tail -> fp8_quantize (4 launches). Every one of them is a per-ROW kernel over a
+        // 576-wide row — for KV that is a SINGLE BLOCK, i.e. one of 48 SMs, launched four times, in
+        // all 41 layers. ggml_dsv4_norm_rope does the whole chain in one block-per-row kernel out of
+        // shared memory. Same math, 6 launches -> 2, and no intermediate row ever reaches HBM.
+        // DSV4_NORM_ROPE=0 restores the explicit chain.
+        static const bool norm_rope_fused = []{
+            const char * e = getenv("DSV4_NORM_ROPE"); return e == nullptr || atoi(e) != 0;
+        }();
+
         ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
         q = ggml_reshape_3d(ctx0, q, n_embd_head_k, n_head, n_tokens);
-        q = ggml_rms_norm(ctx0, q, norm_rms_eps);
-        cb(q, "Qnorm", il);
-        q = dsv4_apply_rope_tail(ctx0, q, inp_pos,
-                n_embd_head_k, n_head, n_tokens, n_rot, rope_type,
-                rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
-                rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
-        cb(q, "Qcur", il);
         ggml_tensor * kv = ggml_mul_mat(ctx0, layer.attn_kv, cur);
-        kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
-        kv = ggml_reshape_3d(ctx0, kv, n_embd_head_k, 1, n_tokens);
-        cb(kv, "KVnorm", il);
-        kv = dsv4_apply_rope_tail(ctx0, kv, inp_pos,
-                n_embd_head_k, 1, n_tokens, n_rot, rope_type,
-                rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
-                rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
-        cb(kv, "KVrope", il);
-        kv = ggml_dsv4_fp8_kv_quantize(ctx0, kv, n_rot);
-        cb(kv, "KVcur", il);
+
+        if (norm_rope_fused) {
+            q = ggml_dsv4_norm_rope(ctx0, q, inp_pos, nullptr, norm_rms_eps,
+                    n_rot, rope_type, rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                    rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow,
+                    /*fp8_kv =*/ false);
+            cb(q, "Qcur", il);
+
+            kv = ggml_reshape_3d(ctx0, kv, n_embd_head_k, 1, n_tokens);
+            kv = ggml_dsv4_norm_rope(ctx0, kv, inp_pos, layer.attn_kv_a_norm, norm_rms_eps,
+                    n_rot, rope_type, rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                    rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow,
+                    /*fp8_kv =*/ true);
+            cb(kv, "KVcur", il);
+        } else {
+            q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+            cb(q, "Qnorm", il);
+            q = dsv4_apply_rope_tail(ctx0, q, inp_pos,
+                    n_embd_head_k, n_head, n_tokens, n_rot, rope_type,
+                    rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                    rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
+            cb(q, "Qcur", il);
+
+            kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+            kv = ggml_reshape_3d(ctx0, kv, n_embd_head_k, 1, n_tokens);
+            cb(kv, "KVnorm", il);
+            kv = dsv4_apply_rope_tail(ctx0, kv, inp_pos,
+                    n_embd_head_k, 1, n_tokens, n_rot, rope_type,
+                    rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                    rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
+            cb(kv, "KVrope", il);
+            kv = ggml_dsv4_fp8_kv_quantize(ctx0, kv, n_rot);
+            cb(kv, "KVcur", il);
+        }
 
         const auto * mctx_swa = inp_attn->mctx->get_swa();
         ggml_build_forward_expand(gf, q);

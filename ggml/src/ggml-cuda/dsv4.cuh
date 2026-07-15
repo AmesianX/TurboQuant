@@ -22,3 +22,5 @@ bool ggml_cuda_op_dsv4_hc_split_sinkhorn_ws_fused(ggml_backend_cuda_context & ct
 // Fused DSA lightning-indexer logits (mul_mat+relu+mul+cont+sum_rows fused into one kernel).
 bool ggml_cuda_op_dsv4_indexer_logits(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_op_dsv4_indexer_logits_supported(const ggml_tensor * dst);
+bool ggml_cuda_op_dsv4_norm_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+bool ggml_cuda_op_dsv4_norm_rope_supported(const ggml_tensor * dst);

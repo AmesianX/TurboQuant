@@ -153,6 +153,7 @@ env_common() {
     [ -n "${GGML_CUDA_NO_GRAPHS:-}" ] && export GGML_CUDA_NO_GRAPHS
     [ -n "${DSV4_INDEXER_NO_WMMA:-}" ] && export DSV4_INDEXER_NO_WMMA
     [ -n "${DSV4_LM_HEAD_F8:-}" ]      && export DSV4_LM_HEAD_F8
+    for _v in $(env | grep -oE '^(DSV4|GGML_CUDA)_[A-Z0-9_]+'); do export "$_v"; done
     export DSV4_GPU_SAMPLER="${DSV4_GPU_SAMPLER:-1}"
     export DSV4_GPU_INPUT_EMBD="${DSV4_GPU_INPUT_EMBD:-1}"
     # NVFP4 grouped-MoE op + sidecar weights + HP-activation threshold. Both ranks (SPMD)
@@ -317,6 +318,10 @@ case "${1:-}" in
         [ -n "${GGML_CUDA_NO_GRAPHS:-}" ] && FWD="$FWD GGML_CUDA_NO_GRAPHS=$GGML_CUDA_NO_GRAPHS"
         [ -n "${DSV4_INDEXER_NO_WMMA:-}" ] && FWD="$FWD DSV4_INDEXER_NO_WMMA=$DSV4_INDEXER_NO_WMMA"
         [ -n "${DSV4_LM_HEAD_F8:-}" ]      && FWD="$FWD DSV4_LM_HEAD_F8=$DSV4_LM_HEAD_F8"
+        # [sweep] forward EVERY DSV4_*/GGML_CUDA_* var in this env — SPMD needs identical graphs.
+        for _v in $(env | grep -oE '^(DSV4|GGML_CUDA)_[A-Z0-9_]+' ); do
+            eval "_val=\$$_v"; FWD="$FWD $_v=$_val"
+        done
         # Both ranks MUST use the same rail set or the NCCL bootstrap mismatches.
         [ -n "${NCCL_IB_HCA:-}" ]         && FWD="$FWD NCCL_IB_HCA=$NCCL_IB_HCA"
         [ -n "${NCCL_DEBUG:-}" ]          && FWD="$FWD NCCL_DEBUG=$NCCL_DEBUG"

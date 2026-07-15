@@ -3437,6 +3437,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_MOE_FUSED:
             ggml_cuda_op_dsv4_moe_fused(ctx, dst);
             break;
+        case GGML_OP_DSV4_NORM_ROPE:
+            ggml_cuda_op_dsv4_norm_rope(ctx, dst);
+            break;
         case GGML_OP_DSV4_INDEXER_LOGITS:
             ggml_cuda_op_dsv4_indexer_logits(ctx, dst);
             break;
@@ -6503,6 +6506,8 @@ static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, co
             return ggml_cuda_op_dsv4_moe_grouped_supported();
         case GGML_OP_DSV4_MOE_FUSED:
             return ggml_cuda_op_dsv4_moe_fused_supported();
+        case GGML_OP_DSV4_NORM_ROPE:
+            return ggml_cuda_op_dsv4_norm_rope_supported(op);
         case GGML_OP_DSV4_INDEXER_LOGITS:
             return ggml_cuda_op_dsv4_indexer_logits_supported(op);
 

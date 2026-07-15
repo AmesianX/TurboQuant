@@ -363,6 +363,142 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
     }
 }
 
+// ============================================================================
+// [Fusion 3] DSV4_NORM_ROPE — RMS-norm [* w] -> RoPE tail -> optional FP8 round.
+//
+// The Q/KV preparation used to be five separate launches per layer per token
+//   (rms_norm, rope_tail) for Q and (rms_norm, mul w, rope_tail, fp8_quantize) for KV
+// each of which is a per-ROW kernel over a 576-wide row: for KV that is ONE BLOCK, i.e. one of the
+// 48 SMs, for a few microseconds, five times, 41 layers deep. The three stages touch the same row
+// and DISJOINT slices of it (RoPE only the trailing n_dims, the FP8 round only the leading nope
+// region), so one block-per-row kernel does all of them out of shared memory and the intermediates
+// never see HBM.
+// ============================================================================
+
+#define DSV4_NR_NT 64   // threads/block — matches the FP8 chunk width (see the amax reduction)
+
+struct ggml_cuda_kargs_dsv4_norm_rope {
+    int64_t  ne00, ne01, ne02, ne03;
+    uint64_t nb00, nb01, nb02, nb03;
+    uint64_t nb0,  nb1,  nb2,  nb3;
+    int32_t  n_dims, mode, n_ctx_orig, fp8_kv;
+    float    eps, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    bool     has_w;
+};
+
+static __global__ void kernel_dsv4_norm_rope_f32(
+        const ggml_cuda_kargs_dsv4_norm_rope args,
+        const char * __restrict__ src0,
+        const char * __restrict__ src1,   // pos, I32
+        const char * __restrict__ src2,   // norm weight, F32 [ne00] (may be null)
+        char * __restrict__ dst) {
+    extern __shared__ float row[];
+    __shared__ float red[DSV4_NR_NT];
+
+    const int64_t n_rows = args.ne01 * args.ne02 * args.ne03;
+    const int     rid    = blockIdx.x;
+    if ((int64_t) rid >= n_rows) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+    const int ne0 = (int) args.ne00;
+
+    const int64_t i1 = rid % args.ne01;
+    const int64_t i2 = (rid / args.ne01) % args.ne02;
+    const int64_t i3 = rid / (args.ne01 * args.ne02);
+
+    const char * sb = src0 + i1*args.nb01 + i2*args.nb02 + i3*args.nb03;
+    char       * db = dst  + i1*args.nb1  + i2*args.nb2  + i3*args.nb3;
+
+    // ---- 1) load the row into shared memory + sum of squares -----------------
+    float ss = 0.0f;
+    for (int i = tid; i < ne0; i += DSV4_NR_NT) {
+        const float v = *((const float *) (sb + i*args.nb00));
+        row[i] = v;
+        ss += v*v;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int s = DSV4_NR_NT/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        __syncthreads();
+    }
+    const float nscale = rsqrtf(red[0] / (float) ne0 + args.eps);
+    __syncthreads();
+
+    // ---- 2) RMS scale (+ the per-dim norm weight, when there is one) ---------
+    const float * w = args.has_w ? (const float *) src2 : nullptr;
+    for (int i = tid; i < ne0; i += DSV4_NR_NT) {
+        row[i] = row[i] * nscale * (w ? w[i] : 1.0f);
+    }
+    __syncthreads();
+
+    // ---- 3) RoPE the trailing n_dims ----------------------------------------
+    const int n_nope = ne0 - args.n_dims;
+    if (n_nope >= 0) {
+        const int32_t * pos = (const int32_t *) src1;
+
+        float corr_dims[2];
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+
+        const float theta_base = (float) pos[i2];
+        const float inv_ndims  = -1.0f / args.n_dims;
+        const int   n_half     = args.n_dims / 2;
+        const bool  is_neox    = args.mode == 2;
+
+        for (int ic = tid; ic < n_half; ic += DSV4_NR_NT) {
+            // neox pairs (ic, ic + n_half); normal pairs (2*ic, 2*ic + 1)
+            const int rel_i0 = is_neox ? 2*ic : 2*ic;
+            const int j0     = is_neox ? n_nope + ic          : n_nope + 2*ic;
+            const int j1     = is_neox ? n_nope + ic + n_half : n_nope + 2*ic + 1;
+
+            const float theta = theta_base * powf(args.freq_base, inv_ndims * rel_i0);
+
+            float ct, st;
+            rope_yarn(theta, args.freq_scale, corr_dims, rel_i0, args.ext_factor, args.attn_factor, &ct, &st);
+
+            const float x0 = row[j0];
+            const float x1 = row[j1];
+            row[j0] = x0*ct - x1*st;
+            row[j1] = x0*st + x1*ct;
+        }
+        __syncthreads();
+    }
+
+    // ---- 4) optional FP8-E4M3 round of the NOPE region, 64-wide chunks -------
+    // (byte-identical to kernel_dsv4_fp8_kv_quantize: per-chunk amax -> power-of-two scale)
+    if (args.fp8_kv) {
+        for (int off = 0; off < n_nope; off += DSV4_NR_NT) {
+            const bool  ok = off + tid < n_nope;
+            const float v  = ok ? row[off + tid] : 0.0f;
+
+            red[tid] = ok ? fabsf(v) : 0.0f;
+            __syncthreads();
+            for (uint32_t s = 32; s > 0; s >>= 1) {
+                if (tid < (int) s) {
+                    red[tid] = fmaxf(red[tid], red[tid + s]);
+                }
+                __syncthreads();
+            }
+
+            const float amax  = fmaxf(red[0], 1.0e-4f);
+            const float qscale = exp2f(ceilf(log2f(amax / 448.0f)));
+            if (ok) {
+                row[off + tid] = dsv4_e4m3fn_dequant(fminf(fmaxf(v / qscale, -448.0f), 448.0f)) * qscale;
+            }
+            __syncthreads();
+        }
+    }
+
+    // ---- 5) store -----------------------------------------------------------
+    for (int i = tid; i < ne0; i += DSV4_NR_NT) {
+        *((float *) (db + i*args.nb0)) = row[i];
+    }
+}
+
 static __global__ void kernel_dsv4_rope_tail_f32(
         const ggml_cuda_kargs_dsv4_rope_tail args,
         const char * src0,
@@ -1068,6 +1204,65 @@ bool ggml_cuda_op_dsv4_indexer_logits(ggml_backend_cuda_context & ctx, ggml_tens
     else if (kf16 && !qf16) launch(half{},  float{});
     else if (!kf16 && qf16) launch(float{}, half{});
     else                    launch(float{}, float{});
+
+    return true;
+}
+
+// [Fusion 3] see kernel_dsv4_norm_rope_f32
+bool ggml_cuda_op_dsv4_norm_rope_supported(const ggml_tensor * dst) {
+    const ggml_tensor * a   = dst->src[0];
+    const ggml_tensor * pos = dst->src[1];
+    const ggml_tensor * w   = dst->src[2];
+    if (!a || !pos) return false;
+    if (a->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (pos->type != GGML_TYPE_I32) return false;
+    if (w && w->type != GGML_TYPE_F32) return false;   // AUX_BF16 could retype a norm weight
+    // the row lives in shared memory for the whole kernel
+    if (a->ne[0] <= 0 || a->ne[0] > 8192) return false;
+    return true;
+}
+
+bool ggml_cuda_op_dsv4_norm_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * a   = dst->src[0];
+    const ggml_tensor * pos = dst->src[1];
+    const ggml_tensor * w   = dst->src[2];
+
+    GGML_ASSERT(a->type   == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(pos->type == GGML_TYPE_I32);
+
+    const int32_t * p = (const int32_t *) dst->op_params;
+
+    ggml_cuda_kargs_dsv4_norm_rope args = {};
+    args.ne00 = a->ne[0]; args.ne01 = a->ne[1]; args.ne02 = a->ne[2]; args.ne03 = a->ne[3];
+    args.nb00 = a->nb[0]; args.nb01 = a->nb[1]; args.nb02 = a->nb[2]; args.nb03 = a->nb[3];
+    args.nb0  = dst->nb[0]; args.nb1 = dst->nb[1]; args.nb2 = dst->nb[2]; args.nb3 = dst->nb[3];
+    args.n_dims     = p[0];
+    args.mode       = p[1];
+    args.n_ctx_orig = p[2];
+    args.fp8_kv     = p[3];
+    memcpy(&args.eps,         p +  4, sizeof(float));
+    memcpy(&args.freq_base,   p +  5, sizeof(float));
+    memcpy(&args.freq_scale,  p +  6, sizeof(float));
+    memcpy(&args.ext_factor,  p +  7, sizeof(float));
+    memcpy(&args.attn_factor, p +  8, sizeof(float));
+    memcpy(&args.beta_fast,   p +  9, sizeof(float));
+    memcpy(&args.beta_slow,   p + 10, sizeof(float));
+    args.has_w = (w != nullptr);
+
+    const int64_t n_rows = args.ne01 * args.ne02 * args.ne03;
+    if (n_rows == 0) {
+        return true;
+    }
+
+    const size_t smem = (size_t) args.ne00 * sizeof(float);
+
+    kernel_dsv4_norm_rope_f32<<<(unsigned) n_rows, DSV4_NR_NT, smem, ctx.stream()>>>(
+        args,
+        (const char *) a->data,
+        (const char *) pos->data,
+        w ? (const char *) w->data : nullptr,
+        (char *) dst->data);
 
     return true;
 }

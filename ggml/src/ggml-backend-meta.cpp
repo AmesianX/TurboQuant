@@ -1126,10 +1126,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
             } break;
-            case GGML_OP_DSV4_ROPE_TAIL: {
+            case GGML_OP_DSV4_ROPE_TAIL:
+            case GGML_OP_DSV4_NORM_ROPE: {
                 // [dsv4-attn-split] rope-like: src0 = x (may be head-split), src1 = positions
                 // (always MIRRORED, no split semantics -> must not vote in handle_generic).
                 // Rotation is per-head within ne[0], so the state is exactly src0's.
+                // NORM_ROPE additionally takes src2 = the norm weight, which is a per-ne[0] vector —
+                // MIRRORED like the positions, and likewise must not vote. handle_rope covers it:
+                // the RMS reduction is within a row (ne[0]), which head-splitting never cuts.
                 split_state = handle_rope(src_ss);
             } break;
             case GGML_OP_DSV4_HC_SPLIT_SINKHORN:

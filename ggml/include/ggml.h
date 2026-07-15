@@ -600,6 +600,7 @@ extern "C" {
         GGML_OP_DSV4_MOE_GROUPED,
         GGML_OP_DSV4_MOE_FUSED,
         GGML_OP_DSV4_INDEXER_LOGITS,
+        GGML_OP_DSV4_NORM_ROPE,
 
         GGML_OP_UNARY,
 
@@ -2694,6 +2695,35 @@ extern "C" {
             struct ggml_tensor  * k,
             struct ggml_tensor  * q,
             struct ggml_tensor  * weights);
+
+    // ggml_dsv4_norm_rope  — [Fusion 3] one kernel for the whole Q/KV preparation:
+    //
+    //     RMS-norm(a) [* norm_w]  ->  RoPE on the trailing n_dims  ->  optional FP8-E4M3 round
+    //
+    // The three stages touch the SAME row and DISJOINT parts of it (RoPE only the last n_dims,
+    // the FP8 round only the leading nope region), so a single block-per-row kernel does all of
+    // them out of shared memory. Replaces rms_norm + dsv4_rope_tail [+ dsv4_fp8_kv_quantize]:
+    // 5 kernels per layer per token become 2, and the intermediate rows never round-trip to HBM.
+    //   a:      [head_dim, n_head, n_tokens] F32
+    //   pos:    [n_tokens] I32
+    //   norm_w: [head_dim] F32 or NULL (NULL = plain RMS norm, as the Q path uses)
+    // Gated by DSV4_NORM_ROPE at the call site.
+    GGML_API struct ggml_tensor * ggml_dsv4_norm_rope(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * pos,
+            struct ggml_tensor  * norm_w,
+            float                 eps,
+            int                   n_dims,
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow,
+            bool                  fp8_kv);
 
     // custom operators
 

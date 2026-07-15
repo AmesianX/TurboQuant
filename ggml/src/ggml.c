@@ -1219,6 +1219,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_MOE_GROUPED",
     "DSV4_MOE_FUSED",
     "DSV4_INDEXER_LOGITS",
+    "DSV4_NORM_ROPE",
 
     "UNARY",
 
@@ -1236,7 +1237,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1337,6 +1338,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_moe_grouped(h,sel,w)",
     "dsv4_moe_fused(h,sel,w)",
     "dsv4_indexer_logits(k,q,w)",
+    "dsv4_norm_rope(x)",
 
     "unary(x)",
 
@@ -1354,7 +1356,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6706,6 +6708,55 @@ struct ggml_tensor * ggml_dsv4_indexer_logits(
     result->src[0] = k;
     result->src[1] = q;
     result->src[2] = weights;
+
+    return result;
+}
+
+// ggml_dsv4_norm_rope — [Fusion 3] RMS-norm [* w] -> RoPE tail -> optional FP8 round, one kernel.
+
+struct ggml_tensor * ggml_dsv4_norm_rope(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pos,
+        struct ggml_tensor  * norm_w,
+        float                 eps,
+        int                   n_dims,
+        int                   mode,
+        int                   n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        bool                  fp8_kv) {
+    GGML_ASSERT(a->type   == GGML_TYPE_F32);
+    GGML_ASSERT(pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_vector(pos));
+    GGML_ASSERT(a->ne[2] == pos->ne[0]);
+    GGML_ASSERT(n_dims > 0 && n_dims <= a->ne[0] && n_dims % 2 == 0);
+
+    if (norm_w) {
+        GGML_ASSERT(norm_w->type == GGML_TYPE_F32);
+        GGML_ASSERT(norm_w->ne[0] == a->ne[0]);
+    }
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    int32_t params[16] = { n_dims, mode, n_ctx_orig, fp8_kv ? 1 : 0 };
+    memcpy(params +  4, &eps,         sizeof(float));
+    memcpy(params +  5, &freq_base,   sizeof(float));
+    memcpy(params +  6, &freq_scale,  sizeof(float));
+    memcpy(params +  7, &ext_factor,  sizeof(float));
+    memcpy(params +  8, &attn_factor, sizeof(float));
+    memcpy(params +  9, &beta_fast,   sizeof(float));
+    memcpy(params + 10, &beta_slow,   sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DSV4_NORM_ROPE;
+    result->src[0] = a;
+    result->src[1] = pos;
+    result->src[2] = norm_w;
 
     return result;
 }
