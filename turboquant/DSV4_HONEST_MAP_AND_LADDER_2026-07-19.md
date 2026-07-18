@@ -81,6 +81,32 @@ covered by ATTN_SPLIT — the -25.8ms measured. Remaining candidates, in value o
 NEXT MEASUREMENT: re-run the ladder winner with DSV4_STEP_OPPROF=1 to get the post-split
 per-op table (the ATTN_SPLIT/SHEXP runs were STEP_TIME-only).
 
+## 3b. Two diagnostics settled (2026-07-19 PM)
+
+**MTP is a net LOSS on the split ladder** (not a STEP_GRAPH interaction):
+plain 16.41 vs MTP+SG 13.67 vs MTP no-SG 13.91. Both MTP configs lose. On this now-fast
+plain config the draft+verify overhead exceeds the acceptance payoff (τ ~1.2-1.3 class from
+Q4 history). MTP only pays when plain is slow; the split ladder made plain fast enough that
+n_max=2 MTP is underwater. Lever for 50+ is DEEPER draft (vLLM MAC=12-class), not n_max=2 —
+and that needs the draft/verify graph-reuse to hold across a wider verify batch.
+
+**Decode MoE GEVM is at the scalar-FFMA compute floor, NOT bandwidth** (bench:
+turboquant/dsv4_dec_gevm_bench.cu, 7 controlled variants):
+| variant | GB/s-equiv | note |
+|---|---|---|
+| V0 current vec16 | 73.6 | shipping kernel |
+| V2 no-ALU raw uint4 sum | 246 | pure weight-stream bandwidth CEILING |
+| V3 2x uint4 ILP | 73.1 | no gain — not latency/ILP bound |
+| V4 bit-trick half2 | 37.6 | SLOWER — __hfma2 half-rate on GB10 |
+| V5 4-way accumulator | 73.9 | no gain — not accumulator-chain bound |
+| V6 e2m1 LUT (shared) | 35.4 | SLOWER — LDS latency > the ALU it saves |
+The 3.3x gap (73.6 vs 246) is pure instruction throughput: per-nibble dequant + FFMA is
+~50 instr / 32 weight bytes vs V2's ~8. No scalar trick closes it (all tried, all fail or
+regress). The ONLY structural fix is the tensor-core MMA path (the W4A16 GEMM the port built)
+— but at M=1 decode the m16n8k16 MMA wastes 15/16 rows, so the win is bounded. This is the
+same physics that caps vLLM/b12x decode at ~40. => MoE GEVM 15.77ms is largely IRREDUCIBLE at
+M=1; do NOT spend more here. Reallocate to the collectives bucket.
+
 ## 4. Arithmetic to target
 
 15.9 t/s = 62.9ms. Ladder projections (honest, each needs measurement):
