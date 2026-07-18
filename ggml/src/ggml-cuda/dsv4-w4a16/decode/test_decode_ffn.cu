@@ -69,13 +69,13 @@ __global__ void decode_ffn(const uint8_t* Wup, const uint8_t* Wgate, const uint8
     }
 }
 
-int main(){
+static int run_ffn_case(float xscale, float denfloor, float reltol, const char * name){
     // host data
     static uint8_t hWup[E*I*(H/2)], hWgate[E*I*(H/2)], hWdown[E*H*(I/2)];
     for(int i=0;i<(int)sizeof hWup;i++)  hWup[i]  =(uint8_t)((i*5+1)&0xFF);
     for(int i=0;i<(int)sizeof hWgate;i++)hWgate[i]=(uint8_t)((i*7+3)&0xFF);
     for(int i=0;i<(int)sizeof hWdown;i++)hWdown[i]=(uint8_t)((i*3+2)&0xFF);
-    float x[H]; for(int i=0;i<H;i++) x[i]=0.5f*(((i%5)-2));  // small f16-exact-ish
+    float x[H]; for(int i=0;i<H;i++) x[i]=0.5f*(((i%5)-2))*xscale;  // f16-exact (xscale = power of 2)
     uint32_t xh[H/2]; for(int i=0;i<H/2;i++){ __half l=__float2half(x[2*i]),h=__float2half(x[2*i+1]);
         uint16_t a=*(uint16_t*)&l,b=*(uint16_t*)&h; xh[i]=((uint32_t)b<<16)|a; }
     float rw[E]={0.6f,0.4f};
@@ -106,10 +106,22 @@ int main(){
     decode_ffn<<<1,H>>>(dU,dG,dD,dx,drw,dout);
     float got[H]; cudaMemcpy(got,dout,H*4,cudaMemcpyDeviceToHost);
     cudaError_t e=cudaDeviceSynchronize();
+    cudaFree(dU); cudaFree(dG); cudaFree(dD); cudaFree(dx); cudaFree(drw); cudaFree(dout);
     int fails=0; float maxrel=0;
-    for(int hh=0;hh<H;hh++){ float r=fabsf(got[hh]-ref[hh])/(fabsf(ref[hh])+1e-3f); maxrel=fmaxf(maxrel,r);
-        if(r>2e-2f){ if(fails<5) printf("  MISS[%d] got=%.4f ref=%.4f\n",hh,got[hh],ref[hh]); fails++; } }
-    printf("decode FFN (FC1->SwiGLU->FC2): %s | %d/%d pass | maxrel=%.4f\n",
-           cudaGetErrorString(e), H-fails, H, maxrel);
+    for(int hh=0;hh<H;hh++){ float r=fabsf(got[hh]-ref[hh])/(fabsf(ref[hh])+denfloor); maxrel=fmaxf(maxrel,r);
+        if(r>reltol){ if(fails<5) printf("  MISS[%d] got=%.6g ref=%.6g\n",hh,got[hh],ref[hh]); fails++; } }
+    printf("decode FFN %-10s (FC1->SwiGLU->FC2): %s | %d/%d pass | maxrel=%.4f\n",
+           name, cudaGetErrorString(e), H-fails, H, maxrel);
+    return fails?1:0;
+}
+
+int main(){
+    int fails = 0;
+    // Case 1: O(1) activations (the original gate).
+    fails += run_ffn_case(1.0f, 1e-3f, 2e-2f, "O(1)");
+    // Case 2: x scaled by 2^-12 -> SwiGLU outputs ~1e-3 feed FC2, whose prescaled products sit
+    // at the fp16 subnormal floor. Catches any regression to an f16 accumulation chain, which
+    // flushed/quantized exactly this regime. Denominator floor scaled down so the check has teeth.
+    fails += run_ffn_case(0.000244140625f, 1e-5f, 2e-2f, "2^-12");
     return fails?1:0;
 }

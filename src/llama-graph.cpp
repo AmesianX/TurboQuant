@@ -1702,6 +1702,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
+    // [dsv4-sidecar] The loader SKIPS ffn_*_exps for layers listed in the sidecar header
+    // (TENSOR_SKIP replaced the old required flag) on the assumption that the NVFP4 registry
+    // serves those layers via the grouped/fused ops above. If the header-derived skip set and
+    // the runtime registry ever diverge (rank-keying mismatch, missing registration), this
+    // fall-through would hand a NULL tensor to mul_mat_id and segfault mid-graph-build; the
+    // old required flag failed at LOAD with a clean message. Restore that contract here.
+    if (arch == LLM_ARCH_DEEPSEEK4 && (up_exps == nullptr || down_exps == nullptr)) {
+        GGML_ABORT("DSV4 MoE layer %d: ffn_*_exps skipped at load (sidecar header) but the "
+                   "grouped/fused path did not claim the layer (dsv4_moe_grouped_have_layer=%d) "
+                   "-- sidecar header vs runtime registry divergence (check DSV4_MOE_SIDECAR "
+                   "rank files against this rank)", il, dsv4_moe_grouped_have_layer(il) ? 1 : 0);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {

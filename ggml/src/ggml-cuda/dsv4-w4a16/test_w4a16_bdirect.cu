@@ -87,7 +87,7 @@ int main(){
     const int SBYTE=129;
     static __nv_bfloat16 hA[M*K]; static uint8_t hBc[K*N];
     for(int i=0;i<M*K;i++) hA[i]=__float2bfloat16((float)((i%5)-2));
-    for(int i=0;i<K*N;i++) hBc[i]=(uint8_t)(((i*7)%7)+(i%15));
+    for(int i=0;i<K*N;i++) hBc[i]=(uint8_t)((i*37+11)&0xFF); // all 256 nibble pairs -> every e2m1 code incl. 15 (-6)
     float scale=ldexpf(1.f,SBYTE-127);
     __nv_bfloat16* dA; uint8_t* dBc; float* dD;
     cudaMalloc(&dA,sizeof hA); cudaMalloc(&dBc,sizeof hBc); cudaMalloc(&dD,(size_t)M*N*sizeof(float));

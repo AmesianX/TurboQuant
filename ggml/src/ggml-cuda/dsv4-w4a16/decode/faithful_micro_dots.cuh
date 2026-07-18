@@ -10,6 +10,13 @@
 // e2m1 bit-trick emits a PRE-SCALE fp16 (FP4 * 2^-14, exp bias deferred) exactly like the GEMM
 // path (which folds the constant into the block/global scale). The dot returns true_dot * 2^-14;
 // the caller folds 2^14 into the per-expert scale (as b12x folds its GEMM 2^119).
+//
+// ACCUMULATION IS FP32, NOT the b12x f16 fma chain. At 2^-14 prescale a product of a prescaled
+// weight and an O(1e-3) activation sits at ~2^-24 -- the very bottom of fp16's subnormal range --
+// so an f16 chain quantizes it to 1-3 significand bits or flushes it to zero. That is safe only
+// at TRUE scale (b12x's cvt.rn.f16x2.e2m1x2 decode) or with bf16's 8-bit exponent (the GEMM
+// path). Decoding at prescale forces the accumulator up to fp32; the GEVM is bandwidth-bound
+// (~125 GB/s vs 17 TFLOP/s idle ALU), so the extra FFMA lanes are free.
 #pragma once
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -33,15 +40,17 @@ __device__ __forceinline__ float fp4_dot8_sum_prescale(
     const uint32_t xs[8] = {x0,x1,x2,x3,x4,x5,x6,x7};
     const uint32_t us[8] = {u_a & 0xFFu, (u_a>>8)&0xFFu, (u_a>>16)&0xFFu, (u_a>>24)&0xFFu,
                             u_b & 0xFFu, (u_b>>8)&0xFFu, (u_b>>16)&0xFFu, (u_b>>24)&0xFFu};
-    __half2 acc = __floats2half2_rn(0.f, 0.f);
+    float acc_lo = 0.f, acc_hi = 0.f;   // fp32: prescaled products underflow an f16 chain
     #pragma unroll
     for (int i = 0; i < 8; i++) {
         uint32_t hbits = e2m1_byte_to_f16x2_prescale(us[i]);
         __half2 h = *reinterpret_cast<__half2*>(&hbits);
-        __half2 x = *reinterpret_cast<const __half2*>(&xs[i]);
-        acc = __hfma2(h, x, acc);
+        float2 hf = __half22float2(h);   // exact: prescaled fp16 values are representable
+        float2 xf = __half22float2(*reinterpret_cast<const __half2*>(&xs[i]));
+        acc_lo = fmaf(hf.x, xf.x, acc_lo);
+        acc_hi = fmaf(hf.y, xf.y, acc_hi);
     }
-    return __low2float(acc) + __high2float(acc);   // lo + hi -> f32 (b12x reduce)
+    return acc_lo + acc_hi;   // lo + hi reduce (b12x shape, fp32 chain)
 }
 
 // b12x fp4_dot4_sum (FC2 8-elem dot): u = 4 FP4 bytes (8 codes); x0..x3 = 4 f16x2 (8 acts).
@@ -50,15 +59,17 @@ __device__ __forceinline__ float fp4_dot4_sum_prescale(
         uint32_t u, uint32_t x0, uint32_t x1, uint32_t x2, uint32_t x3) {
     const uint32_t xs[4] = {x0,x1,x2,x3};
     const uint32_t us[4] = {u & 0xFFu, (u>>8)&0xFFu, (u>>16)&0xFFu, (u>>24)&0xFFu};
-    __half2 acc = __floats2half2_rn(0.f, 0.f);
+    float acc_lo = 0.f, acc_hi = 0.f;   // fp32: see fp4_dot8_sum_prescale
     #pragma unroll
     for (int i = 0; i < 4; i++) {
         uint32_t hb = e2m1_byte_to_f16x2_prescale(us[i]);
         __half2 h = *reinterpret_cast<__half2*>(&hb);
-        __half2 x = *reinterpret_cast<const __half2*>(&xs[i]);
-        acc = __hfma2(h, x, acc);
+        float2 hf = __half22float2(h);
+        float2 xf = __half22float2(*reinterpret_cast<const __half2*>(&xs[i]));
+        acc_lo = fmaf(hf.x, xf.x, acc_lo);
+        acc_hi = fmaf(hf.y, xf.y, acc_hi);
     }
-    return __low2float(acc) + __high2float(acc);
+    return acc_lo + acc_hi;
 }
 
 // b12x fp4_dot8_dual_sum: fused up+gate, shared activations, 2 accumulator chains.

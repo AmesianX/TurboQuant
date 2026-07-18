@@ -165,8 +165,13 @@ namespace dsv4_opprof {
         // Drain any pending event pairs whose stop event has completed (lazy, non-blocking).
         void drain_locked(bool force) {
             // Everything accumulated so far is warmup (cold kernels, prompt prefill) -- drop it.
+            // Including the in-flight pairs: they were RECORDED before the threshold, so letting
+            // them drain after the clear would put the cold first-launch outliers (the 237 ms
+            // hc_attn_fn class this skip exists to remove) right back into the "warm" table.
             if (skip > 0 && !skipped && seen >= skip) {
                 acc.clear();
+                for (entry & en : pending) { cudaEventDestroy(en.e0); cudaEventDestroy(en.e1); }
+                pending.clear();
                 skipped = true;
                 fprintf(stderr, "[DSV4_OPPROF] warmup discarded at %lld ops; profiling the warm step from here\n",
                         (long long) seen);
@@ -1348,9 +1353,20 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
                 const bool capturing = (cap == cudaStreamCaptureStatusActive);
                 if (s_cap < ne && !capturing) {
                     if (s_bf16) cudaFree(s_bf16);
-                    if (cudaMalloc(&s_bf16, (size_t) ne * sizeof(nv_bfloat16)) == cudaSuccess) {
-                        s_cap = ne;
-                    } else { s_bf16 = nullptr; s_cap = 0; }
+                    if (cudaMalloc(&s_bf16, (size_t) ne * sizeof(nv_bfloat16)) != cudaSuccess) {
+                        // NO silent per-rank fallback: the BF16-vs-F32 path choice must be identical
+                        // on both SPMD ranks (same collective dtype + byte count). The peer's malloc
+                        // may have succeeded -- falling back only here would issue mismatched
+                        // ncclAllReduce calls and hang/corrupt the 2-node job. The capture-time
+                        // fall-through below is safe ONLY because both ranks run lockstep with
+                        // identical scratch-growth history; a malloc failure is the one event that
+                        // breaks that symmetry, so fail loudly instead.
+                        GGML_ABORT("DSV4_TP_REDUCE_BF16: bf16 scratch cudaMalloc(%lld B) failed -- "
+                                   "aborting instead of desyncing the SPMD peer (disable "
+                                   "DSV4_TP_REDUCE_BF16 or free VRAM)",
+                                   (long long) (ne * (int64_t) sizeof(nv_bfloat16)));
+                    }
+                    s_cap = ne;
                 }
                 if (s_bf16 && s_cap >= ne) {
                     to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
@@ -3901,7 +3917,8 @@ struct ggml_cuda_step_op {
     cudaEvent_t e0, e1;
     std::string key;
 };
-static std::vector<ggml_cuda_step_op>                     g_step_ops;        // captured, never destroyed
+static std::vector<ggml_cuda_step_op>                     g_step_ops;        // owned by g_step_op_owner's graph
+static ggml_cuda_step_graph *                             g_step_op_owner   = nullptr;
 static bool                                               g_step_op_capture = false;
 static std::map<std::string, std::pair<double, int64_t>>  g_step_op_acc;
 static int64_t                                            g_step_op_replays = 0;
@@ -4011,6 +4028,17 @@ static void ggml_cuda_step_graph_reset(ggml_cuda_step_graph * sg) {
         sg->graph = nullptr;
     }
     sg->stable = 0;
+    // If this slot's graph held the STEP_OPPROF event nodes, the events' timestamps can never be
+    // refreshed again -- drop them so the next capture re-instruments instead of re-accumulating
+    // the last recorded constants on every subsequent replay.
+    if (sg == g_step_op_owner) {
+        for (auto & en : g_step_ops) {
+            cudaEventDestroy(en.e0);
+            cudaEventDestroy(en.e1);
+        }
+        g_step_ops.clear();
+        g_step_op_owner = nullptr;
+    }
 }
 
 static int ggml_backend_cuda_step_graph_begin(void * comm_ctx_v, ggml_cgraph ** cgraphs, size_t n_cgraphs) {
@@ -4075,7 +4103,9 @@ static int ggml_backend_cuda_step_graph_begin(void * comm_ctx_v, ggml_cgraph ** 
     if (sg->instance != nullptr) {
         // Read the PREVIOUS replay's per-op events (finished long ago -- no stall, no illegal query).
         static const bool step_opprof = getenv("DSV4_STEP_OPPROF") != nullptr;
-        if (step_opprof && !g_step_ops.empty()) {
+        // Only replays of the slot whose graph actually CONTAINS the event nodes refresh the
+        // timestamps; replays of any other slot would re-read the previous values as-is.
+        if (step_opprof && !g_step_ops.empty() && sg == g_step_op_owner) {
             if (g_step_op_replays > 0) {
                 for (const auto & en : g_step_ops) {
                     float ms = 0.0f;
@@ -4135,6 +4165,7 @@ static int ggml_backend_cuda_step_graph_begin(void * comm_ctx_v, ggml_cgraph ** 
     // Record the per-op event pairs INTO the graph while we capture it (see DSV4_STEP_OPPROF).
     if (getenv("DSV4_STEP_OPPROF") != nullptr && g_step_ops.empty()) {
         g_step_op_capture = true;
+        g_step_op_owner   = sg;   // the slot being captured owns the event nodes from here on
     }
 
     g_step_active   = sg;
@@ -5367,7 +5398,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         CUDA_CHECK(cudaEventRecordWithFlags(e1, stream, cudaEventRecordExternal));
                         g_step_ops.push_back({ e0, e1, ggml_dsv4_opprof_key(node) });
                     }
-                } else if (dsv4_opprof::g_prof.enabled && !use_cuda_graph) {
+                } else if (dsv4_opprof::g_prof.enabled && !use_cuda_graph && g_step_active == nullptr) {
+                    // (g_step_active check: a whole-step capture also forces use_cuda_graph=false,
+                    // and plain event pairs recorded mid-capture can never be queried -- they would
+                    // only leak into pending. STEP_OPPROF above is the in-capture instrumentation.)
                     // [DSV4_OPPROF] Deferred per-op timing on this node's stream. Gated on
                     // !use_cuda_graph: only PURE-EAGER passes are timed (recording timing events
                     // while the stream is mid-capture is illegal). The heavy DSV4 ops (fused/grouped

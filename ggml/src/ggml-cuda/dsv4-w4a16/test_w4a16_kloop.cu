@@ -68,7 +68,7 @@ int main() {
     for (int m = 0; m < 16; m++) for (int k = 0; k < KDIM; k++)
         hA[m*KDIM+k] = __float2bfloat16((float)(((m + 2*k) % 5) - 2));
     for (int k = 0; k < KDIM; k++) for (int n = 0; n < 8; n++)
-        hBc[k*8+n] = (uint8_t)(((k*3 + n) % 7) + ((k+n) & 8));
+        hBc[k*8+n] = (uint8_t)((k*5 + n*3 + 1) & 0xF); // all 16 e2m1 codes incl. 7 (+6) and 15 (-6)
     float scale = ldexpf(1.f, SBYTE - 127);
     for (int m = 0; m < 16; m++) for (int n = 0; n < 8; n++) {
         float s = 0;
