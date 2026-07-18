@@ -633,9 +633,11 @@ static __global__ void kernel_dsv4_indexer_logits(
         const char * __restrict__ q,
         const char * __restrict__ weights,
         char * __restrict__ dst) {
-    // grid.x = token, grid.y = comp tile. blockDim.x == HEAD_DIM (== head_dim lanes).
-    const int64_t t = blockIdx.x;
-    const int64_t c = (int64_t) blockIdx.y;
+    // grid.x = comp, grid.y = token. blockDim.x == HEAD_DIM (== head_dim lanes).
+    // comp on grid.X on purpose: n_comp reaches 262144 at 1M context (grid.y caps at 65535,
+    // grid.x at 2^31) — the old (token, comp) order aborted every decode past ~262K context.
+    const int64_t t = blockIdx.y;
+    const int64_t c = (int64_t) blockIdx.x;
     if (t >= args.n_tokens || c >= args.n_comp) {
         return;
     }
@@ -1191,7 +1193,8 @@ bool ggml_cuda_op_dsv4_indexer_logits(ggml_backend_cuda_context & ctx, ggml_tens
     }
 
     // CUDA-core fallback (v1): one 128-lane block per (comp,token).
-    const dim3 grid((unsigned) n_tokens, (unsigned) n_comp, 1);
+    // n_comp on grid.X (2^31 cap) — grid.y caps at 65535 = only ~262K context. See kernel.
+    const dim3 grid((unsigned) n_comp, (unsigned) n_tokens, 1);
     const dim3 block(128, 1, 1);
     auto launch = [&](auto kt_tag, auto qt_tag) {
         using kT = decltype(kt_tag);

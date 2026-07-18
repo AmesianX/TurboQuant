@@ -149,6 +149,11 @@ env_common() {
     [ -n "${DSV4_MOE_W4A16_DECODE:-}" ] && export DSV4_MOE_W4A16_DECODE
     [ -n "${DSV4_EP_DECODE_GRAPH:-}" ] && export DSV4_EP_DECODE_GRAPH
     [ -n "${DSV4_LM_HEAD_F8:-}" ] && export DSV4_LM_HEAD_F8
+    # [instruments] whole-step graph + honest per-op/step timing (post review-fix). SPMD-symmetric
+    # execution structure -> forwarded to the slave on the ALLRESTART FWD line like the rest.
+    [ -n "${DSV4_STEP_GRAPH:-}" ]  && export DSV4_STEP_GRAPH
+    [ -n "${DSV4_STEP_OPPROF:-}" ] && export DSV4_STEP_OPPROF
+    [ -n "${DSV4_STEP_TIME:-}" ]   && export DSV4_STEP_TIME
     [ -n "${DSV4_ATTN_SPLIT:-}" ] && export DSV4_ATTN_SPLIT
     [ -n "${DSV4_MOE_FUSED_PROF:-}" ] && export DSV4_MOE_FUSED_PROF
     [ -n "${DSV4_MOE_FUSED_PROF_AFTER:-}" ] && export DSV4_MOE_FUSED_PROF_AFTER
@@ -230,9 +235,9 @@ start_local() {
         SLAVE)
             export GGML_TP_RANK=1
             nohup $CGRUN build/bin/llama-server -m "$MODEL" $COMMON \
-                --host 0.0.0.0 --port "$PORT" > "$LOG" 2>&1 &
+                --host 0.0.0.0 --port "$PORT" --api-key "$API_KEY" > "$LOG" 2>&1 &
             disown
-            echo "[SLAVE] START: follower up (no HTTP), log $LOG" ;;
+            echo "[SLAVE] START: follower up (0.0.0.0 requires api-key per repo rule), log $LOG" ;;
         *)
             echo "ERROR: role UNKNOWN — local $IFACE is neither $MASTER_IP nor $SLAVE_IP"; exit 1 ;;
     esac
@@ -293,6 +298,9 @@ case "${1:-}" in
         [ -n "${DSV4_MOE_VEC16_OFF:-}" ]   && FWD="$FWD DSV4_MOE_VEC16_OFF=$DSV4_MOE_VEC16_OFF"
         [ -n "${DSV4_EP_DECODE_GRAPH:-}" ] && FWD="$FWD DSV4_EP_DECODE_GRAPH=$DSV4_EP_DECODE_GRAPH"
         [ -n "${DSV4_LM_HEAD_F8:-}" ] && FWD="$FWD DSV4_LM_HEAD_F8=$DSV4_LM_HEAD_F8"
+        [ -n "${DSV4_STEP_GRAPH:-}" ]  && FWD="$FWD DSV4_STEP_GRAPH=$DSV4_STEP_GRAPH"
+        [ -n "${DSV4_STEP_OPPROF:-}" ] && FWD="$FWD DSV4_STEP_OPPROF=$DSV4_STEP_OPPROF"
+        [ -n "${DSV4_STEP_TIME:-}" ]   && FWD="$FWD DSV4_STEP_TIME=$DSV4_STEP_TIME"
         [ -n "${DSV4_ATTN_SPLIT:-}" ] && FWD="$FWD DSV4_ATTN_SPLIT=$DSV4_ATTN_SPLIT"
         [ -n "${DSV4_MOE_FUSED_PROF:-}" ] && FWD="$FWD DSV4_MOE_FUSED_PROF=$DSV4_MOE_FUSED_PROF DSV4_MOE_FUSED_PROF_AFTER=${DSV4_MOE_FUSED_PROF_AFTER:-400}"
         [ -n "${DSV4_PREFILL_VRAM_PROBE:-}" ] && FWD="$FWD DSV4_PREFILL_VRAM_PROBE=$DSV4_PREFILL_VRAM_PROBE"
@@ -302,7 +310,16 @@ case "${1:-}" in
         [ -n "${DSV4_INDEXER_QTILE:-}" ]         && FWD="$FWD DSV4_INDEXER_QTILE=$DSV4_INDEXER_QTILE"
         [ -n "${DSV4_ATTN_QTILE:-}" ]            && FWD="$FWD DSV4_ATTN_QTILE=$DSV4_ATTN_QTILE"
         [ -n "${DSV4_INDEXER_FUSED:-}" ]         && FWD="$FWD DSV4_INDEXER_FUSED=$DSV4_INDEXER_FUSED"
-        [ -n "${DSV4_HC_BF16:-}" ]               && FWD="$FWD DSV4_HC_BF16=$DSV4_HC_BF16 DSV4_MLA_MMA=${DSV4_MLA_MMA:-} CTK=${CTK:-tbq3} CTV=${CTV:-tbq3}"
+        # NOTE: never inject set-but-empty vars into the slave env — gates are `getenv() != nullptr`,
+        # so DSV4_MLA_MMA="" ENABLES the MMA path on the slave only (rank-divergent attention).
+        [ -n "${DSV4_HC_BF16:-}" ]               && FWD="$FWD DSV4_HC_BF16=$DSV4_HC_BF16"
+        [ -n "${DSV4_MLA_MMA:-}" ]               && FWD="$FWD DSV4_MLA_MMA=$DSV4_MLA_MMA"
+        [ -n "${CTK:-}" ]                        && FWD="$FWD CTK=$CTK"
+        [ -n "${CTV:-}" ]                        && FWD="$FWD CTV=$CTV"
+        # Graph-shape-changing default-ON gates: an override MUST reach both ranks (SPMD).
+        [ -n "${DSV4_NORM_ROPE:-}" ]             && FWD="$FWD DSV4_NORM_ROPE=$DSV4_NORM_ROPE"
+        [ -n "${DSV4_KV_ADJACENT:-}" ]           && FWD="$FWD DSV4_KV_ADJACENT=$DSV4_KV_ADJACENT"
+        [ -n "${DSV4_KEEP_NOOP_CONT:-}" ]        && FWD="$FWD DSV4_KEEP_NOOP_CONT=$DSV4_KEEP_NOOP_CONT"
         [ -n "${DSV4_COMPRESSOR_BF16:-}" ]       && FWD="$FWD DSV4_COMPRESSOR_BF16=$DSV4_COMPRESSOR_BF16"
         [ -n "${DSV4_INDEXER_BF16:-}" ]          && FWD="$FWD DSV4_INDEXER_BF16=$DSV4_INDEXER_BF16"
         [ -n "${DSV4_RESUMED_RESERVE_MULT:-}" ]  && FWD="$FWD DSV4_RESUMED_RESERVE_MULT=$DSV4_RESUMED_RESERVE_MULT"

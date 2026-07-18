@@ -4038,6 +4038,14 @@ static void ggml_cuda_step_graph_reset(ggml_cuda_step_graph * sg) {
         }
         g_step_ops.clear();
         g_step_op_owner = nullptr;
+        // Print what this generation measured, then start clean: mixing two owner-graph
+        // generations' stats under one shared replay divisor understates every op that
+        // exists in only one of them.
+        if (g_step_op_replays > 0) {
+            ggml_cuda_step_opprof_report();
+        }
+        g_step_op_acc.clear();
+        g_step_op_replays = 0;
     }
 }
 
