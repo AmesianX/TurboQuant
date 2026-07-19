@@ -448,6 +448,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // [DSV4_MTP_FOLD] when the NextN head is folded into the trunk verify graph the whole
+    // ctx_dft round (mirror + AR draft decodes) is gone: the target decode already produced
+    // one greedy draft token per position (llama_get_mtp_draft_ith on ctx_tgt). fold_last_idx
+    // is the batch index of the last accepted token per seq (set in accept()); draft() reads
+    // the folded draft there. Effective n_max is 1 (a single trunk forward yields one AR step).
+    static bool fold_enabled() { static const bool e = getenv("DSV4_MTP_FOLD") != nullptr; return e; }
+    std::vector<int32_t> fold_last_idx;
+
 
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
@@ -513,6 +521,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
 
+        fold_last_idx.assign(n_seq, -1);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -582,6 +591,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
+
+        // [DSV4_MTP_FOLD] the target verify decode already ran the NextN head and produced the
+        // greedy draft tokens on-device; there is no ctx_dft mirror to build. Just record the
+        // per-seq batch row count so accept()/draft() can index llama_get_mtp_draft_ith.
+        if (fold_enabled()) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                verify_h_rows[seq_id] = i_batch_end[seq_id] < 0
+                        ? 0 : (i_batch_end[seq_id] - i_batch_beg[seq_id] + 1);
+            }
+            return true;
+        }
 
         // DSV4_MTP_PROF: split process() wall into tgt-embd fetch / mirror decode / dft-embd extract
         static const bool prof_on = getenv("DSV4_MTP_PROF") != nullptr;
@@ -680,6 +700,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         static const bool prof_on = getenv("DSV4_MTP_PROF") != nullptr;
         const int64_t t_draft0 = prof_on ? ggml_time_us() : 0;
+
+        // [DSV4_MTP_FOLD] the folded head already produced one greedy draft token per position
+        // in the last target verify decode. Read the token at the last accepted row per seq —
+        // no ctx_dft decode, no sampling, no D2H of hidden states. Effective n_max is 1.
+        if (fold_enabled()) {
+            auto * ctx_tgt = this->params.ctx_tgt;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
+                const int32_t idx = fold_last_idx[seq_id];
+                if (idx < 0) {
+                    continue;
+                }
+                const llama_token id = llama_get_mtp_draft_ith(ctx_tgt, idx);
+                if (id == LLAMA_TOKEN_NULL || id < 0) {
+                    continue;
+                }
+                dp.result->push_back(id);
+            }
+            if (prof_on) {
+                mtp_prof.t_total += (ggml_time_us() - t_draft0)*1e-3;
+                if (++mtp_prof.n_calls % 200 == 0) {
+                    LOG_INF("DSV4_MTP_PROF[fold]: %lld draft() calls, 0 dft-decodes | total %.0f ms\n",
+                            (long long) mtp_prof.n_calls, mtp_prof.t_total);
+                }
+            }
+            return;
+        }
 
         auto & ctx_dft = params.ctx_dft;
 
@@ -823,6 +873,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+
+        // [DSV4_MTP_FOLD] no verify_h / pending_h carryover: just remember which verify batch
+        // row the last accepted token sits at, so draft() can read that folded draft token.
+        if (fold_enabled()) {
+            fold_last_idx[seq_id] = i_batch_beg[seq_id] + i_h;
+            return;
+        }
+
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
