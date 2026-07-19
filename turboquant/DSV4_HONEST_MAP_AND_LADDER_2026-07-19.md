@@ -116,6 +116,32 @@ regress). The ONLY structural fix is the tensor-core MMA path (the W4A16 GEMM th
 same physics that caps vLLM/b12x decode at ~40. => MoE GEVM 15.77ms is largely IRREDUCIBLE at
 M=1; do NOT spend more here. Reallocate to the collectives bucket.
 
+## 3c. MTP overhead — localization state (resume here)
+
+Per-round (GS=4, τ~2.1, round ~146ms wall, MTP_PROF 400-500 calls):
+- mirror-decode (ctx_dft, verify batch): 11.5 ms/round — single synchronous 1-layer decode
+- draft: decode 1.26 x2 + "sample" 3.8 x2 (= getter SYNC absorbing real decode+SPMD wait)
+- tgt-embd fetch: 10.2 ms/round — llama_get_embeddings_pre_norm(ctx_tgt) sync + D2H+H2D
+  (CAUTION: may be partially legitimate verify-completion wait, i.e. accounting location,
+  not pure waste — discriminate with an event-stamped verify-end timestamp first)
+- `--spec-draft-device CUDA0` accepted (devices=[CUDA0] in init log) but CHANGED NOTHING —
+  the draft ctx is created against the target model whose buffers are meta/SPMD; a device
+  list alone does not take the decode path off the meta backend.
+
+Fix plan (code surgery, in order):
+1. Instrument verify-end vs process()-start (one cudaEvent pair) to split tgt-embd into
+   "legit verify wait" vs "sync/copy waste". Only then decide the embd handoff surgery.
+2. Draft chain overlap: the 2 sequential draft decodes + samples serialize; keep the chain
+   on-device (backend top-k already produces sampled_ids — check why the sample getter
+   still syncs per step; batch the 2-step draft into one enqueue if possible).
+3. Mirror-decode: either fold the mirror into the verify graph (single decode covering both
+   target layers + MTP head = no second roundtrip), or truly localize ctx_dft (requires
+   giving the draft ctx local (non-meta) COPIES of the MTP-head weights — they are mirrored
+   on both ranks anyway; ~small). The fold is the more orthodox end-state (vLLM does MTP
+   in-graph).
+Target: round 146 -> ~110ms => τ2.1 x (1000/110) ≈ 19-20 t/s, then deepen draft (n_max 4+,
+GS budget permitting) toward 45+ (with collectives work in parallel).
+
 ## 4. Arithmetic to target
 
 15.9 t/s = 62.9ms. Ladder projections (honest, each needs measurement):
