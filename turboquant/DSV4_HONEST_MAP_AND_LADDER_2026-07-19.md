@@ -147,6 +147,37 @@ is pure meta-backend / per-decode orchestration overhead. THIS is the user's "�
   for its mirrored NextN layer. Both are real surgery; the fold is the vLLM-style end-state.
 Everything else (sampler, n_max, GRAPH_SLOTS, spec-draft-device) is proven not to move it.
 
+ROOT CAUSE PINNED TO THE LINE (ggml-backend-meta.cpp:2122):
+  needs_rebuild = compute_dirty || cgraph->uid == 0 || cgraph->uid != backend_ctx->uid;
+backend_ctx->uid is a SINGLE slot, and ctx_tgt (verify) + ctx_dft (draft) share ONE meta
+backend. They interleave every round, so each decode sees uid != last-seen-uid and REBUILDS
+the entire per-simple-backend node list (the `for i in n_nodes: init_tensor_impl` loop +
+get_split_state at 2202-2213) EVERY decode. The draft graph is actually shape-stable
+(single-token, 1 NextN layer) and would cache fine — it's the shared-slot interleave that
+forces the rebuild. That rebuild is the ~26ms/decode tax.
+
+WHY IT IS NOT A ONE-LINER (the trap):
+- bcj.nodes / bcj.cgraphs are SINGLE vectors per backend_config. A 2-slot (verify|draft) cache
+  must double them AND swap by matching cgraph->uid against two remembered uids.
+- The rebuild ALSO advances the STC ring and clears stc_graph (2168-2185). A cached node list
+  from ctx_dft points into STC containers that ctx_tgt's next rebuild will RECYCLE -> the exact
+  "ids-size assert / wrong MoE src" crash the comments at 2102-2119 document. So a correct
+  2-slot node cache also needs the STC ring partitioned/deepened per source context.
+- The aliasing failure is interleave-timing dependent (surfaces after many rounds), so a quick
+  smoke test can pass and it crashes 2-node prod later. Needs sustained-interleave stress to
+  verify — a start-of-session surgery, not an end-of-session rush.
+
+NEXT-SESSION FIRST MOVE (choose one, both real):
+  A) Per-source 2-slot cache: add {uid, nodes[], cgraphs[], n_subgraphs, stc-generation} x2 to
+     backend_ctx, key by cgraph->uid, and give each slot its OWN stc_graph generation so the
+     other context's rebuild cannot recycle a live slot's containers. Verify: 500+ tok x 5
+     interleaved MTP requests, DSV4_EP_DBG on, watch for ids-size/CPU-fallback aborts.
+  B) Fold the MTP head into the verify graph (server-context.cpp process() -> emit the NextN
+     head as extra nodes on the ctx_tgt graph): removes the ctx_dft decode entirely, so the
+     shared-slot problem disappears. Larger but the orthodox vLLM-style end-state.
+Predicted payoff: removing ~26ms x (2 draft + 1 mirror ≈ up to 3 ctx_dft decodes)/round could
+take the round 146 -> ~90-100ms => MTP ~20-22 t/s over plain 16.41, and re-opens deeper draft.
+
 CALL-ORDER FACT (server-context.cpp:3358 vs :3497): common_speculative_process() runs
 IMMEDIATELY after tp_decode(ctx_tgt) and BEFORE common_sampler_sample_and_accept_n().
 => tgt-embd 10.2ms = the verify-decode completion wait landing at the first getter
