@@ -104,3 +104,8 @@ LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+
+// [DSV4_MTP_FOLD] read the folded greedy draft token produced by the trunk verify decode at
+// batch/token position i (LLAMA_TOKEN_NULL if the head was not folded). Lets the speculative
+// draft-mtp path skip the separate ctx_dft decode entirely.
+LLAMA_API llama_token llama_get_mtp_draft_ith(struct llama_context * ctx, int32_t i);

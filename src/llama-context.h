@@ -87,6 +87,8 @@ struct llama_context {
     float * get_embeddings_pre_norm();
     float * get_embeddings_pre_norm_ith(int32_t i);
 
+    llama_token get_mtp_draft_ith(int32_t i); // [DSV4_MTP_FOLD] folded greedy draft token at token i
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -325,6 +327,10 @@ private:
     // populated only when cparams.embeddings_pre_norm is enabled and the model graph
     // sets llm_graph_result::t_h_pre_norm
     buffer_view<float> embd_pre_norm = {nullptr, 0};
+
+    // [DSV4_MTP_FOLD] one greedy folded-draft token per batch position (dense by token index),
+    // populated from llm_graph_result::t_mtp_draft. Empty unless the MTP head is folded.
+    buffer_view<int32_t> mtp_draft = {nullptr, 0};
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

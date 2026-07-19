@@ -986,6 +986,18 @@ float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
     }
 }
 
+llama_token llama_context::get_mtp_draft_ith(int32_t i) {
+    // [DSV4_MTP_FOLD] dense by token position (unmasked layout), no output reorder.
+    if (mtp_draft.data == nullptr) {
+        return LLAMA_TOKEN_NULL;
+    }
+    if (i < 0 || (size_t) i >= mtp_draft.size) {
+        LLAMA_LOG_ERROR("%s: invalid folded draft id %d (size %zu)\n", __func__, i, mtp_draft.size);
+        return LLAMA_TOKEN_NULL;
+    }
+    return (llama_token) mtp_draft.data[i];
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -2342,6 +2354,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // [DSV4_MTP_FOLD] copy the folded greedy draft token(s) out. t_mtp_draft is one i32 per
+        // OUTPUT row (argmax over out_ids positions); in the MTP verify path out_ids covers every
+        // position so output row == token position and the buffer is dense by token (offset =
+        // n_tokens_prev). Copy exactly ne[0] rows so a subset-out_ids path can never overrun.
+        {
+            auto * t_mtp_draft = res->get_mtp_draft();
+            if (mtp_draft.data && t_mtp_draft) {
+                const int64_t n_rows = t_mtp_draft->ne[0];
+                const int64_t offset = n_tokens_prev;
+                if (n_rows > 0 && (offset + n_rows) <= (int64_t) mtp_draft.size) {
+                    ggml_backend_t backend_d = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_draft);
+                    GGML_ASSERT(backend_d != nullptr);
+                    ggml_backend_tensor_get_async(backend_d, t_mtp_draft, mtp_draft.data + offset, 0, n_rows*sizeof(int32_t));
+                }
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2445,6 +2474,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     bool has_logits        = true;
     bool has_embd          = cparams.embeddings;
     bool has_embd_pre_norm = cparams.embeddings_pre_norm;
+    // [DSV4_MTP_FOLD] the folded trunk emits res->t_mtp_draft (one i32 greedy draft token per
+    // batch position). Size a small dense-by-token buffer for it under the same condition the
+    // fold-attach uses (fold env + unmasked pre-norm on the trunk).
+    const bool has_mtp_draft = has_embd_pre_norm && !cparams.embeddings_pre_norm_masked &&
+                               getenv("DSV4_MTP_FOLD") != nullptr;
 
     // TODO: hacky enc-dec support
     if (model.arch == LLM_ARCH_T5) {
@@ -2466,6 +2500,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         embd_pre_norm.size = (size_t) hparams.n_embd_h() * n_batch;
     }
 
+    // one folded draft token per batch position (dense by token, like unmasked embd_pre_norm)
+    mtp_draft.size = has_mtp_draft ? (size_t) n_batch : 0;
+
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
     if (has_sampling) {
@@ -2481,7 +2518,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
         (logits.size + embd.size + embd_pre_norm.size + backend_float_count) * sizeof(float) +
-        (                                               backend_token_count) * sizeof(llama_token);
+        (                                               backend_token_count) * sizeof(llama_token) +
+        (mtp_draft.size) * sizeof(int32_t);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2498,6 +2536,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_pre_norm.data = nullptr;
+            mtp_draft.data = nullptr;
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -2528,6 +2567,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_pre_norm = has_embd_pre_norm ? buffer_view<float>{(float *) (base + offset), embd_pre_norm.size} : buffer_view<float>{nullptr, 0};
     offset += embd_pre_norm.size * sizeof(float);
+
+    mtp_draft = has_mtp_draft ? buffer_view<int32_t>{(int32_t *) (base + offset), mtp_draft.size} : buffer_view<int32_t>{nullptr, 0};
+    offset += mtp_draft.size * sizeof(int32_t);
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -4377,6 +4419,12 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_sampled_token_ith(i);
+}
+
+llama_token llama_get_mtp_draft_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_mtp_draft_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
