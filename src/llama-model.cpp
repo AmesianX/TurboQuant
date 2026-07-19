@@ -2502,9 +2502,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 // DeepSeek-V4: SWA attention KV + per-layer compressed (r4/r128) states.
                 // Layers with a compress ratio carry the recurrent compressed stream.
-                // The trailing NextN/MTP layer(s) belong to the MTP draft context only.
-                llama_memory_i::layer_filter_cb filter_attn = [n_main](int32_t il) {
-                    return (uint32_t) il < n_main;
+                // The trailing NextN/MTP layer(s) belong to the MTP draft context only —
+                // UNLESS the MTP head is folded into the trunk verify graph (DSV4_MTP_FOLD),
+                // in which case the NextN layer runs in this context and needs its own plain
+                // SWA plane here (compress_ratio==0 => filter_recr already excludes it, so it
+                // rides the SWA attn sub-cache only, n_swa window wide = cheap). n_layer here
+                // already includes the NextN layer(s); n_main excludes them.
+                const bool mtp_fold = getenv("DSV4_MTP_FOLD") != nullptr;
+                const uint32_t n_all_dsv4 = hparams.n_layer;
+                llama_memory_i::layer_filter_cb filter_attn = [n_main, n_all_dsv4, mtp_fold](int32_t il) {
+                    if ((uint32_t) il < n_main) return true;
+                    return mtp_fold && (uint32_t) il < n_all_dsv4;
                 };
                 llama_memory_i::layer_filter_cb filter_recr = [&, n_main](int32_t il) {
                     return (uint32_t) il < n_main && hparams.attn_compress_ratio[il] != 0;
