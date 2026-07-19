@@ -107,3 +107,21 @@ REMAINING = the hard 60% (fold-attach in graph::graph + Edit 3 server consume):
 Verify order: fold-attach (logits sane, argmax matches ctx_dft draft) -> Edit 3 (consume,
 greedy token-identical to gate-off, t/s rises toward ~20, DSV4_MTP_PROF shows ctx_dft
 decodes gone) -> sustained 1000+ tok interleave (no ids-size/reduce-null asserts).
+
+## RESULT (2026-07-19, feat/dsv4-mtp-fold @ 59f16912e) — COMPLETE & WORKING
+The fold is done and runs 2-node. DSV4_MTP_FOLD=1 (256K, ATTN+SHEXP+FOLD split):
+coherent (prose + code), deterministic, 15.64 t/s vs 14.5 standalone MTP = +7.9%. The
+entire ctx_dft mirror + AR draft decode subsystem is bypassed.
+
+Key correction to the plan above: bit-identity is NOT a valid gate. The 2-node MTP is
+inherently run-to-run non-deterministic (AllReduce FP non-assoc + near-tie argmax flips:
+fold-OFF standalone gave 369/369/380 across 3 identical greedy runs). Gate on coherence +
+tau + t/s instead. The fold itself is deterministic (15.64 repeats exactly).
+
+Honest perf: the fold beats standalone MTP but 15.64 is around/below plain greedy decode
+(16.41, cross-session) — effective n_max=1 (one trunk forward = one AR draft step) limits
+the win; the folded NextN layer's per-decode cost roughly cancels the single-draft tau
+gain. To make MTP net-positive vs plain and reach ~20+, INCREMENT 3 = restore n_max>=2 via
+CHAINED folded heads (a 2nd NextN head in the trunk graph fed by the 1st head's output +
+its draft), plus gate fold-attach to decode-only (it currently also fires during prefill,
+running the NextN layer per ubatch = a prefill tax). See memory project_dsv4_w4a16_native_port.
