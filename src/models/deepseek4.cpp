@@ -3259,6 +3259,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                        /*folded*/ true, inp_attn, inp_pos, inp_out_ids);
         if (res->t_mtp_logits) {
             ggml_build_forward_expand(gf, res->t_mtp_logits);
+            // greedy folded draft token(s), on-device — the server reads these i32 rows
+            // (cheap) instead of the ctx_dft AR decode. [n_vocab, n_out] -> [n_out] i32.
+            ggml_tensor * mtp_draft = ggml_argmax(ctx0, res->t_mtp_logits);
+            ggml_set_output(mtp_draft);
+            cb(mtp_draft, "mtp_fold_draft", -1);
+            res->t_mtp_draft = mtp_draft;
+            ggml_build_forward_expand(gf, mtp_draft);
         }
     }
 }
