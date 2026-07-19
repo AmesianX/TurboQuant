@@ -70,6 +70,14 @@ llama_context::llama_context(
     cparams.embeddings                  = params.embeddings;
     cparams.embeddings_pre_norm         = false;
     cparams.embeddings_pre_norm_masked  = false;
+    // [DSV4_MTP_FOLD] the trunk verify graph folds the NextN draft head, which reads the
+    // unmasked pre-norm hidden state (t_h_pre_norm over ALL tokens). Force it on from init
+    // — NOT the MTP draft context (ctx_dft) — so graph_reserve builds the folded graph and
+    // sizes the compute buffer for it (the server also flips this on later, harmlessly).
+    if (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP && getenv("DSV4_MTP_FOLD") != nullptr) {
+        cparams.embeddings_pre_norm        = true;
+        cparams.embeddings_pre_norm_masked = false;
+    }
     cparams.dflash_capture              = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;

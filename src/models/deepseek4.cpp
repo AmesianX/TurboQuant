@@ -3218,6 +3218,29 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_output", -1);
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+
+    // [DSV4_MTP_FOLD] fold the NextN draft head into the trunk verify graph: append
+    // the MTP head nodes here, reading the target's on-device hyper-connection state
+    // (res->t_h_pre_norm, unmasked = [hc_dim, n_tokens]) instead of a separate ctx_dft
+    // decode + D2H handoff. Emits res->t_mtp_logits; the trunk output above is untouched.
+    // Increment 1: prove the attach is non-perturbing (trunk output identical) with a
+    // simple unshifted tok_embd = emb(inp_tokens); the exact (h_p, x_{p+1}) token shift
+    // + sampled-token feedback lands in the next increment. Gated OFF by default.
+    static const bool dsv4_mtp_fold = getenv("DSV4_MTP_FOLD") != nullptr;
+    // Only fold when the trunk actually exposed its unmasked pre-norm hidden state.
+    // llama_context init forces embeddings_pre_norm on for the (non-MTP) trunk when
+    // DSV4_MTP_FOLD is set, so this holds at both graph_reserve and decode; guard
+    // gracefully (skip, don't abort) in case a caller builds the trunk without it.
+    if (dsv4_mtp_fold && res->t_h_pre_norm && !cparams.embeddings_pre_norm_masked) {
+        // draft-token embeddings for the folded head's e_proj branch (increment-1: unshifted)
+        ggml_tensor * mtp_tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp_tokens);
+        cb(mtp_tok_embd, "mtp_fold_tok_embd", -1);
+        build_mtp_head(model, res->t_h_pre_norm, mtp_tok_embd,
+                       /*folded*/ true, inp_attn, inp_pos, inp_out_ids);
+        if (res->t_mtp_logits) {
+            ggml_build_forward_expand(gf, res->t_mtp_logits);
+        }
+    }
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for DeepSeek-V4 (ds4 numerics):
@@ -3268,7 +3291,11 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 // hyper-connection collapse + shared output head; emits res->t_logits / t_embd /
 // t_h_pre_norm. Body is behavior-identical to the pre-refactor graph_mtp inline code.
 void llama_model_deepseek4::dsv4_graph_base::build_mtp_head(
-        const llama_model & model, ggml_tensor * h_in, ggml_tensor * tok_embd) {
+        const llama_model & model, ggml_tensor * h_in, ggml_tensor * tok_embd,
+        bool folded,
+        llm_graph_input_attn_kv_iswa * inp_attn_ext,
+        ggml_tensor * inp_pos_ext,
+        ggml_tensor * inp_out_ids_ext) {
     const int il = (int) hparams.n_layer - 1;
     const auto & layer = model.layers[il];
 
@@ -3280,10 +3307,14 @@ void llama_model_deepseek4::dsv4_graph_base::build_mtp_head(
     const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
     const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, 0);
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // Folded: reuse the trunk's position / out_ids / hybrid-SWA attn inputs so the
+    // NextN head rides the trunk verify decode (no separate ctx_dft, no new inputs).
+    // Standalone (graph_mtp): build our own, as before.
+    ggml_tensor * inp_pos     = folded ? inp_pos_ext     : build_inp_pos();
+    ggml_tensor * inp_out_ids = folded ? inp_out_ids_ext : build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv_iswa();
+    llm_graph_input_attn_kv_iswa * inp_attn = folded ? inp_attn_ext : build_attn_inp_kv_iswa();
+    GGML_ASSERT(inp_attn && "MTP head needs an SWA attention input");
 
     // e_proj(enorm(emb)) broadcast over the n_hc rows
     ggml_tensor * e = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
@@ -3399,8 +3430,10 @@ void llama_model_deepseek4::dsv4_graph_base::build_mtp_head(
     cb(inpL, "mtp_hc_ffn_post", il);
 
     // expose the post-layer hyper-connection state so the AR draft loop can
-    // seed the next MTP step (same slot as the trunk graph's t_h_pre_norm)
-    {
+    // seed the next MTP step (same slot as the trunk graph's t_h_pre_norm).
+    // Folded: do NOT touch res->t_h_pre_norm — that slot holds the TRUNK's h_flat
+    // which is this head's INPUT; overwriting it would corrupt the trunk output.
+    if (!folded) {
         ggml_tensor * h_flat = ggml_reshape_2d(ctx0, inpL, hc_dim, n_tokens);
         cb(h_flat, "h_pre_norm", -1);
         res->t_h_pre_norm = h_flat;
@@ -3424,11 +3457,19 @@ void llama_model_deepseek4::dsv4_graph_base::build_mtp_head(
             : model.output_norm;
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "mtp_result_norm", -1);
-    res->t_embd = cur;
+    if (!folded) {
+        res->t_embd = cur;
+    }
 
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "mtp_result_output", -1);
-    res->t_logits = cur;
+    // Folded: emit into the dedicated MTP slot so the trunk's t_logits (already set
+    // by the trunk output head) stays intact; the server reads t_mtp_logits to draft.
+    if (folded) {
+        res->t_mtp_logits = cur;
+    } else {
+        res->t_logits = cur;
+    }
     ggml_build_forward_expand(gf, cur);
 }
 

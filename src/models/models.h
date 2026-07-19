@@ -1063,8 +1063,17 @@ struct llama_model_deepseek4 : public llama_model_base {
         // Builds the NextN head: one plain-SWA MLA+MoE decoder layer + the MTP head's
         // hyper-connection collapse + shared output head. Reads h_in (target post-layer
         // hyper-connection state, hc_dim x n_tokens) and tok_embd (draft token
-        // embeddings, n_embd x n_tokens). Emits res->t_logits / t_embd / t_h_pre_norm.
-        void build_mtp_head(const llama_model & model, ggml_tensor * h_in, ggml_tensor * tok_embd);
+        // embeddings, n_embd x n_tokens).
+        // Standalone (graph_mtp): builds its own pos/out_ids/SWA-attn inputs and emits
+        //   res->t_logits / t_embd / t_h_pre_norm (unchanged behavior).
+        // Folded (graph, DSV4_MTP_FOLD): reuses the trunk's inp_pos/inp_out_ids and its
+        //   hybrid SWA attn input; emits res->t_mtp_logits and leaves t_logits/t_embd/
+        //   t_h_pre_norm (the trunk's) untouched.
+        void build_mtp_head(const llama_model & model, ggml_tensor * h_in, ggml_tensor * tok_embd,
+                            bool folded = false,
+                            llm_graph_input_attn_kv_iswa * inp_attn_ext = nullptr,
+                            ggml_tensor * inp_pos_ext = nullptr,
+                            ggml_tensor * inp_out_ids_ext = nullptr);
     };
 
     struct graph : public dsv4_graph_base {

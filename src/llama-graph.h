@@ -700,6 +700,7 @@ public:
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
+    ggml_tensor * get_mtp_logits()  const { return t_mtp_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
@@ -731,6 +732,9 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_mtp_logits  = nullptr; // [DSV4_MTP_FOLD] folded NextN draft-head logits, emitted
+                                           // by the trunk verify graph so the server can draft without
+                                           // a separate ctx_dft decode. null unless the head is folded.
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
