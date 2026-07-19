@@ -83,12 +83,21 @@ per-op table (the ATTN_SPLIT/SHEXP runs were STEP_TIME-only).
 
 ## 3b. Two diagnostics settled (2026-07-19 PM)
 
-**MTP is a net LOSS on the split ladder** (not a STEP_GRAPH interaction):
-plain 16.41 vs MTP+SG 13.67 vs MTP no-SG 13.91. Both MTP configs lose. On this now-fast
-plain config the draft+verify overhead exceeds the acceptance payoff (τ ~1.2-1.3 class from
-Q4 history). MTP only pays when plain is slow; the split ladder made plain fast enough that
-n_max=2 MTP is underwater. Lever for 50+ is DEEPER draft (vLLM MAC=12-class), not n_max=2 —
-and that needs the draft/verify graph-reuse to hold across a wider verify batch.
+**MTP regression — CORRECTED DIAGNOSIS (the first "structural net loss" call was WRONG):**
+plain 16.41 vs MTP 13.67 (SG on) / 13.91 (SG off) / 13.78 (GS=16) / 14.9 (GS=4, -n400).
+Neither STEP_GRAPH nor GRAPH_SLOTS is the cause. The REAL numbers (first completed-response
+measurement, GS=4): **τ = 2.12-2.20 (59% draft acceptance) — comfortably above the ~1.77
+breakeven.** Implied round cost = 142-148ms vs ~105ms model (verify M=3 ~92 + draft ~13).
+With a 105ms round and τ=2.17, MTP would do ~20.8 t/s and WIN. => there is a ~40ms/round
+overhead leak, not an acceptance problem. Round anatomy: verify(target,M=3) + process()
+mirror-decode(ctx_dft) + n_max sequential draft() decodes(ctx_dft) — up to 4 llama_decode
+calls/round; suspects = per-call graph build/alloc on ctx_dft ("graphs reused = 0" class),
+host-side fixed overhead, DFlash-era checkpoint-cache full-forward leak. DSV4_MTP_PROF
+buckets (tgt-embd/mirror-decode/extract + draft decode/sample/embd + graph builds) localize
+it. ALSO: measurement methodology note — cold first-request probes under-measure MTP (more
+graph shapes to warm than plain); always measure request 2+.
+Lesson recorded: GRAPH_SLOTS=16 at 256K/ub2048 OOMs the box (memwatch killed the server at
+3GB free) — launcher's own ~2GB/slot warning stands; GS=4 is the measurement ceiling here.
 
 **Decode MoE GEVM is at the scalar-FFMA compute floor, NOT bandwidth** (bench:
 turboquant/dsv4_dec_gevm_bench.cu, 7 controlled variants):
