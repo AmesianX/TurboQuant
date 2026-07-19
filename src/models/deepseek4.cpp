@@ -3222,19 +3222,39 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     // [DSV4_MTP_FOLD] fold the NextN draft head into the trunk verify graph: append
     // the MTP head nodes here, reading the target's on-device hyper-connection state
     // (res->t_h_pre_norm, unmasked = [hc_dim, n_tokens]) instead of a separate ctx_dft
-    // decode + D2H handoff. Emits res->t_mtp_logits; the trunk output above is untouched.
-    // Increment 1: prove the attach is non-perturbing (trunk output identical) with a
-    // simple unshifted tok_embd = emb(inp_tokens); the exact (h_p, x_{p+1}) token shift
-    // + sampled-token feedback lands in the next increment. Gated OFF by default.
+    // decode + D2H handoff. Emits res->t_mtp_logits per position; the trunk output above
+    // is untouched. The server (DSV4_MTP_FOLD consume path) reads the accepted position's
+    // t_mtp_logits column as the next-round draft, dropping the ctx_dft decode. Gated OFF.
     static const bool dsv4_mtp_fold = getenv("DSV4_MTP_FOLD") != nullptr;
     // Only fold when the trunk actually exposed its unmasked pre-norm hidden state.
     // llama_context init forces embeddings_pre_norm on for the (non-MTP) trunk when
     // DSV4_MTP_FOLD is set, so this holds at both graph_reserve and decode; guard
     // gracefully (skip, don't abort) in case a caller builds the trunk without it.
     if (dsv4_mtp_fold && res->t_h_pre_norm && !cparams.embeddings_pre_norm_masked) {
-        // draft-token embeddings for the folded head's e_proj branch (increment-1: unshifted)
-        ggml_tensor * mtp_tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp_tokens);
+        // The NextN head predicts x_{p+2} from (h_p, x_{p+1}): pair each position's target
+        // hidden with the NEXT token. In-batch that is inp_tokens shifted left by one; the
+        // final position pairs with the token the trunk just produced — greedy argmax of the
+        // last logit column (== the sampled token at temp 0; at temp>0 the draft is merely
+        // seeded greedily, still verified by the target so output stays correct).
+        ggml_tensor * raw_embd = ggml_get_rows(ctx0, model.tok_embd, inp_tokens); // [n_embd, n_tokens]
+
+        const int64_t n_vocab = res->t_logits->ne[0];
+        const int64_t n_out   = res->t_logits->ne[1];
+        ggml_tensor * last_logit = ggml_view_2d(ctx0, res->t_logits, n_vocab, 1,
+                                                res->t_logits->nb[1], (n_out - 1) * res->t_logits->nb[1]);
+        ggml_tensor * samp      = ggml_argmax(ctx0, last_logit);                  // [1] i32
+        ggml_tensor * samp_embd = ggml_get_rows(ctx0, model.tok_embd, samp);      // [n_embd, 1]
+
+        ggml_tensor * mtp_tok_embd;
+        if (n_tokens > 1) {
+            ggml_tensor * tail = ggml_view_2d(ctx0, raw_embd, n_embd, n_tokens - 1,
+                                              raw_embd->nb[1], raw_embd->nb[1]);   // cols 1..n-1
+            mtp_tok_embd = ggml_concat(ctx0, tail, samp_embd, 1);                 // [n_embd, n_tokens]
+        } else {
+            mtp_tok_embd = samp_embd;                                             // single-token decode
+        }
         cb(mtp_tok_embd, "mtp_fold_tok_embd", -1);
+
         build_mtp_head(model, res->t_h_pre_norm, mtp_tok_embd,
                        /*folded*/ true, inp_attn, inp_pos, inp_out_ids);
         if (res->t_mtp_logits) {
