@@ -167,6 +167,26 @@ WHY IT IS NOT A ONE-LINER (the trap):
   smoke test can pass and it crashes 2-node prod later. Needs sustained-interleave stress to
   verify — a start-of-session surgery, not an end-of-session rush.
 
+ATTEMPT A (per-uid rebuild cache) — TRIED, FAILED CORRECTNESS, REVERTED (2026-07-19):
+Built a uid-keyed LRU cache of the rebuild output (bcj.nodes + subgraph offsets + n_subgraphs),
+restoring on hit and moving the cheap cgraph_main repop to run always. DSV4_META_REBUILD_PROF
+confirmed 99% uid-churn and uid-recurs-in-last8, so mechanically the cache should hit. RESULT:
+2-node server CRASHED at ggml-cuda.cu:1320 (GGML_ASSERT tensors[0] != nullptr && contiguous in
+the AllReduce path), and greedy output differed. ROOT REASON THE APPROACH IS UNSOUND: bcj.nodes
+are RESOLVED simple/split tensors bound to a SPECIFIC cgraph build. llama rebuilds cgraph->nodes
+fresh (new ggml_tensor objects) every decode; the same uid identifies the SHAPE but not the
+tensor instances. Reusing cached resolved tensors mixes stale pointers (old compute-buffer
+activations, since recycled) into the new graph -> the reduce boundary tensor comes back null/
+non-contig. THIS is the real reason the original code rebuilds every decode: the resolution is
+per-instance, not per-shape. Caching resolved pointers cannot work. (Verification caught it
+pre-ship; reverted clean to 9a98ac79c, rebuilt, md5-synced.)
+IMPLICATION FOR NEXT ATTEMPT: the ~26ms is the per-instance RE-RESOLUTION (init_tensor_impl +
+get_split_state over all nodes), which is inherent to running two interleaved contexts on the
+shared meta backend. To cut it you must either (a) memoize only the SHAPE-level split decisions
+per node signature so re-resolution is O(1) lookups instead of recursion (keeps per-instance
+pointer binding, caches only the expensive split-axis math) — subtle but sound; or (b) fold the
+MTP head into the verify graph so there is no separate ctx_dft decode to re-resolve at all.
+
 NEXT-SESSION FIRST MOVE (choose one, both real):
   A) Per-source 2-slot cache: add {uid, nodes[], cgraphs[], n_subgraphs, stc-generation} x2 to
      backend_ctx, key by cgraph->uid, and give each slot its OWN stc_graph generation so the
