@@ -57,7 +57,53 @@ So the fold is NOT data plumbing — it is: append the MTP-head nodes to the tru
 3. Sustained interleave / long context: no ids-size / reduce-null asserts over 1000+ tokens.
 
 ## Status
-Branch created. Attach point proven (h_flat = t_h_pre_norm). Next session: Edit 1 (refactor,
-verify identical), then Edit 3 (consume), then Edit 2 (KV) — or Edit 2 before 3 if the folded
-head needs its KV to produce correct logits (likely yes: the NextN attn reads its SWA cache).
-Recommended order: 1 (refactor) -> 2 (KV) -> fold-attach -> 3 (consume) -> verify.
+Branch feat/dsv4-mtp-fold. Attach point proven (h_flat = t_h_pre_norm).
+
+DONE:
+- Edit 1 (af6082654): build_mtp_head extracted into dsv4_graph_base, shared by graph +
+  graph_mtp. VERIFIED 2-node MTP greedy (temp0/seed42, 256K, ATTN+SHEXP+FOLD split):
+  14.57 t/s warm / 14.06 cold, coherent output, no crash = behavior-identical refactor.
+  Ref output saved turboquant/mtp_edit1_greedy_ref.json (sha256 8df9f47a…) for future
+  strict token A/B vs main (skipped now — verbatim move + baseline t/s is proportionate).
+- Edit 2 (035ef61c6): trunk hybrid_iswa filter_attn extended to include NextN layer under
+  DSV4_MTP_FOLD. CONFIRMED via source: NextN (il=n_layer-1) is plain SWA — deepseek4.cpp
+  load_arch_hparams sets swa_layers[il]=1 + attn_compress_ratio[il]=0, so filter_recr
+  (needs compress_ratio!=0) auto-excludes it => it rides ONLY the SWA attn sub-cache
+  (n_swa window = cheap). Default OFF => filter byte-identical to before. Compiles.
+
+DESIGN CONFIRMED (Option A — orthodox, low churn):
+- The folded head does NOT build its own build_attn_inp_kv_iswa(). It REUSES the trunk's
+  hybrid input: build_inp_mem_hybrid_iswa() returns llm_graph_input_mem_hybrid_iswa whose
+  get_attn() is an llm_graph_input_attn_kv_iswa. Its mctx->get_swa() is the SWA sub-cache
+  that (post Edit 2) contains the NextN plane. Masks/k_idxs_swa are position-based and
+  identical for the NextN layer (same SWA window, same causal) — cpy_k/get_k with
+  il=n_layer-1 target the NextN plane (cache indexes by il). So the folded NextN attention
+  is correct riding the trunk's existing SWA input; no new input tensors, no D2H.
+- => build_mtp_head needs a folded flag / SWA-input-source param. Standalone (graph_mtp):
+  build its own build_attn_inp_kv_iswa + build_inp_pos + build_inp_out_ids (as today).
+  Folded (graph): pass the trunk's inp_mem->get_attn() and REUSE trunk inp_pos; out_ids
+  handling is the crux (see below).
+
+REMAINING = the hard 60% (fold-attach in graph::graph + Edit 3 server consume):
+- Draft-position / out_ids semantics is THE hard part. Today the flow (speculative.cpp
+  common_speculative_impl_draft_mtp): ctx_tgt verify decode -> D2H fetch target h via
+  llama_get_embeddings_pre_norm -> pair (h_p, x_{p+1}) with cross-batch carryover
+  (pending_h / pending_h_prev / verify_h, grouped by seq, row0=sampled tok..rowN=Nth
+  accepted draft) -> mirror to ctx_dft -> decode ctx_dft -> AR draft(). The fold must
+  REPLACE this whole carryover: the folded head reads h_flat on-device and must emit draft
+  logits for the RIGHT position(s) (the last verified/accepted row per seq), then Edit 3
+  does device-side argmax (llama_set_sampler backend chain already exists) to get the draft
+  token(s) directly out of the verify decode — deleting process()+draft() ctx_dft decodes.
+- This touches memory(done)+graph+server+the pending_h/verify_h carryover model. It is a
+  big-bang across subsystems => enter DELIBERATELY at a session start with 2-node verify
+  room; do NOT rush (attempt-A crashed from a rushed meta edit). Recommended: implement
+  fold-attach (build_mtp_head folded call in graph::graph after :3190/:3203, gated) reading
+  h_flat + reusing trunk SWA input + emitting res->t_mtp_logits FIRST, verify the trunk
+  still runs + logits are sane (compare folded-head argmax vs the standalone ctx_dft draft
+  token for the same position — must match), THEN Edit 3 rewires the server to consume it.
+- Gate: DSV4_MTP_FOLD must be forwarded to BOTH ranks (add to tp-w4a16.sh FWD like the
+  other DSV4_* envs) — it now affects memory layout (Edit 2) so ranks MUST agree.
+
+Verify order: fold-attach (logits sane, argmax matches ctx_dft draft) -> Edit 3 (consume,
+greedy token-identical to gate-off, t/s rises toward ~20, DSV4_MTP_PROF shows ctx_dft
+decodes gone) -> sustained 1000+ tok interleave (no ids-size/reduce-null asserts).
