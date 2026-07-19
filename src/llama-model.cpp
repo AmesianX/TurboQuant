@@ -68,6 +68,11 @@ struct dsv4_sidecar_layer_entry {
 void dsv4_moe_grouped_set_expert_weights_blob(int il, const dsv4_moe_grouped_blob_header * hdr,
                                               const void * blob, size_t blob_size);
 bool dsv4_moe_grouped_have_layer(int il);
+// [DSV4_MTP_FOLD] host MXFP4->NVFP4 layer conversion (same math as the offline sidecar); used to
+// register the NextN draft layer's experts online so the folded head runs the fast grouped path.
+void dsv4_moe_grouped_convert_layer(const void * gate_mxfp4, const void * up_mxfp4, const void * down_mxfp4,
+                                    int n_expert, int n_embd, int n_ff_half,
+                                    dsv4_moe_grouped_blob_header * hdr, std::vector<uint8_t> & out);
 // [ep2-dp] set this rank's expert shard so the FUSED op passes runMoe the right MOEParallelismConfig.
 extern "C" void dsv4_moe_set_ep_config(int ep, int expert_base, int n_expert_global, int n_expert_local);
 // rank for the per-process sidecar file (GGML_TP_RANK; 0 when not SPMD). Defined in ggml-backend-meta.cpp.
@@ -1896,6 +1901,62 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_INFO("%s: [dsv4-moe-sidecar] uploaded NVFP4 experts for %d MoE layers from %s "
                 "(rank %d/%d, n_ff_half=%d; MXFP4 never device-resident)\n",
                 __func__, n_loaded, path, rank, fh.n_ranks, fh.n_ff_half);
+        }
+    }
+
+    // [DSV4_MTP_FOLD] Register the NextN draft layer's experts on the fast NVFP4 grouped path so the
+    // folded head's MoE runs the grouped/fused kernels instead of the slow generic mul_mat_id (Q4_K).
+    // The NextN layer is MIRRORED (full expert set on every rank, no TP/EP split), so it registers with
+    // the GLOBAL n_expert; the grouped op detects E==g_ep_n_global and runs it non-EP (ep_size=1). The
+    // Q4_K expert tensors stay loaded (the standalone graph_mtp path still needs them); this adds one
+    // NVFP4 copy of a single layer. Convert Q4_K -> f32 -> MXFP4 (public type traits) -> NVFP4 blob.
+    if (getenv("DSV4_MTP_FOLD") != nullptr && arch == LLM_ARCH_DEEPSEEK4 && hparams.nextn_predict_layers > 0) {
+        // NOTE: with the nsparks FP4 sidecar the NextN layer (il=n_layer-1) is ALREADY registered
+        // as full NVFP4 (E==n_expert), so have_layer() is true here and this fallback is skipped.
+        // It only fires for a GGUF whose NextN experts are NOT pre-converted (e.g. our Q4_K build),
+        // giving them the same fast grouped path. The real EP correctness comes from the grouped op's
+        // E==g_ep_n_global => non-EP override (dsv4-moe-grouped.cu), which fixes the folded head's
+        // NextN MoE dropping half its experts under DSV4_EP.
+        const int nextn_il = (int) hparams.n_layer - 1;
+        const auto & L = layers[nextn_il];
+        if (!dsv4_moe_grouped_have_layer(nextn_il) && L.ffn_gate_exps && L.ffn_up_exps && L.ffn_down_exps) {
+            const int n_expert = (int) hparams.n_expert;
+            const int n_embd   = (int) hparams.n_embd;
+            const int n_ff     = (int) hparams.n_ff_exp;
+            const auto * q4k = ggml_get_type_traits(GGML_TYPE_Q4_K);
+            const auto * mxf = ggml_get_type_traits(GGML_TYPE_MXFP4);
+            const size_t mx_blk = ggml_row_size(GGML_TYPE_MXFP4, 32); // bytes per 32-value MXFP4 block
+
+            auto to_mxfp4 = [&](ggml_tensor * t, int64_t rows, int64_t cols) -> std::vector<uint8_t> {
+                // t: [cols, rows, n_expert] (ne0=cols contiguous, Q4_K per row of `cols`); emit per-expert
+                // MXFP4 blocks in row-major [rows, cols] order = exactly what convert_layer expects.
+                const int64_t per = rows * cols;
+                std::vector<uint8_t> raw(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                const size_t q4k_row = ggml_row_size(GGML_TYPE_Q4_K, cols);
+                const size_t blks    = (size_t)(per / 32);
+                std::vector<float>   f32(per);
+                std::vector<uint8_t> out((size_t) n_expert * blks * mx_blk);
+                for (int e = 0; e < n_expert; ++e) {
+                    const uint8_t * src = raw.data() + (size_t) e * rows * q4k_row;
+                    q4k->to_float(src, f32.data(), per);
+                    mxf->from_float_ref(f32.data(), out.data() + (size_t) e * blks * mx_blk, per);
+                }
+                return out;
+            };
+
+            std::vector<uint8_t> gate_mx = to_mxfp4(L.ffn_gate_exps, n_ff,   n_embd); // [n_ff, n_embd]
+            std::vector<uint8_t> up_mx   = to_mxfp4(L.ffn_up_exps,   n_ff,   n_embd);
+            std::vector<uint8_t> down_mx = to_mxfp4(L.ffn_down_exps, n_embd, n_ff);   // [n_embd, n_ff]
+
+            dsv4_moe_grouped_blob_header hdr{};
+            std::vector<uint8_t> blob;
+            dsv4_moe_grouped_convert_layer(gate_mx.data(), up_mx.data(), down_mx.data(),
+                                           n_expert, n_embd, n_ff, &hdr, blob);
+            dsv4_moe_grouped_set_expert_weights_blob(nextn_il, &hdr, blob.data(), blob.size());
+            LLAMA_LOG_INFO("%s: [DSV4_MTP_FOLD] registered NextN layer %d MoE on fast NVFP4 path "
+                "(%d experts, n_ff=%d) — folded head now uses grouped kernels\n",
+                __func__, nextn_il, n_expert, n_ff);
         }
     }
 

@@ -1318,8 +1318,14 @@ bool ggml_cuda_op_dsv4_moe_grouped(ggml_backend_cuda_context & ctx, ggml_tensor 
   // NOTE: the large-M CUTLASS GROUPED prefill path further below is NOT EP-aware; under EP the graph
   // routes large M to the FUSED op (runMoe) and only small M (decode + the fused-live HP band) here,
   // so the grouped CUTLASS prefill is never reached under EP. Guard it explicitly to be safe.
-  const int ep_base    = g_ep ? g_ep_base    : 0;
-  const int ep_E_local = g_ep ? g_ep_n_local : E;
+  // [DSV4_MTP_FOLD] a layer registered with the FULL global expert set (E == g_ep_n_global) is
+  // NOT EP-sharded — e.g. the mirrored NextN draft layer, which every rank runs whole (no TP
+  // split, no partial AllReduce). Force ep_base=0/E_local=E for it so the GLOBAL->LOCAL remap +
+  // remote-skip is a no-op and all its experts fire; the EP main layers (E == g_ep_n_local) keep
+  // the shard params. Non-EP overall (g_ep==0) is unchanged.
+  const bool layer_ep  = g_ep && (E != g_ep_n_global);
+  const int ep_base    = layer_ep ? g_ep_base    : 0;
+  const int ep_E_local = layer_ep ? g_ep_n_local : E;
 
   cudaStream_t s = ctx.stream();
 
