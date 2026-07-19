@@ -128,6 +128,25 @@ Per-round (GS=4, τ~2.1, round ~146ms wall, MTP_PROF 400-500 calls):
   the draft ctx is created against the target model whose buffers are meta/SPMD; a device
   list alone does not take the decode path off the meta backend.
 
+PER-DECODE COST QUANTIFIED (n_max sweep, GS=4, the decisive number):
+| n_max | t/s | tau | round ms | decodes/round |
+|---|---|---|---|---|
+| 2 | 14.9 | 2.17 | 146 | 4 (2 draft + verify + mirror) |
+| 3 | 13.3 | 2.34 | 176 | 5 |
+=> +1 ctx_dft decode = +30 ms/round, buys only +0.17 tau. A single 1-layer MTP-head
+decode costs ~30ms wall of which real compute is ~4ms (1 layer + lm_head GEVM) => ~26ms
+is pure meta-backend / per-decode orchestration overhead. THIS is the user's "두 대로 나눠
+처리하는 부분" cost, now quantified. Consequences:
+- Deeper draft is NET NEGATIVE (n_max=2 is already past the sweet spot). Do NOT raise n_max.
+- ctx_dft is NOT broadcast (server-context.cpp:1078 "do NOT register ctx_dft" — solo rank 0),
+  yet still built on model_tgt which is split_mode=TENSOR: the MTP head graph runs through the
+  meta backend's per-decode machinery even though its NextN weights are MIRRORED (no AllReduce
+  needed). The 26ms is that machinery's fixed per-decode tax, NOT cross-node data.
+- The ONLY lever left is removing that per-decode tax: fold the MTP head into the verify graph
+  (one decode, zero extra ctx_dft orchestration) OR give ctx_dft a non-meta single-GPU backend
+  for its mirrored NextN layer. Both are real surgery; the fold is the vLLM-style end-state.
+Everything else (sampler, n_max, GRAPH_SLOTS, spec-draft-device) is proven not to move it.
+
 CALL-ORDER FACT (server-context.cpp:3358 vs :3497): common_speculative_process() runs
 IMMEDIATELY after tp_decode(ctx_tgt) and BEFORE common_sampler_sample_and_accept_n().
 => tgt-embd 10.2ms = the verify-decode completion wait landing at the first getter
