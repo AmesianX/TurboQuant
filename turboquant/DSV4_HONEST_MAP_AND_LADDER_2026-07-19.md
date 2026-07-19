@@ -187,7 +187,35 @@ per node signature so re-resolution is O(1) lookups instead of recursion (keeps 
 pointer binding, caches only the expensive split-axis math) — subtle but sound; or (b) fold the
 MTP head into the verify graph so there is no separate ctx_dft decode to re-resolve at all.
 
-NEXT-SESSION FIRST MOVE (choose one, both real):
+DECISION (user, repeated): match vLLM's standard = APPROACH B, fold the MTP head into the
+verify graph. Attempt A (cache the separate-context rebuild) is a dead end BY CONSTRUCTION —
+it tries to make the separate ctx_dft fast; folding removes ctx_dft's decode entirely so the
+whole per-instance-resolution / shared-uid-slot / embd-handoff family of costs disappears at
+once. This is what vLLM does (MTP in the same TP forward).
+
+FOLD SCOPE (concrete, from reading src/models/deepseek4.cpp graph_mtp @3227 + the spec loop):
+graph_mtp is already a standalone graph taking 3 inputs from the target forward:
+  inp->tokens (draft token ids), inp->embd (target hidden state, hc_dim x n_tokens — the
+  D2H-fetched 10ms), inp->h (prev hc rows).
+The fold makes those inputs ON-DEVICE continuations of the ctx_tgt graph instead of a separate
+decode. Three edits:
+  1. deepseek4 graph: after the verify decode's final hidden state, emit the NextN head nodes
+     reading that hidden state on-device (no D2H). i.e. graph_mtp's body appended to the trunk
+     decode graph for the draft positions.
+  2. KV: the NextN layer has its own KV plane (ctx_dft's cache today). Folded, it must be a
+     plane within ctx_tgt's memory (or a mirrored side-cache updated in the same graph).
+  3. server-context.cpp spec loop: drop the separate common_speculative_draft() ctx_dft decode;
+     extract the draft token(s) from the verify decode's MTP-head output (device-side argmax,
+     backend sampling already exists). process()'s mirror-decode + tgt-embd fetch both vanish.
+Payoff: removes 2-3 ctx_dft decodes/round (each ~26ms re-resolution + the 10ms embd handoff) =>
+round 146 -> ~90ms => MTP ~20-22 t/s over plain 16.41, and re-opens deeper draft (n_max was
+net-negative ONLY because each extra draft decode paid the separate-context tax).
+RISK/DISCIPLINE: this is a 3-file architecture change; do it at session START with room to run
+the full 2-node greedy A/B (fold output must match the current separate-ctx_dft output token-
+for-token at temp 0) + sustained interleave. Do NOT rush it at a session tail (attempt A crashed
+exactly from an unverified meta-path edit; verification caught it, reverted clean to 9a98ac79c).
+
+OLDER NOTES (superseded by the fold decision above):
   A) Per-source 2-slot cache: add {uid, nodes[], cgraphs[], n_subgraphs, stc-generation} x2 to
      backend_ctx, key by cgraph->uid, and give each slot its OWN stc_graph generation so the
      other context's rebuild cannot recycle a live slot's containers. Verify: 500+ tok x 5
