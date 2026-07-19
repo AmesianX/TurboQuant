@@ -2064,7 +2064,7 @@ static ggml_tensor * dsv4_cache_view_3d(ggml_context * ctx, ggml_tensor * cache,
 } // namespace
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
-	llm_graph_context(params) {
+	dsv4_graph_base(params) {
 
     const int64_t n_hc        = hparams.n_hc;
     const int64_t n_lora_q    = hparams.n_lora_q;
@@ -3225,7 +3225,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 // one plain-SWA MLA+MoE decoder layer (the NextN block), then the MTP head's
 // own hyper-connection collapse in front of the shared output head.
 llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
-    : llm_graph_context(params) {
+    : dsv4_graph_base(params) {
     GGML_ASSERT(hparams.nextn_predict_layers == 1 && "DSV4 MTP supports exactly one NextN layer");
 
     const int il = (int) hparams.n_layer - 1;
@@ -3236,13 +3236,8 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
                 "(create the MTP shard with turboquant/ds4_mtp_to_shard.py)");
     }
 
-    const int64_t n_hc        = hparams.n_hc;
-    const int64_t hc_dim      = n_hc * n_embd;
-    const int64_t n_out_group = hparams.n_attn_out_groups;
-    const int64_t n_lora_o    = hparams.n_lora_o;
-
-    const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
-    const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, 0);
+    const int64_t n_hc   = hparams.n_hc;
+    const int64_t hc_dim = n_hc * n_embd;
 
     auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim);
 
@@ -3262,6 +3257,28 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     ggml_tensor * h_in = inp->h;
     res->add_input(std::move(inp));
+
+    build_mtp_head(model, h_in, tok_embd);
+}
+
+// NextN MTP draft head, shared by graph_mtp (standalone draft graph) and the folded
+// head inside the trunk graph (DSV4_MTP_FOLD). Reads h_in (target post-layer
+// hyper-connection state, hc_dim x n_tokens) + tok_embd (draft token embeddings,
+// n_embd x n_tokens). Builds one plain-SWA MLA+MoE decoder layer + the MTP head's
+// hyper-connection collapse + shared output head; emits res->t_logits / t_embd /
+// t_h_pre_norm. Body is behavior-identical to the pre-refactor graph_mtp inline code.
+void llama_model_deepseek4::dsv4_graph_base::build_mtp_head(
+        const llama_model & model, ggml_tensor * h_in, ggml_tensor * tok_embd) {
+    const int il = (int) hparams.n_layer - 1;
+    const auto & layer = model.layers[il];
+
+    const int64_t n_hc        = hparams.n_hc;
+    const int64_t hc_dim      = n_hc * n_embd;
+    const int64_t n_out_group = hparams.n_attn_out_groups;
+    const int64_t n_lora_o    = hparams.n_lora_o;
+
+    const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
+    const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, 0);
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();

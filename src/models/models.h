@@ -1053,12 +1053,26 @@ struct llama_model_deepseek4 : public llama_model_base {
     // sidecar env is unset. Populated in load_arch_tensors, consumed there and in load_tensors.
     std::set<int> dsv4_sidecar_layers;
 
-    struct graph : public llm_graph_context {
+    // shared base carrying the NextN MTP draft-head builder so both the standalone
+    // draft graph (graph_mtp) and the folded head inside the trunk (graph) build the
+    // exact same nodes. build_mtp_head needs the protected llm_graph_context build_*
+    // helpers, so it must be a method here (a free function can't reach them).
+    struct dsv4_graph_base : public llm_graph_context {
+        dsv4_graph_base(const llm_graph_params & params) : llm_graph_context(params) {}
+
+        // Builds the NextN head: one plain-SWA MLA+MoE decoder layer + the MTP head's
+        // hyper-connection collapse + shared output head. Reads h_in (target post-layer
+        // hyper-connection state, hc_dim x n_tokens) and tok_embd (draft token
+        // embeddings, n_embd x n_tokens). Emits res->t_logits / t_embd / t_h_pre_norm.
+        void build_mtp_head(const llama_model & model, ggml_tensor * h_in, ggml_tensor * tok_embd);
+    };
+
+    struct graph : public dsv4_graph_base {
         graph(const llama_model & model, const llm_graph_params & params);
     };
 
     // LLM_GRAPH_TYPE_DECODER_MTP draft head (NextN layer + split eh projections)
-    struct graph_mtp : public llm_graph_context {
+    struct graph_mtp : public dsv4_graph_base {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
